@@ -1,0 +1,672 @@
+[
+ {
+  "name": "a00-strict-read",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a01-read-limit-offset-path",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=limit>\n60\n</parameter>\n<parameter=offset>\n1090\n</parameter>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "limit": 60,
+      "offset": 1090,
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a02-read-offset-path",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=offset>\n91\n</parameter>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "offset": 91,
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a03-read-path-limit-offset",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n<parameter=limit>\n40\n</parameter>\n<parameter=offset>\n1090\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "limit": 40,
+      "offset": 1090
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a04-ws-blank-lines",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n\n<function=read>\n\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n\n<parameter=offset>\n5\n</parameter>\n\n</function>\n\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "offset": 5
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a05-ws-no-newlines",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call><function=read><parameter=path>/app/src/index.test.ts</parameter><parameter=limit>10</parameter></function></tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "limit": 10
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a06-ws-trailing-spaces",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>  \n</function> \n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a07-no-function-close",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a08-no-tool-call-close",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ]
+  }
+ },
+ {
+  "name": "a09-call-in-thinking",
+  "request_file": "pi-request.json",
+  "text": "I will read it.\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>\n</think>\n\n",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "I will read it.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a10-call-in-thinking-then-text",
+  "request_file": "pi-request.json",
+  "text": "I will read it.\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>\n</think>\n\nReading now.",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "I will read it.\n",
+   "content": "Reading now.",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a11-text-after-tool-call",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\nBefore.\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>\nI will wait for the result.",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "Before.\nI will wait for the result.",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a12-two-calls",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=command>\nls /app\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    },
+    {
+     "name": "bash",
+     "arguments": {
+      "command": "ls /app"
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a13-two-calls-lenient",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=limit>\n5\n</parameter>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=bash>\n<parameter=timeout>\n30\n</parameter>\n<parameter=command>\nls /app\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "limit": 5,
+      "path": "/app/src/index.test.ts"
+     }
+    },
+    {
+     "name": "bash",
+     "arguments": {
+      "timeout": 30,
+      "command": "ls /app"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a14-value-with-lt",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nif [ \"$n\" -lt 3 ] && grep -q \"<div>\" a.html; then echo \"a<b\"; fi\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "bash",
+     "arguments": {
+      "command": "if [ \"$n\" -lt 3 ] && grep -q \"<div>\" a.html; then echo \"a<b\"; fi"
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a15-value-with-parameter-close",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=write>\n<parameter=path>\n/app/n.md\n</parameter>\n<parameter=content>\nThe XML closes with\n</parameter>\nin the middle of a value.\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "write",
+     "arguments": {
+      "path": "/app/n.md",
+      "content": "The XML closes with\n</parameter>\nin the middle of a value."
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a16-empty-thinking-call",
+  "request_file": "pi-request.json",
+  "text": "</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a17-empty-thinking-content",
+  "request_file": "pi-request.json",
+  "text": "</think>\n\nAll done.",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "",
+   "content": "All done.",
+   "tool_calls": [],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a18-cut-off-in-value",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n<parameter=offset>\n10",
+  "stop": "limit",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "offset": 10
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a19-cut-off-in-name",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n<parameter=off",
+  "stop": "limit",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a20-cut-off-in-string",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\ncd /app && ls",
+  "stop": "limit",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "bash",
+     "arguments": {
+      "command": "cd /app && ls"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a21-cut-off-after-open",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n",
+  "stop": "limit",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {}
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a22-cut-off-in-thinking",
+  "request_file": "pi-request.json",
+  "text": "I need to look at the",
+  "stop": "limit",
+  "expect": {
+   "reasoning_content": "I need to look at the",
+   "content": "",
+   "tool_calls": [],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a23-strata-edits-not-json",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n<parameter=path>\n/app/a.ts\n</parameter>\n<parameter=edits>\n[{oldText: \"a\", newText: \"b\"}]\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {
+      "path": "/app/a.ts",
+      "edits": "[{oldText: \"a\", newText: \"b\"}]"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a24-strata-edits-quoted-string",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n<parameter=path>\n/app/a.ts\n</parameter>\n<parameter=edits>\n\"[{\\\"oldText\\\": \\\"a\\\", \\\"newText\\\": \\\"b\\\"}]\"\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {
+      "path": "/app/a.ts",
+      "edits": "[{\"oldText\": \"a\", \"newText\": \"b\"}]"
+     }
+    }
+   ],
+   "lenient": false
+  }
+ },
+ {
+  "name": "a25-strata-missing-path",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n<parameter=edits>\n[{\"oldText\": \"a\", \"newText\": \"b\"}]\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {
+      "edits": [
+       {
+        "oldText": "a",
+        "newText": "b"
+       }
+      ]
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a26-strata-read-only-offset",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=offset>\n432\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "offset": 432
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a27-strata-edits-without-oldText",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n<parameter=path>\n/app/a.ts\n</parameter>\n<parameter=edits>\n[{\"newText\": \"b\"}]\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {
+      "path": "/app/a.ts",
+      "edits": [
+       {
+        "newText": "b"
+       }
+      ]
+     }
+    }
+   ]
+  }
+ },
+ {
+  "name": "a28-strata-no-arguments",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=edit>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "edit",
+     "arguments": {}
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a29-strata-unknown-key-nested",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n<parameter=edit>\n<parameter=edits>\n[{\"oldText\": \"a\", \"newText\": \"b\"}]\n</parameter>\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "bash",
+     "arguments": {
+      "command": "ls",
+      "edit": "<parameter=edits>\n[{\"oldText\": \"a\", \"newText\": \"b\"}]\n</parameter>"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a30-unknown-function",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=grep>\n<parameter=pattern>\nfoo\n</parameter>\n<parameter=path>\n/app\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "grep",
+     "arguments": {
+      "pattern": "foo",
+      "path": "/app"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a31-type-mismatch",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n<parameter=offset>\nten\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "offset": "ten"
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a32-repeated-name",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\n<function=read>\n<parameter=path>\n/app/a.ts\n</parameter>\n<parameter=offset>\n3\n</parameter>\n<parameter=path>\n/app/src/index.test.ts\n</parameter>\n</function>\n</tool_call>",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "",
+   "tool_calls": [
+    {
+     "name": "read",
+     "arguments": {
+      "path": "/app/src/index.test.ts",
+      "offset": 3
+     }
+    }
+   ],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a33-bare-tool-call-text",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\n<tool_call>\nI cannot call a tool here.",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "<tool_call>\nI cannot call a tool here.",
+   "tool_calls": [],
+   "lenient": true
+  }
+ },
+ {
+  "name": "a34-content-only",
+  "request_file": "pi-request.json",
+  "text": "Let me check the tests around 1096-1110.\n</think>\n\nThe tests pass now.",
+  "stop": "eos",
+  "expect": {
+   "reasoning_content": "Let me check the tests around 1096-1110.\n",
+   "content": "The tests pass now.",
+   "tool_calls": [],
+   "lenient": false
+  }
+ }
+]
