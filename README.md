@@ -4,9 +4,11 @@
 
 # FNFL: Qwen3.8-Flash-Next on two Tesla V100s
 
-This is a from scratch inference engine that runs on 2x32GB Tesla V100 GPU. It supports exactly one model and has been tested on exactly one quant. Qwen Flash Next 3.8 with the ISTA-DASLab IQ3_XXS 3-bit quant. If this interests you, you are in luck! I have written what I think is the fastest runtime for this model on these cards I know about. Every single decision and design choice was built around the V100 from the ground up. Why should you care? It is really, really fast at decoding and making tokens :)
+This is a from scratch inference engine that runs on 2x32GB Tesla V100 GPU. It supports exactly one model and has been tested on exactly one quant. Qwen Flash Next 3.8 with the ISTA-DASLab IQ3_XXS 3-bit quant. This is a preview release, meaning I have barely tested it. If this interests you, you are in luck! I have written what I think is the fastest runtime for this model on these cards I know about. Every single decision and design choice was built around the V100 from the ground up. Why should you care? It is really, really fast at decoding and making tokens :)  
 
-Oh, and, FNFL stands for "Flash Next For Life". 
+I did not trade quality for speed in our implementation.  I used llama.cp as the reference, and FNFL matches it as closely as llama.cpp matches itself. Output distribution good. 
+
+Oh, and, FNFL stands for "Flash Next For Life".  
 
 ## Why should you care?
 
