@@ -21,7 +21,10 @@
 #include <shellapi.h>
 #endif
 
+#include "../fn/fnfl.h"
+
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -35,6 +38,7 @@
 #include <string>
 #include <system_error>
 #include <thread> // for hardware_concurrency
+#include <utility>
 #include <vector>
 
 #ifndef __EMSCRIPTEN__
@@ -55,6 +59,23 @@
 
 using json = common_json;
 using namespace common_arg_utils;
+
+// FNFL (ME3): one handler a setting of fn/cache_settings.h (the parser takes plain function pointers): the engine's
+// parser checks the text, the pair is kept for fnfl_load's own parse
+template <size_t I> static void fnfl_setting(common_params & params, const std::string & value) {
+    fn::settings::values probe;
+    std::string err;
+    if (!fn::settings::parse(int32_t(I), value, probe, err)) {
+        throw std::invalid_argument(std::string(fn::settings::table[I].serve) + ": " + err);
+    }
+    params.fnfl.settings.emplace_back(fn::settings::table[I].serve, value);
+}
+
+template <size_t... I>
+static std::array<void (*)(common_params &, const std::string &), sizeof...(I)> fnfl_setting_handlers(
+    std::index_sequence<I...>) {
+    return {{&fnfl_setting<I>...}};
+}
 
 static std::initializer_list<enum llama_example> mmproj_examples = {
     LLAMA_EXAMPLE_MTMD,
@@ -4158,6 +4179,123 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::invalid_argument("--fnfl-ple-table is lazy or full");
             }
             params.fnfl.ple_table = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // FNFL (ME1): single-card serving with the expert cache
+    add_opt(common_arg(
+        {"--fnfl-single-card"}, "N",
+        "FNFL (ME1): serve on device N alone: the routed experts from pinned host memory through a byte-capped GPU "
+        "cache with CPU products for misses (default: -1, the two-card engine)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--fnfl-single-card is a device index");
+            }
+            params.fnfl.single_card = value;
+            setenv("CUDA_MODULE_LOADING", "EAGER", 1); // the expert cache needs eager module loading (ME1)
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-expert-pool-mib"}, "N",
+        "FNFL (ME1): the expert cache's GPU pool in MiB (default: the free memory after load less 768 MiB)",
+        [](common_params & params, int value) { params.fnfl.expert_pool_mib = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-expert-cpu"}, "N",
+        "FNFL (ME1): the CPU expert-product workers (default: -1, one a physical core less one, pinned)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--fnfl-expert-cpu is at least -1");
+            }
+            params.fnfl.expert_cpu = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-cached-tp"},
+        "FNFL (ME1): the two-card engine with the routed experts from host memory through the expert cache",
+        [](common_params & params) {
+            params.fnfl.cached_tp = true;
+            setenv("CUDA_MODULE_LOADING", "EAGER", 1); // the expert cache needs eager module loading (ME1)
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-kv-host"},
+        "FNFL (ME1, with --fnfl-single-card and the sparse draft): the KV history in pinned host memory, a 32K-cell "
+        "window and the selected older blocks on the device (the 16 GB configuration)",
+        [](common_params & params) {
+            params.fnfl.kv_host = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-kv-format"}, "bf16|q8",
+        "FNFL (KV8): the target KV cache's format: q8, int8 codes with an FP16 scale a group of 64, or bf16 (default: "
+        "q8 on resident TP on two cards, bf16 with --fnfl-single-card, --fnfl-cached-tp or --fnfl-kv-host, where q8 "
+        "is refused; with q8 and -np above 1 the KV pool is the whole -c, each slot's context at most the model's)",
+        [](common_params & params, const std::string & value) {
+            if (value != "bf16" && value != "q8") {
+                throw std::invalid_argument("--fnfl-kv-format is bf16 or q8");
+            }
+            params.fnfl.kv_format = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-device-cap-mib"}, "N",
+        "FNFL (ME1): a ceiling on the device's whole use in MiB; the expert cache's pool shrinks under it (default: "
+        "-1, none)",
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("--fnfl-device-cap-mib is at least -1");
+            }
+            params.fnfl.device_cap_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // FNFL (ME2, expire at ME2's disposition): the expert cache's profile and swaps
+    add_opt(common_arg(
+        {"--fnfl-expert-profile"}, "PATH",
+        "FNFL (ME2): the expert cache's boot ranking, a STRP profile (default: expert order)",
+        [](common_params & params, const std::string & value) {
+            params.fnfl.expert_profile = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-expert-profile-save"}, "PATH",
+        "FNFL (ME2): where the expert cache saves its learned ranking, at each prompt after decode and at exit (default: "
+        "none)",
+        [](common_params & params, const std::string & value) {
+            params.fnfl.expert_profile_save = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--fnfl-expert-swap-overlap"}, "N",
+        "FNFL (ME2): 1 the expert swaps' copies overlap decode, 0 they complete at publication (default: 1)",
+        [](common_params & params, int value) {
+            if (value != 0 && value != 1) {
+                throw std::invalid_argument("--fnfl-expert-swap-overlap is 0 or 1");
+            }
+            params.fnfl.expert_swap_overlap = value != 0;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // FNFL (ME3): the settings of fn/cache_settings.h in their server spellings (the executor among them), each checked
+    // by the engine's parser here and parsed again at load; the cache's reserve
+    {
+        const auto handlers = fnfl_setting_handlers(std::make_index_sequence<size_t(fn::settings::n_entries)>());
+        for (int32_t i = 0; i < fn::settings::n_entries; ++i) {
+            const fn::settings::entry & e = fn::settings::table[i];
+            add_opt(common_arg(
+                {e.serve}, e.metavar,
+                std::string("FNFL (ME3): ") + e.help + " (" + e.unit + "; " + e.range + "; default: " + e.def + ")",
+                handlers[size_t(i)]
+            ).set_examples({LLAMA_EXAMPLE_SERVER}));
+        }
+    }
+    add_opt(common_arg(
+        {"--fnfl-expert-reserve-mib"}, "N",
+        "FNFL (ME3; --ex-reserve-mib's server form): MiB each device keeps free beside the expert cache's pool "
+        "(default: 768)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--fnfl-expert-reserve-mib is at least 0");
+            }
+            params.fnfl.expert_reserve_mib = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     // FNFL (SP2): the proposal count and the draft attention switch

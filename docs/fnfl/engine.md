@@ -130,8 +130,8 @@ That run averaged 3.13 tokens a step, for 194.8 tokens/s. The step time barely m
 Each card reserves everything at load, sized for the `-c` context, and allocates nothing while serving. [`fn/model/state.h`](../../fn/model/state.h) and `state.cpp` list every buffer with the formula for its size.
 
 - **Weights:** 23.2 GiB per card for the target model, plus the draft model's half and the draft head's re-sharded copy of the output head.
-- **Per context token:** about 16 KB per card.
-  - The target's QSA keys and values are BF16, 12 KB.
+- **Per context token:** about 10 KB per card with the default 8-bit KV, about 16 KB with `--fnfl-kv-format bf16`.
+  - The target's QSA keys and values are int8 codes with an FP16 scale every 64 values, about 6 KB (BF16: 12 KB).
   - The draft's keys and values are F16, 1 KB.
   - The indexer's keys and block summaries account for most of the rest.
 - **Fixed state:**

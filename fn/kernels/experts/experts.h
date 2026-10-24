@@ -87,7 +87,8 @@
 
 namespace fn::experts {
 
-enum class fmt : int32_t { iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, q2_0, iq4_nl, q8_0 }; // q8_0: gate/up and down
+// q8_0: gate/up and down. ME1: q4_k, q5_k (gate/up) and q5_1 (down), the Unsloth Q4 candidate's routed formats
+enum class fmt : int32_t { iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, q2_0, iq4_nl, q8_0, q4_k, q5_k, q5_1 };
 
 constexpr int32_t n_ff_card = 320; // channels a card owns per expert
 constexpr int32_t max_rows = 5;     // SP2: the five-row verification pass
@@ -216,6 +217,17 @@ struct gate_up_args {
     // as 2 and the IQ3 formats on the IQ3 body (gate_up_kernel_u<gu_iq3>, the same loop); the same arithmetic and
     // order (bitwise the same GLU). B <= 3 and Q8_0 ignore it. Any other value is rejected
     int32_t map = 0;
+    // ME1 (the expert cache): non-null, expert e's packed gate/up is wt[e] (a device table of 512 pointers, each
+    // 16-byte aligned) instead of w + e x gate_up_bytes(f); w is then not read for routed experts (still non-null and
+    // aligned). The arithmetic is unchanged: an address is the only difference
+    const uint8_t * const * wt = nullptr;
+    // ME1 (GPU-side hit resolution): with wt, skip 1 runs only the routed experts whose wt entry is non-null (the
+    // others' GLU slots are not written) and the shared expert; skip 2 runs the same routed experts and not the shared
+    // expert. 0 runs every expert. The meta is the whole launch's either way (down's slots do not change)
+    int32_t skip = 0;
+    // ME1: non-null, the launch does nothing when *run_if is 0 (read by every block at entry, written before the launch
+    // in stream order)
+    const uint32_t * run_if = nullptr;
 };
 
 struct down_args {
@@ -229,13 +241,83 @@ struct down_args {
     const float * sg;      // [B] the shared expert's weight: sigmoid of the shared gate (DP2's router epilogue)
     float * out;           // [B][2560] out
     uint32_t * status;     // [1] or nullptr
+    // ME1 (the expert cache): wt as gate_up_args::wt, for down (down_bytes(f) an expert); non-null selects the cache's
+    // instantiation (ME3). ME3: each routed slot s with bit s of ext_slots set is the CPU's: its unit's items neither
+    // load nor run and the weighted sum leaves its term out (the remaining terms' order and arithmetic unchanged); the
+    // CPU's products are added after this launch (experts_cache.h combine). Requires wt.
+    const uint8_t * const * wt = nullptr;
+    uint64_t ext_slots = 0;
+    // ME1 (GPU-side hit resolution): non-null, the slot mask is *ext_slots_d (written before the launch in stream
+    // order) and ext_slots is not read; requires wt
+    const uint64_t * ext_slots_d = nullptr;
 };
+
+// ME8: one logical card's routing (its router's top-10 IDs and weights, its shared gate) read by another card's expert
+// launches on the same device and stream: the router computed once. Non-owning; use_route points a launch pair's
+// routing at it (fn/model's single-device pair paths and ex-test's "me8" check take this one function)
+struct route_ptrs {
+    const int32_t * ids = nullptr; // [B][10]
+    const float * wts = nullptr;   // [B][10]
+    const float * sg = nullptr;    // [B]
+};
+inline void use_route(const route_ptrs & r, gate_up_args & ga, down_args & da) {
+    ga.ids = r.ids;
+    da.ids = r.ids;
+    da.wts = r.wts;
+    da.sg = r.sg;
+}
+
+// ME1: glu_out's epilogue (experts_gu.cuh) for gate/up sums made elsewhere (the CPU products, experts_cpu.h): row i of
+// n (n <= max_slots) takes gs[i][c], us[i][c] (F32 [n][320]) as the sums of channel c and writes the GLU in FNFL's
+// activation format to codes [n][320] and scales {d, s} [n][10], bitwise as gate_up would from the same sums. One
+// warp a (row, 32-channel group); false (nothing enqueued) on a bad n or a null or misaligned pointer.
+bool glu_finish(const float * gs, const float * us, int32_t n, int8_t * codes, float * scales, void * stream);
 
 // Enqueue on stream (a cudaStream_t). Return false, with nothing enqueued, for a format combination outside the
 // deployed list, an unsupported row count or a null or misaligned pointer; return false after a failed launch
 // submission (the CUDA error is left for the caller).
 bool gate_up(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, void * stream);
 bool down(fmt f, fmt fs, int32_t rows, const down_args & a, void * stream);
+
+// ME10: one device and stream: both logical shards' gate/up of one cache pass in one launch, 72 blocks, 36 a shard.
+// Block i runs shard k = i / 36's arguments s[k] as its block i % 36 of 36 (the unit deal over 36 blocks) with
+// gate_up's unit arithmetic, staging and reduction order, so each shard's GLU, meta and status are bitwise gate_up's.
+// Supported: an IQ2 or IQ3 routed format with (fg, fu) deployed, rows 4 or 5, each shard valid for gate_up with map 3
+// and a table (wt), both shards with the same ids, skip, run_if and class table and the same activation form (x or
+// hmix), and distinct meta, GLU, F32 GLU and status buffers. Each shard keeps its own table, weights, hmix slot and
+// error word. Unsupported: the caller runs gate_up per shard. gate_up_pair: false, nothing enqueued, when unsupported;
+// false after a failed launch submission
+struct gate_up_pair_args {
+    gate_up_args s[2];
+};
+bool gate_up_pair_supported(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a);
+bool gate_up_pair(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
+                  void * stream);
+
+// FMU2 (build item 1): a joint round's two to four lanes (fn/runtime/joint.h) at B = 5 on one card in one 72-block
+// launch each, the lanes' units never mixed. gate_up_lanes: lane k of n runs on blocks k NB .. k NB + NB - 1 (NB =
+// 72 / n: 36, 24, 18) as its own gate_up launch's deal over NB blocks (ME10's form of the snake deal), with
+// gate_up_kernel_u's body on its own arguments s[k], so each lane's GLU, meta and status are bitwise its own gate_up
+// launch's (every unit's arithmetic, staging and reduction order are the block's alone). down_lanes: block i runs lane
+// k = i / NB and in it the lone launch's blocks n (i % NB) .. n (i % NB) + n - 1 in turn, their output rows and walk
+// unchanged, after one staging of the lane's GLU slots (which block runs an item changes no result: down_kernel), so
+// each lane's out is bitwise its own down launch's. Supported: the resident target formats down's and gate_up's map 2
+// or 3 bodies take at B = 5 (IQ2 and IQ3 routed gate/up with a deployed triple; Q2_0 or IQ4_NL down), no table (wt),
+// no run_if or skip, each lane valid for its lone launch, the lanes' distinct GLU, meta and out buffers (the status
+// word may be shared: every writer stores 1), the same class table and activation form (x or hmix). Unsupported:
+// false, nothing enqueued, and the caller launches each lane alone; false after a failed launch submission.
+constexpr int32_t max_lanes = 4;
+struct gate_up_lanes_args {
+    gate_up_args s[max_lanes];
+};
+struct down_lanes_args {
+    down_args s[max_lanes];
+};
+bool gate_up_lanes_supported(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a);
+bool gate_up_lanes(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
+                   void * stream);
+bool down_lanes_supported(fmt f, fmt fs, int32_t lanes, const down_lanes_args & a);
+bool down_lanes(fmt f, fmt fs, int32_t lanes, const down_lanes_args & a, void * stream);
 
 // XB2: the routing meta of ids ([rows][10]) into meta (meta_bytes, 16-byte aligned) by a one-block launch of the
 // meta builder (experts_meta.cuh): the tests' and benches' reference, and the meta of a down launch that no gate_up
@@ -248,6 +330,16 @@ constexpr int32_t n_gate_up_inst = 31;
 constexpr int32_t n_down_inst = 5;
 bool gate_up_inst(int32_t i, fmt & f, fn::dense::fmt & fg, fn::dense::fmt & fu, int32_t & first_layer);
 bool down_inst(int32_t i, fmt & f, fmt & fs, int32_t & first_layer);
+// ME1: the Q4 candidate's instantiations (experts_inst.h FN_EXPERTS_Q4_*), not deployed: the tests' list
+constexpr int32_t n_q4_gate_up_inst = 2;
+constexpr int32_t n_q4_down_inst = 2;
+bool q4_gate_up_inst(int32_t i, fmt & f, fn::dense::fmt & fg, fn::dense::fmt & fu, int32_t & first_layer);
+bool q4_down_inst(int32_t i, fmt & f, fmt & fs, int32_t & first_layer);
+// ME7: the Q2 draft's instantiations (experts_inst.h FN_EXPERTS_DRAFT_Q2_*), opt-in: the tests' list
+constexpr int32_t n_draft_q2_gate_up_inst = 1;
+constexpr int32_t n_draft_q2_down_inst = 1;
+bool draft_q2_gate_up_inst(int32_t i, fmt & f, fn::dense::fmt & fg, fn::dense::fmt & fu, int32_t & first_layer);
+bool draft_q2_down_inst(int32_t i, fmt & f, fmt & fs, int32_t & first_layer);
 
 const char * fmt_name(fmt f);
 

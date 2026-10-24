@@ -6,4 +6,5 @@
 // smallest subnormal and -0.0 blocks); the K/V write against FP64 (K within one BF16 step, V bitwise); attention over
 // the prompt's own selection against FP64 (1e-5 a row and head) and a rerun bitwise. mode "san": small cases.
 // "qsp-test: PASS".
-int fnfl_qsp_test(int device, const char * mode);
+// KV8: q8 runs the K/V write and attention cases with the caches in the 8-bit format
+int fnfl_qsp_test(int device, const char * mode, bool q8 = false);

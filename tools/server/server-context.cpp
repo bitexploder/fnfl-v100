@@ -7,6 +7,7 @@
 #include "server-schema.h"
 #include "server-splice.h"
 #include "server-stream.h"
+#include "server-tu.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -27,6 +28,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -41,7 +43,8 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 
 enum slot_state {
     SLOT_STATE_IDLE,
-    SLOT_STATE_STARTED,    // after assigning a task and before its prompt is read
+    SLOT_STATE_STARTED,           // after assigning a task and before its prompt is read
+    SLOT_STATE_PROCESSING_PROMPT, // MU1: its read is a job (prepared, its chunks running in turns)
     SLOT_STATE_GENERATING,
 };
 
@@ -91,6 +94,19 @@ struct server_slot {
 
     // BG2: the answers the slot generated to end-of-generation and still holds, ascending, for later turns' splices
     std::vector<server_answer> answers;
+
+    // (ticket TU2, Amendment 1; MU1) the cached prefix a not-begun task's read will reuse, computed once per task
+    // (tu_remaining), and when its last turn began (tu_order's rotation)
+    int     tu_prefix_id_task = -1;
+    int32_t tu_prefix         = 0;
+    int64_t tu_last_read_seq  = 0;
+    // MU1: the read job's prefix kept by the shell, its new tokens and the engine's processed count (start_prompt's),
+    // its start time, and a cancellation the client asked for while it reads (BG1: honored at the chunk's end)
+    int32_t tu_n_past      = 0;
+    int32_t tu_n_new       = 0;
+    int32_t tu_n_processed = 0;
+    int64_t tu_t_start     = 0;
+    bool    tu_cancel      = false;
 
     server_slot_stats stats;
 
@@ -312,6 +328,12 @@ public:
         metrics.reset_bucket();
     }
 
+    // (ticket TU2; MU1) the two-user scheduling policy's effective values, for GET /props (any thread)
+    json tu_props_json() const {
+        std::lock_guard<std::mutex> lock(tu_props_mutex);
+        return tu_props;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -327,6 +349,54 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // (tickets TU1..TU6; MU1) two-user scheduling, engaged whenever the server has more than one slot: a slot's read is
+    // a job of layer groups (fnfl_read_*), the generating slots' steps run between its slices. The policy is runtime
+    // state: slice_ms and group, with POST /props (TU2); TU6's fix and fair_read are permanent behavior
+    struct tu_policy_t {
+        int32_t slice_ms   = 100;  // a slice's budget
+        // layers a group (the engine's, for chunks that start after a change). MU1's G2 preset: 2, not TU6's 4: at
+        // 8,192 rows a group of 4 takes about 190 ms, twice the slice; 2 fits it (engineer's preset decision, MU1)
+        int32_t group      = 2;
+        // V1's fixed preset: the short-read class (uncached <= fast_limit first), TU6's reviewed n_batch, whatever
+        // the launch's -b. A turn is one FNFL chunk (PF1's partition, the read's numerics), and a reader served out of
+        // turn runs its chunk in the other-reader lane in slices, so TU6's n_ubatch cap has no counterpart
+        int32_t fast_limit = 4096;
+    } tu_policy;
+
+    bool tu_engaged = false;
+    // FMU1: resident TP (fnfl_resident_tp): the path is chosen from what is active each iteration (a lone writer the
+    // one-slot body, a lone reader whole chunks, writers beside a reader 1-layer groups; admissions charged to slices;
+    // the next reader's chunk staged ahead). Off (the one-card and cached configurations): MU1's and MXMU1's loop
+    bool tu_resident = false;
+    int32_t tu_version = 1; // +1 per accepted POST /props
+
+    mutable std::mutex tu_props_mutex;
+    json               tu_props = json::object(); // the effective values (tu_publish)
+
+    // (ticket TU2) the reader to serve next, at the start of every iteration (tu_order)
+    server_slot * tu_pick      = nullptr;
+    server_slot * tu_pick_prev = nullptr;
+    int64_t       tu_read_seq  = 0;
+    std::vector<tu_reader> tu_readers; // FMU1: the iteration's readers (tu_order), for the next reader (tu_follow)
+
+    // the jobs: [0] the live reader's chunk in the main arena; [1] (TU2's tu_read_other) a reader served out of turn,
+    // its chunk in the other-reader lane while job 0's stays suspended. A job is one turn: its chunk, start to end
+    struct tu_job_t {
+        bool          active = false;
+        server_slot * slot   = nullptr;
+
+        int32_t n_rounds_pending = 0; // decode rounds since the job's last step
+        int32_t peer_rounds      = 0; // decode rounds between the job's consecutive steps
+        bool    overshoot_logged = false;
+
+        double  service_ms       = 0.0; // the job's own wall time (its steps)
+        double  longest_slice_ms = 0.0;
+        double  last_group_ms    = -1.0; // the chunk's last measured group (-1 at its start)
+        int32_t steps            = 0;
+        int64_t groups_at_start  = 0;
+        int32_t chunk            = 0, rows = 0, lane = -1;
+    } tu_job[2];
 
     int slots_debug = 0; // env: LLAMA_SERVER_SLOTS_DEBUG
 
@@ -457,6 +527,18 @@ private:
         lp.config.check_state    = params_base.fnfl.check_state;
         lp.config.test_eog       = params_base.fnfl.test_eog;
         lp.config.test_fail_step = params_base.fnfl.test_fail_step;
+        lp.config.single_card     = params_base.fnfl.single_card;
+        lp.config.expert_pool_mib = params_base.fnfl.expert_pool_mib;
+        lp.config.expert_cpu      = params_base.fnfl.expert_cpu;
+        lp.config.cached_tp       = params_base.fnfl.cached_tp;
+        lp.config.kv_host         = params_base.fnfl.kv_host;
+        lp.config.device_cap_mib  = params_base.fnfl.device_cap_mib;
+        lp.config.expert_profile      = params_base.fnfl.expert_profile;
+        lp.config.expert_profile_save = params_base.fnfl.expert_profile_save;
+        lp.config.expert_swap_overlap = params_base.fnfl.expert_swap_overlap;
+        lp.config.settings            = params_base.fnfl.settings; // ME3
+        lp.config.expert_reserve_mib  = params_base.fnfl.expert_reserve_mib;
+        lp.config.kv_format           = params_base.fnfl.kv_format; // KV8
         SRV_INF("FNFL end-of-generation IDs: %s\n", eog_list.c_str());
 
         std::string err;
@@ -494,6 +576,10 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // MU1: the engine's slot is idle (its pages reclaimable); one slot keeps today's calls
+                if (params_base.n_parallel > 1) {
+                    fnfl_release_slot(engine, id_slot);
+                }
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -505,6 +591,27 @@ private:
             };
 
             slot.reset();
+        }
+
+        // (MU1) two-user scheduling: engaged with more than one slot; the engine's group is the policy's
+        tu_engaged = params_base.n_parallel > 1;
+        if (tu_engaged && !fnfl_set_read_group(engine, tu_policy.group)) {
+            SRV_ERR("FNFL refused the read group of %d layers\n", tu_policy.group);
+            return false;
+        }
+        tu_resident = tu_engaged && fnfl_resident_tp(engine);
+        tu_publish();
+        if (tu_engaged) {
+            SRV_INF("multi-user scheduling (FMU1): %s\n",
+                    tu_resident ? "resident TP, the path chosen from the active slots (lone writer, lone reader, "
+                                  "writers beside a reader, readers)"
+                                : "MU1's turn-taking (not resident TP)");
+            SRV_INF("two-user scheduling (MU1, TU6's port): engaged, %d slots, slice %d ms, group %d layers, short "
+                    "reads up to %d uncached tokens (TU6's n_batch), a turn one chunk (main lane %d rows), "
+                    "other-reader lane %d rows; KV pool %lld cells in pages of %d, each slot's context %d\n",
+                    params_base.n_parallel, tu_policy.slice_ms, tu_policy.group, tu_policy.fast_limit,
+                    fnfl_lane_rows(engine, 0), fnfl_lane_rows(engine, 1), (long long) model_meta.pool_cells,
+                    model_meta.pool_page_cells, n_ctx_slot());
         }
 
         {
@@ -706,7 +813,11 @@ private:
             }
 
             if (ret != nullptr) {
-                const float f_keep = (f_sim_best*task.tokens.size()) / ret->prompt.tokens.size();
+                // (ticket TU6) the common prefix over the slot's tokens
+                const float f_keep = ret->prompt.tokens.empty()
+                    ? 1.0f
+                    : float(ret->prompt.tokens.get_common_prefix(task.tokens)) / float(ret->prompt.tokens.size());
+                (void) f_sim_best;
 
                 SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         f_sim_best, slot_prompt_similarity, f_keep);
@@ -723,8 +834,8 @@ private:
                     continue;
                 }
 
-                // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                // select the current slot if the criteria match ((ticket TU6) idle ties go to the lowest slot)
+                if (!ret || slot.t_last_used < t_last) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
@@ -850,6 +961,11 @@ private:
 
         slot.task  = std::make_unique<const server_task>(std::move(task));
         slot.state = SLOT_STATE_STARTED;
+        // (ticket TU2, Amendment 1) the prefix its read will reuse, once per task; no turn yet
+        slot.tu_prefix_id_task = slot.task->id;
+        slot.tu_prefix         = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+        slot.tu_last_read_seq  = 0;
+        slot.tu_cancel         = false;
 
         SLT_INF(slot, "%s", "processing task\n");
         return true;
@@ -1285,10 +1401,46 @@ private:
                     // release slot linked with the task id
                     for (auto & slot : slots) {
                         if (slot.task && slot.task->id == task.id_target) {
+                            // (ticket TU1, BG1; MU1) a reading slot: its job finishes the chunk in progress, the other
+                            // slots served between its slices, then stops; the slot is released then (tu_slice)
+                            if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+                                fnfl_read_cancel(engine, slot.id);
+                                slot.tu_cancel = true;
+                                SLT_INF(slot, "%s", "cancel during the read: the job stops at its chunk's end (BG1)\n");
+                                break;
+                            }
                             slot.release();
                             break;
                         }
                     }
+                } break;
+            case SERVER_TASK_TYPE_TU_POLICY:
+                {
+                    // (ticket TU2) POST /props, validated by the HTTP thread; applied here, between steps (never while
+                    // yielding): a living job takes the new slice at its next slice, a new group the chunks begun after
+                    const auto & set = task.tu_set;
+                    if (!tu_engaged) {
+                        send_error(task, "two-user scheduling needs more than one slot (--parallel 2 .. 4)", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (set.slice_ms > 0) {
+                        tu_policy.slice_ms = set.slice_ms;
+                    }
+                    if (set.group > 0) {
+                        const int32_t g = std::min<int32_t>(set.group, 48); // clamped to the layer count
+                        if (fnfl_set_read_group(engine, g)) {
+                            tu_policy.group = g;
+                        }
+                    }
+                    tu_version++;
+                    LOG_WRN("TU policy: version %d, slice %d ms, group %d layers (POST /props)\n", tu_version,
+                            tu_policy.slice_ms, tu_policy.group);
+                    tu_publish();
+
+                    auto res = std::make_unique<server_task_result_tu_policy>();
+                    res->id = task.id;
+                    res->tu = get_tu_props();
+                    queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
                 {
@@ -1322,12 +1474,23 @@ private:
 
                     int n_idle_slots = 0;
 
+                    // KV8: the engine's own count of each slot's held cells, and the pool's mapped cells (the
+                    // shell's prompt record syncs only when a task starts on the slot)
+                    fnfl_pool_report pool_rep;
+                    const bool have_pool = engine != nullptr && fnfl_pool(engine, pool_rep) && pool_rep.on;
                     for (server_slot & slot : slots) {
                         if (!slot.is_processing()) {
                             n_idle_slots++;
                         }
 
-                        slots_data.push_back(slot.to_json(slots_debug == 0));
+                        json js = slot.to_json(slots_debug == 0);
+                        if (engine != nullptr) {
+                            js["fnfl_held"] = fnfl_slot_held(engine, slot.id);
+                            if (have_pool && slot.id >= 0 && slot.id < 4) {
+                                js["fnfl_pool_cells"] = (int64_t) pool_rep.mapped[slot.id] * pool_rep.page_cells;
+                            }
+                        }
+                        slots_data.push_back(std::move(js));
                     }
                     SRV_DBG("n_idle_slots = %d\n", n_idle_slots);
 
@@ -1357,6 +1520,7 @@ private:
                     const size_t n_erased = slot->prompt.tokens.size();
 
                     prompt_clear(*slot);
+                    slot->t_last_used = -1; // (ticket TU6) an erased slot is the least recently used
 
                     auto res = std::make_unique<server_task_result_slot_erase>();
                     res->id       = task.id;
@@ -1379,10 +1543,14 @@ private:
     }
 
     // an engine call failed: the request gets the engine's reason, and the slot is released
-    void engine_failed(server_slot & slot, fnfl_status status) {
-        const std::string why = fnfl_last_error(engine);
+    void engine_failed(server_slot & slot, fnfl_status status) { engine_failed(slot, status, fnfl_last_error(engine)); }
+
+    // (FMU2) a slot's failure with its own reason (a joint step's)
+    void engine_failed(server_slot & slot, fnfl_status status, const std::string & why) {
         send_error(slot, std::string(fnfl_status_str(status)) + (why.empty() ? "" : ": " + why),
-                   status == FNFL_NOT_BUILT ? ERROR_TYPE_NOT_SUPPORTED : ERROR_TYPE_SERVER);
+                   status == FNFL_NOT_BUILT    ? ERROR_TYPE_NOT_SUPPORTED
+                   : status == FNFL_NO_CONTEXT ? ERROR_TYPE_EXCEED_CONTEXT_SIZE
+                                               : ERROR_TYPE_SERVER);
         prompt_clear(slot);
         slot.release();
     }
@@ -1539,7 +1707,11 @@ private:
             engine_failed(slot, st);
             return;
         }
+        apply_step(slot, r);
+    }
 
+    // a step's tokens into the slot: the state check, each token's processing and the request's end
+    void apply_step(server_slot & slot, const fnfl_step_result & r) {
         if (r.n_tokens < 1) {
             engine_failed(slot, FNFL_ERROR);
             return;
@@ -1592,6 +1764,597 @@ private:
         slot.print_timings_tg();
     }
 
+    // ---- (tickets TU1..TU6; MU1) two-user scheduling ----
+
+    json get_tu_props() const {
+        std::lock_guard<std::mutex> lock(tu_props_mutex);
+        return tu_props;
+    }
+
+    // (ticket TU2) the effective values, for GET /props and the POST /props response
+    void tu_publish() {
+        fnfl_pool_report pr;
+        const bool pool = engine != nullptr && fnfl_pool(engine, pr);
+        std::lock_guard<std::mutex> lock(tu_props_mutex);
+        tu_props = {
+            {"enabled", tu_engaged},
+            {"presence", tu_resident},
+            {"slice_ms", tu_policy.slice_ms},
+            {"group", tu_policy.group},
+            {"fast_limit", tu_policy.fast_limit},
+            {"version", tu_version},
+            {"slots", params_base.n_parallel},
+            {"n_ctx_slot", n_ctx_slot()},
+            {"kv_pool",
+             json{
+                 {"on", pool && pr.on},
+                 {"cells", pool ? pr.capacity_cells : 0},
+                 {"page_cells", pool ? pr.page_cells : 0},
+                 {"pages", pool ? pr.pages : 0},
+             }},
+        };
+    }
+
+    // a slot other than the job's generates (the peer whose steps run between the job's slices)
+    bool tu_peer(const server_slot * job_slot) const {
+        for (const auto & slot : slots) {
+            if (&slot != job_slot && slot.state == SLOT_STATE_GENERATING) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // (ticket TU2) the slot's task can be a job (TU1's rule; FNFL serves completions of one text prompt only)
+    bool tu_eligible(const server_slot & slot) const {
+        return slot.task && (slot.task->type == SERVER_TASK_TYPE_COMPLETION || slot.task->type == SERVER_TASK_TYPE_INFILL);
+    }
+
+    // (ticket TU2, Amendment 1) prompt tokens the reader has left: a slot not begun counts its prompt less the prefix its
+    // begin will reuse (once per task); a begun read its prompt less the tokens the engine has committed
+    int32_t tu_remaining(server_slot & slot) const {
+        if (slot.state == SLOT_STATE_STARTED && slot.tu_prefix_id_task != slot.task->id) {
+            slot.tu_prefix_id_task = slot.task->id;
+            slot.tu_prefix = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
+        }
+        int32_t committed = 0;
+        if (slot.state == SLOT_STATE_PROCESSING_PROMPT) {
+            fnfl_read_report r;
+            if (fnfl_read_info(engine, slot.id, r) && r.live) {
+                committed = r.committed;
+            }
+        }
+        return tu_remaining_tokens(slot.state == SLOT_STATE_PROCESSING_PROMPT, slot.task->n_tokens(), slot.tu_prefix, committed);
+    }
+
+    // (ticket TU2, TU6) the eligible readers sorted by priority, short first, then the live reader and turn order
+    // (long) or remaining (short); the first is the reader to serve next. One line when the pick or the readers change
+    void tu_order() {
+        tu_pick = nullptr;
+        const int32_t fast_limit = tu_policy.fast_limit;
+        std::vector<tu_reader> readers;
+        for (auto & slot : slots) {
+            const bool reading = slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT;
+            if (reading && tu_eligible(slot)) {
+                tu_reader r;
+                r.slot      = slot.id;
+                r.priority  = slot.task->params.priority;
+                r.remaining = tu_remaining(slot);
+                r.uncached  = tu_uncached(r.remaining, slot.task->n_tokens(), slot.tu_prefix);
+                r.last_seq  = slot.tu_last_read_seq;
+                r.id_task   = slot.task->id;
+                r.live      = tu_job[0].active && tu_job[0].slot == &slot;
+                r.begun = slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                readers.push_back(r);
+            }
+        }
+        tu_readers = readers;
+        if (readers.empty()) {
+            tu_pick_prev = nullptr;
+            return;
+        }
+        tu_sort(readers, fast_limit);
+        tu_pick = &slots[size_t(readers[0].slot)];
+
+        static int  last_pick_slot = -1;
+        static int  last_n_readers = 0;
+        static int  last_task_0    = -1;
+        static int  last_task_1    = -1;
+        static bool last_job_act   = false;
+        const int cur_task_1 = readers.size() > 1 ? readers[1].id_task : -1;
+        if (tu_pick->id != last_pick_slot || (int) readers.size() != last_n_readers || readers[0].id_task != last_task_0 ||
+            cur_task_1 != last_task_1 || tu_job[0].active != last_job_act) {
+            std::string r_str;
+            for (size_t i = 0; i < readers.size(); ++i) {
+                r_str += (i > 0 ? ";" : "") + std::string("s") + std::to_string(readers[i].slot) +
+                         "(t=" + std::to_string(readers[i].id_task) + ",p=" + std::to_string(readers[i].priority) +
+                         ",rem=" + std::to_string(readers[i].remaining) + ",unc=" + std::to_string(readers[i].uncached) +
+                         ",seq=" + std::to_string(readers[i].last_seq) + ")";
+            }
+            LOG_WRN("TU order: t_us=%" PRId64 " job0=%d job1=%d pick=%d readers=[%s]\n", ggml_time_us(),
+                    tu_job[0].active ? tu_job[0].slot->id : -1, tu_job[1].active ? tu_job[1].slot->id : -1,
+                    tu_pick->id, r_str.c_str());
+            last_pick_slot = tu_pick->id;
+            last_n_readers = (int) readers.size();
+            last_task_0    = readers[0].id_task;
+            last_task_1    = cur_task_1;
+            last_job_act   = tu_job[0].active;
+        }
+        if (tu_pick_prev != nullptr && tu_pick_prev != tu_pick) {
+            for (const auto & r : readers) {
+                if (r.slot == tu_pick_prev->id) {
+                    LOG_WRN("TU pick: slot %d (priority %d, remaining %d) ahead of %sslot %d (remaining %d)\n",
+                            tu_pick->id, readers[0].priority, readers[0].remaining,
+                            tu_job[0].active && tu_job[0].slot == tu_pick_prev ? "the job's " : "", r.slot, r.remaining);
+                    break;
+                }
+            }
+        }
+        tu_pick_prev = tu_pick;
+    }
+
+    // a started slot's read begun as a job (start_prompt's first half): the request's sampling, the reused prefix
+    // (capped at what the engine still holds: a reclaimed slot holds nothing), the progress headers, then
+    // fnfl_read_begin. false: the slot was answered and released
+    bool tu_admit(server_slot & slot) {
+        const auto & input_tokens = slot.task->tokens;
+        slot.stats.update_prompt_start();
+        if (input_tokens.empty()) {
+            SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
+            slot.stats.update_prompt_last();
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return false;
+        }
+        if (slot.task->n_tokens() >= slot.n_ctx) {
+            send_error(slot,
+                       string_format("request (%d tokens) exceeds the available context size (%d "
+                                     "tokens), try increasing it",
+                                     slot.task->n_tokens(), slot.n_ctx),
+                       ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+            slot.release();
+            return false;
+        }
+        {
+            const common_params_sampling & sp = slot.task->params.sampling;
+            fnfl_sampling fs;
+            fs.seed        = sp.seed == LLAMA_DEFAULT_SEED ? (uint64_t(std::random_device{}()) << 32) | std::random_device{}()
+                                                           : uint64_t(sp.seed);
+            fs.temperature = sp.temp;
+            fs.top_k       = sp.top_k;
+            fs.top_p       = sp.top_p;
+            fs.min_p       = sp.min_p;
+            fs.max_tokens  = slot.n_predict_max;
+            fs.n_ctx       = slot.n_ctx;
+            std::string err;
+            if (fnfl_set_sampling(engine, slot.id, fs, err) != FNFL_OK) {
+                send_error(slot, "FNFL: " + err, ERROR_TYPE_INVALID_REQUEST);
+                slot.release();
+                return false;
+            }
+        }
+        // MU1: the engine may hold fewer tokens than the slot's record (its pages were reclaimed while it was idle)
+        const int32_t held = fnfl_slot_held(engine, slot.id);
+        if (held < (int32_t) slot.prompt.tokens.size()) {
+            SLT_INF(slot, "the KV pool reclaimed the slot's cached prompt: the engine holds %d of its %zu tokens\n", held,
+                    slot.prompt.tokens.size());
+            prompt_keep_first(slot, held);
+            slot.answers.clear();
+        }
+        int32_t n_past = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(input_tokens) : 0;
+        if (n_past == slot.task->n_tokens()) {
+            n_past--;
+        }
+        const fnfl_status st_trunc = fnfl_truncate(engine, slot.id, n_past);
+        if (st_trunc != FNFL_OK) {
+            engine_failed(slot, st_trunc);
+            return false;
+        }
+        prompt_keep_first(slot, n_past);
+        if (!fnfl_check_state(slot, "truncate")) {
+            send_error(slot, "FNFL state check: mismatch after truncate", ERROR_TYPE_SERVER);
+            prompt_clear(slot);
+            slot.release();
+            return false;
+        }
+        slot.stats.n_prompt_cached    = n_past;
+        slot.stats.n_prompt_processed = 0;
+        const llama_tokens & all = input_tokens.get_tokens();
+        const int32_t n_new = slot.task->n_tokens() - n_past;
+        if (slot.task->params.stream) {
+            if (slot.task->params.return_progress) {
+                send_progress(slot, n_past, n_past);
+            } else {
+                send_partial_response(slot, {}, false, true);
+            }
+        }
+        int32_t n_processed = n_new;
+        const int32_t r = fnfl_read_begin(engine, slot.id, all.data() + n_past, n_new, n_past, &n_processed);
+        if (r == 1) {
+            send_error(slot, "FNFL: " + fnfl_last_error(engine) + " (the KV pool or the context cannot hold the request)",
+                       ERROR_TYPE_EXCEED_CONTEXT_SIZE);
+            slot.release();
+            return false;
+        }
+        if (r != 0) {
+            engine_failed(slot, FNFL_ERROR);
+            return false;
+        }
+        slot.tu_n_past      = n_past;
+        slot.tu_n_new       = n_new;
+        slot.tu_n_processed = n_processed;
+        slot.tu_t_start     = ggml_time_us();
+        slot.state          = SLOT_STATE_PROCESSING_PROMPT;
+        SLT_INF(slot, "read job begun: %d tokens kept, %d new, %d to process\n", n_past, n_new, n_processed);
+        return true;
+    }
+
+    // the generating slots' steps, each once, in slot order (decode first: TU1's round before any slice)
+    std::string tu_stepped; // the iteration's stepped slots, for its line (tu_update)
+    void tu_decode() {
+        int32_t n = 0;
+        tu_stepped.clear();
+        // (FMU2) two or more generating slots step together: one call, the engine's joint round for those it can take
+        std::vector<server_slot *> gen;
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                gen.push_back(&slot);
+            }
+        }
+        if (gen.size() >= 2 && gen.size() <= 4) {
+            int32_t ids[4] = {};
+            fnfl_step_result res[4];
+            fnfl_status st[4] = {};
+            std::string why[4];
+            for (size_t k = 0; k < gen.size(); ++k) {
+                ids[k] = gen[k]->id;
+                metrics_on_step();
+            }
+            const fnfl_status call = fnfl_step_joint(engine, ids, int32_t(gen.size()), res, st, why);
+            for (size_t k = 0; k < gen.size(); ++k) {
+                server_slot & slot = *gen[k];
+                try {
+                    if (call != FNFL_OK || st[k] != FNFL_OK) {
+                        engine_failed(slot, call != FNFL_OK ? call : st[k], call != FNFL_OK ? "step_joint" : why[k]);
+                    } else {
+                        apply_step(slot, res[k]);
+                    }
+                    tu_stepped += (n > 0 ? "," : "") + std::to_string(slot.id);
+                    ++n;
+                } catch (const std::exception & e) {
+                    SLT_ERR(slot, "got exception: %s\n", e.what());
+                    send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                }
+            }
+            gen.clear();
+        }
+        for (server_slot * sp : gen) {
+            server_slot & slot = *sp;
+            try {
+                metrics_on_step();
+                step_slot(slot);
+                tu_stepped += (n > 0 ? "," : "") + std::to_string(slot.id);
+                ++n;
+            } catch (const std::exception & e) {
+                SLT_ERR(slot, "got exception: %s\n", e.what());
+                send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+        for (auto & j : tu_job) {
+            if (j.active) {
+                j.n_rounds_pending += n;
+            }
+        }
+    }
+
+    // (ticket TU1) a job (one turn: the reader's next chunk) begins on slot k's lane and runs its first slice;
+    // (ticket TU2) the turn's order counter is taken when its rows begin
+    void tu_start(server_slot & slot, int k) {
+        tu_job_t & j = tu_job[k];
+        j = tu_job_t();
+        j.active = true;
+        j.slot   = &slot;
+        fnfl_read_report r;
+        fnfl_read_info(engine, slot.id, r);
+        j.groups_at_start = r.groups_done;
+        j.chunk           = r.chunk;
+        j.rows            = r.next_rows;
+        slot.tu_last_read_seq = ++tu_read_seq;
+        tu_slice(k);
+    }
+
+    // one slice of job k: groups while the slice's time so far plus the next step's predicted time stays within it
+    // (TU3's one-sync loop: a step's groups synchronize once at its end), at least one group
+    void tu_slice(int k) {
+        tu_job_t & j = tu_job[k];
+        server_slot & slot = *j.slot;
+        const bool peer = tu_peer(&slot);
+        // FMU1: the presence rule (resident TP): writers beside a reader one step a slice of main's group in 1-layer
+        // groups (FMU2's reader rule); MU1's shared slices otherwise. FMU2's correction: a lone reader runs main's
+        // geometry, one step a call, so an arrival waits one step, not the chunk (FMU1's lone chunk was one step)
+        const tu_mode mode = tu_resident ? tu_slot_mode(slot) : tu_mode::shared;
+        const fnfl_read_mode rmode = mode == tu_mode::writers ? FNFL_READ_WRITERS : FNFL_READ_SHARED;
+        const double budget = tu_mode_budget(mode, tu_policy.slice_ms);
+        double  t_slice      = 0.0;
+        int32_t n_run        = 0;
+        int64_t n_groups_run = 0;
+        fnfl_read_status ret = FNFL_READ_YIELDED;
+        while (true) {
+            // FMU2's reader rule: beside writers, one step a slice
+            const int32_t n_groups = mode == tu_mode::writers
+                                         ? (n_run > 0 ? 0 : tu_writers_groups(budget, j.last_group_ms, tu_policy.group))
+                                         : tu_next_groups(budget, t_slice, j.last_group_ms, n_run);
+            if (n_groups < 1) {
+                break;
+            }
+            fnfl_read_report before;
+            fnfl_read_info(engine, slot.id, before);
+            if (before.groups_done > j.groups_at_start) {
+                j.peer_rounds += j.n_rounds_pending;
+            }
+            j.n_rounds_pending = 0;
+            const int64_t t0 = ggml_time_us();
+            queue_tasks.yield_to_queue([&]() { ret = fnfl_read_step(engine, slot.id, n_groups, rmode); });
+            const double dt = (ggml_time_us() - t0) / 1000.0;
+            fnfl_read_report after;
+            fnfl_read_info(engine, slot.id, after);
+            const int64_t ran = std::max<int64_t>(0, after.groups_done - before.groups_done);
+            if (j.lane < 0) {
+                j.lane = before.in_chunk ? before.lane : after.lane;
+            }
+            t_slice += dt;
+            n_run++;
+            n_groups_run += ran;
+            j.steps++;
+            j.service_ms += dt;
+            j.last_group_ms = ret == FNFL_READ_YIELDED && ran > 0 ? dt / ran : -1.0;
+            if (ret != FNFL_READ_YIELDED || mode == tu_mode::lone) {
+                break;
+            }
+        }
+        j.longest_slice_ms = std::max(j.longest_slice_ms, t_slice);
+        if (peer && n_run == 1 && n_groups_run == 1 && t_slice > budget && !j.overshoot_logged) {
+            j.overshoot_logged = true;
+            LOG_WRN("TU job: slot %d, a group of %.1f ms overshoots the %d ms slice\n", slot.id, t_slice, tu_policy.slice_ms);
+        }
+        switch (ret) {
+            case FNFL_READ_YIELDED:
+                break;
+            case FNFL_READ_CHUNK_DONE:
+                {
+                    // BG1: the prompt's progress at the chunk's end (where the read started, what the slot holds)
+                    fnfl_read_report r;
+                    if (slot.task->params.stream && slot.task->params.return_progress && fnfl_read_info(engine, slot.id, r)) {
+                        send_progress(slot, r.from, r.committed);
+                    }
+                    tu_turn_end(k, "chunk");
+                } break;
+            case FNFL_READ_DONE:
+                tu_turn_end(k, "read");
+                tu_finish(slot);
+                break;
+            case FNFL_READ_CANCELLED:
+                {
+                    tu_turn_end(k, "cancelled");
+                    LOG_WRN("TU job: slot %d cancelled at its chunk's end\n", slot.id);
+                    tu_cancelled(slot);
+                } break;
+            default:
+                {
+                    tu_turn_end(k, "failed");
+                    SLT_ERR(slot, "%s", "two-user scheduling: a step of the read job failed\n");
+                    engine_failed(slot, FNFL_ERROR);
+                } break;
+        }
+    }
+
+    // FMU1: the presence rule for slot's read step: the generating slots, and the other slots reading or admitted
+    tu_mode tu_slot_mode(const server_slot & reader) const {
+        int32_t n_writers = 0, n_readers = 0;
+        for (const auto & slot : slots) {
+            if (&slot == &reader) {
+                continue;
+            }
+            n_writers += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
+            n_readers += slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT ? 1 : 0;
+        }
+        return tu_presence(n_writers, n_readers);
+    }
+
+    // FMU1 (P): the reader whose turn follows the main lane's current one (in progress, or the pick's about to start)
+    // has its next chunk staged ahead while the turn and the writers' rounds run
+    void tu_prefetch() {
+        server_slot * now = tu_job[0].active                                                       ? tu_job[0].slot
+                            : tu_pick != nullptr && tu_pick->state == SLOT_STATE_PROCESSING_PROMPT ? tu_pick
+                                                                                                   : nullptr;
+        const int next = tu_follow(tu_readers, now != nullptr ? now->id : -1, tu_policy.fast_limit);
+        if (!fnfl_read_prefetch(engine, now != nullptr ? now->id : -1, next)) {
+            SRV_WRN("FNFL read prefetch failed: %s\n", fnfl_last_error(engine).c_str());
+        }
+    }
+
+    // the turn's line (the job's identity, chunk, groups, peer rounds, service and longest slice), and the job's end
+    void tu_turn_end(int k, const char * how) {
+        tu_job_t & j = tu_job[k];
+        fnfl_read_report r;
+        fnfl_read_info(engine, j.slot->id, r);
+        LOG_WRN("TU job: slot %d, task %d, %s: chunk %d (%d rows), lane %d, groups %lld of %d layers, peer rounds %d, "
+                "steps %d, service ms %.1f, longest slice ms %.1f (slice %d ms); read %d of %d tokens committed\n",
+                j.slot->id, j.slot->task ? j.slot->task->id : -1, how, j.chunk, j.rows, j.lane,
+                (long long) (r.groups_done - j.groups_at_start), r.layers, j.peer_rounds, j.steps, j.service_ms,
+                j.longest_slice_ms, tu_policy.slice_ms, r.committed, r.total);
+        j.active = false;
+        j.slot   = nullptr;
+    }
+
+    // the read is done: start_prompt's second half (the slot's tokens, stats, the last progress event), then generating
+    void tu_finish(server_slot & slot) {
+        const llama_tokens & all = slot.task->tokens.get_tokens();
+        int32_t n_new = slot.tu_n_new;
+        if (slot.tu_n_processed != n_new) {
+            slot.stats.n_prompt_cached = slot.task->n_tokens() - slot.tu_n_processed;
+            n_new = slot.tu_n_processed;
+        }
+        metrics.add_prompt_cached(slot.stats.n_prompt_cached);
+        slot.prompt.tokens.insert(llama_tokens(all.begin() + slot.tu_n_past, all.end()));
+        if (!fnfl_check_state(slot, "prefill")) {
+            send_error(slot, "FNFL state check: mismatch after prefill", ERROR_TYPE_SERVER);
+            prompt_clear(slot);
+            slot.release();
+            return;
+        }
+        slot.stats.n_prompt_processed = n_new;
+        slot.stats.update_prompt_last();
+        metrics.add_prompt(n_new, ggml_time_us() - slot.tu_t_start);
+        if (slot.task->params.stream && slot.task->params.return_progress) {
+            send_partial_response(slot, {}, true);
+        }
+        slot.stats.n_gen = 0;
+        slot.sampled     = LLAMA_TOKEN_NULL;
+        slot.state       = SLOT_STATE_GENERATING;
+    }
+
+    // BG1: the client left during the read: the slot keeps the prompt's tokens the engine kept
+    void tu_cancelled(server_slot & slot) {
+        const llama_tokens & all = slot.task->tokens.get_tokens();
+        const int32_t kept = std::min(fnfl_slot_held(engine, slot.id), slot.task->n_tokens());
+        if (kept <= slot.tu_n_past) {
+            prompt_keep_first(slot, kept);
+        } else {
+            slot.prompt.tokens.insert(llama_tokens(all.begin() + slot.tu_n_past, all.begin() + kept));
+        }
+        SLT_INF(slot, "prefill cancelled by the client; the slot keeps %d of the prompt's %d tokens\n", kept,
+                slot.task->n_tokens());
+        slot.sampled = LLAMA_TOKEN_NULL;
+        slot.release();
+    }
+
+    // (ticket TU2) another reader is to be served next while job 0's chunk is suspended: its next chunk in the
+    // other-reader lane when it fits (else it waits for job 0's turn to end: the lane holds chunks of at most
+    // fnfl_lane_rows(1) rows, and FNFL's chunk partition is the read's numerics)
+    bool tu_other_fits(server_slot & slot) {
+        if (slot.state == SLOT_STATE_STARTED) {
+            return false; // begun by tu_admit first
+        }
+        fnfl_read_report r;
+        if (!fnfl_read_info(engine, slot.id, r) || !r.live || r.in_chunk) {
+            return false;
+        }
+        const bool fits = r.next_rows <= fnfl_lane_rows(engine, 1) && fnfl_lane_owner(engine, 1) < 0;
+        static int last_logged = -1;
+        if (!fits && last_logged != slot.task->id) {
+            last_logged = slot.task->id;
+            LOG_WRN("TU pick: slot %d's next chunk (%d rows) exceeds the other-reader lane (%d rows): it waits for slot %d's "
+                    "turn to end\n", slot.id, r.next_rows, fnfl_lane_rows(engine, 1), tu_job[0].slot ? tu_job[0].slot->id : -1);
+        }
+        return fits;
+    }
+
+    // (tickets TU1, TU2, TU6) one iteration: begin the started reads; order the readers; then a nested job's slice
+    // (decode first), or the live job's slice or another reader's chunk out of turn (decode first), or the decode
+    // steps and the pick's next turn. Returns to the queue loop between slices, so new and cancelled requests are seen
+    // one line an iteration while a reader's chunk and at least one writer share it (the writers' service between
+    // a job's slices); none for a lone reader or lone writers
+    int64_t tu_iter = 0;
+    void tu_iter_line(int k) {
+        if (tu_stepped.empty()) {
+            return;
+        }
+        const tu_job_t & j = tu_job[k];
+        LOG_INF("TU iteration %lld: t_us=%" PRId64 " writers stepped [%s]; then job %d (slot %d, %s)\n",
+                (long long) ++tu_iter, ggml_time_us(), tu_stepped.c_str(), k, j.slot ? j.slot->id : -1,
+                j.active ? "slice" : "turn ended");
+    }
+
+    void tu_update() {
+        // FMU1 (resident TP): who has model work this iteration
+        int32_t n_writers = 0, n_reading = 0, n_started = 0;
+        server_slot * writer = nullptr;
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING) {
+                ++n_writers;
+                writer = &slot;
+            }
+            n_reading += slot.state == SLOT_STATE_PROCESSING_PROMPT ? 1 : 0;
+            n_started += slot.state == SLOT_STATE_STARTED ? 1 : 0;
+        }
+        if (tu_resident && tu_lone_writer(n_writers, n_reading + n_started, tu_job[0].active || tu_job[1].active)) {
+            // a lone writer: the one-slot loop's body (I2)
+            try {
+                metrics_on_step();
+                step_slot(*writer);
+            } catch (const std::exception & e) {
+                SLT_ERR(*writer, "got exception: %s\n", e.what());
+                send_error(*writer, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                writer->release();
+            }
+            return;
+        }
+        // admissions: FMU1, one an iteration while other slots have model work, and with writers present their
+        // rounds follow it before any slice (an admission's truncate, restore and page mapping are a slice's work)
+        const bool busy = n_writers > 0 || n_reading > 0;
+        int32_t n_admitted = 0;
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_STARTED) {
+                if (tu_resident && !tu_admit_more(busy, n_admitted)) {
+                    break;
+                }
+                ++n_admitted;
+                tu_admit(slot);
+            }
+        }
+        // a cancelled read with no chunk in progress stops now (BG1: no chunk started for it)
+        for (auto & slot : slots) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.tu_cancel &&
+                !(tu_job[0].active && tu_job[0].slot == &slot) && !(tu_job[1].active && tu_job[1].slot == &slot)) {
+                fnfl_read_report r;
+                if (fnfl_read_info(engine, slot.id, r) && !r.in_chunk) {
+                    const fnfl_read_status st = fnfl_read_step(engine, slot.id, 1);
+                    if (st == FNFL_READ_CANCELLED) {
+                        tu_cancelled(slot);
+                    } else if (st == FNFL_READ_ERROR) {
+                        engine_failed(slot, FNFL_ERROR);
+                    }
+                }
+            }
+        }
+        tu_order();
+        if (tu_resident) {
+            tu_prefetch();
+            if (busy && n_admitted > 0 && n_writers > 0) {
+                tu_decode();
+                return;
+            }
+        }
+        if (tu_job[1].active) {
+            tu_decode();
+            tu_iter_line(1);
+            tu_slice(1);
+            return;
+        }
+        if (tu_job[0].active) {
+            tu_decode();
+            if (!tu_job[0].active) {
+                return;
+            }
+            if (tu_pick != nullptr && tu_pick != tu_job[0].slot && tu_other_fits(*tu_pick)) {
+                tu_iter_line(0);
+                tu_start(*tu_pick, 1);
+                return;
+            }
+            tu_iter_line(0);
+            tu_slice(0);
+            return;
+        }
+        tu_decode();
+        if (tu_pick != nullptr && tu_pick->state == SLOT_STATE_PROCESSING_PROMPT) {
+            tu_start(*tu_pick, 0);
+        }
+    }
+
     void update_slots() {
         // check if all slots are idle
         {
@@ -1614,6 +2377,12 @@ private:
             server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
             task.id = queue_tasks.get_new_id();
             queue_tasks.post(std::move(task));
+        }
+
+        // (MU1) more than one slot: two-user scheduling (the one-slot loop below is unchanged)
+        if (tu_engaged) {
+            tu_update();
+            return;
         }
 
         for (auto & slot : slots) {
@@ -2091,7 +2860,8 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
-static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
+static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping,
+                          const json & tu = json::object()) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     task_params tparams;
@@ -2127,6 +2897,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "build_info",                  meta.build_info },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
+        { "tu",                          tu }, // (ticket TU2; MU1) two-user scheduling, the effective values
     };
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
@@ -2295,18 +3066,80 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            res->ok(get_res_props(*meta, params, false, ctx_server.tu_props_json()));
         }
         return res;
     };
 
-    this->post_props = [this](const server_http_req &) {
+    this->post_props = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
         // update any props here
+
+        // (ticket TU2; MU1) two-user scheduling: {"tu": {"slice_ms": 10..10000, "group": layers}}. Validated here, and a
+        // rejected request changes nothing; the owner thread applies it between steps and answers with the effective
+        // values. FNFL's TU is engaged whenever the server has more than one slot, and TU6's fix and fair_read are its
+        // permanent behavior: every other tu. field is rejected
+        json body;
+        try {
+            body = req.body.empty() ? json::object() : json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.is_object() && body.contains("tu")) {
+            const json & tu = body.at("tu");
+            server_task task(SERVER_TASK_TYPE_TU_POLICY);
+            std::string err;
+            if (!tu.is_object()) {
+                err = "\"tu\" must be an object";
+            }
+            for (auto it = tu.begin(); err.empty() && it != tu.end(); ++it) {
+                const std::string & key = it.key();
+                const json & v = it.value();
+                if (key == "slice_ms") {
+                    if (!v.is_number_integer() || v.get<int64_t>() < 10 || v.get<int64_t>() > 10000) {
+                        err = "tu.slice_ms must be an integer from 10 to 10000";
+                    } else {
+                        task.tu_set.slice_ms = v.get<int32_t>();
+                    }
+                } else if (key == "group") {
+                    if (!v.is_number_integer() || v.get<int64_t>() < 1) {
+                        err = "tu.group must be a positive integer (layers per group)";
+                    } else {
+                        task.tu_set.group = (int32_t) std::min<int64_t>(v.get<int64_t>(), INT32_MAX);
+                    }
+                } else if (key == "enabled" || key == "fix" || key == "fair_read") {
+                    err = "tu." + key + " is not a setting on FNFL: two-user scheduling is engaged with more than one "
+                          "slot, and TU6's fix and fair read are its permanent behavior";
+                } else if (key == "force" || key == "diag" || key == "peer_rows" || key == "version") {
+                    err = "tu." + key + " is not a setting on FNFL";
+                } else {
+                    err = "unknown field tu." + key;
+                }
+            }
+            if (!err.empty()) {
+                res->error(format_error_response(err, ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            auto & rd = res->rd;
+            task.id = rd.get_new_id();
+            rd.post_task(std::move(task));
+            auto result = rd.next(req.should_stop);
+            if (!result) {
+                GGML_ASSERT(req.should_stop());
+                return res;
+            }
+            if (result->is_error()) {
+                res->error(result->to_json());
+                return res;
+            }
+            res->ok(result->to_json());
+            return res;
+        }
 
         res->ok({{ "success", true }});
         return res;
@@ -2617,7 +3450,7 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
     if (is_sleeping) {
         cached_models  = get_res_models(*meta);
-        cached_props   = get_res_props(*meta, params, true);
+        cached_props   = get_res_props(*meta, params, true, ctx_server.tu_props_json());
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;

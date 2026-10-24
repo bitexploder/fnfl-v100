@@ -145,6 +145,11 @@ int64_t ple_foll_pinned_pages() {
     return acquired < 0 || released < 0 ? -1 : acquired - released;
 }
 
+void ple_pinned_range(uintptr_t & first, uintptr_t & end) {
+    first = pinned_first.load(std::memory_order_acquire);
+    end = pinned_end.load(std::memory_order_acquire);
+}
+
 ple_pin::~ple_pin() {
     release();
 }

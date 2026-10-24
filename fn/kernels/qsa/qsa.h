@@ -137,6 +137,9 @@ struct round_update_args {
     int32_t rows = 0;                // 1 .. max_rows
     int32_t max_cells = 0;           // host: the key cache's cells (the slot's capacity); depth + rows beyond it writes
                                      // nothing
+    // ME6 (the host-backed tier's graphs, fn/model/kv_tier.h): optional device word w; when set, cell c is read and
+    // written at keys + (c - *w) * 128, *w read on the device (null: the resident form)
+    const int64_t * shift = nullptr;
 };
 bool summary_update(const round_update_args & a, void * stream);
 

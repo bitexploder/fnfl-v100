@@ -131,6 +131,7 @@ struct update_kargs {
     int32_t n_new;
     const int32_t * depth; // the round form: first, count, new_first and n_new from the device depth (n_new = rows)
     int32_t cap;           // the round form: the key cache's cells
+    const int64_t * shift; // ME6, the round form: optional device word w; cell c at keys + (c - *w) * head_dim
 };
 
 // round to nearest even (finite keys), as the cache stores them
@@ -156,12 +157,14 @@ __global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs 
     if (i >= count + a.n_new) {
         return;
     }
+    // ME6: the host-backed tier's window start (graph mode); the window holds every cell the launch touches
+    const int64_t shift = a.shift != nullptr ? *a.shift : 0;
     if (i >= count) {
         // a new cell's raw key: the warp stores its 128 values rounded to BF16
         const int n = i - count;
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
-            a.key_out[(static_cast<int64_t>(new_first) + n) * head_dim + m * 32 + lane] =
+            a.key_out[(static_cast<int64_t>(new_first) + n - shift) * head_dim + m * 32 + lane] =
                 bf16_rn(a.ik[n * head_dim + m * 32 + lane]);
         }
         return;
@@ -172,7 +175,7 @@ __global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs 
     for (int r = 0; r < ratio; ++r) {
         const int64_t c = static_cast<int64_t>(b) * ratio + r;
         const int64_t n = c - new_first;
-        const uint16_t * k = a.keys + c * head_dim;
+        const uint16_t * k = a.keys + (c - shift) * head_dim;
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
             // a cell this launch writes is taken from ik, never read back from the cache
@@ -976,7 +979,7 @@ bool summary_update(const update_args & a, void * stream) {
     }
     const update_kargs k = {a.keys,  a.k_norm, a.summaries, a.first, a.count, 1.0f / static_cast<float>(ratio),
                             0.0f,    fn::rms_eps, head_dim, a.rope,  nullptr, nullptr,
-                            0,       0,           nullptr,  0};
+                            0,       0,           nullptr,  0,           nullptr};
     const int warps = 4;
     summary_update_kernel<<<(a.count + warps - 1) / warps, warps * 32, 0, static_cast<cudaStream_t>(stream)>>>(k);
     return cudaPeekAtLastError() == cudaSuccess;
@@ -990,7 +993,7 @@ bool summary_update(const round_update_args & a, void * stream) {
     }
     const update_kargs k = {a.keys, a.k_norm,    a.summaries, 0,      0,       1.0f / static_cast<float>(ratio),
                             0.0f,   fn::rms_eps, head_dim,    a.rope, a.ik,    a.keys,
-                            0,      a.rows,      a.depth,     a.max_cells};
+                            0,      a.rows,      a.depth,     a.max_cells, a.shift};
     // the most warps any depth needs: the blocks rows cells can complete (one for rows <= 4, SP2: two at 5) pooled and
     // rows cells written
     const int warps = 4;

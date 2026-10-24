@@ -1,6 +1,7 @@
 #include "fn/kernels/experts/experts_prompt_test.h"
 
 #include "fn/kernels/experts/experts_prompt.h"
+#include "fn/kernels/experts/experts_share.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
@@ -31,13 +32,14 @@ constexpr int32_t NE = fn::n_expert;      // 512
 
 fn::quant::wfmt to_quant(fmt f) {
     using fn::quant::wfmt;
-    static const wfmt q[7] = {wfmt::iq2_xxs, wfmt::iq2_xs, wfmt::iq2_s, wfmt::iq3_xxs,
-                              wfmt::iq3_s,   wfmt::q2_0,   wfmt::iq4_nl}; // fmt's order
+    static const wfmt q[11] = {wfmt::iq2_xxs, wfmt::iq2_xs, wfmt::iq2_s, wfmt::iq3_xxs, wfmt::iq3_s, wfmt::q2_0,
+                               wfmt::iq4_nl,  wfmt::q8_0,   wfmt::q4_k,  wfmt::q5_k,    wfmt::q5_1}; // fmt's order
     return q[static_cast<int32_t>(f)];
 }
 
+// ME1: Q5_1 and Q8_0 are the Q4 candidate's down formats (Q8_0 in its down shape, load_synth's down)
 bool is_down(fmt f) {
-    return f == fmt::q2_0 || f == fmt::iq4_nl;
+    return f == fmt::q2_0 || f == fmt::iq4_nl || f == fmt::q5_1 || f == fmt::q8_0;
 }
 
 // runs fn(i) for i in [0, n) on up to 12 threads
@@ -140,11 +142,22 @@ struct case_cfg {
 };
 const case_cfg k_cases[] = {{128, 5, 100, 1, 0}, {128, 5, 100, 1, 1}, {512, 17, 1000, 4, 0}, {1536, 33, 2000, 8, 0}};
 
-const fmt k_gu[5] = {fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s};
-const fmt k_dn[2] = {fmt::q2_0, fmt::iq4_nl};
+// the deployed formats ("all"), then ME1's Q4 candidate's ("q4": gate/up Q4_K, Q5_K; down Q5_1, Q8_0)
+const fmt k_gu[7] = {fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s, fmt::q4_k, fmt::q5_k};
+const fmt k_dn[4] = {fmt::q2_0, fmt::iq4_nl, fmt::q5_1, fmt::q8_0};
+constexpr int32_t n_fmt = 11;
+
+bool is_q4(fmt f) {
+    return f == fmt::q4_k || f == fmt::q5_k || f == fmt::q5_1 || f == fmt::q8_0;
+}
+// f's index in k_dn
+int32_t dn_index(fmt f) {
+    return f == fmt::q2_0 ? 0 : f == fmt::iq4_nl ? 1 : f == fmt::q5_1 ? 2 : 3;
+}
 
 const char * lname(fmt f) {
-    static const char * names[7] = {"iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q2_0", "iq4_nl"};
+    static const char * names[n_fmt] = {"iq2_xxs", "iq2_xs", "iq2_s", "iq3_xxs", "iq3_s", "q2_0",
+                                        "iq4_nl",  "q8_0",   "q4_k",  "q5_k",    "q5_1"};
     return names[static_cast<int32_t>(f)];
 }
 
@@ -314,16 +327,19 @@ void down_refs(const case_in & c, const std::vector<float> & wdn, const std::vec
 } // namespace
 } // namespace fn::experts
 
-int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes) {
+int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes, const char * formats) {
     using namespace fn::experts;
     ep_fn4 fr;
-    if (!ep_read_fn4(routes, fr)) {
+    const bool q4 = strcmp(formats, "q4") == 0;
+    if ((!q4 && strcmp(formats, "all") != 0) || !ep_read_fn4(routes, fr)) {
+        fprintf(stderr, "ep-prep: FORMATS is all (the deployed formats) or q4 (ME1's)\n");
         return 1;
     }
     std::map<int32_t, synth> syn;
-    for (int32_t i = 0; i < 7; ++i) {
-        if (!load_synth(static_cast<fmt>(i), syn_dir, syn[i], true)) {
-            fprintf(stderr, "ep-prep: synthetic %s failed\n", fmt_name(static_cast<fmt>(i)));
+    for (int32_t i = 0; i < n_fmt; ++i) {
+        const fmt f = static_cast<fmt>(i);
+        if (is_q4(f) == q4 && !load_synth(f, syn_dir, syn[i], true, f == fmt::q8_0)) {
+            fprintf(stderr, "ep-prep: synthetic %s failed\n", fmt_name(f));
             return 1;
         }
     }
@@ -331,9 +347,16 @@ int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes) {
         const case_in c = make_inputs(fr, cfg, false);
         printf("ep-prep: R %d card %d: layer %d rows %d.., %d experts touched (most rows %d), %d sampled pairs\n",
                cfg.rows, cfg.card, cfg.layer, cfg.start, c.touched, c.max_rows, c.n_sp());
-        std::vector<float> wdn[2] = {dequant_card(syn[static_cast<int32_t>(fmt::q2_0)], cfg.card),
-                                     dequant_card(syn[static_cast<int32_t>(fmt::iq4_nl)], cfg.card)};
+        std::vector<float> wdn[4];
+        for (int32_t d = 0; d < 4; ++d) {
+            if (is_q4(k_dn[d]) == q4) {
+                wdn[d] = dequant_card(syn[static_cast<int32_t>(k_dn[d])], cfg.card);
+            }
+        }
         for (const fmt gu : k_gu) {
+            if (is_q4(gu) != q4) {
+                continue;
+            }
             const std::vector<float> wg = dequant_card(syn[static_cast<int32_t>(gu)], cfg.card);
             std::vector<double> glu(size_t(c.n_sp()) * n_ff_card);
             parallel_for(c.n_sp(), [&](int32_t i) {
@@ -357,7 +380,10 @@ int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes) {
             for (size_t i = 0; i < g16.size(); ++i) {
                 in[i] = f16_to_double(g16[i]);
             }
-            for (int32_t d = 0; d < 2; ++d) {
+            for (int32_t d = 0; d < 4; ++d) {
+                if (is_q4(k_dn[d]) != q4) {
+                    continue;
+                }
                 std::vector<float> p4;
                 std::vector<double> sum;
                 down_refs(c, wdn[d], in, p4, sum);
@@ -725,7 +751,7 @@ void run_case(ctx & x, const case_in & c, const std::vector<fmt> & gus, const st
         }
         for (const fmt dn : dns) {
             const std::string td = tg + "/" + fmt_name(dn);
-            const int32_t di = dn == fmt::q2_0 ? 0 : 1;
+            const int32_t di = dn_index(dn);
             std::vector<uint8_t> dh;
             if (!packed(x.syn[static_cast<int32_t>(dn)], card, dh)) {
                 x.ok = false;
@@ -876,11 +902,226 @@ void bad_id_case(ctx & x, const ep_fn4 & fr, fmt gu) {
     x.check(st == 1 && untouched, "bad expert ID");
 }
 
+// ME4: the cache instantiation's ring groups. One routed input three ways: the resident bank (w), the cache's table
+// (wt) in one launch, and the table in four uneven expert groups (one a single expert) over ep_task_offsets with each
+// group's tight grid. Every task reads the same weights, so the GLU and the partials must be bitwise equal across the
+// three, and every pair written (the buffers start 0xff)
+void grouped_case(ctx & x, const ep_fn4 & fr, fmt gu, fmt dn, const case_cfg & cfg) {
+    const case_in c = make_inputs(fr, cfg, false);
+    const int32_t R = c.cfg.rows, pairs = R * NU, tr = ep_task_rows(gu);
+    dev_mem ids(c.ids.size() * 4), xh(c.xh.size() * 2), toff(size_t(NE + 1) * 4), tab_gu(size_t(NE) * 8),
+        tab_dn(size_t(NE) * 8);
+    route_dev rd;
+    std::vector<int32_t> pos;
+    std::vector<uint8_t> wh, dh;
+    if (!ids.put(c.ids.data(), ids.n, x.st) || !xh.put(c.xh.data(), xh.n, x.st) ||
+        !run_group(x, c, tr, ids, rd, pos) || !packed(x.syn[static_cast<int32_t>(gu)], c.cfg.card, wh) ||
+        !packed(x.syn[static_cast<int32_t>(dn)], c.cfg.card, dh)) {
+        x.ok = false;
+        return;
+    }
+    dev_mem w(wh.size()), wd(dh.size());
+    std::vector<const uint8_t *> tg(NE), td(NE);
+    for (int32_t e = 0; e < NE; ++e) {
+        tg[size_t(e)] = w.p + int64_t(e) * gate_up_bytes(gu);
+        td[size_t(e)] = wd.p + int64_t(e) * down_bytes(dn);
+    }
+    if (!w.put(wh.data(), wh.size(), x.st) || !wd.put(dh.data(), dh.size(), x.st) ||
+        !tab_gu.put(tg.data(), tab_gu.n, x.st) || !tab_dn.put(td.data(), tab_dn.n, x.st) ||
+        !ep_task_offsets(rd.view(), toff.as<int32_t>(), x.st) || !x.sync("task offsets")) {
+        x.ok = false;
+        return;
+    }
+    // the experts' pairs (the group grids' bound, as the caller computes it from the route)
+    std::vector<int64_t> pe(NE, 0);
+    for (const int32_t id : c.ids) {
+        ++pe[size_t(id)];
+    }
+    const int32_t cuts[5] = {0, 100, 101, 400, NE};
+    std::vector<uint16_t> glu_h[3];
+    std::vector<float> part_h[3];
+    for (int32_t way = 0; way < 3; ++way) {
+        dev_mem glu(size_t(pairs) * n_ff_card * 2), part(size_t(pairs) * D * 4);
+        if (!glu.fill(0xff, x.st) || !part.fill(0xff, x.st)) {
+            x.ok = false;
+            return;
+        }
+        for (int32_t g = 0; g < (way == 2 ? 4 : 1); ++g) {
+            ep_gate_up_args a = {w.p, x.grids->p, xh.as<uint16_t>(), rd.view(), glu.as<uint16_t>(), nullptr};
+            ep_down_args d = {wd.p, x.grids->p, glu.as<uint16_t>(), rd.view(), part.as<float>()};
+            if (way > 0) {
+                a.wt = tab_gu.as<const uint8_t *>();
+                d.wt = tab_dn.as<const uint8_t *>();
+            }
+            if (way == 2) {
+                int64_t gp = 0;
+                for (int32_t e = cuts[g]; e < cuts[g + 1]; ++e) {
+                    gp += pe[size_t(e)];
+                }
+                a.task_off = d.task_off = toff.as<int32_t>();
+                a.e_lo = d.e_lo = cuts[g];
+                a.e_hi = d.e_hi = cuts[g + 1];
+                a.grid = d.grid = int32_t((cuts[g + 1] - cuts[g]) + (gp + tr - 1) / tr);
+            }
+            if (!x.check(ep_gate_up(gu, R, a, x.st), tag(c) + ": grouped gate_up enqueued") ||
+                !x.check(ep_down(dn, R, d, x.st), tag(c) + ": grouped down enqueued") || !x.sync("grouped")) {
+                return;
+            }
+        }
+        glu_h[way].resize(size_t(pairs) * n_ff_card);
+        part_h[way].resize(size_t(pairs) * D);
+        if (!glu.get(glu_h[way].data(), glu.n, x.st) || !part.get(part_h[way].data(), part.n, x.st)) {
+            x.ok = false;
+            return;
+        }
+    }
+    bool written = true;
+    for (const uint16_t v : glu_h[2]) {
+        written = written && v != 0xffff;
+    }
+    const bool same = glu_h[0] == glu_h[1] && glu_h[1] == glu_h[2] &&
+                      std::memcmp(part_h[0].data(), part_h[1].data(), part_h[0].size() * 4) == 0 &&
+                      std::memcmp(part_h[1].data(), part_h[2].data(), part_h[1].size() * 4) == 0;
+    printf("ep-test: %s/%s %s: grouped (4 groups, task offsets, tight grids) against one table launch and the "
+           "resident bank: GLU and partials %s, every pair written %s\n",
+           fmt_name(gu), fmt_name(dn), tag(c).c_str(), same ? "bitwise equal" : "DIFFER", written ? "yes" : "NO");
+    x.check(same && written, tag(c) + ": ME4 grouped launches equal the single launch bitwise");
+}
+
+// MX7: the prompt CPU share's kernels (experts_share.h) on one routed input. es_drop against the host's in-order
+// filter of ep_group's tasks (the CPU's experts: every third expert of at most 8 pairs, and two unrouted), then
+// ep_task_offsets over the kept tasks; after a bad ID it changes nothing. es_gather: the CPU experts' rows bitwise.
+// es_add: their pairs' rows (or zeros) at pos, every other partial untouched, the error bit only when flagged
+void share_case(ctx & x, const ep_fn4 & fr, fmt gu, const case_cfg & cfg) {
+    const case_in c = make_inputs(fr, cfg, false);
+    const int32_t R = c.cfg.rows, pairs = R * NU, tr = ep_task_rows(gu);
+    dev_mem ids(c.ids.size() * 4), xh(c.xh.size() * 2), toff(size_t(NE + 1) * 4), skip(NE);
+    route_dev rd;
+    std::vector<int32_t> pos;
+    if (!ids.put(c.ids.data(), ids.n, x.st) || !xh.put(c.xh.data(), xh.n, x.st) || !run_group(x, c, tr, ids, rd, pos)) {
+        x.ok = false;
+        return;
+    }
+    std::vector<int32_t> cnt(NE, 0);
+    for (const int32_t id : c.ids) {
+        ++cnt[size_t(id)];
+    }
+    std::vector<uint8_t> sk(NE, 0);
+    int32_t n_cpu = 0, unrouted = 0;
+    for (int32_t e = 0; e < NE; ++e) {
+        if (cnt[size_t(e)] >= 1 && cnt[size_t(e)] <= 8 && e % 3 == 0) {
+            sk[size_t(e)] = 1;
+            ++n_cpu;
+        } else if (cnt[size_t(e)] == 0 && unrouted < 2) {
+            sk[size_t(e)] = 1;
+            ++unrouted;
+        }
+    }
+    std::vector<int32_t> t0(size_t(ep_max_tasks) * 4), t1(t0.size()), c0(8), c1(8), off(NE + 1);
+    if (!rd.tasks.get(t0.data(), t0.size() * 4, x.st) || !rd.counters.get(c0.data(), 32, x.st) ||
+        !skip.put(sk.data(), sk.size(), x.st) || !x.check(es_drop(rd.view(), skip.as<uint8_t>(), x.st), "es_drop") ||
+        !x.check(ep_task_offsets(rd.view(), toff.as<int32_t>(), x.st), "task offsets") || !x.sync("es_drop") ||
+        !rd.tasks.get(t1.data(), t1.size() * 4, x.st) || !rd.counters.get(c1.data(), 32, x.st) ||
+        !toff.get(off.data(), off.size() * 4, x.st)) {
+        x.ok = false;
+        return;
+    }
+    std::vector<int32_t> kept;
+    for (int32_t i = 0; i < c0[0]; ++i) {
+        if (sk[size_t(t0[size_t(i) * 4])] == 0) {
+            kept.insert(kept.end(), t0.begin() + i * 4, t0.begin() + i * 4 + 4);
+        }
+    }
+    const int32_t nk = int32_t(kept.size() / 4);
+    bool drop =
+        c1[0] == nk && c1[1] == 0 && n_cpu > 0 && nk < c0[0] && std::equal(kept.begin(), kept.end(), t1.begin());
+    for (int32_t e = 0, i = 0; e <= NE && drop; ++e) {
+        while (i < nk && kept[size_t(i) * 4] < e) {
+            ++i;
+        }
+        drop = off[size_t(e)] == (e == NE ? nk : i);
+    }
+    // a bad ID flagged: nothing changes
+    std::vector<int32_t> bad = c1, t2(t1.size()), c2(8);
+    bad[1] = 1;
+    const bool held = rd.counters.put(bad.data(), 32, x.st) && es_drop(rd.view(), skip.as<uint8_t>(), x.st) &&
+                      x.sync("es_drop bad") && rd.tasks.get(t2.data(), t2.size() * 4, x.st) &&
+                      rd.counters.get(c2.data(), 32, x.st) && t2 == t1 && c2 == bad;
+    x.check(drop && held, tag(c) + ": MX7 es_drop keeps the GPU's tasks in order, task offsets over them, a bad ID "
+                                   "changes nothing");
+    // the CPU experts' rows (ascending) and pairs (by expert, then pair)
+    std::vector<int32_t> rows, cp;
+    std::vector<uint8_t> in(size_t(R), 0);
+    for (int32_t e = 0; e < NE; ++e) {
+        for (int32_t p = 0; p < pairs && sk[size_t(e)] != 0; ++p) {
+            if (c.ids[size_t(p)] == e) {
+                cp.push_back(p);
+                in[size_t(p / NU)] = 1;
+            }
+        }
+    }
+    for (int32_t r = 0; r < R; ++r) {
+        if (in[size_t(r)] != 0) {
+            rows.push_back(r);
+        }
+    }
+    const int32_t nr = int32_t(rows.size()), np = int32_t(cp.size());
+    dev_mem rows_d(size_t(nr) * 4), out(size_t(nr) * D * 2), cp_d(size_t(np) * 4), r16(size_t(np) * D * 2),
+        part(size_t(pairs) * D * 2), err(4);
+    std::vector<uint16_t> got(size_t(nr) * D), rh(size_t(np) * D);
+    std::mt19937 rng(17);
+    for (uint16_t & v : rh) {
+        v = uint16_t(rng() & 0x7bff); // finite F16
+    }
+    if (!rows_d.put(rows.data(), rows_d.n, x.st) || !cp_d.put(cp.data(), cp_d.n, x.st) ||
+        !r16.put(rh.data(), r16.n, x.st) || !part.fill(0xff, x.st) || !err.fill(0, x.st) ||
+        !x.check(es_gather(xh.as<uint16_t>(), rows_d.as<int32_t>(), nr, out.as<uint16_t>(), x.st), "es_gather") ||
+        !x.sync("es_gather") || !out.get(got.data(), out.n, x.st)) {
+        x.ok = false;
+        return;
+    }
+    bool gather = true;
+    for (int32_t i = 0; i < nr && gather; ++i) {
+        gather = std::memcmp(got.data() + int64_t(i) * D, c.xh.data() + int64_t(rows[size_t(i)]) * D, D * 2) == 0;
+    }
+    std::vector<uint16_t> ph(size_t(pairs) * D);
+    uint32_t e0 = 1, e1 = 0;
+    bool add = x.check(es_add(cp_d.as<int32_t>(), r16.as<uint16_t>(), np, rd.pos.as<int32_t>(), part.as<uint16_t>(), 0,
+                              err.as<uint32_t>(), 4u, x.st),
+                       "es_add") &&
+               x.sync("es_add") && part.get(ph.data(), part.n, x.st) && err.get(&e0, 4, x.st) && e0 == 0;
+    std::vector<uint8_t> at(size_t(pairs), 0);
+    for (int32_t i = 0; i < np && add; ++i) {
+        const int32_t q = pos[size_t(cp[size_t(i)])];
+        at[size_t(q)] = 1;
+        add = std::memcmp(ph.data() + int64_t(q) * D, rh.data() + int64_t(i) * D, D * 2) == 0;
+    }
+    for (int32_t q = 0; q < pairs && add; ++q) {
+        for (int32_t k = 0; k < D && at[size_t(q)] == 0 && add; ++k) {
+            add = ph[size_t(q) * D + size_t(k)] == 0xffff;
+        }
+    }
+    add = add &&
+          es_add(cp_d.as<int32_t>(), nullptr, np, rd.pos.as<int32_t>(), part.as<uint16_t>(), 1, err.as<uint32_t>(), 4u,
+                 x.st) &&
+          x.sync("es_add zeros") && part.get(ph.data(), part.n, x.st) && err.get(&e1, 4, x.st) && e1 == 4u;
+    for (int32_t q = 0; q < pairs && add; ++q) {
+        for (int32_t k = 0; k < D && add; ++k) {
+            add = ph[size_t(q) * D + size_t(k)] == (at[size_t(q)] != 0 ? 0 : 0xffff);
+        }
+    }
+    printf("ep-test: %s %s: MX7 share kernels: %d CPU experts (+%d unrouted), tasks %d -> %d, %d rows gathered %s, "
+           "%d pairs added %s\n",
+           fmt_name(gu), tag(c).c_str(), n_cpu, unrouted, c0[0], c1[0], nr, gather ? "bitwise" : "DIFFER", np,
+           add ? "at their positions (zeros, the error bit)" : "WRONG");
+    x.check(gather && add, tag(c) + ": MX7 es_gather and es_add");
+}
+
 bool parse_formats(const char * s, std::vector<fmt> & gus, std::vector<fmt> & dns) {
     const std::string str(s);
-    for (int32_t i = 0; i < 7; ++i) {
+    for (int32_t i = 0; i < n_fmt; ++i) {
         const fmt f = static_cast<fmt>(i);
-        bool want = str == "all";
+        bool want = (str == "all" && !is_q4(f)) || (str == "q4" && is_q4(f));
         size_t p = 0;
         while (!want && p <= str.size()) {
             const size_t e = std::min(str.find(',', p), str.size());
@@ -923,9 +1164,11 @@ int fnfl_ep_test(int device, const char * rows, const char * formats, const char
         !cuda_ok(cudaStreamCreateWithFlags(&x.st, cudaStreamNonBlocking), "stream")) {
         return 1;
     }
-    for (int32_t i = 0; i < 7; ++i) {
-        if (!load_synth(static_cast<fmt>(i), syn_dir, x.syn[i], true)) {
-            return 1;
+    for (const std::vector<fmt> * v : {&gus, &dns}) {
+        for (const fmt f : *v) {
+            if (!load_synth(f, syn_dir, x.syn[static_cast<int32_t>(f)], true, f == fmt::q8_0)) {
+                return 1;
+            }
         }
     }
     std::vector<uint8_t> g;
@@ -943,6 +1186,23 @@ int fnfl_ep_test(int device, const char * rows, const char * formats, const char
     if (x.full) {
         zero_case(x, fr, gus[0], dns[0]);
         bad_id_case(x, fr, gus[0]);
+    }
+    // ME4: grouped launches, every listed gate/up format with each down format, at every listed row count
+    for (const case_cfg & cfg : k_cases) {
+        if (std::find(want.begin(), want.end(), cfg.rows) == want.end() || cfg.card != 0) {
+            continue;
+        }
+        for (const fmt g : gus) {
+            for (const fmt d : dns) {
+                grouped_case(x, fr, g, d, cfg);
+            }
+        }
+    }
+    // MX7: the share's kernels at every listed row count
+    for (const case_cfg & cfg : k_cases) {
+        if (std::find(want.begin(), want.end(), cfg.rows) != want.end() && cfg.card == 0) {
+            share_case(x, fr, gus[0], cfg);
+        }
     }
     cudaStreamDestroy(x.st);
     if (x.ok) {

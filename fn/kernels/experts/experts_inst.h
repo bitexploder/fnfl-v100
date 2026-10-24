@@ -47,3 +47,21 @@
     X(q2_0, q2_0, 3)     /* layers 3,6,12,13,14,19,20 */                                                               \
     X(iq4_nl, q2_0, 4)   /* layers 4 */                                                                                \
     X(q8_0, q8_0, 48)    /* layer 48 (the MTP draft, DR1) */
+
+// ME1: the Unsloth UD-Q4_K_XL candidate's routed pairs (tickets/ME1/unsloth-q4-header-inventory.json, revision
+// 766911a6): gate/up Q4_K with down Q5_1 (43 layers), Q4_K with Q8_0 (layers 4, 30, 46, 47), Q5_K with Q8_0 (layer
+// 2); its shared expert is Q8_0 (gate, up and down) in every layer. Not the deployed model's: the kernels and the
+// tests take them, the bench does not. First layer: the candidate's.
+#define FN_EXPERTS_Q4_GATE_UP_INSTANCES(X)                                                                             \
+    X(q4_k, q8_0, q8_0, 0) /* layers 0,1,3-47 */                                                                       \
+    X(q5_k, q8_0, q8_0, 2) /* layer 2 */
+
+#define FN_EXPERTS_Q4_DOWN_INSTANCES(X)                                                                                \
+    X(q5_1, q8_0, 0) /* 43 layers */                                                                                   \
+    X(q8_0, q8_0, 2) /* layers 2,4,30,46,47 (the deployed list's draft entry, at B = 5 too) */
+
+// ME7: the Q2 draft's routed pairs (work/ME7's splice of Strata-V100 69713b61's Q2_0 experts into our MTP draft): Q2_0
+// gate/up and down with the draft's shared expert in Q8_0, as the Q8 draft's. Opt-in (the draft file's formats choose
+// it, fn/loader); the draft runs B <= 4. First layer: the draft's
+#define FN_EXPERTS_DRAFT_Q2_GATE_UP_INSTANCES(X) X(q2_0, q8_0, q8_0, 48) /* layer 48 (the Q2 MTP draft) */
+#define FN_EXPERTS_DRAFT_Q2_DOWN_INSTANCES(X) X(q2_0, q8_0, 48)          /* layer 48 (the Q2 MTP draft) */

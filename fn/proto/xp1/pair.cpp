@@ -184,7 +184,7 @@ struct card {
     int8_t * gd_codes = nullptr; // [4][3072]
     float * gd_scales = nullptr; // [4][96][2]
     void * gd_ws = nullptr;      // fn::gdn::workspace_bytes()
-    uint32_t * gd_cur = nullptr; // the committed slot (SR1): 0 throughout, this prototype keeps its own state copies
+    uint32_t * gd_cur = nullptr; // the GDN selector (ME11): 0 throughout, this prototype keeps its own state copies
     float * qkv_out = nullptr;   // [4][6144]
     float * attn_out = nullptr;  // [4][3072]
     uint16_t * k_cache = nullptr; // [cells][256] BF16, this card's KV head
@@ -1237,8 +1237,10 @@ bool pair::build(variant v, int32_t rows, bool graph, std::vector<op> & prog, st
                     g.dt = cr.gd_w + std::ptrdiff_t{5120} * 4;
                     g.a = g.dt + 24;
                     g.norm_w = g.dt + 48;
+                    // ME11: the two banks and the record sets inside the prototype's six-version buffer; selector 0
                     g.state = cr.gdn_state;
-                    g.cur = cr.gd_cur;
+                    g.rec = cr.gdn_state + 2 * fn::gdn::state_version_floats;
+                    g.gsel = cr.gd_cur;
                     g.gated = cr.recur_out;
                     g.gated_q = {cr.gd_codes, cr.gd_scales, B, 3072};
                     g.ws = cr.gd_ws;

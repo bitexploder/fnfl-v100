@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -260,10 +262,11 @@ struct inputs {
     std::vector<float> hres, hx, hpost; // [B][4][2560], [B][2560], [B][4]
 };
 
-enum class kind { plain, stress, zero_hx };
+// ME12's special: signed zeros, cancellation-sensitive sums and NaNs, compared bitwise only (between two GPU orders)
+enum class kind { plain, stress, zero_hx, special };
 
 const char * kind_name(kind k) {
-    return k == kind::plain ? "plain" : k == kind::stress ? "stress" : "zero-hx";
+    return k == kind::plain ? "plain" : k == kind::stress ? "stress" : k == kind::zero_hx ? "zero-hx" : "special";
 }
 
 void make_inputs(inputs & in, int32_t rows, kind k) {
@@ -293,6 +296,25 @@ void make_inputs(inputs & in, int32_t rows, kind k) {
                 in.hpost[static_cast<size_t>(b) * S + s] *= f;
             }
         }
+    }
+    if (k == kind::special) {
+        // every 7th hres and 11th hx feature -0, stream 3's hres +-1e7 about a small residue (sums that cancel),
+        // row 0's stream 2 hpost -0, and NaNs in the last row (hres stream 1, hx)
+        for (int32_t b = 0; b < rows; ++b) {
+            for (int32_t d = 0; d < D; ++d) {
+                for (int32_t s = 0; s < S; ++s) {
+                    float & v = in.hres[(static_cast<size_t>(b) * S + s) * D + d];
+                    v = s == 3 ? ((d & 1) != 0 ? 1e7f : -1e7f) + 1e-3f * v : d % 7 == 0 ? -0.0f : v;
+                }
+                if (d % 11 == 0) {
+                    in.hx[static_cast<size_t>(b) * D + d] = -0.0f;
+                }
+            }
+        }
+        in.hpost[2] = -0.0f;
+        const size_t last = static_cast<size_t>(rows) - 1;
+        in.hres[(last * S + 1) * D + 5] = std::numeric_limits<float>::quiet_NaN();
+        in.hx[last * D + 9] = std::numeric_limits<float>::quiet_NaN();
     }
 }
 
@@ -1273,6 +1295,75 @@ bool head_q8_case(card2 * c[2], fn::xchg::rings & rg, const inputs & in, const r
     return worst <= head_bound && cards && format && same && same_fused;
 }
 
+// FMU2 (build item 2, the joint draft step: lane k is row k of one U-row step): the Q8_0 sublayer and head at B = 2
+// .. 5, each row bitwise the same row run alone at B = 1 (the sublayer's x, inject, F32 mixed, codes and scales; the
+// head's x, mixed rows, codes and scales), on both cards, for plain and stress rows
+bool row_alone_q8(card2 * c[2], fn::xchg::rings & rg, const weights & w, int32_t dev0) {
+    bool ok = true;
+    int32_t n_same = 0, n_cmp = 0;
+    const auto row = [](const auto & v, int32_t B, int32_t r) {
+        const size_t n = v.size() / static_cast<size_t>(B);
+        return std::make_pair(v.data() + static_cast<size_t>(r) * n, n);
+    };
+    const auto same_row = [&](const auto & vb, int32_t B, int32_t r, const auto & v1) {
+        const auto [p, n] = row(vb, B, r);
+        return vb.size() % static_cast<size_t>(B) == 0 && n == v1.size() && memcmp(p, v1.data(), n * sizeof(*p)) == 0;
+    };
+    for (const kind kd : {kind::plain, kind::stress}) {
+        inputs in5;
+        make_inputs(in5, fn::hc::max_rows, kd);
+        const auto slice = [&](int32_t r0, int32_t B) {
+            inputs in;
+            in.rows = B;
+            in.hres.assign(in5.hres.begin() + int64_t(r0) * S * D, in5.hres.begin() + int64_t(r0 + B) * S * D);
+            in.hx.assign(in5.hx.begin() + int64_t(r0) * D, in5.hx.begin() + int64_t(r0 + B) * D);
+            in.hpost.assign(in5.hpost.begin() + int64_t(r0) * S, in5.hpost.begin() + int64_t(r0 + B) * S);
+            return in;
+        };
+        pair_out o1[fn::hc::max_rows];
+        head_out h1[fn::hc::max_rows];
+        for (int32_t r = 0; r < fn::hc::max_rows && ok; ++r) {
+            const inputs in = slice(r, 1);
+            reference ref;
+            make_reference(w, in, ref);
+            ok = cuda_ok(cudaSetDevice(dev0), "cudaSetDevice") &&
+                 run_hc2_case(c, rg, in, ref, nullptr, fn::hc::up_arm::ring,
+                              std::string("hc2 q8 alone ") + kind_name(kd) + " row " + std::to_string(r), &o1[r],
+                              true) &&
+                 run_head(c, rg, in, true, h1[r]);
+        }
+        for (int32_t B = 2; B <= fn::hc::max_rows && ok; ++B) {
+            const inputs in = slice(0, B);
+            reference ref;
+            make_reference(w, in, ref);
+            pair_out o;
+            head_out h;
+            ok = cuda_ok(cudaSetDevice(dev0), "cudaSetDevice") &&
+                 run_hc2_case(c, rg, in, ref, nullptr, fn::hc::up_arm::ring,
+                              std::string("hc2 q8 rows ") + kind_name(kd) + " B" + std::to_string(B), &o, true) &&
+                 run_head(c, rg, in, true, h);
+            for (int32_t r = 0; r < B && ok; ++r) {
+                for (int32_t k = 0; k < 2; ++k) {
+                    const bool sub =
+                        same_row(o.x[k], B, r, o1[r].x[k]) && same_row(o.inject[k], B, r, o1[r].inject[k]) &&
+                        same_row(o.full[k], B, r, o1[r].full[k]) && same_row(o.codes[k], B, r, o1[r].codes[k]) &&
+                        same_row(o.scales[k], B, r, o1[r].scales[k]);
+                    const bool hd = same_row(h.x[k], B, r, h1[r].x[k]) && same_row(h.full[k], B, r, h1[r].full[k]) &&
+                                    same_row(h.codes[k], B, r, h1[r].codes[k]) &&
+                                    same_row(h.scales[k], B, r, h1[r].scales[k]);
+                    n_same += (sub ? 1 : 0) + (hd ? 1 : 0);
+                    n_cmp += 2;
+                }
+            }
+        }
+    }
+    printf("hc-test hc2 q8 rows alone: every row of B = 2 .. %d against the same row alone at B = 1 (the sublayer's x, "
+           "inject, F32 mixed, codes, scales; the head's x, mixed rows, codes, scales; both cards; plain and stress): "
+           "%d of %d bitwise%s\n",
+           fn::hc::max_rows, n_same, n_cmp, ok && n_same == n_cmp ? "" : "  FAIL");
+    return ok && n_same == n_cmp;
+}
+
 // the head's down weights from a sublayer's (rows 0..319 of each stream: no injection rows), BF16 and Q8_0
 void head_weights(const weights & w, int32_t r, std::vector<uint16_t> & bf, std::vector<uint8_t> & q8) {
     constexpr int32_t FB = F / 32;
@@ -1378,10 +1469,530 @@ bool run_q8(card2 * c[2], fn::xchg::rings & rg, cudaStream_t st, int32_t dev0, u
             }
         }
         if (ok && !pow2 && (rows_mask >> (fn::hc::max_rows - 1) & 1u) != 0) {
-            ok = batch_invariance(c, rg, w, dw, st, dev0, true);
+            ok = batch_invariance(c, rg, w, dw, st, dev0, true) && row_alone_q8(c, rg, w, dev0);
         }
     }
     return ok;
+}
+
+// ME12: the paired launch (hc::pair, head_pair) against the four-launch order it replaces on one device (hc::sub or
+// head_sub, mode 1 on both cards, then mode 2 on both, one stream). Sublayer n of a sequence takes slot n % 3 and
+// resets slot (n - 1) % 3 (sub_args_of); its x and inject go to entry n % n_sub.
+fn::hc::sub_args pair_sub_args(card2 & k, fn::xchg::rings & rg, int32_t r, int32_t n, bool head) {
+    fn::hc::sub_args a = sub_args_of(k, rg, r, n % n_sub, head);
+    const fn::hc::sub_args at = sub_args_of(k, rg, r, n, head);
+    a.hc_ring = at.hc_ring;
+    a.hc_peer = at.hc_peer;
+    a.hc_reset = at.hc_reset;
+    a.hmix_reset = at.hmix_reset;
+    a.hmix_own = at.hmix_own;
+    a.hmix_peer = at.hmix_peer;
+    return a;
+}
+
+// appends n words at device address p (current device)
+bool append_words(const void * p, size_t n, std::vector<uint32_t> & out) {
+    const size_t at = out.size();
+    out.resize(at + n);
+    return cuda_ok(cudaMemcpy(out.data() + at, p, n * sizeof(uint32_t), cudaMemcpyDeviceToHost), "snapshot");
+}
+
+// every word the paired launch is held to after sublayer n, both cards: all three X-HC slots (both regions of the
+// written one, the reset one, the untouched one) and X-HMIX slots (F32 mixed, codes, scales), sublayer n's x and
+// inject entries, and the error word
+bool snapshot(card2 * c[2], fn::xchg::rings & rg, int32_t n, bool head, std::vector<uint32_t> & out) {
+    using fn::xchg::msg;
+    bool ok = cuda_ok(cudaStreamSynchronize(c[0]->st), "sublayer");
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        for (int32_t sl = 0; sl < fn::xchg::n_slot && ok; ++sl) {
+            ok = append_words(rg.slot(r, msg::hc, sl), size_t(fn::xchg::slot_words(msg::hc)), out) &&
+                 append_words(rg.slot(r, msg::hmix, sl), size_t(fn::xchg::slot_words(msg::hmix)), out);
+        }
+        const size_t i = static_cast<size_t>(n % n_sub);
+        ok = ok && append_words(c[r]->x.p + i * card2::n_x, card2::n_x, out) &&
+             (head || append_words(c[r]->inj.p + i * card2::n_j, card2::n_j, out));
+        uint32_t e = ~0u;
+        ok = ok && rg.read_err(r, e);
+        out.push_back(e);
+    }
+    return ok;
+}
+
+// sublayer n of a sequence at rows, paired or in the four-launch order, on card 0's stream
+bool pair_enqueue(card2 * c[2], fn::xchg::rings & rg, int32_t n, int32_t rows, bool head, bool paired,
+                  float * scratch) {
+    const fn::hc::pair_args pa = {{pair_sub_args(*c[0], rg, 0, n, head), pair_sub_args(*c[1], rg, 1, n, head)},
+                                  scratch};
+    if (paired) {
+        return head ? fn::hc::head_pair(rows, pa, c[0]->st) : fn::hc::pair(rows, pa, c[0]->st);
+    }
+    bool ok = true;
+    for (const int32_t mode : {1, 2}) {
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            ok = head ? fn::hc::head_sub(rows, mode, pa.s[r], c[0]->st) : fn::hc::sub(rows, mode, pa.s[r], c[0]->st);
+        }
+    }
+    return ok;
+}
+
+// fresh rings (every slot its sentinels, error words zero) and poisoned outputs and scratch
+bool pair_fresh(card2 * c[2], fn::xchg::rings & rg, const dev_buf<float> & scratch) {
+    bool ok = rg.reset_all() && cuda_ok(cudaDeviceSynchronize(), "rings reset") && scratch.poison(c[0]->st);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        ok = c[r]->x.poison(c[0]->st) && c[r]->inj.poison(c[0]->st);
+    }
+    return ok && cuda_ok(cudaStreamSynchronize(c[0]->st), "poison");
+}
+
+// the inputs on both cards' buffers, complete before card 0's stream runs
+bool pair_inputs(card2 * c[2], const inputs & in) {
+    return put_inputs(c, in) && cuda_ok(cudaStreamSynchronize(c[0]->st), "inputs") &&
+           cuda_ok(cudaStreamSynchronize(c[1]->st), "inputs");
+}
+
+// one sequence at widths, a snapshot after every sublayer
+bool pair_sequence(card2 * c[2], fn::xchg::rings & rg, const std::vector<int32_t> & widths, bool head, bool paired,
+                   const dev_buf<float> & scratch, std::vector<uint32_t> & out) {
+    out.clear();
+    bool ok = pair_fresh(c, rg, scratch);
+    for (int32_t n = 0; n < static_cast<int32_t>(widths.size()) && ok; ++n) {
+        ok = pair_enqueue(c, rg, n, widths[n], head, paired, scratch.p) && snapshot(c, rg, n, head, out);
+    }
+    return ok;
+}
+
+// the words of two snapshots that differ (all of them if the sizes do)
+size_t words_differ(const std::vector<uint32_t> & a, const std::vector<uint32_t> & b) {
+    if (a.size() != b.size()) {
+        return std::max(a.size(), b.size());
+    }
+    size_t bad = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        bad += a[i] != b[i] ? 1 : 0;
+    }
+    return bad;
+}
+
+// a sequence paired and in the four-launch order: every snapshot word bitwise; the error words zero except with
+// special inputs (there both orders' words are held equal instead)
+bool pair_case(card2 * c[2], fn::xchg::rings & rg, const inputs & in, kind kd, const std::vector<int32_t> & widths,
+               bool head, const dev_buf<float> & scratch, const std::string & label) {
+    std::vector<uint32_t> want, got;
+    bool ok = pair_inputs(c, in) && pair_sequence(c, rg, widths, head, false, scratch, want) &&
+              pair_sequence(c, rg, widths, head, true, scratch, got);
+    if (!ok) {
+        printf("hc-test %-28s not run: %s  FAIL\n", label.c_str(), cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    const size_t bad = words_differ(want, got);
+    // the last snapshot's error words: card 1's ends it, card 0's ends card 0's part (snapshot)
+    using fn::xchg::msg;
+    const size_t slots = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    const size_t card_words = size_t(fn::xchg::n_slot) * slots + card2::n_x + (head ? 0 : card2::n_j) + 1;
+    const bool clean = kd == kind::special || (got.back() == 0u && got[got.size() - 1 - card_words] == 0u);
+    printf("hc-test %-28s paired launch bitwise the four-launch order after each of %zu sublayers (X-HC and X-HMIX "
+           "slots, x%s, error words; both cards; %zu words): %s%s\n",
+           label.c_str(), widths.size(), head ? "" : ", inject", want.size(), bad == 0 ? "yes" : "NO  FAIL",
+           clean ? "" : "; error words not zero  FAIL");
+    return bad == 0 && clean;
+}
+
+// rejected before any launch: B = 0 and 6, a null stream, the cards swapped, a peer slot not the other card's own (X-HC
+// and X-HMIX), both shards one card's slots, a reset of a written slot (either shard's current X-HC or X-HMIX slot,
+// from either shard), a null error word, and a null or misaligned scratch; head_pair the same
+bool check_rejects_pair(card2 * c[2], fn::xchg::rings & rg, float * scratch) {
+    using fn::xchg::msg;
+    const fn::hc::pair_args pa = {{pair_sub_args(*c[0], rg, 0, 1, false), pair_sub_args(*c[1], rg, 1, 1, false)},
+                                  scratch};
+    fn::hc::pair_args swap = pa, peer = pa, hpeer = pa, same = pa, reset = pa, hreset = pa, err = pa, mis = pa,
+                      none = pa, x_reset01 = pa, x_reset10 = pa, x_hreset01 = pa, x_hreset10 = pa;
+    swap.s[0] = pa.s[1];
+    swap.s[1] = pa.s[0];
+    peer.s[0].hc_peer = rg.slot(1, msg::hc, 2);
+    hpeer.s[1].hmix_peer = rg.slot(0, msg::hmix, 2);
+    same.s[1] = pa.s[0];
+    same.s[1].card = 1;
+    reset.s[1].hc_reset = pa.s[1].hc_ring;
+    hreset.s[0].hmix_reset = pa.s[0].hmix_own;
+    // the other shard's current slots, both directions
+    x_reset01.s[0].hc_reset = pa.s[1].hc_ring;
+    x_reset10.s[1].hc_reset = pa.s[0].hc_ring;
+    x_hreset01.s[0].hmix_reset = pa.s[1].hmix_own;
+    x_hreset10.s[1].hmix_reset = pa.s[0].hmix_own;
+    err.s[1].err = nullptr;
+    mis.scratch = scratch + 1;
+    none.scratch = nullptr;
+    const cudaStream_t st = c[0]->st;
+    bool ok = true;
+    for (const bool head : {false, true}) {
+        const auto run = [&](int32_t rows, const fn::hc::pair_args & a, cudaStream_t s) {
+            return head ? fn::hc::head_pair(rows, a, s) : fn::hc::pair(rows, a, s);
+        };
+        ok = ok && !run(0, pa, st) && !run(6, pa, st) && !run(3, pa, nullptr) && !run(3, swap, st) &&
+             !run(3, peer, st) && !run(3, hpeer, st) && !run(3, same, st) && !run(3, reset, st) &&
+             !run(3, hreset, st) && !run(3, x_reset01, st) && !run(3, x_reset10, st) && !run(3, x_hreset01, st) &&
+             !run(3, x_hreset10, st) && !run(3, err, st) && !run(3, mis, st) && !run(3, none, st);
+    }
+    // nothing was enqueued: the stream is idle and no launch error is pending
+    ok = ok && cudaStreamQuery(st) == cudaSuccess && cudaPeekAtLastError() == cudaSuccess;
+    printf("hc-test me12 pair and head_pair reject B = 0 and 6, a null stream, swapped cards, a peer X-HC or X-HMIX "
+           "slot not the other card's, one card's slots twice, a reset of either shard's written X-HC or X-HMIX slot "
+           "(own and cross-shard, both directions), a null error word, a null or misaligned scratch, before any "
+           "launch: %s\n",
+           ok ? "yes" : "NO  FAIL");
+    return ok;
+}
+
+// ME12: the paired launch in a captured graph, as the one-device verify graph holds it: n_graph_sub sublayers at
+// max_rows, each one kernel node with the cooperative launch attribute. Replays (two on the first inputs, one on
+// changed inputs) are bitwise the eager paired order on the same inputs; then a replay while another stream runs a
+// full-device cooperative grid sequence (the four-launch order on a second ring set: one 640-thread block on every SM
+// at a time) completes, both bitwise their eager results.
+constexpr int32_t n_graph_sub = 3;
+
+bool final_state(card2 * c[2], fn::xchg::rings & rg, std::vector<uint32_t> & out) {
+    out.clear();
+    bool ok = true;
+    for (int32_t n = 0; n < n_graph_sub && ok; ++n) {
+        ok = snapshot(c, rg, n, false, out);
+    }
+    return ok;
+}
+
+bool pair_graph(card2 * c[2], fn::xchg::rings & rg, const dev_buf<float> & scratch, card2 * o[2],
+                fn::xchg::rings & rg2, const dev_buf<float> & scratch2) {
+    constexpr int32_t B = fn::hc::max_rows;
+    inputs in_a, in_b;
+    make_inputs(in_a, B, kind::plain);
+    make_inputs(in_b, B, kind::stress);
+    const std::vector<int32_t> widths(n_graph_sub, B);
+    const auto eager = [&](const inputs & in, std::vector<uint32_t> & st) {
+        std::vector<uint32_t> each;
+        return pair_inputs(c, in) && pair_sequence(c, rg, widths, false, true, scratch, each) && final_state(c, rg, st);
+    };
+    std::vector<uint32_t> want_a, want_b;
+    bool ok = eager(in_a, want_a) && eager(in_b, want_b);
+    // capture
+    cudaGraph_t g = nullptr;
+    cudaGraphExec_t ge = nullptr;
+    ok = ok && cuda_ok(cudaStreamBeginCapture(c[0]->st, cudaStreamCaptureModeThreadLocal), "begin capture");
+    for (int32_t n = 0; n < n_graph_sub && ok; ++n) {
+        ok = pair_enqueue(c, rg, n, B, false, true, scratch.p);
+    }
+    ok = cuda_ok(cudaStreamEndCapture(c[0]->st, &g), "end capture") && ok;
+    size_t n_nodes = 0;
+    ok = ok && cuda_ok(cudaGraphGetNodes(g, nullptr, &n_nodes), "graph nodes");
+    std::vector<cudaGraphNode_t> nodes(n_nodes);
+    ok = ok && cuda_ok(cudaGraphGetNodes(g, nodes.data(), &n_nodes), "graph nodes");
+    int32_t n_coop = 0;
+    for (size_t i = 0; i < n_nodes && ok; ++i) {
+        cudaGraphNodeType t = cudaGraphNodeTypeEmpty;
+        cudaKernelNodeAttrValue v = {};
+        ok = cuda_ok(cudaGraphNodeGetType(nodes[i], &t), "node type");
+        if (ok && t == cudaGraphNodeTypeKernel) {
+            ok = cuda_ok(cudaGraphKernelNodeGetAttribute(nodes[i], cudaLaunchAttributeCooperative, &v), "node attr");
+            n_coop += v.cooperative != 0 ? 1 : 0;
+        }
+    }
+    const bool shape = ok && n_nodes == size_t(n_graph_sub) && n_coop == n_graph_sub;
+    printf("hc-test me12 graph: %d paired sublayers captured as %zu nodes, %d of them cooperative kernel nodes: %s\n",
+           n_graph_sub, n_nodes, n_coop, shape ? "yes" : "NO  FAIL");
+    ok = ok && cuda_ok(cudaGraphInstantiate(&ge, g, 0), "instantiate");
+    const auto replay = [&](const inputs & in, std::vector<uint32_t> & st) {
+        return pair_inputs(c, in) && pair_fresh(c, rg, scratch) && cuda_ok(cudaGraphLaunch(ge, c[0]->st), "launch") &&
+               final_state(c, rg, st);
+    };
+    std::vector<uint32_t> got_a1, got_a2, got_b;
+    ok = ok && replay(in_a, got_a1) && replay(in_a, got_a2) && replay(in_b, got_b);
+    const size_t d_a1 = words_differ(want_a, got_a1), d_a2 = words_differ(want_a, got_a2);
+    const size_t d_b = words_differ(want_b, got_b), d_ab = words_differ(want_a, want_b);
+    const bool replays = ok && d_a1 == 0 && d_a2 == 0 && d_b == 0 && d_ab > 0;
+    printf("hc-test me12 graph replays bitwise the eager paired order (inputs A twice, then changed inputs B; A and B "
+           "differ in %zu of %zu words): %s\n",
+           d_ab, want_a.size(), replays ? "yes" : "NO  FAIL");
+    // co-residency: the other stream's full-device cooperative grids are enqueued first, the replay behind them on
+    // its own stream; the replay's grids wait for SMs and both finish within the host's bound
+    constexpr int32_t n_other = 12;
+    const std::vector<int32_t> other_widths(n_other, B);
+    std::vector<uint32_t> other_each;
+    ok = ok && pair_inputs(o, in_b) && pair_sequence(o, rg2, other_widths, false, false, scratch2, other_each);
+    // its last snapshot: the state the concurrent run must end in
+    const std::vector<uint32_t> other_want(other_each.end() - static_cast<int64_t>(other_each.size() / n_other),
+                                           other_each.end());
+    std::vector<uint32_t> got_c, other_got;
+    ok = ok && pair_inputs(c, in_a) && pair_fresh(c, rg, scratch) && pair_fresh(o, rg2, scratch2);
+    for (int32_t n = 0; n < n_other && ok; ++n) {
+        ok = pair_enqueue(o, rg2, n, B, false, false, scratch2.p);
+    }
+    ok = ok && cuda_ok(cudaGraphLaunch(ge, c[0]->st), "launch");
+    card2 * both[2] = {c[0], o[0]};
+    // the host's bound: four cases' (the other stream's launches are twice a case's)
+    ok = ok && wait_two(both, 4 * hc2_timeout_s) && final_state(c, rg, got_c) &&
+         snapshot(o, rg2, n_other - 1, false, other_got);
+    const size_t d_c = words_differ(want_a, got_c), d_o = words_differ(other_want, other_got);
+    const bool co = ok && d_c == 0 && d_o == 0;
+    printf("hc-test me12 graph replay behind %d full-device cooperative grids on another stream: completes, bitwise "
+           "(replay %zu words differ, other stream %zu): %s\n",
+           4 * n_other, d_c, d_o, co ? "yes" : "NO  FAIL");
+    if (ge != nullptr) {
+        cudaGraphExecDestroy(ge);
+    }
+    if (g != nullptr) {
+        cudaGraphDestroy(g);
+    }
+    return ok && shape && replays && co;
+}
+
+// ME12 on one device (loopback): the static and residency checks (pair_prepare), rejects, every B and both modes for
+// each input kind with fixed widths, a sequence of changing widths, and the graph checks
+bool run_pair(card2 * c[2], fn::xchg::rings & rg, const weights & w, uint32_t rows_mask) {
+    dev_buf<float> scratch(size_t(fn::hc::pair_scratch_bytes) / sizeof(float));
+    bool ok = cuda_ok(cudaSetDevice(c[0]->dev), "cudaSetDevice") && scratch.p != nullptr;
+    const bool prep = ok && fn::hc::pair_prepare();
+    printf("hc-test me12 pair_prepare (cooperative launch, every B and mode co-resident at 72 x 640 by the occupancy "
+           "API, no local memory): %s\n",
+           prep ? "yes" : "NO  FAIL");
+    ok = ok && prep && check_rejects_pair(c, rg, scratch.p);
+    // the head's down weights: rows 0..319 of each stream of the sublayer's (head_weights' BF16 part)
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        std::vector<uint16_t> hbf(static_cast<size_t>(fn::hc::w_down_head_elems));
+        for (int32_t s = 0; s < S; ++s) {
+            std::copy_n(&w.w_down[r][static_cast<size_t>(s) * RD * F], static_cast<size_t>(L) * F,
+                        &hbf[static_cast<size_t>(s) * L * F]);
+        }
+        ok = c[r]->hw_down.put(hbf, c[0]->st) && cuda_ok(cudaStreamSynchronize(c[0]->st), "head weights");
+    }
+    for (const kind kd : {kind::plain, kind::stress, kind::zero_hx, kind::special}) {
+        for (int32_t rows = 1; rows <= fn::hc::max_rows && ok; ++rows) {
+            if ((rows_mask >> (rows - 1) & 1u) == 0) {
+                continue;
+            }
+            inputs in;
+            make_inputs(in, rows, kd);
+            for (const bool head : {false, true}) {
+                const std::string label = std::string(head ? "me12 head " : "me12 pair ") + kind_name(kd) + " B" +
+                                          std::to_string(rows);
+                ok = pair_case(c, rg, in, kd, std::vector<int32_t>(n_sub, rows), head, scratch, label) && ok;
+            }
+        }
+    }
+    // changing widths over twelve sublayers (each slot four times): a wider sublayer's rows in a slot before a
+    // narrower one's, so a row the narrower one does not write must stay unlanded (its reset words)
+    const std::vector<int32_t> widths = {5, 3, 1, 4, 2, 5, 1, 5, 2, 4, 3, 1};
+    for (const kind kd : {kind::plain, kind::special}) {
+        inputs in;
+        make_inputs(in, fn::hc::max_rows, kd);
+        for (const bool head : {false, true}) {
+            const std::string label =
+                std::string(head ? "me12 head " : "me12 pair ") + kind_name(kd) + " widths 5..1";
+            ok = ok && pair_case(c, rg, in, kd, widths, head, scratch, label);
+        }
+    }
+    // the graph checks, with a second card pair and ring set on the same device for the other stream
+    if (ok) {
+        card2 o0(c[0]->dev), o1(c[0]->dev);
+        card2 * o[2] = {&o0, &o1};
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            ok = o[r]->st != nullptr && o[r]->w_down.put(w.w_down[r], o[0]->st) &&
+                 o[r]->w_up.put(w.w_up[r], o[0]->st) && o[r]->gamma.put(w.gamma_card[r], o[0]->st) &&
+                 cuda_ok(cudaStreamSynchronize(o[0]->st), "weights");
+        }
+        fn::xchg::rings rg2(c[0]->dev, c[0]->dev);
+        dev_buf<float> scratch2(size_t(fn::hc::pair_scratch_bytes) / sizeof(float));
+        ok = ok && rg2.ok() && scratch2.p != nullptr && pair_graph(c, rg, scratch, o, rg2, scratch2);
+        cudaSetDevice(c[0]->dev);
+    }
+    return ok;
+}
+
+// FMU2: the joint sublayer (hc::sub_joint, head_sub_joint) against each lane's own launches. Lanes of max_rows rows,
+// each its own inputs, outputs and ring set (as the joint round's lane rings), all on lane 0's weights. A sequence of
+// sublayers (slot n % 3, the previous one's slots reset: sub_args_of) runs once per lane alone (hc::sub or head_sub on
+// both cards) and twice jointly (one joint launch a card a sublayer); after every sublayer each lane's snapshot (every
+// X-HC and X-HMIX slot, x and inject, the error words; both cards) is held bitwise its lone run's, and the second joint
+// run bitwise the first. In loopback (DEV0 == DEV1) every launch goes on one stream, modes 1 then 2.
+constexpr int32_t n_joint_sub = 5, n_joint_head = 2;
+
+struct jlane {
+    card2 k0, k1;
+    card2 * c[2] = {&k0, &k1};
+    fn::xchg::rings rg;
+
+    jlane(int32_t d0, int32_t d1) : k0(d0), k1(d1), rg(d0, d1) {}
+};
+
+using jlanes = std::vector<std::unique_ptr<jlane>>;
+
+// lane l's arguments for card r's sublayer n, on the weights of w (lane 0's card r)
+fn::hc::sub_args joint_lane_args(jlane & l, const card2 & w, int32_t r, int32_t n, bool head) {
+    fn::hc::sub_args a = sub_args_of(*l.c[r], l.rg, r, n, head);
+    a.w_down = head ? w.hw_down.p : w.w_down.p;
+    a.w_up = w.w_up.p;
+    a.gamma = w.gamma.p;
+    return a;
+}
+
+bool devices_idle(const jlanes & ln) {
+    bool ok = true;
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        ok = cuda_ok(cudaSetDevice(ln[0]->c[r]->dev), "cudaSetDevice") && cuda_ok(cudaDeviceSynchronize(), "idle");
+    }
+    return ok;
+}
+
+// every lane's rings fresh (sentinels, error words zero), its x and inject poisoned
+bool joint_fresh(const jlanes & ln) {
+    bool ok = true;
+    for (size_t k = 0; k < ln.size() && ok; ++k) {
+        ok = ln[k]->rg.reset_all();
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            card2 & c = *ln[k]->c[r];
+            ok = cuda_ok(cudaSetDevice(c.dev), "cudaSetDevice") && c.x.poison(c.st) && c.inj.poison(c.st);
+        }
+    }
+    return ok && devices_idle(ln);
+}
+
+// lane k's sequence alone, a snapshot after every sublayer
+bool joint_lone(const jlanes & ln, size_t k, bool head, int32_t subs, std::vector<uint32_t> & out) {
+    jlane & l = *ln[k];
+    const bool loopback = l.c[0]->dev == l.c[1]->dev;
+    out.clear();
+    bool ok = joint_fresh(ln);
+    for (int32_t n = 0; n < subs && ok; ++n) {
+        for (const int32_t mode : {loopback ? 1 : 3, loopback ? 2 : 0}) {
+            for (int32_t r = 0; r < 2 && ok && mode != 0; ++r) {
+                const fn::hc::sub_args a = joint_lane_args(l, *ln[0]->c[r], r, n, head);
+                ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                     (head ? fn::hc::head_sub(fn::hc::max_rows, mode, a, launch_stream(l.c, r))
+                           : fn::hc::sub(fn::hc::max_rows, mode, a, launch_stream(l.c, r)));
+            }
+        }
+        ok = ok && wait_two(l.c, hc2_timeout_s) && snapshot(l.c, l.rg, n, head, out);
+    }
+    return ok;
+}
+
+// the lanes' sequence jointly (lanes' launches on lane 0's streams), each lane's snapshots
+bool joint_run(const jlanes & ln, int32_t lanes, bool head, int32_t subs, std::vector<uint32_t> * out) {
+    const bool loopback = ln[0]->c[0]->dev == ln[0]->c[1]->dev;
+    for (int32_t k = 0; k < lanes; ++k) {
+        out[k].clear();
+    }
+    bool ok = joint_fresh(ln);
+    for (int32_t n = 0; n < subs && ok; ++n) {
+        for (const int32_t mode : {loopback ? 1 : 3, loopback ? 2 : 0}) {
+            for (int32_t r = 0; r < 2 && ok && mode != 0; ++r) {
+                fn::hc::sub_args a[fn::xchg::max_lanes] = {};
+                for (int32_t k = 0; k < lanes; ++k) {
+                    a[k] = joint_lane_args(*ln[k], *ln[0]->c[r], r, n, head);
+                }
+                ok = cuda_ok(cudaSetDevice(ln[0]->c[r]->dev), "cudaSetDevice") &&
+                     (head ? fn::hc::head_sub_joint(lanes, mode, a, launch_stream(ln[0]->c, r))
+                           : fn::hc::sub_joint(lanes, mode, a, launch_stream(ln[0]->c, r)));
+            }
+        }
+        ok = ok && wait_two(ln[0]->c, hc2_timeout_s);
+        for (int32_t k = 0; k < lanes && ok; ++k) {
+            ok = snapshot(ln[k]->c, ln[k]->rg, n, head, out[k]);
+        }
+    }
+    return ok;
+}
+
+// U lanes, a sequence each way: every lane's snapshots bitwise its lone run's, the second joint run bitwise the first;
+// the error words zero except a lane of special inputs (held equal instead)
+bool joint_case(const jlanes & ln, int32_t lanes, const kind * kinds, bool head) {
+    const int32_t subs = head ? n_joint_head : n_joint_sub;
+    const std::string label = std::string(head ? "hcj head" : "hcj sub") + " U" + std::to_string(lanes);
+    std::vector<uint32_t> want[fn::xchg::max_lanes], got[fn::xchg::max_lanes], again[fn::xchg::max_lanes];
+    bool ok = true;
+    for (int32_t k = 0; k < lanes && ok; ++k) {
+        ok = joint_lone(ln, size_t(k), head, subs, want[k]);
+    }
+    ok = ok && joint_run(ln, lanes, head, subs, got) && joint_run(ln, lanes, head, subs, again);
+    if (!ok) {
+        printf("hc-test %-14s not run: %s  FAIL\n", label.c_str(), cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    using fn::xchg::msg;
+    const size_t slots = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    const size_t card_words = size_t(fn::xchg::n_slot) * slots + card2::n_x + (head ? 0 : card2::n_j) + 1;
+    size_t bad = 0, bad2 = 0, words = 0;
+    bool clean = true;
+    for (int32_t k = 0; k < lanes; ++k) {
+        bad += words_differ(want[k], got[k]);
+        bad2 += words_differ(got[k], again[k]);
+        words += want[k].size();
+        clean = clean &&
+                (kinds[k] == kind::special || (got[k].back() == 0u && got[k][got[k].size() - 1 - card_words] == 0u));
+    }
+    printf("hc-test %-14s each lane bitwise its lone launches after each of %d sublayers (X-HC and X-HMIX slots, x%s, "
+           "error words; both cards; %zu words): %s; second joint run: %s%s\n",
+           label.c_str(), subs, head ? "" : ", inject", words, bad == 0 ? "yes" : "NO  FAIL",
+           bad2 == 0 ? "bitwise" : "DIFFERS  FAIL", clean ? "" : "; error words not zero  FAIL");
+    return bad == 0 && bad2 == 0 && clean;
+}
+
+// refused with nothing enqueued (every lane's X-HMIX slots still the sentinels): lanes 1 and 5, mode 0, two lanes on
+// one ring, lanes on different cards, a lane's reset of a slot another lane writes, a lane on other weights (down, up
+// or gamma: the launch streams lane 0's), and the head form's one lane
+bool joint_rejects(const jlanes & ln) {
+    const card2 & w = *ln[0]->c[0];
+    fn::hc::sub_args a[fn::xchg::max_lanes] = {};
+    for (size_t k = 0; k < ln.size(); ++k) {
+        a[k] = joint_lane_args(*ln[k], w, 0, 1, false);
+    }
+    cudaStream_t st = ln[0]->c[0]->st;
+    bool ok = joint_fresh(ln) && cuda_ok(cudaSetDevice(w.dev), "cudaSetDevice");
+    int32_t refused = 0, cases = 0;
+    const auto refuse = [&](bool launched) {
+        ++cases;
+        refused += launched ? 0 : 1;
+    };
+    refuse(fn::hc::sub_joint(1, 3, a, st));
+    refuse(fn::hc::sub_joint(5, 3, a, st));
+    refuse(fn::hc::sub_joint(2, 0, a, st));
+    fn::hc::sub_args b[fn::xchg::max_lanes];
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[1] = joint_lane_args(*ln[0], w, 0, 1, false); // lane 1 on lane 0's ring
+    b[1].x = a[1].x;
+    b[1].inject = a[1].inject;
+    refuse(fn::hc::sub_joint(2, 3, b, st));
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[1] = joint_lane_args(*ln[1], *ln[0]->c[1], 1, 1, false); // lane 1 card 1's
+    refuse(fn::hc::sub_joint(2, 3, b, st));
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[2].hc_reset = b[0].hc_ring; // lane 2 resets lane 0's X-HC slot
+    refuse(fn::hc::sub_joint(3, 3, b, st));
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[3].hmix_reset = b[1].hmix_own; // lane 3 resets lane 1's X-HMIX slot
+    refuse(fn::hc::sub_joint(4, 3, b, st));
+    for (int32_t which = 0; which < 3; ++which) { // a lane on other weights (16-byte aligned, valid addresses)
+        std::copy_n(a, fn::xchg::max_lanes, b);
+        if (which == 0) {
+            b[1].w_down = a[0].w_down + 8;
+        } else if (which == 1) {
+            b[1].w_up = a[0].w_up + 8;
+        } else {
+            b[1].gamma = a[0].gamma + 4;
+        }
+        refuse(fn::hc::sub_joint(2, 3, b, st));
+    }
+    refuse(fn::hc::head_sub_joint(1, 3, a, st));
+    ok = ok && cuda_ok(cudaStreamSynchronize(st), "refused") && cuda_ok(cudaGetLastError(), "refused");
+    // nothing reached the rings: every lane's slots still the sentinels
+    int64_t touched = 0;
+    for (size_t k = 0; k < ln.size() && ok; ++k) {
+        for (int32_t sl = 0; sl < fn::xchg::n_slot && ok; ++sl) {
+            int64_t bad = 0;
+            ok = hmix_slot_reset(ln[k]->rg, sl, bad);
+            touched += bad;
+        }
+    }
+    printf("hc-test hcj rejects: %d of %d refused, rings untouched: %s\n", refused, cases,
+           ok && touched == 0 ? "yes" : "NO  FAIL");
+    return ok && refused == cases && touched == 0;
 }
 
 } // namespace
@@ -1504,6 +2115,17 @@ int fnfl_hc2_test(int dev0, int dev1, uint32_t rows_mask) {
             ok = batch_invariance(c, rg, w, dw, st, dev0);
         }
         ok = ok && run_q8(c, rg, st, dev0, rows_mask);
+        // ME12: the paired launch is one device's (dev0 == dev1); two devices keep hc::sub, checked above
+        if (dev0 == dev1) {
+            // run_q8 left the cards' weights its own: the BF16 sublayer's again
+            for (int32_t r = 0; r < 2 && ok; ++r) {
+                ok = c[r]->w_down.put(w.w_down[r], c[r]->st) && c[r]->w_up.put(w.w_up[r], c[r]->st) &&
+                     c[r]->gamma.put(w.gamma_card[r], c[r]->st) && cuda_ok(cudaStreamSynchronize(c[r]->st), "weights");
+            }
+            ok = ok && run_pair(c, rg, w, rows_mask);
+        } else {
+            printf("hc2-test: two devices: the paired launch (ME12) is one device's; hc::sub cases above\n");
+        }
         for (int32_t r = 0; r < 2; ++r) {
             cudaSetDevice(c[r]->dev);
             ok = cuda_ok(cudaDeviceSynchronize(), "final sync") && ok;
@@ -1514,5 +2136,53 @@ int fnfl_hc2_test(int dev0, int dev1, uint32_t rows_mask) {
         }
     }
     printf("hc2-test: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+int fnfl_hcj_test(int dev0, int dev1) {
+    if (dev0 == dev1) {
+        printf("hcj-test: loopback on device %d: both cards' launches on one stream, modes 1 then 2\n", dev0);
+    } else if (!fn::xchg::enable_peer_access(dev0, dev1)) {
+        printf("hcj-test: FAIL (no peer access)\n");
+        return 1;
+    }
+    bool ok = true;
+    {
+        weights w;
+        make_weights(w);
+        jlanes ln;
+        for (int32_t k = 0; k < fn::xchg::max_lanes; ++k) {
+            ln.push_back(std::make_unique<jlane>(dev0, dev1));
+            ok = ok && ln.back()->rg.ok() && ln.back()->k0.st != nullptr && ln.back()->k1.st != nullptr;
+        }
+        // lane 0's cards hold the weights every lane reads: the sublayer's and the head's down (no injection rows)
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            card2 & c = *ln[0]->c[r];
+            std::vector<uint16_t> hbf(static_cast<size_t>(fn::hc::w_down_head_elems));
+            for (int32_t s = 0; s < S; ++s) {
+                std::copy_n(&w.w_down[r][static_cast<size_t>(s) * RD * F], static_cast<size_t>(L) * F,
+                            &hbf[static_cast<size_t>(s) * L * F]);
+            }
+            ok = cuda_ok(cudaSetDevice(c.dev), "cudaSetDevice") && fn::hc::prepare2() &&
+                 c.w_down.put(w.w_down[r], c.st) && c.w_up.put(w.w_up[r], c.st) && c.gamma.put(w.gamma_card[r], c.st) &&
+                 c.hw_down.put(hbf, c.st) && cuda_ok(cudaStreamSynchronize(c.st), "weights");
+        }
+        // each lane its own inputs
+        const kind kinds[fn::xchg::max_lanes] = {kind::plain, kind::stress, kind::zero_hx, kind::special};
+        for (int32_t k = 0; k < fn::xchg::max_lanes && ok; ++k) {
+            inputs in;
+            make_inputs(in, fn::hc::max_rows, kinds[k]);
+            ok = put_inputs(ln[size_t(k)]->c, in) && devices_idle(ln);
+        }
+        ok = ok && joint_rejects(ln);
+        for (int32_t lanes = 2; lanes <= fn::xchg::max_lanes && ok; ++lanes) {
+            for (const bool head : {false, true}) {
+                ok = joint_case(ln, lanes, kinds, head) && ok;
+            }
+        }
+        ok = devices_idle(ln) && ok;
+        cudaSetDevice(dev0);
+    }
+    printf("hcj-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

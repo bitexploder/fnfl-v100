@@ -63,6 +63,7 @@ json task_params::to_json(bool only_metrics) const {
             {"n_predict",                 n_predict}, // TODO: deduplicate?
             {"n_keep",                    n_keep},
             {"n_discard",                 n_discard},
+            {"priority",                  priority}, // (ticket TU2; MU1)
             {"ignore_eos",                sampling.ignore_eos},
             {"stream",                    stream},
             {"n_probs",                   sampling.n_probs},
@@ -115,6 +116,7 @@ json task_params::to_json(bool only_metrics) const {
         {"n_predict",                 n_predict}, // TODO: deduplicate?
         {"n_keep",                    n_keep},
         {"n_discard",                 n_discard},
+        {"priority",                  priority}, // (ticket TU2; MU1)
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},

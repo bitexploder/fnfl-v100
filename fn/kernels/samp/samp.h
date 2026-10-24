@@ -296,6 +296,10 @@ bool pick(const card_view & v, const pick_io & io, void * stream);
 // pick's two stages (0: select, sends samp_a; 1: tk_decide, reads it), for a single stream serving both cards
 // (loopback, Compute Sanitizer): stage 0 on both cards before stage 1 on either
 bool pick_stage(const card_view & v, const pick_io & io, int32_t stage, void * stream);
+// FMU4: one stage of the joint draft step's pick of `lanes` (1 .. max_rows) lanes on one stream, lane k's pick_stage on
+// its own view v[k] and io[k], except that its list travels in row k of samp_a's slot (row 0 alone), so lanes whose
+// views name the same rings never share a row; each lane's proposal and q_list row are its lone pick's
+bool pick_lanes_stage(const card_view * const v[], const pick_io io[], int32_t lanes, int32_t stage, void * stream);
 
 // ---- host-side state operations (synchronous; no round in flight) ----
 // the window from the ledger's last min(L, cap) tokens: counts, ring, record.window = L, record cleared

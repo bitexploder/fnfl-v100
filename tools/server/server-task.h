@@ -20,6 +20,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_METRICS,
     SERVER_TASK_TYPE_SLOT_GET,
     SERVER_TASK_TYPE_SLOT_ERASE,
+    SERVER_TASK_TYPE_TU_POLICY, // (ticket TU2; MU1) POST /props: the two-user scheduling policy, applied between steps
 };
 
 // TODO: change this to more generic "response_format" to replace the "format_response_*" in server-common
@@ -52,6 +53,7 @@ struct task_params {
     int32_t n_predict = -1; // new tokens to predict
     int32_t n_indent  =  0; // minimum line indentation for the generated text in number of whitespace characters
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
+    int32_t priority  =  0; // (ticket TU2; MU1) two-user scheduling: a reader of higher priority has its prompt read first
 
 
 
@@ -142,6 +144,15 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_METRICS
     bool metrics_reset_bucket = false;
+
+    // (ticket TU2; MU1) used by SERVER_TASK_TYPE_TU_POLICY: the values to set, -1 for unchanged (validated by the HTTP
+    // thread). FNFL serves slice_ms and group only: TU6's fix and fair_read are its permanent behavior, and TU is
+    // engaged whenever the server has more than one slot
+    struct tu_policy_set {
+        int32_t slice_ms = -1;
+        int32_t group    = -1;
+    };
+    tu_policy_set tu_set;
 
     server_task() = default;
 
@@ -406,6 +417,15 @@ struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
 
     virtual json to_json() override;
+};
+
+// (ticket TU2; MU1) the two-user scheduling policy's effective values after a POST /props
+struct server_task_result_tu_policy : server_task_result {
+    json tu;
+
+    virtual json to_json() override {
+        return json { { "success", true }, { "tu", tu } };
+    }
 };
 
 // the tokens a slot's engine state holds

@@ -1055,6 +1055,17 @@ int fnfl_dp_test(int device, uint32_t rows_mask, const char * mode) {
          2560,
          {plain("attn_q", fmt::q8_0, 6144), plain("attn_k", fmt::q8_0, 256), plain("attn_v", fmt::q8_0, 256),
           plain("idx_q", fmt::bf16, 512), plain("idx_k", fmt::bf16, 128)}});
+    // FMU2 (build item 2, the joint draft step at B = U): the draft step's own groupings (layer 48, Q8_0), each row
+    // against the row alone below
+    cases.push_back(
+        {"draft q/k/v (layer 48, Q8_0)",
+         2560,
+         {plain("attn_q", fmt::q8_0, 6144), plain("attn_k", fmt::q8_0, 256), plain("attn_v", fmt::q8_0, 256)}});
+    cases.push_back({"draft q/k/v and index q (layer 48)",
+                     2560,
+                     {plain("attn_q", fmt::q8_0, 6144), plain("attn_k", fmt::q8_0, 256),
+                      plain("attn_v", fmt::q8_0, 256), plain("idx_q", fmt::bf16, 512)}});
+    cases.push_back({"draft attn_output Q8_0 (layer 48)", 3072, {plain("attn_output", fmt::q8_0, 2560)}});
     cases.push_back({"ssm_out Q5_K split", 3072, {plain("ssm_out", fmt::q5_k, 2560)}});
     cases.push_back({"ssm_out Q5_K unsplit", 3072, {plain("ssm_out", fmt::q5_k, 2560, 1)}});
     cases.push_back({"ssm_out IQ3_S split", 3072, {plain("ssm_out", fmt::iq3_s, 2560)}});

@@ -546,10 +546,12 @@ __global__ void __launch_bounds__(threads, 2) scan_kernel(const prompt_args a) {
     const int32_t grp = h % n_group, tid = static_cast<int32_t>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
     const int32_t qp = (lane >> 2) & 3, ra = (lane & 3) | ((lane >> 2) & 4);
     const int32_t lr = ((lane & 16) ? 4 : 0) | (lane & 1), cc = 2 * ((lane >> 1) & 1);
-    const uint32_t    cur = *a.cur;
-    constexpr int64_t sv  = state_version_floats;
-    const float * st_in = a.state + fn::round::version_slot(cur, a.v_in) * sv + (int64_t(h) * head_dim + p * srow) * head_dim;
-    float * st_out = a.state + fn::round::version_slot(cur, a.v_out) * sv + (int64_t(h) * head_dim + p * srow) * head_dim;
+    // ME11: the banks by logical version (version.h); half 1 reads and writes the same bank, each cell by one thread
+    const uint32_t    gs = *a.gsel;
+    constexpr int64_t sv = state_version_floats;
+    const float * st_in =
+        a.state + fn::round::gdn_bank_of(gs, a.v_in) * sv + (int64_t(h) * head_dim + p * srow) * head_dim;
+    float * st_out = a.state + fn::round::gdn_bank_of(gs, a.v_out) * sv + (int64_t(h) * head_dim + p * srow) * head_dim;
     // M's tile: value rows 16 wj + 8 (qp & 1) + lr + (i & 2), key channels 32 wk + 16 ni + 8 (qp >> 1) + cc + (i & 5)
     const int32_t wj = warp >> 2, wk = warp & 3;
     float         m[2][8];
@@ -559,6 +561,29 @@ __global__ void __launch_bounds__(threads, 2) scan_kernel(const prompt_args a) {
         for (int32_t i = 0; i < 8; ++i) {
             const int32_t j = 16 * wj + 8 * (qp & 1) + lr + (i & 2), k = 32 * wk + 16 * ni + 8 * (qp >> 1) + cc + (i & 5);
             m[ni][i]        = st_in[j * head_dim + k];
+        }
+    }
+    // ME11: version 0 is the committed bank with the selector's k records replayed, each cell m <- fmaf(k, delta, m *
+    // decay) in step order, gdn_core's sequence (gdn.h), so the start is that version's matrix bit for bit
+    if (a.v_in == 0) {
+        const float * rec_in = a.rec + fn::round::gdn_set(gs) * rec_set_floats;
+        const int32_t steps  = fn::round::gdn_steps(gs);
+#pragma unroll 1
+        for (int32_t t = 0; t < steps; ++t) {
+            const float * r   = rec_in + t * rec_step_floats;
+            const float   dec = __ldg(r + rec_decay + h);
+#pragma unroll
+            for (int32_t ni = 0; ni < 2; ++ni) {
+#pragma unroll
+                for (int32_t i = 0; i < 8; ++i) {
+                    const int32_t j = 16 * wj + 8 * (qp & 1) + lr + (i & 2),
+                                  k = 32 * wk + 16 * ni + 8 * (qp >> 1) + cc + (i & 5);
+                    const float kv    = __ldg(r + rec_k + grp * head_dim + k);
+                    const float delta = __ldg(r + rec_delta + h * head_dim + p * srow + j);
+                    m[ni][i] *= dec;
+                    m[ni][i] = fmaf(kv, delta, m[ni][i]);
+                }
+            }
         }
     }
     // M's FP16 copy and its row scales: each lane's two rows' maxima, over the 8 lanes and the 4 warps of a row
@@ -910,7 +935,8 @@ bool gdn_prompt_prep(const prompt_args & a, void * stream) {
 bool gdn_prompt_recur(const prompt_args & a, void * stream) {
     if (!common_ok(a, stream) || a.conv_out == nullptr || a.g == nullptr || a.beta == nullptr ||
         (a.o == nullptr && (a.o16 == nullptr || a.err == nullptr)) || a.state == nullptr || a.wy == nullptr ||
-        a.v_in < 0 || a.v_out < 1 || a.v_in >= a.v_out || a.v_out > 4 || !smem_once(wy_attr)) {
+        a.gsel == nullptr || (a.v_in == 0 && a.rec == nullptr) || a.v_in < 0 || a.v_out < 1 || a.v_in >= a.v_out ||
+        a.v_out > 4 || !smem_once(wy_attr)) {
         return fail("recur");
     }
     const cudaStream_t s = static_cast<cudaStream_t>(stream);

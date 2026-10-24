@@ -114,4 +114,34 @@ bool pass_bootstrap_enqueue(pass_card * const p[2], int32_t row, const pass_opti
 // the GPU use counters of one round of the whole pass in a graph: HC sublayers (96 and the head), X-A, X-F, X-SELECT
 use_counters pass_graph_counters(const pass_options & o);
 
+// ---- FMU2: the joint verify round on one card (fn/model/layer.h joint_lanes) ----
+//
+// 2..4 slots' rounds of layer_max_rows rows, one graph a card: every lane's begin and embedding, then each layer joint
+// (layer_joint_step; PLE per lane after layer 0), then the head HC of every lane in one launch (hc::head_sub_joint)
+// and each lane's logits, decision, commit and finish. A lane's pieces outside the joint launches are its slot's pass
+// with the lane frame, so each lane's round reads its own descriptor, writes its own state, logits, carry and sampler
+// record and finishes into its own completion record; its lane ring sees the lone pass's sequence (slot rules by
+// position, pass_graph_counters). The whole model only (layers 0 .. 47, no records).
+struct joint_pass {
+    int32_t lanes = 0;
+    pass_card * lane[fn::xchg::max_lanes] = {};       // pass_lane_init's
+    const pass_options * o[fn::xchg::max_lanes] = {}; // each lane's slot's (its sampler)
+    joint_lanes j;                                    // pass_joint_enqueue points j.lane[u] at lane[u]->c
+};
+
+// Lane u's pass from its slot's (slot), on the same card: the lane ring (jr.lane(u)) for the frame, the sampler's
+// exchange slots and error word; the joint layer_ws's lane view (lane_ws); the joint routing's rows 5u .. (ids
+// [20][10], wts [20][10]) and the lane's GLU slots and meta (joint_lane_ex), from route (joint_route_bytes, on the
+// card); the commit's error list in errs (device memory, fn::round::max_err pointers on the
+// card): the lane ring's word, attend's, select's, the experts' status and the joint word. Synchronous.
+bool pass_lane_init(const pass_card & slot, const fn::xchg::joint_rings & jr, int32_t u, const layer_ws & joint_ws,
+                    void * route, const uint32_t ** errs, pass_card & out, std::string & err);
+
+// One card's joint round, for a graph capture; u: the joint graph's counters (pass_graph_counters of the whole pass)
+step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & err);
+
+// Both cards' joint rounds in phases (sends before receives, HC modes 1 then 2 on both cards), eagerly: the eager
+// engine's and Compute Sanitizer's joint round, as pass_pair_enqueue is the lone pass's
+step_status pass_joint_pair_enqueue(joint_pass * const jp[2], use_counters u[2], std::string & err);
+
 } // namespace fn::model

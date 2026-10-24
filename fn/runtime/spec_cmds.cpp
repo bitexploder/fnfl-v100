@@ -10,9 +10,12 @@
 #include "fn/model/draft.h"
 #include "fn/model/model.h"
 #include "fn/quant/formats.h"
+#include "fn/runtime/json_check.h"
+#include "fn/runtime/mx7_check.h"
 #include "fn/runtime/runtime.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
 
@@ -20,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -138,7 +142,8 @@ uint64_t hash_bytes(uint64_t h, const void * p, size_t n) {
 
 template <typename T> bool get(std::vector<T> & v, const T * src, size_t n) {
     v.resize(n);
-    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+    // cudaMemcpyDefault: a source in device or (ME1: the host-backed KV, the PF1 checkpoints) pinned host memory
+    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDefault), "download");
 }
 
 bool sync_cards(rt::target & t, md::model & m) {
@@ -147,6 +152,12 @@ bool sync_cards(rt::target & t, md::model & m) {
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "sync")) {
             return false;
         }
+    }
+    // ME1: with the host-backed KV the KV classes are its host history, made whole for the reads that follow
+    std::string err;
+    if (!t.kv_flush(err)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return false;
     }
     return true;
 }
@@ -515,6 +526,10 @@ std::string sm_clocks() {
 } // namespace
 
 int fnfl_spec(const fnfl_target_args & a) {
+    return fnfl_spec_on(a, nullptr);
+}
+
+int fnfl_spec_on(const fnfl_target_args & a, md::model * loaded) {
     const bool dry = a.mode == "dry";
     std::vector<int32_t> prompt;
     if (!read_ids(a.ids, prompt)) {
@@ -551,9 +566,17 @@ int fnfl_spec(const fnfl_target_args & a) {
         return 1;
     }
     const int32_t cells = dry ? 8192 : a.n_cells;
-    auto m = std::make_unique<md::model>();
-    if (!(dry ? fnfl_load_dry(a, cells, *m) : fnfl_load(a, cells, *m, "spec"))) {
-        return 1;
+    // KV8: a model loaded by the caller (model-test's load 4) is used as it is, its state as reserved
+    std::unique_ptr<md::model> own;
+    md::model * m = loaded;
+    if (m == nullptr) {
+        own = std::make_unique<md::model>();
+        m = own.get();
+        if (!(dry ? fnfl_load_dry(a, cells, *m) : fnfl_load(a, cells, *m, "spec"))) {
+            return 1;
+        }
+    } else {
+        printf("spec: on the caller's loaded model (KV format %s), no load of its own\n", m->kv_q8 ? "q8" : "bf16");
     }
     FILE * log = fopen((a.out_dir + "/spec-checks.log").c_str(), "w");
     if (log == nullptr) {
@@ -1032,6 +1055,7 @@ bool fnfl_spec_request(rt::engine &                 e,
         return false;
     }
     out.pre_s                           = since(tp);
+    out.n_processed                     = n_pre;
     int32_t    buf[rt::max_step_tokens] = {};
     int32_t    n                        = 0;
     bool       end                      = false;
@@ -1046,15 +1070,1014 @@ bool fnfl_spec_request(rt::engine &                 e,
     return true;
 }
 
+namespace {
+
+// ME1: the device's and the process's memory now: the device's used bytes, the host's resident and peak resident
+// bytes, and the page-locked bytes the cache holds (its backing and buffers)
+std::string me1_memory(const fn::runtime::expert_cache & x) {
+    std::string dev;
+    for (int32_t d = 0; d < x.devices(); ++d) {
+        size_t fr = 0, tot = 0;
+        int32_t id = 0;
+        cudaGetDevice(&id);
+        cudaSetDevice(x.device_id(d));
+        cudaMemGetInfo(&fr, &tot);
+        cudaSetDevice(id);
+        char v[160];
+        snprintf(v, sizeof(v), "%sdevice %d used %.3f of %.3f GiB (cache %.3f, its pool %.3f)", d == 0 ? "" : "; ",
+                 x.device_id(d), double(tot - fr) / 1073741824.0, double(tot) / 1073741824.0,
+                 double(x.device_bytes(d)) / 1073741824.0, double(x.pool_bytes()) / 1073741824.0);
+        dev += v;
+    }
+    int64_t rss = 0, hwm = 0;
+    if (FILE * f = fopen("/proc/self/status", "r")) {
+        char line[256];
+        while (fgets(line, sizeof(line), f) != nullptr) {
+            long long v = 0;
+            if (sscanf(line, "VmRSS: %lld kB", &v) == 1) {
+                rss = v << 10;
+            } else if (sscanf(line, "VmHWM: %lld kB", &v) == 1) {
+                hwm = v << 10;
+            }
+        }
+        fclose(f);
+    }
+    const double g = 1073741824.0;
+    char b[768];
+    snprintf(b, sizeof(b),
+             "memory: %s; host RSS %.3f GiB, peak %.3f GiB; cache page-locked %.3f GiB (backing %.3f, buffers %.3f)",
+             dev.c_str(), double(rss) / g, double(hwm) / g, double(x.backing_bytes() + x.pinned_bytes()) / g,
+             double(x.backing_bytes()) / g, double(x.pinned_bytes()) / g);
+    return b;
+}
+
+// ME1's model check (--ex-check PROMPT): the same T = 0 request with every decode miss on the CPU, every miss a GPU
+// copy (both from an empty cache, no admission), then the normal policy from an empty cache and again warm: the
+// tokens bitwise equal (the serving placement does not change the answer); the first run's tokens against
+// --ex-ref's (an earlier run's tokens file, the two-card resident engine's; information, not a gate)
+// ME1 amendment 3: the target's logits at the first token k where the T = 0 run (own) and --ex-ref's (ref) differ.
+// The same T = 0 request stopped after its k equal tokens (the history the two runs share, made by the same rounds),
+// then one generate round of the pending token (B = 1): its decision must be own again; printed: both tokens' logits,
+// their difference and the row's two largest logits; the row ([248,320] F32) written to OUT/me1-divergence-logits.f32.
+// The slot is re-prefilled by the next request.
+bool me1_divergence(rt::engine & e, const std::vector<int32_t> & prompt, size_t k, int32_t own, int32_t ref,
+                    const fnfl_target_args & a) {
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    o.max_tokens = static_cast<int32_t>(k);
+    fnfl_request_out ro;
+    if (!fnfl_spec_request(e, prompt, 0, o, ro) || ro.toks.size() != k) {
+        fprintf(stderr, "spec run: divergence: the request to %zu tokens: %s\n", k, e.error().c_str());
+        return false;
+    }
+    rt::target & t = e.test_target();
+    rt::round_result r;
+    std::string err;
+    if (!t.generate(r, err)) {
+        fprintf(stderr, "spec run: divergence: %s\n", err.c_str());
+        return false;
+    }
+    std::vector<float> row(static_cast<size_t>(V));
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!cuda_ok(cudaMemcpy(row.data() + size_t(c) * VC, t.card(c).logits, size_t(VC) * 4, cudaMemcpyDefault),
+                     "logits")) {
+            return false;
+        }
+    }
+    bool checked = false;
+    if (!t.close_check(checked, err)) {
+        fprintf(stderr, "spec run: divergence: closing check: %s\n", err.c_str());
+        return false;
+    }
+    int32_t top[2] = {-1, -1};
+    for (int32_t v = 0; v < V; ++v) {
+        if (top[0] < 0 || row[size_t(v)] > row[size_t(top[0])]) {
+            top[1] = top[0];
+            top[0] = v;
+        } else if (top[1] < 0 || row[size_t(v)] > row[size_t(top[1])]) {
+            top[1] = v;
+        }
+    }
+    const float lo = row[size_t(own)], lr = row[size_t(ref)];
+    printf("spec run: ME1 divergence at token %zu (position %zu): this run %d, the reference %d; a B = 1 round over "
+           "the shared history decides %d (%s); logits: %d %.6f, %d %.6f, difference %.6f (%.3g of |%.6f|); the row's "
+           "largest %d %.6f, second %d %.6f\n",
+           k, prompt.size() + k, own, ref, r.out[0], r.out[0] == own ? "as the run" : "NOT as the run", own,
+           double(lo), ref, double(lr), double(lo - lr), double((lo - lr) / std::fabs(lo)), double(lo), top[0],
+           double(row[size_t(top[0])]), top[1], double(row[size_t(top[1])]));
+    write_bin(a.out_dir + "/me1-divergence-logits.f32", row.data(), row.size() * 4);
+    return true;
+}
+
+bool me1_check(rt::engine & e, fn::runtime::expert_cache & x, const fnfl_target_args & a) {
+    std::vector<int32_t> prompt;
+    if (!read_ids(a.ex_check, prompt)) {
+        return false;
+    }
+    static const char * const name[4] = {"CPU misses", "GPU misses", "normal, cold", "normal, warm"};
+    static const int32_t mode[4] = {1, 2, 0, 0};
+    std::vector<int32_t> toks[4];
+    std::string err;
+    bool same = true;
+    for (int32_t i = 0; i < 4; ++i) {
+        if ((i < 3 && !x.reset_to_profile(err)) || !x.set_mode(mode[i], err)) {
+            fprintf(stderr, "spec run: check: %s\n", err.c_str());
+            return false;
+        }
+        x.reset_counters();
+        rt::request_options o;
+        o.sampling.temp = 0.0f;
+        o.max_tokens = 128;
+        fnfl_request_out ro;
+        if (!fnfl_spec_request(e, prompt, 0, o, ro)) {
+            fprintf(stderr, "spec run: check: %s\n", e.error().c_str());
+            return false;
+        }
+        toks[i] = ro.toks;
+        same = same && toks[i] == toks[0];
+        printf("spec run: ME1 check %d (%s): %zu tokens, %s run 0's; prefill %.3f s; %s; expert cache: %s\n", i,
+               name[i], toks[i].size(), toks[i] == toks[0] ? "equal to" : "DIFFERENT from", ro.pre_s,
+               e.last_summary_line().c_str(), x.counters_json().c_str());
+        write_tokens(a.out_dir + "/me1-check-" + std::to_string(i) + "-tokens.txt", toks[i]);
+    }
+    printf("spec run: ME1 check: placement invariance (4 runs, T = 0, %s): %s\n", a.ex_check.c_str(),
+           same ? "PASS" : "FAIL");
+    if (!a.ex_ref.empty()) {
+        std::vector<int32_t> ref;
+        if (read_ids(a.ex_ref, ref)) {
+            size_t k = 0;
+            while (k < ref.size() && k < toks[0].size() && ref[k] == toks[0][k]) {
+                ++k;
+            }
+            printf("spec run: ME1 check against %s (%zu tokens): the first %zu of %zu tokens equal%s\n",
+                   a.ex_ref.c_str(), ref.size(), k, toks[0].size(),
+                   k == ref.size() && k == toks[0].size() ? " (all)" : "");
+            if (k > 0 && k < ref.size() && k < toks[0].size() && !me1_divergence(e, prompt, k, toks[0][k], ref[k], a)) {
+                return false;
+            }
+        }
+    }
+    fflush(stdout);
+    return same;
+}
+
+// ME2's model-level check (--ex-kl IDS): NC1 section 5's teacher-forced KL against the pinned engine's decode-mode
+// reference, in normal mode from the profile state, then with every decode miss on the CPU from the profile state.
+// A FAIL is reported (the line and the summary), not fatal: the requests still run. ME4 (refill_held, with --me4-arms):
+// before the normal pass a loan of the layer buffers alone is taken and returned and its refill held to one batch
+// (test_refill_limit; the drain after the pass lifts it), so the pass's windows run with a refill outstanding (the
+// real-weights check of windows served during a refill); their count is printed
+bool me2_kl(rt::engine & e, fn::runtime::expert_cache & x, const fnfl_target_args & a, bool refill_held = false) {
+    static const char * const name[2] = {"normal", "all-CPU"};
+    std::string err;
+    bool all = true;
+    for (int32_t i = 0; i < 2; ++i) {
+        if (!x.reset_to_profile(err) || !x.set_mode(i, err)) {
+            fprintf(stderr, "spec run: KL check: %s\n", err.c_str());
+            return false;
+        }
+        x.reset_counters();
+        if (refill_held && i == 0) {
+            void * const s[2] = {e.test_target().stream(0), e.test_target().stream(1)};
+            const std::vector<md::byte_span> none;
+            x.set_prompt_ring(0);
+            if (!x.prompt_hold(true, s, &none, err) || !x.prompt_hold(false, s, nullptr, err)) {
+                fprintf(stderr, "spec run: KL check: the held refill's loan: %s\n", err.c_str());
+                return false;
+            }
+            x.test_refill_limit(1);
+        }
+        bool pass = false;
+        if (!fnfl_kl_check(e.test_target(), a.ex_kl, a.ex_kl_ref, a.ex_kl_spread, a.out_dir, name[i], pass) ||
+            !x.drain(err)) {
+            fprintf(stderr, "spec run: KL check (%s) did not run: %s\n", name[i], err.c_str());
+            return false;
+        }
+        all = all && pass;
+        printf("spec run: ME2 KL check %d (%s): expert cache: %s\n", i, name[i], x.counters_json().c_str());
+        if (refill_held && i == 0) {
+            const fn::runtime::expert_cache_counters c = x.counters();
+            printf("spec run: ME4 KL check with a refill outstanding: %lld lane waits of windows served while it was "
+                   "outstanding (lane_wait_refill), %lld refill batches; %s\n",
+                   (long long)c.lane_wait_refill.n, (long long)c.refill_batches,
+                   c.lane_wait_refill.n > 0 ? "exercised" : "NOT EXERCISED");
+        }
+    }
+    printf("spec run: ME2 KL check (normal and all-CPU, %s against %s): %s\n", a.ex_kl.c_str(), a.ex_kl_ref.c_str(),
+           all ? "PASS" : "FAIL");
+    fflush(stdout);
+    return true;
+}
+
+
+// ME3 (--me3-arms, expires at ME3's disposition): an arm's boot state. The slot emptied and its checkpoints dropped;
+// the arm's mechanisms (base: ME2b's whole loan, its refill enqueued by the decode caller, the staging thread's
+// inherited mask, no short reads; final: ME3's) and executor (base eager, final the graphs; the target reset); the
+// cache's profile placement, usage, heat, rounds, split share and refinement, mode and counters; the K/V tier's
+// counters
+bool me3_arm(rt::engine & e, fn::runtime::expert_cache & x, const std::string & arm) {
+    const bool base = arm == "base";
+    std::string err;
+    rt::prefiller * pf = &e.prefill_driver();
+    if (e.truncate(0, 0) != rt::run_status::ok) {
+        fprintf(stderr, "spec run: ME3 arm %s: %s\n", arm.c_str(), e.error().c_str());
+        return false;
+    }
+    pf->drop_all();
+    x.set_legacy(base);
+    pf->set_legacy(base);
+    md::kv_tier * kt = e.test_target().tier();
+    if (!e.test_target().set_executor(!base, err) || !x.reset_to_profile(err) || !x.set_mode(0, err) ||
+        (kt != nullptr && !kt->reset_counters(err))) {
+        fprintf(stderr, "spec run: ME3 arm %s: %s\n", arm.c_str(), err.c_str());
+        return false;
+    }
+    x.reset_counters();
+    printf("spec run: ME3 arm %s: the boot state restored (slot empty, checkpoints dropped, profile placement, usage, "
+           "heat, split share %.3f, counters); executor %s; mechanisms %s\n",
+           arm.c_str(), x.share(), e.test_target().graph_executor() ? "graph" : "eager",
+           base ? "ME2b's (whole loan, refill enqueued by the decode caller, inherited staging mask, no short reads; "
+                  "not reproduced: ME2b's zero-product down work for CPU slots, removed in step 2)"
+                : "ME3's (sized loan, bounded refill, helper mask, short reads)");
+    fflush(stdout);
+    return true;
+}
+
+// ME4 (--me4-arms, expires at ME4's disposition): ME3's final boot state and mechanisms (me3_arm: the split's share,
+// refinement and rates reset to the settings' start, so no arm inherits another's), then the arm's prompt staging and
+// CPU path: base main's (no ring, the parity buffers at the zone's start, routed-rows, ME3's wrap: layer 0 staged
+// again after the run's last layer; the per-miss reconstruction
+// from the packed backing), final ME4's (the native views when the residency holds them: not in a dry run)
+bool me4_arm(rt::engine & e, fn::runtime::expert_cache & x, const std::string & arm) {
+    if (!me3_arm(e, x, "final")) {
+        return false;
+    }
+    x.set_me4_base(arm == "base");
+    printf("spec run: ME4 arm %s: prompt staging %s; CPU experts %s\n", arm.c_str(),
+           arm == "base" ? "ME3's (layer buffers at the zone's start, routed-rows, the wrap)"
+                         : "ME4's (the ring for one-half runs, the layer buffers by usage)",
+           x.cpu_native() ? "the native views in place"
+                          : "the reconstruction from the packed backing per miss (main's path)");
+    fflush(stdout);
+    return true;
+}
+
+// TEST (--me3-stall, Fable's load G ruling; expires at ME4's disposition): a completion wait that times out, then the
+// engine's release. From the boot state, the refill held to no batches (expert_cache::test_refill_limit) so the decode
+// after base's bulk read misses, and the service's first window with misses withheld (no copies, CPU work or flags:
+// the GPU waits on flags nobody writes); base's request then fails on its round's completion timeout with the cache's
+// GPU waits released and the GPU finished, and a second request is refused. The caller returns at once: the engine's
+// teardown follows on a released cache (the wrapper checks the exit and the cards' release)
+bool me3_stall_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & base) {
+    if (!me3_arm(e, x, "final")) {
+        return false;
+    }
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    o.max_tokens = 8;
+    fnfl_request_out ro;
+    x.test_refill_limit(0);
+    x.test_withhold(1);
+    const bool first = fnfl_spec_request(e, base, 0, o, ro);
+    const std::string e1 = e.error();
+    const int32_t layer = x.test_withheld();
+    const bool second = fnfl_spec_request(e, base, 0, o, ro);
+    const std::string e2 = e.error();
+    const auto has = [](const std::string & t, const char * w) { return t.find(w) != std::string::npos; };
+    const bool ok = layer >= 0 && !first && has(e1, "no completion record") && has(e1, "were released") &&
+                    has(e1, "the GPU finished") && !second && has(e2, "released") && has(e2, "restart");
+    printf("spec run: ME3 stall check: window withheld at layer %d; the request: %s (%s); the next request: %s (%s): "
+           "%s\n",
+           layer, first ? "served" : "failed", e1.c_str(), second ? "served" : "refused", e2.c_str(),
+           ok ? "PASS" : "FAIL");
+    fflush(stdout);
+    return ok;
+}
+
+// ME3: a request's tokens: a fresh prompt (n_reuse 0), or an append (--next-append): the slot's history, its pending
+// token, then ids, n_reuse the history's length. ME4 (--append-close): close >= 0 is read after the pending token
+bool me3_request_tokens(rt::engine & e, const std::vector<int32_t> & ids, bool append, std::vector<int32_t> & all,
+                        int32_t & n_reuse, int32_t close = -1) {
+    all.clear();
+    n_reuse = 0;
+    if (!append) {
+        all = ids;
+        return true;
+    }
+    std::vector<int32_t> hist;
+    int32_t pending = -1;
+    if (e.history(0, hist, pending) != rt::run_status::ok || hist.empty()) {
+        fprintf(stderr, "spec run: an append without a previous request's state\n");
+        return false;
+    }
+    all = hist;
+    if (pending >= 0) {
+        all.push_back(pending);
+    }
+    if (close >= 0) {
+        all.push_back(close);
+    }
+    all.insert(all.end(), ids.begin(), ids.end());
+    n_reuse = static_cast<int32_t>(hist.size());
+    return true;
+}
+
+// ME3: the request's prefill and affinity account: the path (short read or bulk), the arena's layout, the loan's spans,
+// the staging thread's mask read back against the cache's helper, service and decode CPUs
+std::string me3_prefill_text(rt::engine & e, const fn::runtime::expert_cache & x) {
+    const rt::pf_run_stats & s = e.last_prefill();
+    const std::vector<int32_t> * hc = x.helper_cpus();
+    uint64_t want = 0;
+    for (const int32_t c : *hc) {
+        want |= c < 64 ? uint64_t(1) << c : 0;
+    }
+    const auto in_mask = [](uint64_t m, int32_t c) { return c >= 0 && c < 64 && (m >> c & 1) != 0; };
+    std::string aff = "no staging thread ran";
+    if (s.helper_mask != 0) {
+        const bool on = (s.helper_mask & ~want) == 0;
+        const bool off = !in_mask(s.helper_mask, x.service_cpu()) && !in_mask(s.helper_mask, x.decode_cpu());
+        char b[256];
+        snprintf(b, sizeof(b), "staging thread mask 0x%llx (helpers 0x%llx): on the helper CPUs %s, off the service "
+                               "CPU %d and decode CPU %d %s",
+                 (unsigned long long)s.helper_mask, (unsigned long long)want, on ? "yes" : "NO", x.service_cpu(),
+                 x.decode_cpu(), off ? "yes" : "NO");
+        aff = b;
+    }
+    char b[512];
+    snprintf(b, sizeof(b), "ME3 prefill: %s; layout %d rows in halves of %d; loan spans %lld bytes (-1 the whole "
+                           "region); %s",
+             s.short_read ? "a known-token short read (target windows, no loan)" : (s.bulk ? "bulk" : "forced"),
+             s.layout_rows, s.layout_half, (long long)s.loan_span_bytes, aff.c_str());
+    return b;
+}
+
+// ME3: the request's boundaries (prompt entry to decode-ready, the first step and the first speculative step, entry to
+// the completed continuation)
+std::string me3_boundaries(rt::engine & e, const fnfl_request_out & ro) {
+    double first = -1, first_spec = -1;
+    for (const rt::step_info & x : e.last_steps()) {
+        if (first < 0) {
+            first = x.wall_s;
+        }
+        if (first_spec < 0 && x.kind == 2) {
+            first_spec = x.wall_s;
+        }
+    }
+    char b[320];
+    snprintf(b, sizeof(b), "ME3 boundaries (driver clock): prompt entry to decode-ready %.4f s; first step %.3f ms; "
+                           "first speculative step %.3f ms; entry through the completed continuation %.4f s",
+             ro.pre_s, first * 1e3, first_spec * 1e3, ro.pre_s + ro.gen_s);
+    return b;
+}
+
+// ME3: an append is a pure extension: only its new tokens processed (a deeper reuse restores a checkpoint and
+// processes more)
+bool me3_append_ok(const fnfl_request_out & ro, size_t n_req, int32_t n_reuse) {
+    return ro.n_processed == static_cast<int32_t>(n_req) - n_reuse;
+}
+
+// ME3: tokens [n_reuse, all) prefilled with no continuation (the T = 0 settings); n_pre the tokens processed
+bool me3_prefill(rt::engine & e, const std::vector<int32_t> & all, int32_t n_reuse, int32_t & n_pre) {
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    n_pre = 0;
+    return e.set_sampling(0, o) == rt::run_status::ok && e.truncate(0, n_reuse) == rt::run_status::ok &&
+           e.prefill(0, all.data() + n_reuse, static_cast<int32_t>(all.size()) - n_reuse, n_reuse, n_pre) ==
+               rt::run_status::ok;
+}
+
+// ME3: the slot's T = 0 continuation of n tokens (its settings set by the prefill)
+bool me3_continue(rt::engine & e, int32_t n, std::vector<int32_t> & toks) {
+    int32_t buf[rt::max_step_tokens] = {};
+    int32_t got = 0;
+    bool end = false;
+    while (!end && static_cast<int32_t>(toks.size()) < n) {
+        if (e.step(0, buf, got, end) != rt::run_status::ok) {
+            return false;
+        }
+        toks.insert(toks.end(), buf, buf + got);
+    }
+    return true;
+}
+
+// TEST (--me9-check, ME9; expires at ME9's disposition): admission on the dry one-device path, in the final arm.
+//   1. a fresh prompt (base), 8 tokens and a drain (its loan and refill settled), then 32 tokens: rounds admit, each
+//      layer's reservations made; held after = held before + retired + adopted - published over those 32 tokens;
+//   2. every reserved slot poisoned (0xFF), then a known eligible GPU miss a layer (Shell 0a1b4eb5, request 11): of
+//      each layer's last decode window's experts (the dry route repeats them) the most used resident evicted and its
+//      lifecycle tracked, every miss GPU-served with the split's mode kept 0, the adapt pass held so no swap returns
+//      it; 80 tokens more and a drain: every evicted key missed, was assigned, copied into a poisoned reserved slot and
+//      published, and is resident by admission or was replaced after; every admitted resident's bytes equal its
+//      backing (published only after its copy landed);
+//   3. a bulk append (more: a loan, which may borrow reserved slots) and 8 tokens with its refill held outstanding
+//      (test_refill_limit 0): no resident retired to replace a reservation, the reservations held = before less those
+//      published at the loan's settle, rounds off for the refill, nothing admitted; after the drain (the refill
+//      completed) every zone resident and every admitted one equals its backing;
+//   the copy bytes: every GPU miss's copy in lane_bytes whatever its destination, admission's a subset (2, 3);
+//   4. the boot state again (reset_to_profile): no reservation held.
+//   The cache's request and counter records (as printed at each request's end) parse as JSON after 2 and 3.
+// A dry route repeats every window, so without the eviction phase 2 would hold no new miss (R9-08).
+bool me9_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & base,
+               const std::vector<int32_t> & more) {
+    using cc = fn::runtime::expert_cache_counters;
+    std::string err;
+    bool ok = true;
+    const auto line = [&](bool pass, const std::string & what) {
+        ok = ok && pass;
+        printf("spec run: ME9 admission check: %s: %s\n", what.c_str(), pass ? "ok" : "FAIL");
+    };
+    if (!me3_arm(e, x, "final")) {
+        return false;
+    }
+    line(x.test_adm_held() == 0, "the boot state holds no reservation");
+    std::vector<int32_t> toks;
+    int32_t n_pre = 0;
+    // the prompt's own loan and refill settled first (drain), then rounds with neither
+    if (!me3_prefill(e, base, 0, n_pre) || !me3_continue(e, 8, toks) || !x.drain(err)) {
+        fprintf(stderr, "spec run: ME9 check: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    const cc c0 = x.counters();
+    const int32_t held0 = x.test_adm_held();
+    if (!me3_continue(e, 32, toks) || !x.drain(err)) {
+        fprintf(stderr, "spec run: ME9 check: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    const cc d1 = fn::runtime::counters_delta(x.counters(), c0);
+    const int32_t held1 = x.test_adm_held();
+    // Shell (request 11): over the same interval, reservations held = before + retired + adopted - published (a
+    // collision re-reserves its slot; an invalidation keeps it)
+    line(d1.adm_rounds_on > 0 && held1 > 0 && held1 == held0 + d1.adm_retired + d1.adm_adopted - d1.adm_published,
+         "rounds admitting " + std::to_string(d1.adm_rounds_on) + ", reservations " + std::to_string(held0) + " -> " +
+             std::to_string(held1) + " (retired " + std::to_string(d1.adm_retired) + ", adopted " +
+             std::to_string(d1.adm_adopted) + ", published " + std::to_string(d1.adm_published) + ")");
+    int32_t n_forced = 0;
+    if (!x.test_adm_poison(err) || !x.test_adm_force(n_forced, err)) {
+        fprintf(stderr, "spec run: ME9 check: %s\n", err.c_str());
+        return false;
+    }
+    const cc c1 = x.counters();
+    if (!me3_continue(e, 80, toks) || !x.drain(err)) {
+        fprintf(stderr, "spec run: ME9 check: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    x.test_adm_force_end();
+    const cc d2 = fn::runtime::counters_delta(x.counters(), c1);
+    // the records as printed, strictly parsed (Shell 0a1b4eb5)
+    const auto records = [&](const char * when) {
+        size_t at_r = 0, at_c = 0;
+        const std::string rj = x.request_json(), cj = x.counters_json();
+        const bool vr = fn::runtime::json_valid(rj, at_r), vc = fn::runtime::json_valid(cj, at_c);
+        line(vr && vc, std::string("records as JSON ") + when + ": request record " +
+                           (vr ? "parses" : "NOT JSON at byte " + std::to_string(at_r)) + ", counters record " +
+                           (vc ? "parses" : "NOT JSON at byte " + std::to_string(at_c)) + " (" +
+                           std::to_string(x.share_attempts().size()) + " share attempts logged)");
+    };
+    records("after the forced misses");
+    int64_t checked = 0, bad = 0;
+    if (!x.test_adm_verify(checked, bad, err)) {
+        fprintf(stderr, "spec run: ME9 check: %s\n", err.c_str());
+        return false;
+    }
+    // Shell (fad3e540): every GPU miss's copy in lane_bytes whatever its destination (one device: a miss's entry is
+    // one copy), the admitted ones a subset
+    line(d2.lane_bytes == d2.gpu_miss_bytes && d2.adm_bytes > 0 && d2.adm_bytes <= d2.lane_bytes,
+         "copy bytes with admission: lane " + std::to_string(d2.lane_bytes) + " = GPU miss " +
+             std::to_string(d2.gpu_miss_bytes) + ", admitted " + std::to_string(d2.adm_bytes) + " of them");
+    // Shell (request 11): every tracked key missed, was assigned, copied and published, and is resident by admission
+    // now or left its slot after (legitimately replaced); a key short of that is listed with its events
+    int32_t n_adm_now = 0, n_replaced = 0;
+    std::string forced_fail;
+    x.test_adm_forced(n_adm_now, n_replaced, forced_fail);
+    line(n_forced > 0 && forced_fail.empty() && n_adm_now > 0 && d2.adm_started >= n_forced,
+         "known misses: " + std::to_string(n_forced) + " layers' routed residents evicted, each missed, copied and "
+             "published; " + std::to_string(n_adm_now) + " resident by admission now, " + std::to_string(n_replaced) +
+             " replaced after publication; " + std::to_string(d2.gpu_miss) + " GPU misses" +
+             (forced_fail.empty() ? std::string() : "; NOT SO: " + forced_fail));
+    line(d2.adm_started > 0 && d2.adm_published > 0 && checked > 0 && bad == 0,
+         "into poisoned reserved slots: " + std::to_string(d2.adm_started) + " copies started, " +
+             std::to_string(d2.adm_published) + " published, " + std::to_string(d2.adm_hits) +
+             " later hits; admitted residents " + std::to_string(checked) + " checked, " + std::to_string(bad) +
+             " differ from their backing");
+    // 3: the loan
+    const int32_t held2 = x.test_adm_held();
+    const cc c2 = x.counters();
+    std::vector<int32_t> all;
+    int32_t n_reuse = 0;
+    std::vector<int32_t> t3;
+    // the refill held to no batch, so the whole decode runs with it outstanding (its restore set's keys miss and are
+    // served by the lane or the CPU, nothing admitted); the drain below lifts the hold
+    x.test_refill_limit(0);
+    if (!me3_request_tokens(e, more, true, all, n_reuse) || !me3_prefill(e, all, n_reuse, n_pre) ||
+        !me3_continue(e, 8, t3)) {
+        fprintf(stderr, "spec run: ME9 check: %s\n", e.error().c_str());
+        return false;
+    }
+    const cc d3 = fn::runtime::counters_delta(x.counters(), c2);
+    const int32_t held3 = x.test_adm_held();
+    line(d3.lane_bytes == d3.gpu_miss_bytes && d3.adm_bytes == 0,
+         "copy bytes with admission off (the refill): lane " + std::to_string(d3.lane_bytes) + " = GPU miss " +
+             std::to_string(d3.gpu_miss_bytes) + ", admitted " + std::to_string(d3.adm_bytes));
+    line(d3.loans >= 1 && d3.adm_retired == 0 && held3 + d3.adm_published == held2 && d3.adm_off_refill > 0,
+         "a loan (" + std::to_string(d3.loans) + ") and decode during its refill: retired " +
+             std::to_string(d3.adm_retired) + ", reservations " + std::to_string(held2) + " -> " +
+             std::to_string(held3) + " with " + std::to_string(d3.adm_published) + " published at the settle, rounds "
+             "off for the refill " + std::to_string(d3.adm_off_refill));
+    int64_t zc = 0, zb = 0;
+    if (!x.drain(err) || !x.test_verify_zone(zc, zb, err) || !x.test_adm_verify(checked, bad, err)) {
+        fprintf(stderr, "spec run: ME9 check: %s\n", err.c_str());
+        return false;
+    }
+    line(zb == 0 && bad == 0 && zc > 0, "after the drain: zone residents " + std::to_string(zc) + " checked, " +
+                                            std::to_string(zb) + " differ; admitted " + std::to_string(checked) +
+                                            " checked, " + std::to_string(bad) + " differ");
+    records("after the loan");
+    if (!me3_arm(e, x, "final")) {
+        return false;
+    }
+    line(x.test_adm_held() == 0, "reset to the profile: no reservation held");
+    printf("spec run: ME9 admission check: %s\n", ok ? "PASS" : "FAIL");
+    fflush(stdout);
+    return ok;
+}
+
+// TEST (R9-12's repair, Shell f056e89f; every dry run with ME3's loan and short-read checks): FC-RD2 in a verify
+// round. A verify round carries its proposals on the token vector for its inputs only; an error word's recovery checks
+// the ledger inside the round, so it must take them off first (R9-12 reported "ledger: L != N + U" in place of the
+// round's error word). A fresh base request, 8 tokens at T 0 (the reference); the same request with its first verify
+// round's commit seeing an injected error on card 1: the request ends with that round's error word reported as
+// recovered (not a ledger failure) and the ledger holds L = N + U at the pre-step state; then the same request again
+// equals the reference's tokens.
+bool verify_recovery_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & base) {
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    o.max_tokens = 8;
+    std::string err;
+    fnfl_request_out ref, bad, again;
+    if (!me3_arm(e, x, "final") || !fnfl_spec_request(e, base, 0, o, ref) || !x.drain(err)) {
+        fprintf(stderr, "spec run: verify-recovery check: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    e.test_target().test_fail_next_verify(2);
+    const bool failed = !fnfl_spec_request(e, base, 0, o, bad);
+    const std::string msg = e.error();
+    const fn::runtime::ledger & l = e.test_target().slot();
+    const int64_t L = static_cast<int64_t>(l.tok.size()), N = l.n, U = l.u;
+    e.test_target().test_fail_next_verify(0);
+    const bool drained = x.drain(err);
+    const bool ran = drained && fnfl_spec_request(e, base, 0, o, again) && x.drain(err);
+    const bool reported = failed && msg.find("error word") != std::string::npos &&
+                          msg.find("recovered") != std::string::npos && msg.find("ledger") == std::string::npos;
+    const bool pass = reported && L == N + U && ran && again.toks == ref.toks && !ref.toks.empty();
+    printf("spec run: verify-recovery check (an injected commit error on card 1 in the first verify round): the "
+           "request %s with \"%s\"; ledger after it L %lld = N %lld + U %lld: %s; the next request's %zu tokens %s "
+           "the reference's %zu: %s\n",
+           failed ? "ended" : "DID NOT FAIL", msg.c_str(), (long long)L, (long long)N, (long long)U,
+           L == N + U ? "yes" : "NO", again.toks.size(), again.toks == ref.toks ? "equal" : "DIFFER FROM",
+           ref.toks.size(), pass ? "PASS" : "FAIL");
+    if (!drained || !ran) {
+        fprintf(stderr, "spec run: verify-recovery check: %s%s\n", e.error().c_str(), err.c_str());
+    }
+    fflush(stdout);
+    return pass;
+}
+
+// TEST (--me3-cancel, Fable's ruling on ME3's completeness gaps; expires at ME4's disposition): prefill-test's two
+// cancellations (its dry B4, the prefiller at 8,192 and the resend from its checkpoint; its engine E7, the engine's
+// callback at 8,192 and the resend) with the expert cache on, in the final arm. Each cancelled prompt runs with its
+// borrowed slots poisoned (expert_cache::test_poison_lent). Right after the cancel the prompt's hold has ended, its
+// restore set is exactly its borrowed residents and every zone resident never borrowed equals its backing. B4's
+// loan returns at a drain, then its resend equals the prefiller's uninterrupted run's state. E7's resend follows with
+// no drain (its hold returns the cancelled zone first) and equals the engine's uninterrupted prompt's state and T = 0
+// continuation (8 tokens). After each drain every loan has returned exactly the borrowed residents' bytes, nothing
+// carried, every zone resident equals its backing, no refill is outstanding and the target's streams are idle
+std::string me3_json_field(const std::string & js, const char * key) {
+    const std::string k = std::string("\"") + key + "\": ";
+    const size_t p = js.find(k);
+    if (p == std::string::npos) {
+        return "?";
+    }
+    const size_t a = p + k.size();
+    return js.substr(a, js.find_first_of(",}", a) - a);
+}
+
+std::string me3_state_diff(const state_hash & a, const state_hash & b) {
+    std::string d;
+    if (a.n != b.n || a.draft_n != b.draft_n || a.index_n != b.index_n) {
+        d = " N " + std::to_string(a.n) + "/" + std::to_string(b.n) + ", draft N " + std::to_string(a.draft_n) + "/" +
+            std::to_string(b.draft_n) + ", index N " + std::to_string(a.index_n) + "/" + std::to_string(b.index_n);
+    }
+    for (int32_t i = 0; i < n_hash; ++i) {
+        d += a.h[i] == b.h[i] ? "" : std::string(" ") + hash_names[i];
+    }
+    return d.empty() ? "equal" : "DIFFERENT:" + d;
+}
+
+bool me3_cancel_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & P) {
+    constexpr int32_t at = 8192, n_cont = 8;
+    const int32_t L = static_cast<int32_t>(P.size());
+    rt::target & t = e.test_target();
+    md::model & m = e.test_model();
+    rt::prefiller & pf = e.prefill_driver();
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    std::string err;
+    const rt::prefill_progress stop = [](int64_t, int64_t done, int64_t) { return done < at; };
+    const auto streams_idle = [&]() {
+        bool idle = true;
+        for (int32_t c = 0; c < 2; ++c) {
+            idle = idle && cudaSetDevice(m.device[c]) == cudaSuccess &&
+                   cudaStreamQuery(static_cast<cudaStream_t>(t.stream(c))) == cudaSuccess;
+        }
+        return idle;
+    };
+    // right after a cancel: the prompt's hold ended and its zone still out (expert_cache::prompt_hold: its keys refill
+    // at the next decode window, the next prompt's hold or a drain, as after a whole prompt), the restore set exactly
+    // the one loan's borrowed residents, and every zone resident never borrowed its backing
+    const auto after_cancel = [&](const char * form, const fn::runtime::expert_cache_counters & c0) {
+        int64_t k = 0, b = 0;
+        const std::string j = x.request_json();
+        const int64_t rk = std::atoll(me3_json_field(j, "refill_outstanding_keys").c_str());
+        const bool v = x.test_verify_zone(k, b, err);
+        const fn::runtime::expert_cache_counters c = fn::runtime::counters_delta(x.counters(), c0);
+        const bool ok = v && !x.prompt_held() && me3_json_field(j, "zone_taken") == "true" && c.loans == 1 &&
+                        c.refills == 0 && c.borrowed_slots > 0 && c.borrowed_slots < x.zone_slots() &&
+                        rk == c.borrowed_residents && k > 0 && b == 0;
+        printf("spec run: ME3 cancel check (%s): after the cancel the hold %s, the zone taken %s; loans %lld (%lld of "
+               "the zone's %lld slots, %lld residents, %lld bytes), returns %lld; restore set %lld keys; %lld zone "
+               "residents never borrowed, %lld differ from their backing: %s%s\n",
+               form, x.prompt_held() ? "HELD" : "ended", me3_json_field(j, "zone_taken").c_str(), (long long)c.loans,
+               (long long)c.borrowed_slots, (long long)x.zone_slots(), (long long)c.borrowed_residents,
+               (long long)c.borrowed_resident_bytes, (long long)c.refills, (long long)rk, (long long)k, (long long)b,
+               ok ? "ok" : "FAIL", err.empty() ? "" : (" [" + err + "]").c_str());
+        return ok;
+    };
+    // after a drain: every loan since c0 returned, the refill's bytes exactly the borrowed residents', nothing carried,
+    // every zone resident its backing, no refill outstanding and the zone not taken
+    const auto after_drain = [&](const char * form, const fn::runtime::expert_cache_counters & c0, int64_t loans) {
+        int64_t k = 0, b = 0;
+        const bool v = x.drain(err) && x.test_verify_zone(k, b, err);
+        const std::string j = x.request_json();
+        const fn::runtime::expert_cache_counters c = fn::runtime::counters_delta(x.counters(), c0);
+        const bool ok = v && c.loans == loans && c.refills == loans && c.refill_bytes == c.borrowed_resident_bytes &&
+                        c.refill_carried == 0 && k > 0 && b == 0 &&
+                        me3_json_field(j, "refill_outstanding_keys") == "0" && me3_json_field(j, "zone_taken") == "false";
+        printf("spec run: ME3 cancel check (%s): after the drain loans %lld, returns %lld, borrowed residents %lld "
+               "bytes, refill %lld bytes, carried %lld; %lld zone residents, %lld differ from their backing; refill "
+               "outstanding %s keys, zone taken %s: %s%s\n",
+               form, (long long)c.loans, (long long)c.refills, (long long)c.borrowed_resident_bytes,
+               (long long)c.refill_bytes, (long long)c.refill_carried, (long long)k, (long long)b,
+               me3_json_field(j, "refill_outstanding_keys").c_str(), me3_json_field(j, "zone_taken").c_str(),
+               ok ? "ok" : "FAIL", err.empty() ? "" : (" [" + err + "]").c_str());
+        return ok;
+    };
+    // the uninterrupted prompt: its state and T = 0 continuation
+    state_hash h_ref, h;
+    std::vector<int32_t> ref, toks;
+    int32_t np = 0;
+    bool ok = me3_arm(e, x, "final") && e.set_sampling(0, o) == rt::run_status::ok &&
+              e.prefill(0, P.data(), L, 0, np) == rt::run_status::ok && np == L && snapshot(t, m, h_ref) &&
+              me3_continue(e, n_cont, ref) && x.drain(err);
+    if (!ok) {
+        fprintf(stderr, "spec run: ME3 cancel check: the uninterrupted prompt: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    // B4's form: the prefiller's uninterrupted run (its state, the reference), then its run stopped at 8,192 through
+    // its callback and begun again from its checkpoint
+    bool pass = me3_arm(e, x, "final") && e.set_sampling(0, o) == rt::run_status::ok;
+    int64_t from = -1;
+    rt::pf_run_stats st;
+    state_hash h_pf;
+    pass = pass && pf.begin(t, P, 0, from, err) && pf.run(t, &st, err) && from == 0 && snapshot(t, m, h_pf) &&
+           x.drain(err) && me3_arm(e, x, "final") && e.set_sampling(0, o) == rt::run_status::ok;
+    const std::string d_pf = pass ? me3_state_diff(h_ref, h_pf) : "not run";
+    fn::runtime::expert_cache_counters c0 = x.counters();
+    x.test_poison_lent(true);
+    const bool begun = pass && pf.begin(t, P, 0, from, err);
+    const bool stopped = begun && !pf.run(t, &st, err, stop);
+    x.test_poison_lent(false);
+    const bool at_ok = stopped && st.stopped == at && t.slot().n == at && t.draft_n() == at &&
+                       pf.book().latest(at) >= 0 && pf.book().at(pf.book().latest(at)).pos == at;
+    const int64_t stopped_at = st.stopped, n_at = t.slot().n, draft_at = t.draft_n();
+    err.clear();
+    const bool loan_b4 = stopped && after_cancel("prefiller, B4's form", c0) &&
+                         after_drain("prefiller, B4's form: the cancelled prompt's loan", c0, 1);
+    const bool resent = loan_b4 && pf.begin(t, P, at, from, err) && pf.run(t, &st, err) && from == at &&
+                        snapshot(t, m, h) && x.drain(err);
+    const std::string d4 = resent ? me3_state_diff(h_pf, h) : "not resent";
+    const bool b4 = pass && at_ok && loan_b4 && resent && d4 == "equal" && streams_idle();
+    printf("spec run: ME3 cancel check (prefiller, B4's form): its uninterrupted run against the engine's prompt: %s; "
+           "stopped at %lld (N %lld, draft N %lld, checkpoint %s); resend from %lld; state against its uninterrupted "
+           "run: %s; streams idle after: %s: %s%s\n",
+           d_pf.c_str(), (long long)stopped_at, (long long)n_at, (long long)draft_at, at_ok ? "at it" : "WRONG",
+           (long long)from, d4.c_str(), streams_idle() ? "yes" : "NO", b4 ? "PASS" : "FAIL",
+           err.empty() ? "" : (" [" + err + "]").c_str());
+    // E7's form: the engine's prefill cancelled at 8,192 through its callback, then the resend from its checkpoint
+    err.clear();
+    pass = me3_arm(e, x, "final") && e.set_sampling(0, o) == rt::run_status::ok;
+    c0 = x.counters();
+    x.test_poison_lent(true);
+    const rt::run_status cs = pass ? e.prefill(0, P.data(), L, 0, np, stop) : rt::run_status::error;
+    x.test_poison_lent(false);
+    const int32_t np_c = np;
+    const std::string pl = e.last_phase_line();
+    const bool phase_ok = pl.find("decode-ready not reached") != std::string::npos &&
+                          pl.find("; rows 0;") != std::string::npos &&
+                          pl.find("restored checkpoint none") != std::string::npos;
+    err.clear();
+    const bool loan_e7 = cs == rt::run_status::cancelled && np_c == at && after_cancel("engine, E7's form", c0);
+    toks.clear();
+    // the serving path: the resend with no drain between, its hold returning the cancelled prompt's zone first
+    const bool resent7 = loan_e7 && e.prefill(0, P.data() + at, L - at, at, np) == rt::run_status::ok &&
+                         np == L - at && e.last_prefill().from == at && snapshot(t, m, h) &&
+                         me3_continue(e, n_cont, toks) &&
+                         after_drain("engine, E7's form: the cancelled prompt's and the resend's loans", c0, 2);
+    const std::string d7 = resent7 ? me3_state_diff(h_ref, h) : "not resent";
+    const std::string j_end = x.request_json();
+    const bool e7 = phase_ok && loan_e7 && resent7 && d7 == "equal" && toks == ref && streams_idle() &&
+                    me3_json_field(j_end, "refill_outstanding_keys") == "0" &&
+                    me3_json_field(j_end, "zone_taken") == "false";
+    printf("spec run: ME3 cancel check (engine, E7's form): status %s, %d processed; phase line %s; resend from %lld, "
+           "%d processed; state against the uninterrupted prompt: %s; its %zu tokens %s; at the end refill outstanding "
+           "%s keys, zone taken %s, streams idle %s: %s%s\n",
+           cs == rt::run_status::cancelled ? "cancelled" : "NOT cancelled", np_c,
+           phase_ok ? "ok" : ("WRONG (" + pl + ")").c_str(),
+           (long long)e.last_prefill().from, np, d7.c_str(), toks.size(), toks == ref ? "equal" : "DIFFER",
+           me3_json_field(j_end, "refill_outstanding_keys").c_str(), me3_json_field(j_end, "zone_taken").c_str(),
+           streams_idle() ? "yes" : "NO", e7 ? "PASS" : "FAIL",
+           (err + e.error()).empty() ? "" : (" [" + err + e.error() + "]").c_str());
+    printf("spec run: ME3 cancel check: %s\n", b4 && e7 ? "PASS" : "FAIL");
+    fflush(stdout);
+    return b4 && e7;
+}
+
+// ME3 (in the final arm's mode): the loan check. A base prompt, then a bulk append of more with the borrowed slots and
+// spans poisoned: right after the append's prefill every zone slot still holding a key (none borrowed) equals its
+// backing bytes, then after the drain (the refill) every zone resident does; the borrowed set is smaller than the
+// zone, and the refill's bytes are the borrowed residents'; the append's T = 0 continuation (8 tokens) equals the
+// unpoisoned one's
+bool me3_loan_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & base,
+                    const std::vector<int32_t> & more) {
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    o.max_tokens = 8;
+    std::vector<int32_t> toks[2];
+    bool ok = true;
+    for (int32_t poison = 1; poison >= 0; --poison) {
+        if (!me3_arm(e, x, "final")) {
+            return false;
+        }
+        fnfl_request_out ro;
+        std::vector<int32_t> all;
+        int32_t n_reuse = 0, n_pre = 0;
+        std::string err;
+        if (!fnfl_spec_request(e, base, 0, o, ro) || !x.drain(err) ||
+            !me3_request_tokens(e, more, true, all, n_reuse)) {
+            fprintf(stderr, "spec run: ME3 loan check: %s%s\n", e.error().c_str(), err.c_str());
+            return false;
+        }
+        x.test_poison_lent(poison != 0);
+        const fn::runtime::expert_cache_counters c0 = x.counters();
+        const bool pre = me3_prefill(e, all, n_reuse, n_pre);
+        x.test_poison_lent(false);
+        int64_t checked = 0, bad = 0, checked2 = 0, bad2 = 0;
+        if (!pre || n_pre != static_cast<int32_t>(all.size()) - n_reuse || !x.test_verify_zone(checked, bad, err)) {
+            fprintf(stderr, "spec run: ME3 loan check: the append (%d processed): %s%s\n", n_pre, e.error().c_str(),
+                    err.c_str());
+            return false;
+        }
+        const rt::pf_run_stats ps = e.last_prefill();
+        if (!me3_continue(e, o.max_tokens, toks[poison]) || !x.drain(err) ||
+            !x.test_verify_zone(checked2, bad2, err)) {
+            fprintf(stderr, "spec run: ME3 loan check: %s%s\n", e.error().c_str(), err.c_str());
+            return false;
+        }
+        const fn::runtime::expert_cache_counters c = fn::runtime::counters_delta(x.counters(), c0);
+        const bool sized = c.loans == 1 && c.borrowed_slots > 0 && c.borrowed_slots < x.zone_slots() &&
+                           c.refill_bytes == c.borrowed_resident_bytes;
+        const bool pass = bad == 0 && bad2 == 0 && checked > 0 && checked2 > checked && sized && !ps.short_read;
+        ok = ok && pass;
+        printf("spec run: ME3 loan check (%s): the append's loan %lld of the zone's %lld slots, %lld residents (%lld "
+               "bytes), refill %lld bytes, spans %lld bytes, layout %d / %d; after its prefill %lld zone residents "
+               "never borrowed, %lld differ from their backing; after the refill %lld zone residents, %lld differ: "
+               "%s\n",
+               poison ? "poisoned" : "unpoisoned", (long long)c.borrowed_slots, (long long)x.zone_slots(),
+               (long long)c.borrowed_residents, (long long)c.borrowed_resident_bytes, (long long)c.refill_bytes,
+               (long long)ps.loan_span_bytes, ps.layout_rows, ps.layout_half, (long long)checked, (long long)bad,
+               (long long)checked2, (long long)bad2, pass ? "ok" : "FAIL");
+    }
+    const bool same = toks[0] == toks[1];
+    ok = ok && same;
+    printf("spec run: ME3 loan check (sized loan, poison, retained and refilled slots): the poisoned append's %zu "
+           "tokens %s the unpoisoned one's: %s\n",
+           toks[1].size(), same ? "equal" : "DIFFER from", ok ? "PASS" : "FAIL");
+    fflush(stdout);
+    return ok;
+}
+
+// the first position where a and b differ (their common length when one is a prefix of the other)
+size_t first_difference(const std::vector<int32_t> & a, const std::vector<int32_t> & b) {
+    size_t i = 0;
+    while (i < a.size() && i < b.size() && a[i] == b[i]) {
+        ++i;
+    }
+    return i;
+}
+
+// ME3 (in the final arm's mode): the short-read check over a base prompt (bulk) and more (at least 400 tokens):
+//   - a read of short_read tokens (its first short_read - 1 appended after the base request's pending output) read
+//     short (no loan, no refill, the short windows counted), and its T = 0 continuation (8 tokens) against the same
+//     append read in bulk (short reads off for it);
+//   - the threshold, counted in tokens read: short_read + 1 read in bulk (one loan), short_read short;
+//   - a prior outstanding loan: a bulk append of 200 tokens, its refill held to one batch (the cleanup's test hook,
+//     expert_cache::test_refill_limit), then at once (no step, its refill outstanding) a 13-token append: short, no
+//     new loan, the outstanding refill reported at the request's entry (not as zero work); then a second bulk append
+//     of 200 at once: its loan stops the held refill (its batch landed and published, the moves never submitted
+//     carried back to the restore set), and after the drain (the limit lifted) every zone resident equals its backing;
+//   - a deeper reuse than the history fails the pure-extension test.
+// Each short read's handoff (N = L, the draft at N) is checked in prefiller::run_short. No graph is captured again
+// TEST (ME10): X-F's receive slots on both cards at the sentinel, read synchronously between requests. On one device
+// the cached FFN's finish replaces X-F's exchange (its slots unused); the draft's FFN exchange still uses and resets
+// them. A slot left written (a send without its receive) shows here
+bool me10_xf_check(rt::engine & e) {
+    const fn::xchg::rings & rg = *e.test_model().rings;
+    constexpr int32_t n = fn::xchg::slot_words(fn::xchg::msg::f);
+    std::vector<uint32_t> h(static_cast<size_t>(n));
+    int64_t checked = 0, bad = 0;
+    for (int32_t card = 0; card < 2; ++card) {
+        for (int32_t s = 0; s < fn::xchg::slots_of(fn::xchg::msg::f); ++s) {
+            if (cudaMemcpy(h.data(), rg.slot(card, fn::xchg::msg::f, s), size_t(n) * 4, cudaMemcpyDefault) !=
+                cudaSuccess) {
+                fprintf(stderr, "spec run: ME10 X-F check: %s\n", cudaGetErrorString(cudaGetLastError()));
+                return false;
+            }
+            for (const uint32_t w : h) {
+                ++checked;
+                bad += w != fn::xchg::sentinel ? 1 : 0;
+            }
+        }
+    }
+    printf("spec run: ME10 X-F slots between requests: %lld words on both cards, %lld not the sentinel: %s\n",
+           (long long)checked, (long long)bad, bad == 0 ? "ok" : "FAIL");
+    return bad == 0;
+}
+
+bool me3_short_check(rt::engine & e, fn::runtime::expert_cache & x, const std::vector<int32_t> & base,
+                     const std::vector<int32_t> & more) {
+    rt::prefiller & pf = e.prefill_driver();
+    const int32_t sr = pf.short_read(), chunk = pf.chunk_rows();
+    if (sr < 1 || static_cast<int32_t>(more.size()) < std::max(sr + 1, 400)) {
+        fprintf(stderr, "spec run: ME3 short-read check: short reads off or fewer than %d tokens to append\n",
+                std::max(sr + 1, 400));
+        return false;
+    }
+    const int32_t g0 = e.test_target().captures();
+    rt::request_options o;
+    o.sampling.temp = 0.0f;
+    o.max_tokens = 8;
+    std::string err;
+    // one append to a fresh base request: the counters' change, the read's path, the continuation
+    struct appended {
+        fn::runtime::expert_cache_counters c;
+        bool short_read = false;
+        int32_t read = 0; // the tokens the prefill read (a continued request's pending token among them)
+        std::vector<int32_t> toks;
+        std::string line;
+    };
+    // limit (>= 0): the refill's batches held to it from this append on (a drain lifts it)
+    const auto append = [&](const std::vector<int32_t> & ids, bool fresh, int32_t steps, appended & out,
+                            int32_t limit = -1) {
+        fnfl_request_out ro;
+        std::vector<int32_t> all;
+        int32_t n_reuse = 0, n_pre = 0;
+        if (fresh && (!me3_arm(e, x, "final") || !fnfl_spec_request(e, base, 0, o, ro) || !x.drain(err))) {
+            return false;
+        }
+        if (limit >= 0) {
+            x.test_refill_limit(limit);
+        }
+        const fn::runtime::expert_cache_counters c0 = x.counters();
+        x.request_begin();
+        if (!me3_request_tokens(e, ids, true, all, n_reuse) || !me3_prefill(e, all, n_reuse, n_pre) ||
+            n_pre != static_cast<int32_t>(all.size()) - n_reuse) {
+            return false;
+        }
+        out.short_read = e.last_prefill().short_read;
+        out.read = n_pre;
+        out.line = x.request_json();
+        if (!me3_continue(e, steps, out.toks)) {
+            return false;
+        }
+        out.c = fn::runtime::counters_delta(x.counters(), c0);
+        return true;
+    };
+    // a fresh base request leaves its last output pending, which the append's read includes: short_read - 1 new
+    // tokens read short_read, short_read new ones short_read + 1; after an append without steps nothing is pending
+    const std::vector<int32_t> m_sr1(more.begin(), more.begin() + sr - 1), m_sr(more.begin(), more.begin() + sr),
+        m_bulk(more.begin(), more.begin() + 200), m_13(more.begin() + 200 - 13, more.begin() + 200),
+        m_bulk2(more.begin() + 200, more.begin() + 400);
+    appended s1, b1, over, at, bulk, after, bulk2;
+    bool ok = append(m_sr1, true, o.max_tokens, s1);
+    ok = ok && pf.set_options(0, chunk, err) && append(m_sr1, true, o.max_tokens, b1) &&
+         pf.set_options(sr, chunk, err);
+    ok = ok && append(m_sr, true, 0, over) && append(m_sr, false, 0, at);
+    ok = ok && append(m_bulk, true, 0, bulk, 1) && append(m_13, false, 0, after) && append(m_bulk2, false, 0, bulk2) &&
+         x.drain(err);
+    int64_t z_checked = 0, z_bad = 0;
+    ok = ok && x.test_verify_zone(z_checked, z_bad, err);
+    if (!ok) {
+        x.test_refill_limit(-1);
+        pf.set_options(sr, chunk, err);
+        fprintf(stderr, "spec run: ME3 short-read check: %s%s\n", e.error().c_str(), err.c_str());
+        return false;
+    }
+    const auto none = [](const fn::runtime::expert_cache_counters & c) {
+        return c.loans == 0 && c.borrowed_slots == 0 && c.borrowed_bytes == 0 && c.short_windows > 0;
+    };
+    const bool short_ok = s1.read == sr && s1.short_read && none(s1.c) && s1.c.refill_bytes == 0 && b1.read == sr &&
+                          !b1.short_read && b1.c.loans == 1;
+    const std::string diff_at =
+        s1.toks == b1.toks ? "" : " (first at " + std::to_string(first_difference(s1.toks, b1.toks)) + ")";
+    const bool threshold = over.read == sr + 1 && !over.short_read && over.c.loans == 1 && at.read == sr &&
+                           at.short_read && none(at.c);
+    const bool outstanding = !bulk.short_read && bulk.c.loans == 1 && after.short_read && none(after.c);
+    // the held refill (one batch) stopped by the second loan: its unsubmitted moves carried back
+    const bool stopped = !bulk2.short_read && bulk2.c.loans == 1 && bulk2.c.refill_carried > 0 &&
+                         bulk.c.refill_batches + after.c.refill_batches <= 1 && z_checked > 0 && z_bad == 0;
+    // a deeper reuse: the history kept to 100 tokens fewer, so the prefill restores a checkpoint and processes more
+    fnfl_request_out ro;
+    std::vector<int32_t> all;
+    int32_t n_reuse = 0;
+    ok = me3_request_tokens(e, m_13, true, all, n_reuse);
+    const int32_t deep = std::max(n_reuse - 100, 1);
+    ok = ok && fnfl_spec_request(e, all, deep, o, ro) && x.drain(err);
+    const bool refused = ok && ro.n_processed > static_cast<int32_t>(all.size()) - deep &&
+                         !me3_append_ok(ro, all.size(), deep);
+    const int32_t g1 = e.test_target().captures();
+    const bool pass = short_ok && threshold && outstanding && stopped && refused && g1 == g0;
+    printf("spec run: ME3 short-read check (threshold %d): the %d-token read %s (loans %lld, borrowed %lld bytes, "
+           "refill %lld bytes, %lld short windows of %lld rows); its 8 tokens %s the bulk read's%s\n",
+           sr, s1.read, s1.short_read ? "short" : "IN BULK", (long long)s1.c.loans,
+           (long long)s1.c.borrowed_bytes, (long long)s1.c.refill_bytes, (long long)s1.c.short_windows,
+           (long long)s1.c.short_rows, s1.toks == b1.toks ? "equal" : "differ from", diff_at.c_str());
+    printf("spec run: ME3 short-read check: a %d-token read %s (loans %lld), a %d-token read %s (loans %lld); after "
+           "a bulk append of 200 (loans %lld), 13 tokens at once %s (loans %lld, borrowed %lld bytes), entry %s\n",
+           over.read, over.short_read ? "SHORT" : "in bulk", (long long)over.c.loans, at.read,
+           at.short_read ? "short" : "IN BULK", (long long)at.c.loans, (long long)bulk.c.loans,
+           after.short_read ? "short" : "IN BULK", (long long)after.c.loans, (long long)after.c.borrowed_bytes,
+           after.line.substr(0, after.line.find(", \"settings\"")).c_str());
+    printf("spec run: ME3 short-read check: the refill held to one batch (%lld batches before the second loan); a "
+           "second bulk append of 200 at once (loans %lld) stopped it, %lld moves carried back; after the drain %lld "
+           "zone residents, %lld differ from their backing: %s\n",
+           (long long)(bulk.c.refill_batches + after.c.refill_batches), (long long)bulk2.c.loans,
+           (long long)bulk2.c.refill_carried, (long long)z_checked, (long long)z_bad, stopped ? "ok" : "FAIL");
+    printf("spec run: ME3 short-read check: a reuse of %d of %d kept tokens processed %d, not its %d new: %s; graph "
+           "captures %d before, %d after: %s\n",
+           deep, n_reuse, ro.n_processed, static_cast<int32_t>(all.size()) - deep,
+           refused ? "refused as not a pure extension" : "NOT REFUSED", g0, g1, pass ? "PASS" : "FAIL");
+    fflush(stdout);
+    return pass;
+}
+
+} // namespace
+
 int fnfl_spec_run(const fnfl_target_args & a) {
     const bool dry = a.mode == "run-dry";
-    std::vector<int32_t> prompt;
-    if (!read_ids(a.ids, prompt)) {
-        return 1;
+    // ME2 (--next-ids): the prompts in order, PROMPT_IDS first
+    std::vector<std::string> paths{a.ids};
+    paths.insert(paths.end(), a.next_ids.begin(), a.next_ids.end());
+    // ME3: which prompts are appends (--next-append), and the arms (--me3-arms; none: the run as configured)
+    std::vector<bool> append(paths.size(), false);
+    std::vector<int32_t> rows(paths.size(), -1); // ME3 (--next-append-rows): the read's rows, checked
+    for (size_t i = 0; i < a.next_append.size() && i + 1 < paths.size(); ++i) {
+        append[i + 1] = a.next_append[i];
+        rows[i + 1] = i < a.next_rows.size() ? a.next_rows[i] : -1;
     }
-    if (dry) {
-        prompt.resize(std::min<size_t>(prompt.size(), 13));
+    std::vector<std::string> arms;
+    const bool me4 = !a.me4_arms.empty(); // ME4's arms (--me4-arms), else ME3's
+    const std::string & arm_list = me4 ? a.me4_arms : a.me3_arms;
+    for (size_t q = 0; q < arm_list.size();) {
+        const size_t c = std::min(arm_list.find(',', q), arm_list.size());
+        arms.push_back(arm_list.substr(q, c - q));
+        q = c + 1;
     }
+    if (arms.empty()) {
+        arms.emplace_back();
+    }
+    std::vector<std::vector<int32_t>> prompts(paths.size());
+    for (size_t p = 0; p < paths.size(); ++p) {
+        if (!read_ids(paths[p], prompts[p])) {
+            return 1;
+        }
+        if (rows[p] > 0 && static_cast<int32_t>(prompts[p].size()) < rows[p]) {
+            fprintf(stderr, "spec run: %s has fewer than %d IDs (--next-append-rows)\n", paths[p].c_str(), rows[p]);
+            return 1;
+        }
+        if (dry && rows[p] < 0) {
+            prompts[p].resize(std::min<size_t>(prompts[p].size(), 13));
+        }
+    }
+    const std::vector<int32_t> & prompt = prompts[0];
     rt::draft_options dopt;
     if (!fnfl_draft_settings(a, true, "spec run", dopt)) {
         return 1;
@@ -1064,7 +2087,8 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         settings.emplace_back();
         settings.back().sampling.temp = 0.0f;
     }
-    const int32_t cells = dry ? 8192 : a.n_cells;
+    // ME1: a cached dry run takes --cells (the memory plan at the served capacity)
+    const int32_t cells = dry && !a.cached() ? 8192 : a.n_cells;
     auto m = std::make_unique<md::model>();
     if (!(dry ? fnfl_load_dry(a, cells, *m) : fnfl_load(a, cells, *m, "spec run"))) {
         return 1;
@@ -1076,6 +2100,24 @@ int fnfl_spec_run(const fnfl_target_args & a) {
     c.eog = a.eog.empty() ? std::vector<int32_t>{eos_tokenizer} : a.eog;
     c.timeout_s = dry ? 30.0 : 60.0;
     c.spec_d = a.spec_d;
+    // ME1: the expert cache (one device, or cached TP), made after the engine's other allocations. ME3: the executor
+    // --ex-executor names (the graphs unless eager); the cache captures the graphs before its pool (service_hook)
+    fn::runtime::expert_cache * xc = nullptr;
+    c.eager = a.ex_eager;
+    c.short_read = a.cached() ? a.cache.short_read : 0; // ME3
+    c.prompt_chunk = a.cache.prompt_chunk;
+    if (a.cached()) {
+        c.experts = [&a, dry, &xc](md::model & mm, const md::service_hook & hook,
+                                   std::string & e2) -> std::unique_ptr<md::expert_service> {
+            std::unique_ptr<fn::runtime::expert_cache> x = fnfl_expert_cache(a, mm, dry, "spec run", hook);
+            if (x == nullptr) {
+                e2 = "the expert cache";
+                return nullptr;
+            }
+            xc = x.get();
+            return x;
+        };
+    }
     rt::engine e;
     std::string err;
     if (!e.init(std::move(m), c, err)) {
@@ -1083,8 +2125,86 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         return 1;
     }
     printf("spec run: %s\n", e.settings().c_str());
-    printf("spec run: prompt %s (%zu tokens); %zu settings x %d runs, each from a fresh prefill\n", a.ids.c_str(),
-           prompt.size(), settings.size(), a.runs);
+    // ME3: the graphs captured at init; none after (the end's line compares)
+    const int32_t captures0 = e.test_target().captures();
+    printf("spec run: ME3 executor: %s; %d graph captures at init\n",
+           e.test_target().graph_executor() ? "graph" : "eager", captures0);
+    if (xc != nullptr) {
+        printf("spec run: ME1 %s, %s executor, expert cache on; %s\n",
+               a.single_card >= 0 ? ("single card: device " + std::to_string(a.single_card)).c_str() : "cached TP",
+               e.test_target().graph_executor() ? "graph" : "eager", me1_memory(*xc).c_str());
+        // ME3: the model checks in the final arm's mode, then (with the arms) the loan check
+        if (!arms.front().empty() && !(me4 ? me4_arm(e, *xc, "final") : me3_arm(e, *xc, "final"))) {
+            return 1;
+        }
+        if (!a.ex_check.empty() && !me1_check(e, *xc, a)) {
+            return 1;
+        }
+        if (!a.ex_kl.empty() && !me2_kl(e, *xc, a, me4)) {
+            return 1;
+        }
+        if (!a.mx7_check.empty()) { // TEST (--mx7-check): MX7's model checks alone
+            rt::mx7_check_args ma;
+            ma.ids = a.mx7_check;
+            ma.out_dir = a.out_dir;
+            for (size_t p0 = 0; p0 <= a.mx7_shares.size();) {
+                const size_t p1 = std::min(a.mx7_shares.find(',', p0), a.mx7_shares.size());
+                if (p1 > p0) {
+                    ma.shares.push_back(a.mx7_shares.substr(p0, p1 - p0));
+                }
+                p0 = p1 + 1;
+            }
+            ma.set_share = [xc](double s, std::string & e2) { return xc->set_prompt_cpu_share(s, e2); };
+            ma.counters = [xc]() { return xc->request_json(); };
+            ma.set_shadow = [xc](bool on) { xc->set_prompt_cpu_share_shadow(on); };
+            ma.take_shadow = [xc]() { return xc->take_prompt_cpu_share_shadow(); };
+            return rt::mx7_check(e, ma) ? 0 : 1;
+        }
+        // ME3: the loan and short-read checks, on the KL fixture's tokens (with the arms) or, dry, on synthetic ones
+        std::vector<int32_t> kl;
+        if (!arms.front().empty() && !a.ex_kl.empty() && (!read_ids(a.ex_kl, kl) || kl.size() < 3048)) {
+            fprintf(stderr, "spec run: ME3 checks: %s has fewer than 3,048 tokens\n", a.ex_kl.c_str());
+            return 1;
+        }
+        if (dry) {
+            for (int32_t i = 0; i < 3048; ++i) {
+                kl.push_back(1000 + (i * 7919) % 200000);
+            }
+        }
+        const size_t n_kb = kl.empty() ? 0 : dry ? 300 : 2048, n_km = kl.empty() ? 0 : 1000;
+        const std::vector<int32_t> kb(kl.begin(), kl.begin() + int64_t(n_kb));
+        const std::vector<int32_t> km(kl.begin() + int64_t(n_kb), kl.begin() + int64_t(n_kb + n_km));
+        if (a.me9_check) { // TEST (--me9-check): the admission check alone (one device)
+            return !kb.empty() && me9_check(e, *xc, kb, km) ? 0 : 1;
+        }
+        if (a.me3_stall) { // TEST (--me3-stall): the stall check alone, then the teardown
+            return !kb.empty() && me3_stall_check(e, *xc, kb) ? 0 : 1;
+        }
+        if (a.me3_cancel) { // TEST (--me3-cancel): the cancellation check alone, on prefill-test's 9,000 tokens' length
+            std::vector<int32_t> p9;
+            for (int32_t i = 0; i < 9000; ++i) {
+                p9.push_back(1000 + (i * 7919) % 200000);
+            }
+            return me3_cancel_check(e, *xc, p9) ? 0 : 1;
+        }
+        if (!kl.empty() && (!me3_loan_check(e, *xc, kb, km) || !me3_short_check(e, *xc, kb, km) ||
+                            !verify_recovery_check(e, *xc, kb) || !me10_xf_check(e))) {
+            return 1;
+        }
+        // the checks' cache contents and counts do not reach the requests below (ME2: the profile state again)
+        md::kv_tier * kt = e.test_target().tier();
+        if (!xc->reset_to_profile(err) || !xc->set_mode(0, err) || (kt != nullptr && !kt->reset_counters(err))) {
+            fprintf(stderr, "spec run: %s\n", err.c_str());
+            return 1;
+        }
+        xc->reset_counters();
+    }
+    for (size_t p = 0; p < paths.size(); ++p) {
+        printf("spec run: prompt %zu: %s (%zu tokens)%s\n", p, paths[p].c_str(), prompts[p].size(),
+               append[p] ? ", an append to the previous request's state (ME3)" : "");
+    }
+    printf("spec run: %zu prompts x %zu settings x %d runs, each from a fresh prefill\n", paths.size(),
+           settings.size(), a.runs);
     FILE * log = fopen((a.out_dir + "/run-summary.txt").c_str(), "w");
     if (log == nullptr) {
         fprintf(stderr, "spec run: cannot write %s/run-summary.txt\n", a.out_dir.c_str());
@@ -1108,74 +2228,169 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         return std::string(b);
     };
     bool all = true;
-    for (size_t g = 0; g < settings.size(); ++g) {
-        const fnfl_target_args::run_setting & st = settings[g];
-        char what[256];
-        snprintf(what, sizeof(what), "setting %zu: T %.2f top-k %d top-p %.2f min-p %.2f seed %llu max_tokens %d", g,
-                 double(st.sampling.temp), st.sampling.top_k, double(st.sampling.top_p), double(st.sampling.min_p),
-                 static_cast<unsigned long long>(st.sampling.seed), st.max_tokens);
-        printf("spec run: %s\n", what);
-        fprintf(log, "%s\n", what);
-        std::vector<int32_t> first;
-        std::vector<double> med, tps_engine, tps_driver;
-        for (int32_t r = 0; r < a.runs; ++r) {
-            rt::request_options o;
-            o.sampling = st.sampling;
-            o.max_tokens = st.max_tokens;
-            const std::string clk0 = sm_clocks();
-            fnfl_request_out  ro;
-            if (!fnfl_spec_request(e, prompt, 0, o, ro)) {
-                fprintf(stderr, "spec run: %s\n", e.error().c_str());
+    // ME2: setting g of prompt p is numbered p x settings + g in the files and lines below (prompt 0's as before);
+    // ME3: arm i's from i x prompts x settings
+    const size_t per_arm = paths.size() * settings.size();
+    for (size_t ai = 0; ai < arms.size(); ++ai) {
+        if (!arms[ai].empty()) {
+            if (!(me4 ? me4_arm(e, *xc, arms[ai]) : me3_arm(e, *xc, arms[ai]))) {
                 return 1;
             }
-            const double                 pre_s = ro.pre_s, gen_s = ro.gen_s;
-            const std::vector<int32_t> & toks = ro.toks;
-            const std::string clk1 = sm_clocks();
-            const rt::request_summary & sm = e.last_summary();
-            med.push_back(sm.wall_median_ms);
-            tps_engine.push_back(sm.span_s > 0 ? (sm.tokens - 1) / sm.span_s : 0.0);
-            tps_driver.push_back(gen_s > 0 ? (double(toks.size()) - 1) / gen_s : 0.0);
-            const bool same = r == 0 || toks == first;
-            if (r == 0) {
-                first = toks;
-            }
-            all = all && same;
-            char line[512];
-            snprintf(line, sizeof(line),
-                     "run %zu.%d: %zu tokens; prefill %.3f s; driver: after the prefill to the last step %.4f s, %.2f "
-                     "tokens/s ((tokens - 1) / time, the server's definition); tokens %s run 0's; SM clocks before "
-                     "[%s] after [%s]",
-                     g, r, toks.size(), pre_s, gen_s, tps_driver.back(), same ? "equal to" : "DIFFERENT from",
-                     clk0.c_str(), clk1.c_str());
-            printf("spec run: %s\nspec run: %s\n", line, e.last_summary_line().c_str());
-            fprintf(log, "%s\n%s\n", line, e.last_summary_line().c_str());
-            write_tokens(a.out_dir + "/run-" + std::to_string(g) + "-" + std::to_string(r) + "-tokens.txt", toks);
-            int32_t k = 0;
-            for (const rt::step_info & x : e.last_steps()) {
-                fprintf(rc, "%zu,%d,%d,%s,%lld,%d,%d,%d,%d,%d,%s,%s,%s,%s,%.4f\n", g, r, k++,
-                        x.kind == 0   ? "bootstrap"
-                        : x.kind == 1 ? "generate"
-                                      : "spec",
-                        static_cast<long long>(x.n_before), x.d, x.a, x.n_out, x.cut ? 1 : 0, x.waits,
-                        ms(x.to_draft_s).c_str(), ms(x.to_verify_s).c_str(), ms(x.to_catchup_s).c_str(),
-                        ms(x.to_one_s).c_str(), x.wall_s * 1e3);
-            }
-            fflush(rc);
-            fflush(stdout);
-            fflush(log);
+            fprintf(log, "%s arm %s: requests %zu .. %zu\n", me4 ? "ME4" : "ME3", arms[ai].c_str(), ai * per_arm,
+                    ai * per_arm + per_arm - 1);
         }
-        const auto spread = [](const std::vector<double> & v) {
-            return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()) - *std::min_element(v.begin(), v.end());
-        };
-        char sum[512];
-        snprintf(sum, sizeof(sum),
-                 "setting %zu over %d runs: median step wall ms median %.4f (max-min %.4f); tokens/s (engine span, "
-                 "(tokens - 1) / span) median %.3f (max-min %.3f); tokens/s (driver, the server's definition) median "
-                 "%.3f (max-min %.3f); tokens equal across runs: %s",
-                 g, a.runs, median_of(med), spread(med), median_of(tps_engine), spread(tps_engine),
-                 median_of(tps_driver), spread(tps_driver), all ? "yes" : "NO");
-        printf("spec run: %s\n", sum);
-        fprintf(log, "%s\n", sum);
+        for (size_t pg = 0; pg < per_arm; ++pg) {
+            const size_t g = ai * per_arm + pg, p = pg / settings.size();
+            const fnfl_target_args::run_setting & st = settings[pg % settings.size()];
+            char what[384];
+            snprintf(what, sizeof(what),
+                     "setting %zu: T %.2f top-k %d top-p %.2f min-p %.2f seed %llu max_tokens %d; prompt %zu (%zu "
+                     "tokens)",
+                     g, double(st.sampling.temp), st.sampling.top_k, double(st.sampling.top_p),
+                     double(st.sampling.min_p), static_cast<unsigned long long>(st.sampling.seed), st.max_tokens, p,
+                     prompts[p].size());
+            printf("spec run: %s\n", what);
+            fprintf(log, "%s\n", what);
+            std::vector<int32_t> first;
+            std::vector<double> med, tps_engine, tps_driver;
+            for (int32_t r = 0; r < a.runs; ++r) {
+                rt::request_options o;
+                o.sampling = st.sampling;
+                o.max_tokens = st.max_tokens;
+                const std::string clk0 = sm_clocks();
+                fnfl_request_out  ro;
+                std::vector<int32_t> req;
+                int32_t n_reuse = 0;
+                // ME3 (--next-append-rows): the IDs that make the read rows[p] rows with the slot's pending token
+                std::vector<int32_t> ids = prompts[p];
+                int32_t pend = -1;
+                if (rows[p] > 0) {
+                    std::vector<int32_t> hist;
+                    if (e.history(0, hist, pend) != rt::run_status::ok) {
+                        fprintf(stderr, "spec run: %s\n", e.error().c_str());
+                        return 1;
+                    }
+                    ids.resize(size_t(rows[p] - (pend >= 0 ? 1 : 0)));
+                }
+                // ME4 (--append-close): the previous request ended at its budget, so its turn is closed here
+                const bool closed = append[p] && a.append_close >= 0 && e.last_summary().ended == "budget";
+                if (closed) {
+                    printf("spec run: ME4 append: the previous request ended at its budget; its turn closed with ID %d "
+                           "before the recorded IDs (one row more than recorded)\n",
+                           a.append_close);
+                }
+                if (!me3_request_tokens(e, ids, append[p], req, n_reuse, closed ? a.append_close : -1) ||
+                    !fnfl_spec_request(e, req, n_reuse, o, ro)) {
+                    fprintf(stderr, "spec run: %s\n", e.error().c_str());
+                    return 1;
+                }
+                if (rows[p] > 0) {
+                    const bool is_short = e.last_prefill().short_read;
+                    const bool want_short = rows[p] <= e.prefill_driver().short_read();
+                    const bool rows_ok = ro.n_processed == rows[p] && is_short == want_short;
+                    all = all && rows_ok;
+                    printf("spec run: ME3 rows: a read of %d rows asked (the pending token %s, %zu IDs): %d processed, "
+                           "%s (threshold %d: %s expected): %s\n",
+                           rows[p], pend >= 0 ? "kept" : "none", ids.size(), ro.n_processed,
+                           is_short ? "short" : "bulk", e.prefill_driver().short_read(), want_short ? "short" : "bulk",
+                           rows_ok ? "as expected" : "UNEXPECTED");
+                }
+                // ME3: an append is a pure extension (only its new tokens processed), or the request fails
+                if (append[p] && !me3_append_ok(ro, req.size(), n_reuse)) {
+                    fprintf(stderr, "spec run: the append processed %d tokens, not its %d new ones (not a pure "
+                                    "extension)\n", ro.n_processed, static_cast<int32_t>(req.size()) - n_reuse);
+                    return 1;
+                }
+                if (append[p]) {
+                    printf("spec run: ME3 append: %d tokens kept, %d new (the pending token and %zu IDs), %d "
+                           "processed: a pure extension; populated depth %zu\n",
+                           n_reuse, static_cast<int32_t>(req.size()) - n_reuse, ids.size(), ro.n_processed,
+                           req.size());
+                }
+                const double                 pre_s = ro.pre_s, gen_s = ro.gen_s;
+                const std::vector<int32_t> & toks = ro.toks;
+                const std::string clk1 = sm_clocks();
+                const rt::request_summary & sm = e.last_summary();
+                printf("spec run: ME4 request %zu.%d ended: %s\n", g, r, sm.ended.c_str());
+                fprintf(log, "request %zu.%d ended: %s\n", g, r, sm.ended.c_str());
+                med.push_back(sm.wall_median_ms);
+                tps_engine.push_back(sm.span_s > 0 ? (sm.tokens - 1) / sm.span_s : 0.0);
+                tps_driver.push_back(gen_s > 0 ? (double(toks.size()) - 1) / gen_s : 0.0);
+                const bool same = r == 0 || toks == first;
+                if (r == 0) {
+                    first = toks;
+                }
+                all = all && same;
+                char line[512];
+                snprintf(line, sizeof(line),
+                         "run %zu.%d: %zu tokens; prefill %.3f s; driver: after the prefill to the last step %.4f "
+                         "s, %.2f tokens/s ((tokens - 1) / time, the server's definition); tokens %s run 0's; SM "
+                         "clocks before [%s] after [%s]",
+                         g, r, toks.size(), pre_s, gen_s, tps_driver.back(), same ? "equal to" : "DIFFERENT from",
+                         clk0.c_str(), clk1.c_str());
+                printf("spec run: %s\nspec run: %s\n", line, e.last_summary_line().c_str());
+                fprintf(log, "%s\n%s\n", line, e.last_summary_line().c_str());
+                if (xc != nullptr) {
+                    // ME3: the request's prefill path, loan and affinity, its boundaries and its cache line
+                    const std::string m3 = me3_prefill_text(e, *xc) + "\n" + me3_boundaries(e, ro) +
+                                           "\nexpert cache request: " + e.last_cache_line();
+                    printf("spec run: %s\n", m3.c_str());
+                    fprintf(log, "%s\n", m3.c_str());
+                }
+                if (xc != nullptr) {
+                    // ME2: after the request (outside its timing): the last windows' times read, the pass
+                    // committed, the learned profile saved (--ex-profile-save)
+                    std::string derr;
+                    if (!xc->drain(derr)) {
+                        fprintf(stderr, "spec run: %s\n", derr.c_str());
+                        return 1;
+                    }
+                    const std::string xs = "expert cache: " + xc->counters_json() + "; " + me1_memory(*xc);
+                    printf("spec run: %s\n", xs.c_str());
+                    fprintf(log, "%s\n", xs.c_str());
+                    xc->reset_counters();
+                }
+                if (md::kv_tier * kt = e.test_target().tier()) { // ME1 (--kv-host): the KV moved for this request
+                    std::string kerr;
+                    if (!kt->read_counters(kerr)) {
+                        fprintf(stderr, "spec run: %s\n", kerr.c_str());
+                        return 1;
+                    }
+                    printf("spec run: %s\n", kt->counters_text().c_str());
+                    fprintf(log, "%s\n", kt->counters_text().c_str());
+                    if (!kt->reset_counters(kerr)) {
+                        fprintf(stderr, "spec run: %s\n", kerr.c_str());
+                        return 1;
+                    }
+                }
+                write_tokens(a.out_dir + "/run-" + std::to_string(g) + "-" + std::to_string(r) + "-tokens.txt", toks);
+                int32_t k = 0;
+                for (const rt::step_info & x : e.last_steps()) {
+                    fprintf(rc, "%zu,%d,%d,%s,%lld,%d,%d,%d,%d,%d,%s,%s,%s,%s,%.4f\n", g, r, k++,
+                            x.kind == 0   ? "bootstrap"
+                            : x.kind == 1 ? "generate"
+                                          : "spec",
+                            static_cast<long long>(x.n_before), x.d, x.a, x.n_out, x.cut ? 1 : 0, x.waits,
+                            ms(x.to_draft_s).c_str(), ms(x.to_verify_s).c_str(), ms(x.to_catchup_s).c_str(),
+                            ms(x.to_one_s).c_str(), x.wall_s * 1e3);
+                }
+                fflush(rc);
+                fflush(stdout);
+                fflush(log);
+            }
+            const auto spread = [](const std::vector<double> & v) {
+                return v.empty() ? 0.0 : *std::max_element(v.begin(), v.end()) - *std::min_element(v.begin(), v.end());
+            };
+            char sum[512];
+            snprintf(sum, sizeof(sum),
+                     "setting %zu over %d runs: median step wall ms median %.4f (max-min %.4f); tokens/s (engine "
+                     "span, (tokens - 1) / span) median %.3f (max-min %.3f); tokens/s (driver, the server's "
+                     "definition) median %.3f (max-min %.3f); tokens equal across runs: %s",
+                     g, a.runs, median_of(med), spread(med), median_of(tps_engine), spread(tps_engine),
+                     median_of(tps_driver), spread(tps_driver), all ? "yes" : "NO");
+            printf("spec run: %s\n", sum);
+            fprintf(log, "%s\n", sum);
+        }
     }
     fclose(rc);
     if (dry) {
@@ -1183,6 +2398,10 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         const int32_t k = a.run_settings.front().sampling.top_k;
         all = run_dry_paths(e, prompt, k > 0 ? k : sp::options().top_k, log) && all;
     }
+    const int32_t captures1 = e.test_target().captures();
+    printf("spec run: ME3 executor: %d graph captures at the end, %d after init (rebuilds)\n", captures1,
+           captures1 - captures0);
+    all = all && captures1 == captures0;
     fclose(log);
     printf("spec run: %s\n", all ? "PASS" : "FAILED");
     return all ? 0 : 1;

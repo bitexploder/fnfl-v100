@@ -58,6 +58,20 @@ void decode_q8_0(const uint8_t * b, float * y) {
     }
 }
 
+// ME1: ggml-quants.c lines 524-549 (the Q5_1 row decoder): 32 values, x d + m with x = nibble | 16 x bit j of qh
+// (value j, low nibble; value j + 16, high nibble with bit j + 16); d at 0, m at 2, qh (u32) at 4, qs at 8
+void decode_q5_1(const uint8_t * b, float * y) {
+    const float d = f16_to_f32(u16_at(b));
+    const float m = f16_to_f32(u16_at(b + 2));
+    const uint32_t qh = u32_at(b + 4);
+    for (int32_t j = 0; j < 16; ++j) {
+        const int32_t x0 = static_cast<int32_t>((b[8 + j] & 0xfu) | (((qh >> j) << 4) & 0x10u));
+        const int32_t x1 = static_cast<int32_t>((b[8 + j] >> 4) | ((qh >> (j + 12)) & 0x10u));
+        y[j] = static_cast<float>(x0) * d + m;
+        y[j + 16] = static_cast<float>(x1) * d + m;
+    }
+}
+
 // ggml-quants.c lines 880-887 (get_scale_min_k4): the 6-bit scale and min j of 8, packed in 12 bytes
 void scale_min_k4(int32_t j, const uint8_t * q, uint32_t & sc, uint32_t & m) {
     if (j < 4) {
@@ -321,6 +335,9 @@ void decode_block(wfmt f, const uint8_t * block, float * out) {
             return;
         case wfmt::q8_0:
             decode_q8_0(block, out);
+            return;
+        case wfmt::q5_1:
+            decode_q5_1(block, out);
             return;
         case wfmt::bf16:
             *out = bf16_to_f32(u16_at(block));

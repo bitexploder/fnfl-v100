@@ -1,4 +1,5 @@
 #include "fn/kernels/qsa/attend.h"
+#include "fn/kernels/qsa/kv_q8.cuh"
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/tc/tc_gemm.cuh"
 #include "fn/model/shapes.h"
@@ -9,6 +10,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <type_traits>
 
 namespace fn::qsa {
 namespace {
@@ -69,8 +72,21 @@ __device__ void norm_rope_pos(float (&y)[8],
     }
 }
 
-// a warp a row: k normed and roped and v, BF16, at the row's cell
-__global__ void __launch_bounds__(256) kv_kernel(const qsp_kv_args a, float theta_scale) {
+// KV8: a row's 8 values quantized (kv8::quantize8, every lane of the warp) to the row's codes and its group's scale
+__device__ __forceinline__ void put_q8(const float (&x)[8], uint16_t * cache, uint16_t * scale, int64_t cell,
+                                       int32_t lane) {
+    uint2 codes;
+    uint16_t sbits = 0;
+    kv8::quantize8(x, codes, sbits);
+    // reason: in q8 the cache array holds int8 codes [cell][256]
+    reinterpret_cast<uint2 *>(reinterpret_cast<int8_t *>(cache) + cell * HD)[lane] = codes;
+    if ((lane & 7) == 0) {
+        scale[cell * kv8::scale_stride + lane / 8] = sbits;
+    }
+}
+
+// a warp a row: k normed and roped and v, BF16 (KV8, Q8: the 8-bit format), at the row's cell
+template <bool Q8> __global__ void __launch_bounds__(256) kv_kernel(const qsp_kv_args a, float theta_scale) {
     const int32_t lane = threadIdx.x & 31;
     const int32_t t    = static_cast<int32_t>(blockIdx.x) * 8 + static_cast<int32_t>(threadIdx.x >> 5);
     if (t >= a.rows) {
@@ -79,20 +95,28 @@ __global__ void __launch_bounds__(256) kv_kernel(const qsp_kv_args a, float thet
     const int64_t cell = int64_t(a.pos0) + t;
     float         y[8];
     norm_rope_pos(y, a.kv_k + int64_t(t) * HD, a.k_norm, a.pos0 + t, theta_scale, lane);
-    uint32_t w[4];
+    if constexpr (Q8) {
+        put_q8(y, a.k_cache, a.k_scale, cell, lane);
+        const float4 v0 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane);
+        const float4 v1 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane + 1);
+        const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+        put_q8(vv, a.v_cache, a.v_scale, cell, lane);
+    } else {
+        uint32_t w[4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        w[i] = bf16_bits(y[2 * i]) | (bf16_bits(y[2 * i + 1]) << 16);
-    }
-    reinterpret_cast<uint4 *>(a.k_cache + cell * HD)[lane] = make_uint4(w[0], w[1], w[2], w[3]);
-    const float4 v0    = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane);
-    const float4 v1    = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane + 1);
-    const float  vv[8] = { v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w };
+        for (int i = 0; i < 4; ++i) {
+            w[i] = bf16_bits(y[2 * i]) | (bf16_bits(y[2 * i + 1]) << 16);
+        }
+        reinterpret_cast<uint4 *>(a.k_cache + cell * HD)[lane] = make_uint4(w[0], w[1], w[2], w[3]);
+        const float4 v0 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane);
+        const float4 v1 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane + 1);
+        const float vv[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        w[i] = bf16_bits(vv[2 * i]) | (bf16_bits(vv[2 * i + 1]) << 16);
+        for (int i = 0; i < 4; ++i) {
+            w[i] = bf16_bits(vv[2 * i]) | (bf16_bits(vv[2 * i + 1]) << 16);
+        }
+        reinterpret_cast<uint4 *>(a.v_cache + cell * HD)[lane] = make_uint4(w[0], w[1], w[2], w[3]);
     }
-    reinterpret_cast<uint4 *>(a.v_cache + cell * HD)[lane] = make_uint4(w[0], w[1], w[2], w[3]);
 }
 
 __device__ __forceinline__ float bf_lo(uint32_t w) {
@@ -147,6 +171,39 @@ __device__ __forceinline__ uint2 bf4_h4(uint2 w) {
     return make_uint2(fn::tc::pack2(bf_lo(w.x), bf_hi(w.x)), fn::tc::pack2(bf_lo(w.y), bf_hi(w.y)));
 }
 
+// KV8: a word's two halves as a half2 and back (the bits unchanged)
+__device__ __forceinline__ __half2 h2_of(uint32_t u) {
+    __half2 h;
+    static_assert(sizeof(h) == 4, "half2 is a word");
+    memcpy(&h, &u, 4);
+    return h;
+}
+
+__device__ __forceinline__ uint32_t u32_of(__half2 h) {
+    uint32_t u = 0;
+    memcpy(&u, &h, 4);
+    return u;
+}
+
+// KV8: one FP16 scale (the low 16 bits of s) in both halves
+__device__ __forceinline__ uint32_t dup_lo(uint32_t s) {
+    return __byte_perm(s, 0u, 0x1010u);
+}
+
+// KV8: 4 codes (one word of the cache, value i in byte i) times their group's FP16 scale s2 (in both halves), in FP16
+// pairs: a biased byte under FP16's exponent byte 0x64 (a PRMT) is 1152 + code exactly; less 1152 (HSUB2) the code
+// exactly (|code| <= 127); times s (HMUL2) code x s rounded once to nearest even. The product is exact before that
+// rounding (8 x 11 significant bits), so this is bit for bit the F32 path's exact float(code) * s rounded once by
+// F2F.F16.F32 (be1aa909's form), subnormal results and overflow to inf alike. No F2F.
+__device__ __forceinline__ uint2 q4_h4(uint32_t w, uint32_t s2) {
+    const uint32_t b = w ^ 0x80808080u;
+    const __half2 bias = h2_of(0x64806480u); // 1152 in both halves
+    const __half2 s = h2_of(s2);
+    const __half2 lo = __hmul2_rn(__hsub2_rn(h2_of(__byte_perm(b, 0x64u, 0x4140u)), bias), s);
+    const __half2 hi = __hmul2_rn(__hsub2_rn(h2_of(__byte_perm(b, 0x64u, 0x4342u)), bias), s);
+    return make_uint2(u32_of(lo), u32_of(hi));
+}
+
 struct tc_smem {
     uint16_t q[m_rows][q_ld];  // F16 q / 16, rows 12..15 zero
     float    s[m_rows][s_ld];  // the tile's scores (-inf past the last cell)
@@ -157,12 +214,19 @@ struct tc_smem {
     int32_t  cell[tc_tile];    // the tile's cells (-1 past the row's last)
 };
 
+// KV8 (attend_kernel<true>): the tile's cells' 4 K and 4 V FP16 scales (zero for a -1 cell), staged with the cells
+struct tc_smem_q8 : tc_smem {
+    uint2 ks[tc_tile];
+    uint2 vs[tc_tile];
+};
+
 // a CTA a row: the row's cells in body order (its blocks' 4 cells each, then its tail) in tiles of 64. S = Q K^T: warp
 // w takes cells 8 w .. 8 w + 7, quadpair qp the k-chunks 4 j + qp, summed across quadpairs (xor 4, 8). The online
 // softmax: thread tid takes row tid / 16, columns 4 (tid % 16) .. + 3. O = O alpha + P V: warp w takes dims 32 w ..,
 // quadpair qp 8 of them. The finish: out = O / l x sigmoid(gate), F32 and FP16.
+template <bool Q8>
 __global__ void __launch_bounds__(at_threads, 2) attend_kernel(const qsp_attend_args a, float theta_scale) {
-    __shared__ tc_smem sm;
+    __shared__ std::conditional_t<Q8, tc_smem_q8, tc_smem> sm;
     const int32_t      t   = static_cast<int32_t>(blockIdx.x);
     const int32_t      tid = static_cast<int32_t>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
     const int32_t      qp  = (lane >> 2) & 3;
@@ -206,22 +270,60 @@ __global__ void __launch_bounds__(at_threads, 2) attend_kernel(const qsp_attend_
                 cell = static_cast<int32_t>(body[2 + nb + (c - 4 * nb)]);
             }
             sm.cell[tid] = cell;
+            if constexpr (Q8) {
+                // KV8: the cell's scales once a tile (8 bytes each), read by the fragments from shared memory
+                uint2 kz = make_uint2(0u, 0u), vz = make_uint2(0u, 0u);
+                if (cell >= 0) {
+                    kz = __ldg(reinterpret_cast<const uint2 *>(a.k_scale + int64_t(cell) * kv8::scale_stride));
+                    vz = __ldg(reinterpret_cast<const uint2 *>(a.v_scale + int64_t(cell) * kv8::scale_stride));
+                }
+                sm.ks[tid] = kz;
+                sm.vs[tid] = vz;
+            }
         }
         __syncthreads();
         // the tile's fragments: K (S: cell 8 warp + fr, dims 16 j + 4 qp ..) and V (P V: cell 4 kc + lane % 4, dims
         // d0 ..), zero past the row's last cell
         const int32_t kcell = sm.cell[8 * warp + fr];
-        const uint2 * kp    = reinterpret_cast<const uint2 *>(a.k_cache + int64_t(max(kcell, 0)) * HD);
         uint2         kb[16], vb[16];
+        if constexpr (Q8) {
+            // KV8: the cell's 4 K scales from the tile's shared copy, then a word of codes a fragment (k-chunk j:
+            // group j / 4); V: a word of codes and the lane's group's scale (dims d0 .. d0 + 3 are group warp / 2),
+            // also from shared memory; each decoded in FP16 pairs (q4_h4)
+            // reason: in q8 the cache arrays hold int8 codes
+            const int8_t * kq = reinterpret_cast<const int8_t *>(a.k_cache);
+            const int8_t * vq = reinterpret_cast<const int8_t *>(a.v_cache);
+            const uint2 sw = sm.ks[8 * warp + fr];
+            const uint32_t ks[kv8::row_groups] = {dup_lo(sw.x), dup_lo(sw.x >> 16), dup_lo(sw.y), dup_lo(sw.y >> 16)};
+            const uint32_t * kp = reinterpret_cast<const uint32_t *>(kq + int64_t(max(kcell, 0)) * HD);
 #pragma unroll
-        for (int32_t j = 0; j < 16; ++j) {
-            kb[j] = kcell >= 0 ? bf4_h4(__ldg(kp + 4 * j + qp)) : make_uint2(0u, 0u);
-        }
+            for (int32_t j = 0; j < 16; ++j) {
+                kb[j] = kcell >= 0 ? q4_h4(__ldg(kp + 4 * j + qp), ks[j / 4]) : make_uint2(0u, 0u);
+            }
+            const int32_t vg = warp / 2;
 #pragma unroll
-        for (int32_t kc = 0; kc < 16; ++kc) {
-            const int32_t vcell = sm.cell[4 * kc + (lane & 3)];
-            vb[kc] = vcell >= 0 ? bf4_h4(__ldg(reinterpret_cast<const uint2 *>(a.v_cache + int64_t(vcell) * HD + d0))) :
-                                  make_uint2(0u, 0u);
+            for (int32_t kc = 0; kc < 16; ++kc) {
+                const int32_t slot = 4 * kc + (lane & 3);
+                const int32_t vcell = sm.cell[slot];
+                // reason: the staged scales as their 4 halves
+                const uint32_t vs = reinterpret_cast<const uint16_t *>(&sm.vs[slot])[vg];
+                vb[kc] = vcell >= 0 ? q4_h4(__ldg(reinterpret_cast<const uint32_t *>(vq + int64_t(vcell) * HD + d0)),
+                                            dup_lo(vs))
+                                    : make_uint2(0u, 0u);
+            }
+        } else {
+            const uint2 * kp = reinterpret_cast<const uint2 *>(a.k_cache + int64_t(max(kcell, 0)) * HD);
+#pragma unroll
+            for (int32_t j = 0; j < 16; ++j) {
+                kb[j] = kcell >= 0 ? bf4_h4(__ldg(kp + 4 * j + qp)) : make_uint2(0u, 0u);
+            }
+#pragma unroll
+            for (int32_t kc = 0; kc < 16; ++kc) {
+                const int32_t vcell = sm.cell[4 * kc + (lane & 3)];
+                vb[kc] = vcell >= 0
+                             ? bf4_h4(__ldg(reinterpret_cast<const uint2 *>(a.v_cache + int64_t(vcell) * HD + d0)))
+                             : make_uint2(0u, 0u);
+            }
         }
         float sc[2][8];
 #pragma unroll
@@ -335,22 +437,34 @@ __global__ void __launch_bounds__(at_threads, 2) attend_kernel(const qsp_attend_
 
 bool qsp_kv(const qsp_kv_args & a, void * stream) {
     if (a.rows < 1 || a.rows > prompt_max_rows || a.pos0 < 0 || a.pos0 + a.rows > a.max_cells || a.kv_k == nullptr ||
-        a.kv_v == nullptr || a.k_norm == nullptr || a.k_cache == nullptr || a.v_cache == nullptr || stream == nullptr) {
+        a.kv_v == nullptr || a.k_norm == nullptr || a.k_cache == nullptr || a.v_cache == nullptr || stream == nullptr ||
+        (a.k_scale == nullptr) != (a.v_scale == nullptr)) {
         fprintf(stderr, "qsp_kv: rejected\n");
         return false;
     }
-    kv_kernel<<<(a.rows + 7) / 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(a, attn::rope_theta_scale());
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (a.k_scale != nullptr) {
+        kv_kernel<true><<<(a.rows + 7) / 8, 256, 0, st>>>(a, attn::rope_theta_scale());
+    } else {
+        kv_kernel<false><<<(a.rows + 7) / 8, 256, 0, st>>>(a, attn::rope_theta_scale());
+    }
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
 bool qsp_attend(const qsp_attend_args & a, void * stream) {
     if (a.rows < 1 || a.rows > prompt_max_rows || a.pos0 < 0 || a.pos0 + a.rows > a.max_cells || a.qfull == nullptr ||
         a.q_norm == nullptr || a.body == nullptr || a.offsets == nullptr || a.k_cache == nullptr ||
-        a.v_cache == nullptr || a.out16 == nullptr || stream == nullptr) {
+        a.v_cache == nullptr || a.out16 == nullptr || stream == nullptr ||
+        (a.k_scale == nullptr) != (a.v_scale == nullptr)) {
         fprintf(stderr, "qsp_attend: rejected\n");
         return false;
     }
-    attend_kernel<<<a.rows, at_threads, 0, static_cast<cudaStream_t>(stream)>>>(a, attn::rope_theta_scale());
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (a.k_scale != nullptr) {
+        attend_kernel<true><<<a.rows, at_threads, 0, st>>>(a, attn::rope_theta_scale());
+    } else {
+        attend_kernel<false><<<a.rows, at_threads, 0, st>>>(a, attn::rope_theta_scale());
+    }
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
@@ -358,9 +472,13 @@ bool qsp_kernel_resources(int32_t which, qsp_resources & r) {
     cudaFuncAttributes at = {};
     cudaError_t        e  = cudaErrorInvalidValue;
     if (which == 1) {
-        e = cudaFuncGetAttributes(&at, attend_kernel);
+        e = cudaFuncGetAttributes(&at, attend_kernel<false>);
     } else if (which == 2) {
-        e = cudaFuncGetAttributes(&at, kv_kernel);
+        e = cudaFuncGetAttributes(&at, kv_kernel<false>);
+    } else if (which == 3) {
+        e = cudaFuncGetAttributes(&at, attend_kernel<true>);
+    } else if (which == 4) {
+        e = cudaFuncGetAttributes(&at, kv_kernel<true>);
     }
     if (e != cudaSuccess) {
         return false;

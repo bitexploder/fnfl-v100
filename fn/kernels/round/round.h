@@ -14,13 +14,16 @@
 //           descriptor and the committed slot from state::cur (version.h); the decision writes desc::argmax.
 //   commit  (SR1) every versioned object makes logical version k current, k = N_after - N_before from the descriptor's
 //           kind (FC-RD3: forced B, generate 1, bootstrap 0; the test-only forced_k its test_k), only when every listed
-//           error word is clear (FC-RD2): state::cur <- version_slot(cur, k), one word. Nothing is copied, so the
+//           error word is clear (FC-RD2): state::cur <- version_slot(cur, k) and, ME11, state::gdn <-
+//           gdn_after_round(gdn, k) (version.h), from the same thread; k = 0 leaves both. A selector outside the
+//           contract sets err_gdn_sel and nothing is committed. Nothing is copied, so the
 //           pre-step contents (slot cur before the commit) and the round's other versions survive until the next
 //           round writes over them, which is after the step's acknowledgment (FC-ST2, RS1 section 3).
 //   finish  sets desc::out and n_out by kind (generate and bootstrap: out[0] = argmax[0]; verify: the decision's
 //           out[0 .. a] and n_out = a + 1, unchanged, SP1), then writes the completion
 //           record into mapped host memory: outputs, argmax, error words, stamps and cur, then (after a system fence)
-//           its round number, which the host polls (FC-RD2's completion).
+//           its round number, which the host polls (FC-RD2's completion). ME11: the record carries the selector beside
+//           cur.
 //
 // Who writes cur: this card's commit node, in stream order after every reader of the round, and the host between
 // rounds (a truncate within the last step, or the restore after a recoverable error on either card), when no round is
@@ -35,7 +38,7 @@
 //             one) is seen (FC-G8: a round's inputs do not change while it is in flight). A flag not reached within
 //             start_timeout_ns sets err_poll_start; a slot whose round differs from the counter sets err_round. Both
 //             mean the round's commit does not take effect (commit reads the error word).
-//   numerics: exact copies; cur in 0..5.
+//   numerics: exact copies; cur in 0..5; gdn a word gdn_valid accepts.
 //   budget:   begin, commit and finish: one warp; stamp: one thread.
 //   floor:    commit reads the listed error words and the descriptor and writes one word: launch-bound (under the 1.95 us
 //             ramp HX12 measured for a launch [E]). TG1's copy moved about 59 MB a card (floor about 116 us [A]).
@@ -103,8 +106,10 @@ struct state {
     uint64_t t_end;      // %globaltimer in finish
     uint64_t t_logits;   // SM1: %globaltimer after the logits (stamp_logits; the decision's start in context)
     uint32_t cur;        // SR1: the committed version's physical slot, 0..5 (version.h)
-    uint32_t pad[3];
+    uint32_t gdn;        // ME11: the GDN state's selector (version.h gdn_word), in a former pad word
+    uint32_t pad[2];
 };
+static_assert(sizeof(state) == 56, "ME11: the selector takes a pad word; the round state keeps its size");
 
 // the completion record in mapped host memory, one a card; round is written last
 struct done {
@@ -116,6 +121,7 @@ struct done {
     int32_t argmax[max_rows];
     uint32_t err[max_err]; // the listed error words at finish (0: the card's exchange word)
     uint32_t cur;          // SR1: state::cur after the commit
+    uint32_t gdn;          // ME11: state::gdn after the commit
 };
 
 struct begin_args {
@@ -153,6 +159,10 @@ bool finish(const finish_args & a, void * stream);
 // cur <- version_slot(cur, k) on the device, in stream order: the commit of k (0..5) outside the round frame, for
 // layer-test's runner and the kernel tests (gd-test, ple-test). One thread.
 bool advance(uint32_t * cur, int32_t k, void * stream);
+// ME11: the same with the GDN selector: for k >= 1, gdn <- gdn_after_round(gdn, k) (a target step, prompt false) or
+// gdn_after_prompt(gdn) (a prompt chunk of k halves, prompt true); a selector outside the contract is left unchanged
+// (the caller's read-back finds it). The prompt path's publication (target::prompt_commit) and layer-test's runner.
+bool advance(uint32_t * cur, uint32_t * gdn, int32_t k, bool prompt, void * stream);
 
 // k = N_after - N_before of a round kind with rows B (FC-RD3); verify takes a + 1, forced_k test_k (host mirror of the
 // device rule)

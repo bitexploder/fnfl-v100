@@ -3,6 +3,7 @@
 #include "fn/borrowed/gguf_tensors.h"
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/gdn/gdn.h"
+#include "fn/kernels/gdn/gdn_ref.h"
 #include "fn/kernels/round/round.h"
 #include "fn/kernels/round/version.h"
 #include "fn/model/placement.h"
@@ -563,26 +564,42 @@ struct card_gpu {
     dev_buf alpha{size_t(gd::max_rows) * gd::n_head * 4}, beta{size_t(gd::max_rows) * gd::n_head * 4};
     dev_buf conv{size_t(gd::n_channel) * gd::n_tap * 4}, dt{size_t(gd::n_head) * 4}, a{size_t(gd::n_head) * 4},
         norm{size_t(S) * 4};
-    dev_buf state{size_t(gd::n_version) * gd::state_version_floats * 4};
+    // ME11: the compact state, two banks and two record sets (gdn.h)
+    dev_buf state{size_t(gd::n_bank) * gd::state_version_floats * 4};
+    dev_buf rec{size_t(gd::n_rec_set) * gd::rec_set_floats * 4};
     dev_buf hist{size_t(gd::n_version) * gd::hist_version_floats * 4};
     dev_buf gated{size_t(gd::max_rows) * gd::n_value * 4};
     dev_buf codes{fn::act::codes_bytes(gd::max_rows, gd::n_value)};
     dev_buf scales{fn::act::scales_bytes(gd::max_rows, gd::n_value)};
     dev_buf ws{gd::workspace_bytes()};
-    dev_buf cur{4};          // the committed slot (SR1)
-    uint32_t cur_h = 0;      // its host mirror
+    dev_buf cur{8};          // the committed slot (SR1), then the GDN selector (ME11)
+    uint32_t cur_h = 0;      // their host mirrors
+    uint32_t gsel_h = 0;
     uint32_t slots_seen = 0; // bit s: a launch ran with the committed slot at s
+    uint32_t orient_seen = 0; // ME11: bit bank + 2 set: a launch ran from that bank and record set
+    // ME11 test reference (gdn_ref.h): the pre-ME11 kernel's six versions, its slot word and outputs
+    dev_buf ref_state{size_t(gd::n_version) * gd::state_version_floats * 4};
+    dev_buf ref_cur{4};
+    dev_buf ref_gated{size_t(gd::max_rows) * gd::n_value * 4};
+    dev_buf ref_codes{fn::act::codes_bytes(gd::max_rows, gd::n_value)};
+    dev_buf ref_scales{fn::act::scales_bytes(gd::max_rows, gd::n_value)};
+    uint32_t ref_cur_h = 0;
 
     bool ready() const {
         return st != nullptr && qkv.p && cv.p && z.p && alpha.p && beta.p && conv.p && dt.p && a.p && norm.p &&
-               state.p && hist.p && gated.p && codes.p && scales.p && ws.p && cur.p;
+               state.p && rec.p && hist.p && gated.p && codes.p && scales.p && ws.p && cur.p && ref_state.p &&
+               ref_cur.p && ref_gated.p && ref_codes.p && ref_scales.p;
     }
-    // logical version v's slot (fn::round::version_slot)
-    float * state_v(int32_t v) const {
-        return state.f() + fn::round::version_slot(cur_h, v) * gd::state_version_floats;
-    }
+    float * bank(int32_t b) const { return state.f() + b * gd::state_version_floats; }
+    float * rec_set(int32_t r) const { return rec.f() + r * gd::rec_set_floats; }
+    // the committed bank: the committed matrix when the selector has no steps
+    float * state_v0() const { return bank(fn::round::gdn_bank(gsel_h)); }
     float * hist_v(int32_t v) const { return hist.f() + fn::round::version_slot(cur_h, v) * gd::hist_version_floats; }
+    float * ref_v(int32_t v) const {
+        return ref_state.f() + fn::round::version_slot(ref_cur_h, v) * gd::state_version_floats;
+    }
     const uint32_t * cur_word() const { return static_cast<const uint32_t *>(cur.p); }
+    const uint32_t * gsel_word() const { return cur_word() + 1; }
 };
 
 bool put(void * dst, const void * src, size_t n, cudaStream_t st) {
@@ -626,7 +643,8 @@ bool run_kernel(card_gpu & g, int32_t rows) {
     a.a = g.a.f();
     a.norm_w = g.norm.f();
     a.state = g.state.f();
-    a.cur = g.cur_word();
+    a.rec = g.rec.f();
+    a.gsel = g.gsel_word();
     a.gated = g.gated.f();
     a.gated_q = {static_cast<int8_t *>(g.codes.p), g.scales.f(), rows, gd::n_value};
     a.ws = g.ws.p;
@@ -636,31 +654,65 @@ bool run_kernel(card_gpu & g, int32_t rows) {
         return false;
     }
     g.slots_seen |= 1u << g.cur_h;
+    g.orient_seen |= 1u << (fn::round::gdn_bank(g.gsel_h) + 2 * fn::round::gdn_set(g.gsel_h));
     return cuda_ok(cudaStreamSynchronize(g.st), "gdn_core");
 }
 
-// the committed slot set from the host (SR1: the short cases start each case at another slot)
-bool set_cur(card_gpu & g, uint32_t cur) {
+// ME11: the pre-ME11 kernel on the same convolution output and inputs (gdn_ref.h), into its own state and outputs
+bool run_ref(card_gpu & g, int32_t rows) {
+    gd::ref::core_ref_args a;
+    a.conv = g.cv.f();
+    a.z = g.z.f();
+    a.alpha = g.alpha.f();
+    a.beta = g.beta.f();
+    a.dt = g.dt.f();
+    a.a = g.a.f();
+    a.norm_w = g.norm.f();
+    a.state = g.ref_state.f();
+    a.cur = static_cast<const uint32_t *>(g.ref_cur.p);
+    a.gated = g.ref_gated.f();
+    a.gated_q = {static_cast<int8_t *>(g.ref_codes.p), g.ref_scales.f(), rows, gd::n_value};
+    a.ws = g.ws.p;
+    a.rows = rows;
+    if (!gd::ref::core_ref(a, g.st)) {
+        fprintf(stderr, "gd-test: the reference not enqueued: %s\n", cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    return cuda_ok(cudaStreamSynchronize(g.st), "reference");
+}
+
+// the committed slot and the GDN selector set from the host (SR1: the short cases start each case at another slot;
+// ME11: and another bank and record set)
+bool set_cur(card_gpu & g, uint32_t cur, uint32_t gsel = 0) {
     g.cur_h = cur;
-    return cuda_ok(cudaMemcpyAsync(g.cur.p, &g.cur_h, 4, cudaMemcpyHostToDevice, g.st), "cur") &&
+    g.gsel_h = gsel;
+    const uint32_t w[2] = {cur, gsel};
+    return cuda_ok(cudaMemcpyAsync(g.cur.p, w, 8, cudaMemcpyHostToDevice, g.st), "cur") &&
            cuda_ok(cudaStreamSynchronize(g.st), "cur");
 }
 
 // the commit (SR1, fn::round::advance as layer-test's runner does it): logical version c becomes the committed one by
-// moving the slot word; the device word is checked against the host mirror
+// moving the slot word and (ME11) the GDN selector; the device words are checked against the host mirrors
 bool commit(card_gpu & g, int32_t c) {
-    uint32_t got = 0;
+    uint32_t got[2] = {0, 0};
     g.cur_h = static_cast<uint32_t>(fn::round::version_slot(g.cur_h, c));
-    return (fn::round::advance(static_cast<uint32_t *>(g.cur.p), c, g.st) ? true
-                                                                          : cuda_ok(cudaGetLastError(), "commit")) &&
-           cuda_ok(cudaMemcpyAsync(&got, g.cur.p, 4, cudaMemcpyDeviceToHost, g.st), "cur") &&
-           cuda_ok(cudaStreamSynchronize(g.st), "commit") && got == g.cur_h;
+    g.gsel_h = c >= 1 ? fn::round::gdn_after_round(g.gsel_h, c) : g.gsel_h;
+    uint32_t * w = static_cast<uint32_t *>(g.cur.p);
+    return (fn::round::advance(w, w + 1, c, false, g.st) ? true : cuda_ok(cudaGetLastError(), "commit")) &&
+           cuda_ok(cudaMemcpyAsync(got, g.cur.p, 8, cudaMemcpyDeviceToHost, g.st), "cur") &&
+           cuda_ok(cudaStreamSynchronize(g.st), "commit") && got[0] == g.cur_h && got[1] == g.gsel_h;
+}
+
+// ME11: the selector's steps dropped (bank and set kept) after the committed matrix is written to its bank by the host
+bool set_plain(card_gpu & g) {
+    return set_cur(g, g.cur_h, fn::round::gdn_word(fn::round::gdn_bank(g.gsel_h), fn::round::gdn_set(g.gsel_h), 0));
 }
 
 // what one launch wrote
 struct step_result {
     std::vector<float> gated, scales, state, hist, conv; // state and hist: versions 1..rows; conv [rows][5120]
     std::vector<int8_t> codes;
+    std::vector<float> pre, recs; // ME11: the bank the launch stored (its pre-step matrix) and its record set
 };
 
 bool get_result(card_gpu & g, int32_t rows, bool versions, step_result & r) {
@@ -673,16 +725,23 @@ bool get_result(card_gpu & g, int32_t rows, bool versions, step_result & r) {
               get(r.scales.data(), g.scales.p, r.scales.size() * 4, g.st) &&
               get(r.conv.data(), g.cv.p, r.conv.size() * 4, g.st);
     if (versions) {
+        // ME11: the launch's pre-step bank and record set (from the selector it ran with, still g.gsel_h); version v
+        // is that bank with the first v records replayed (gdn_ref.h's replay_host, the device's own operations)
         r.state.resize(size_t(rows) * gd::state_version_floats);
         r.hist.resize(size_t(rows) * gd::hist_version_floats);
+        r.pre.resize(size_t(gd::state_version_floats));
+        r.recs.resize(size_t(gd::rec_set_floats));
+        ok = ok && get(r.pre.data(), g.bank(fn::round::gdn_bank_of(g.gsel_h, 1)), r.pre.size() * 4, g.st) &&
+             get(r.recs.data(), g.rec_set(1 - fn::round::gdn_set(g.gsel_h)), r.recs.size() * 4, g.st);
         for (int32_t v = 1; ok && v <= rows; ++v) {
-            ok = get(r.state.data() + size_t(v - 1) * gd::state_version_floats, g.state_v(v),
-                     size_t(gd::state_version_floats) * 4, g.st) &&
-                 get(r.hist.data() + size_t(v - 1) * gd::hist_version_floats, g.hist_v(v),
+            ok = get(r.hist.data() + size_t(v - 1) * gd::hist_version_floats, g.hist_v(v),
                      size_t(gd::hist_version_floats) * 4, g.st);
         }
     }
     ok = ok && cuda_ok(cudaStreamSynchronize(g.st), "download");
+    for (int32_t v = 1; ok && versions && v <= rows; ++v) {
+        gd::ref::replay_host(r.pre.data(), r.recs.data(), v, r.state.data() + size_t(v - 1) * gd::state_version_floats);
+    }
     const std::string t = "gd-B" + std::to_string(rows) + "-cur" + std::to_string(g.cur_h);
     return ok && fn::tools::test_dump(t + "-gated", r.gated.data(), r.gated.size() * 4) &&
            fn::tools::test_dump(t + "-codes", r.codes.data(), r.codes.size()) &&
@@ -793,16 +852,21 @@ bool short_cases(card_gpu & g, int32_t layer, const layer_weights & w, worst & w
             }
             step_result res[2];
             // SR1: each case and rerun starts at another committed slot, so every reader runs at all five; every
-            // other slot is poisoned
+            // other slot is poisoned. ME11: and from each bank and record set in turn (no records: the state is
+            // the bank's); the other bank and both record sets are poisoned, so a record element the launch does
+            // not write shows as NaN in a replayed version
             for (int32_t rep = 0; rep < 2 && ok; ++rep) {
-                ok = set_cur(g, static_cast<uint32_t>((2 * (edge * gd::max_rows + rows - 1) + rep) % gd::n_version)) &&
-                     put(g.state_v(0), state.data(), state.size() * 4, g.st) &&
+                const int32_t o = edge * gd::max_rows + rows - 1 + rep;
+                ok = set_cur(g, static_cast<uint32_t>((2 * (edge * gd::max_rows + rows - 1) + rep) % gd::n_version),
+                             fn::round::gdn_word(o & 1, (o >> 1) & 1, 0)) &&
+                     cuda_ok(cudaMemsetAsync(g.state.p, 0xff, g.state.n, g.st), "poison") &&
+                     cuda_ok(cudaMemsetAsync(g.rec.p, 0xff, g.rec.n, g.st), "poison") &&
+                     put(g.state_v0(), state.data(), state.size() * 4, g.st) &&
                      put(g.hist_v(0), hist.data(), hist.size() * 4, g.st) && put_inputs(g, in) &&
                      cuda_ok(cudaMemsetAsync(g.gated.p, 0xff, g.gated.n, g.st), "poison") &&
                      cuda_ok(cudaMemsetAsync(g.codes.p, 0x5a, g.codes.n, g.st), "poison");
                 for (int32_t v = 1; ok && v < gd::n_version; ++v) {
-                    ok = cuda_ok(cudaMemsetAsync(g.state_v(v), 0xff, gd::state_version_floats * 4, g.st), "poison") &&
-                         cuda_ok(cudaMemsetAsync(g.hist_v(v), 0xff, gd::hist_version_floats * 4, g.st), "poison");
+                    ok = cuda_ok(cudaMemsetAsync(g.hist_v(v), 0xff, gd::hist_version_floats * 4, g.st), "poison");
                 }
                 ok = ok && run_kernel(g, rows) && get_result(g, rows, true, res[rep]);
             }
@@ -812,6 +876,9 @@ bool short_cases(card_gpu & g, int32_t layer, const layer_weights & w, worst & w
             check_outputs(where, res[0].gated.data(), r64, r32, rows, gd::n_head, wr);
             check_conv(where, res[0].conv.data(), r64, r32, rows, wr);
             check_states(where, res[0].state.data(), r64, r32, rows, gd::n_head, wr);
+            if (memcmp(res[0].pre.data(), state.data(), state.size() * 4) != 0) {
+                wr.fail(where + ": the stored pre-step bank is not the committed state (ME11)");
+            }
             if (memcmp(res[0].hist.data(), r64.hist.data(), r64.hist.size() * 4) != 0) {
                 wr.fail(where + ": history versions differ from the reference");
             }
@@ -849,8 +916,8 @@ bool short_cases(card_gpu & g, int32_t layer, const layer_weights & w, worst & w
 // check_every steps, and the committed state and history at the end.
 bool chained(card_gpu & g, int32_t layer, const layer_weights & w, int32_t positions,
              const std::vector<int32_t> & cycle, int32_t check_every, const char * name, worst & wr) {
-    if (!put_weights(g, w) ||
-        !cuda_ok(cudaMemsetAsync(g.state_v(0), 0, gd::state_version_floats * 4, g.st), "zero state") ||
+    if (!put_weights(g, w) || !set_plain(g) ||
+        !cuda_ok(cudaMemsetAsync(g.state_v0(), 0, gd::state_version_floats * 4, g.st), "zero state") ||
         !cuda_ok(cudaMemsetAsync(g.hist_v(0), 0, gd::hist_version_floats * 4, g.st), "zero history")) {
         return false;
     }
@@ -911,10 +978,10 @@ bool chained(card_gpu & g, int32_t layer, const layer_weights & w, int32_t posit
         pos += c;
         ++step;
     }
-    // the committed state and history at the end
+    // the committed state (ME11: the selector's bank with its records replayed) and history at the end
     std::vector<float> st(gd::state_version_floats), hi(gd::hist_version_floats);
-    if (!get(st.data(), g.state_v(0), st.size() * 4, g.st) || !get(hi.data(), g.hist_v(0), hi.size() * 4, g.st) ||
-        !cuda_ok(cudaStreamSynchronize(g.st), "download")) {
+    if (!get(hi.data(), g.hist_v(0), hi.size() * 4, g.st) || !cuda_ok(cudaStreamSynchronize(g.st), "download") ||
+        !gd::ref::read_committed(g.state.f(), g.rec.f(), g.gsel_h, st)) {
         return false;
     }
     ref_out<double> e64;
@@ -977,8 +1044,9 @@ bool mapping(card_gpu & g, int32_t card, int32_t layer, const layer_weights & wg
                       gs.begin() + std::ptrdiff_t(m.head[l] + 1) * S * S, cs.begin() + std::ptrdiff_t(l) * S * S);
         }
         step_result res;
-        ok = put(g.state_v(0), cs.data(), cs.size() * 4, g.st) && put(g.hist_v(0), ch.data(), ch.size() * 4, g.st) &&
-             put_inputs(g, ci) && run_kernel(g, rows) && get_result(g, rows, true, res);
+        ok = set_plain(g) && put(g.state_v0(), cs.data(), cs.size() * 4, g.st) &&
+             put(g.hist_v(0), ch.data(), ch.size() * 4, g.st) && put_inputs(g, ci) && run_kernel(g, rows) &&
+             get_result(g, rows, true, res);
         if (!ok) {
             return false;
         }
@@ -1030,7 +1098,8 @@ bool invariance(card_gpu & g, int32_t layer, const layer_weights & w, worst & wr
     std::vector<float> out[2], sc[2], st[2], hi[2];
     std::vector<int8_t> cd[2];
     for (int32_t run = 0; run < 2; ++run) {
-        if (!cuda_ok(cudaMemsetAsync(g.state_v(0), 0, gd::state_version_floats * 4, g.st), "zero state") ||
+        if (!set_plain(g) ||
+            !cuda_ok(cudaMemsetAsync(g.state_v0(), 0, gd::state_version_floats * 4, g.st), "zero state") ||
             !cuda_ok(cudaMemsetAsync(g.hist_v(0), 0, gd::hist_version_floats * 4, g.st), "zero history")) {
             return false;
         }
@@ -1058,9 +1127,9 @@ bool invariance(card_gpu & g, int32_t layer, const layer_weights & w, worst & wr
         }
         st[run].resize(gd::state_version_floats);
         hi[run].resize(gd::hist_version_floats);
-        if (!get(st[run].data(), g.state_v(0), st[run].size() * 4, g.st) ||
-            !get(hi[run].data(), g.hist_v(0), hi[run].size() * 4, g.st) ||
-            !cuda_ok(cudaStreamSynchronize(g.st), "download")) {
+        if (!get(hi[run].data(), g.hist_v(0), hi[run].size() * 4, g.st) ||
+            !cuda_ok(cudaStreamSynchronize(g.st), "download") ||
+            !gd::ref::read_committed(g.state.f(), g.rec.f(), g.gsel_h, st[run])) {
             return false;
         }
     }
@@ -1078,6 +1147,110 @@ bool invariance(card_gpu & g, int32_t layer, const layer_weights & w, worst & wr
     return true;
 }
 
+// ME11: the compact state against the pre-ME11 kernel (gdn_ref.h), bitwise. A chain of rounds from one random state:
+// for B = 1..5 and every k = 0..B, a round of B rows (both kernels on the same convolution output and inputs, the
+// edge rows in turn), then the commit of k (k = 0: the zero-version commit, the selector unchanged), and a last round.
+// Each round: the outputs (F32, codes, scales) bitwise; the bank the round stored (the device's replay of the previous
+// round's k records, its materialized start) bitwise the reference's version 0; and every accepted prefix v = 1..B,
+// the host replay of the round's records, bitwise the reference's version v. Both record sets start poisoned (NaN).
+bool replay_chain(card_gpu & g, int32_t layer, const layer_weights & w, int32_t start_bank, int32_t max_b, worst & wr) {
+    if (!put_weights(g, w)) {
+        return false;
+    }
+    std::mt19937_64 rng(0x6744314a40ull + uint64_t(layer) * 3 + uint64_t(start_bank));
+    std::vector<float> state, hist;
+    gen_state(rng, gd::state_version_floats, gd::hist_version_floats, state, hist);
+    g.ref_cur_h = static_cast<uint32_t>(start_bank + 2);
+    if (!set_cur(g, static_cast<uint32_t>(start_bank), fn::round::gdn_word(start_bank, 0, 0)) ||
+        !cuda_ok(cudaMemsetAsync(g.state.p, 0xff, g.state.n, g.st), "poison") ||
+        !cuda_ok(cudaMemsetAsync(g.rec.p, 0xff, g.rec.n, g.st), "poison") ||
+        !put(g.state_v0(), state.data(), state.size() * 4, g.st) ||
+        !put(g.hist_v(0), hist.data(), hist.size() * 4, g.st) ||
+        !put(g.ref_cur.p, &g.ref_cur_h, 4, g.st) || !put(g.ref_v(0), state.data(), state.size() * 4, g.st) ||
+        !cuda_ok(cudaStreamSynchronize(g.st), "upload")) {
+        return false;
+    }
+    std::vector<std::pair<int32_t, int32_t>> plan; // (B, k)
+    for (int32_t b = 1; b <= max_b; ++b) {
+        for (int32_t k = 0; k <= b; ++k) {
+            plan.emplace_back(b, k);
+        }
+    }
+    plan.emplace_back(max_b, 0); // the last round checks the last commit's replay
+    int32_t same_out = 0, same_pre = 0, prefixes = 0, same_prefix = 0, round = 0;
+    const size_t sv = size_t(gd::state_version_floats);
+    std::vector<float> ref(sv), rg, rsc;
+    std::vector<int8_t> rcd;
+    for (const auto & [rows, k] : plan) {
+        step_inputs in;
+        gen_inputs(rng, card_shape, rows, in);
+        const int32_t edge = round % 5;
+        for (int32_t b = 0; b < rows; ++b) {
+            for (int32_t h = 0; h < gd::n_head; ++h) {
+                const double sp = -100.0 / double(w.a[h]);
+                const double x = sp > 20.0 ? sp : std::log(std::expm1(sp));
+                float & al = in.alpha[size_t(b) * gd::n_head + h];
+                al = edge == 2 ? float(x - double(w.dt[h])) : edge == 3 ? -30.0f - w.dt[h] : al;
+            }
+        }
+        if (edge == 1) {
+            for (float & x : in.qkv) {
+                x *= 1e3f;
+            }
+        }
+        step_result res;
+        if (!put_inputs(g, in) || !run_kernel(g, rows) || !run_ref(g, rows) || !get_result(g, rows, true, res)) {
+            return false;
+        }
+        rg.resize(size_t(rows) * gd::n_value);
+        rcd.resize(res.codes.size());
+        rsc.resize(res.scales.size());
+        bool ok = get(rg.data(), g.ref_gated.p, rg.size() * 4, g.st) &&
+                  get(rcd.data(), g.ref_codes.p, rcd.size(), g.st) &&
+                  get(rsc.data(), g.ref_scales.p, rsc.size() * 4, g.st) && get(ref.data(), g.ref_v(0), sv * 4, g.st) &&
+                  cuda_ok(cudaStreamSynchronize(g.st), "download");
+        if (!ok) {
+            return false;
+        }
+        const std::string where = "replay L" + std::to_string(layer) + " bank " + std::to_string(start_bank) +
+                                  " round " + std::to_string(round) + " (B" + std::to_string(rows) + ", commit " +
+                                  std::to_string(k) + ")";
+        if (memcmp(rg.data(), res.gated.data(), rg.size() * 4) == 0 && rcd == res.codes &&
+            memcmp(rsc.data(), res.scales.data(), rsc.size() * 4) == 0) {
+            ++same_out;
+        } else {
+            wr.fail(where + ": the outputs differ from the pre-ME11 kernel's");
+        }
+        if (memcmp(ref.data(), res.pre.data(), sv * 4) == 0) {
+            ++same_pre;
+        } else {
+            wr.fail(where + ": the stored pre-step matrix (the device replay) differs from the reference's version 0");
+        }
+        for (int32_t v = 1; v <= rows; ++v) {
+            ++prefixes;
+            if (!get(ref.data(), g.ref_v(v), sv * 4, g.st) || !cuda_ok(cudaStreamSynchronize(g.st), "download")) {
+                return false;
+            }
+            if (memcmp(ref.data(), res.state.data() + size_t(v - 1) * sv, sv * 4) == 0) {
+                ++same_prefix;
+            } else {
+                wr.fail(where + ": accepted prefix " + std::to_string(v) + " differs from the reference's version");
+            }
+        }
+        g.ref_cur_h = static_cast<uint32_t>(fn::round::version_slot(g.ref_cur_h, k));
+        if (!commit(g, k) || !put(g.ref_cur.p, &g.ref_cur_h, 4, g.st) ||
+            !cuda_ok(cudaStreamSynchronize(g.st), "commit")) {
+            fprintf(stderr, "gd-test: %s: commit\n", where.c_str());
+            return false;
+        }
+        ++round;
+    }
+    printf("gd-test: replay L%d from bank %d set 0: %d rounds (B 1..%d, every commit 0..B): outputs bitwise %d/%d, "
+           "stored pre-step matrix (device replay) bitwise %d/%d, accepted prefixes (host replay) bitwise %d/%d\n",
+           layer, start_bank, round, max_b, same_out, round, same_pre, round, same_prefix, prefixes);
+    return true;
+}
+
 // arguments outside the contract are rejected with nothing enqueued
 bool rejects(card_gpu & g) {
     gd::core_args a;
@@ -1089,13 +1262,16 @@ bool rejects(card_gpu & g) {
     a.a = g.a.f();
     a.norm_w = g.norm.f();
     a.state = g.state.f();
-    a.cur = g.cur_word();
+    a.rec = g.rec.f();
+    a.gsel = g.gsel_word();
     a.gated = g.gated.f();
     a.gated_q = {static_cast<int8_t *>(g.codes.p), g.scales.f(), 1, gd::n_value};
     a.ws = g.ws.p;
     a.rows = 1;
-    gd::core_args r0 = a, r6 = a, mis = a, nul = a, qk = a, nocur = a;
-    nocur.cur = nullptr;
+    gd::core_args r0 = a, r6 = a, mis = a, nul = a, qk = a, nocur = a, norec = a, overlap = a;
+    nocur.gsel = nullptr;
+    norec.rec = nullptr;
+    overlap.rec = g.state.f() + gd::state_version_floats; // ME11: the records inside the second bank
     r0.rows = 0;
     r6.rows = 6; // SP2: rows 1..5
     r6.gated_q.rows = 6;
@@ -1116,8 +1292,9 @@ bool rejects(card_gpu & g) {
     c2.cur = nullptr;
     const bool rej = !gd::core(r0, g.st) && !gd::core(r6, g.st) && !gd::core(mis, g.st) && !gd::core(nul, g.st) &&
                      !gd::core(nocur, g.st) && !gd::conv_silu(c2, g.st) && !gd::core(qk, g.st) &&
-                     !gd::core(a, nullptr) && !gd::conv_silu(c, g.st) && !gd::conv_silu(c1, g.st);
-    printf("gd-test: rejected arguments: %s\n", rej ? "all eight rejected" : "FAIL");
+                     !gd::core(a, nullptr) && !gd::conv_silu(c, g.st) && !gd::conv_silu(c1, g.st) &&
+                     !gd::core(norec, g.st) && !gd::core(overlap, g.st);
+    printf("gd-test: rejected arguments: %s\n", rej ? "all twelve rejected" : "FAIL");
     return rej && cuda_ok(cudaStreamSynchronize(g.st), "sync");
 }
 
@@ -1126,8 +1303,8 @@ bool rejects(card_gpu & g) {
 int fnfl_gd_test(int device, const char * mode, const char * model) {
     const std::string md = mode;
     const bool all = md == "all", san = md == "san";
-    if (!all && !san && md != "short" && md != "chain" && md != "map" && md != "inv") {
-        fprintf(stderr, "gd-test: mode is all, short, chain, map, inv or san\n");
+    if (!all && !san && md != "short" && md != "chain" && md != "map" && md != "inv" && md != "replay") {
+        fprintf(stderr, "gd-test: mode is all, short, chain, map, inv, replay or san\n");
         return 2;
     }
     if (device != 0 && device != 1) {
@@ -1196,8 +1373,20 @@ int fnfl_gd_test(int device, const char * mode, const char * model) {
         if (ok && (all || md == "inv")) {
             ok = invariance(g, 10, wc[0], wr) && invariance(g, 40, wc[1], wr);
         }
+        if (ok && (all || md == "replay")) {
+            // ME11: from bank 0 and from bank 1 (set 0 both): every bank and set orientation (the round flips both)
+            ok = replay_chain(g, 10, wc[0], 0, gd::max_rows, wr) && replay_chain(g, 10, wc[0], 1, gd::max_rows, wr) &&
+                 replay_chain(g, 40, wc[1], 0, gd::max_rows, wr) && replay_chain(g, 40, wc[1], 1, gd::max_rows, wr);
+            if (ok) {
+                printf("gd-test: bank and record-set orientations the launches ran from: %d of 4 (ME11)\n",
+                       __builtin_popcount(g.orient_seen));
+                if (g.orient_seen != 15u) {
+                    wr.fail("the launches did not run from every bank and record set");
+                }
+            }
+        }
         if (ok && san) {
-            ok = chained(g, 10, wc[0], 64, {1, 3}, 1, "san", wr);
+            ok = chained(g, 10, wc[0], 64, {1, 3}, 1, "san", wr) && replay_chain(g, 10, wc[0], 1, 3, wr);
         }
         // SR1: the readers ran at every committed slot
         if (ok && (all || md == "short")) {

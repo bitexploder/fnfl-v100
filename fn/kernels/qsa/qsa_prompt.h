@@ -28,6 +28,13 @@
 //                FP16, S = Q K^T and O = P V by HMMA.884 with F32 accumulators, the online softmax F32 (expf), P
 //                rounded to FP16 (the sum l of the rounded P). Check (qsp-test): against FP64 at a loose bug-check
 //                tolerance for selection, mask and layout errors.
+// KV8 (--fnfl-kv-format q8; k_scale and v_scale set): qsp_kv writes the 8-bit format (fn/kernels/qsa/kv_q8.cuh,
+// attend.h's prepare rule: codes [cell][256], FP16 scales [cell][kv8::scale_stride]) and qsp_attend's operand is
+// code x s rounded once to FP16 (nearest even) where it rounds BF16 once today: formed in FP16 pairs (the biased
+// code under FP16's exponent, less the bias, times the scale; bit for bit the exact F32 product rounded by F2F), the
+// tile's scales staged in shared memory with its cells. Check: the same bound
+// against FP64 over the decoded cache, the written codes and scales bitwise the CPU quantizer of the FP64 k's F32
+// (within its rounding) and of v.
 
 #include "fn/kernels/qsa/qsa.h"
 
@@ -82,6 +89,8 @@ struct qsp_kv_args {
     int32_t       rows = 0, pos0 = 0, max_cells = 0;
     uint16_t *    k_cache = nullptr;
     uint16_t *    v_cache = nullptr;
+    uint16_t * k_scale = nullptr; // KV8: both set, the caches are q8 (int8 codes) and these the layer's scales
+    uint16_t * v_scale = nullptr;
 };
 
 bool qsp_kv(const qsp_kv_args & a, void * stream);
@@ -93,6 +102,8 @@ struct qsp_attend_args {
     const int32_t *  offsets = nullptr;
     const uint16_t * k_cache = nullptr;
     const uint16_t * v_cache = nullptr;
+    const uint16_t * k_scale = nullptr; // KV8: both set, the caches are q8
+    const uint16_t * v_scale = nullptr;
     int32_t          rows = 0, pos0 = 0, max_cells = 0;
     float *          out   = nullptr;  // optional F32 [rows][3072]
     uint16_t *       out16 = nullptr;  // FP16 [rows][3072]
@@ -105,7 +116,7 @@ struct qsp_resources {
     int32_t regs, local_bytes, shared_bytes;
 };
 
-// 0: score, 1: attend, 2: kv
+// 0: score, 1: attend, 2: kv; KV8: 3 attend and 4 kv in q8
 bool qsp_kernel_resources(int32_t which, qsp_resources & r);
 
 }  // namespace fn::qsa

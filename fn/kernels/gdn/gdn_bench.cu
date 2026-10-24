@@ -132,7 +132,10 @@ set_layout layout() {
     l.dt = take(gd::n_head * 4);
     l.a = take(gd::n_head * 4);
     l.norm = take(gd::head_dim * 4);
+    // six versions' room (the write-rate probe's versions 1..3); ME11: gdn_core's two banks, then its record sets
     l.state = take(size_t(gd::n_version) * gd::state_version_floats * 4);
+    static_assert(gd::banks_bytes + gd::records_bytes <= int64_t(gd::n_version) * gd::state_version_floats * 4,
+                  "the banks and records fit the set's state room");
     l.hist = take(size_t(gd::n_version) * gd::hist_version_floats * 4);
     l.gated = take(size_t(gd::max_rows) * gd::n_value * 4);
     l.codes = take(fn::act::codes_bytes(gd::max_rows, gd::n_value));
@@ -151,7 +154,8 @@ gd::core_args args_of(uint8_t * base, const set_layout & l, void * ws, const uin
     a.a = reinterpret_cast<const float *>(base + l.a);
     a.norm_w = reinterpret_cast<const float *>(base + l.norm);
     a.state = reinterpret_cast<float *>(base + l.state);
-    a.cur = cur; // slot 0 throughout (SR1): the bench never commits
+    a.rec = reinterpret_cast<float *>(base + l.state + gd::banks_bytes);
+    a.gsel = cur; // ME11: selector 0 throughout (bank 0, no records): the bench never commits
     a.gated = reinterpret_cast<float *>(base + l.gated);
     a.gated_q = {reinterpret_cast<int8_t *>(base + l.codes), reinterpret_cast<float *>(base + l.scales), rows,
                  gd::n_value};

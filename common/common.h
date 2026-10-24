@@ -447,6 +447,20 @@ struct common_params_fnfl {
     bool                 check_state    = false; // TEST: compare the engine's tokens with the slot's after every call
     std::vector<int32_t> test_eog;               // TEST: more end-of-generation IDs
     int32_t              test_fail_step = 0;     // TEST: step K of the next request fails once (0: off)
+    int32_t              single_card     = -1;   // ME1: one device with the expert cache (-1: off)
+    int32_t              expert_pool_mib = -1;   // ME1: the expert cache's GPU pool (-1: free less the reserve)
+    int32_t              expert_cpu      = -1;   // ME1: the CPU expert workers (-1: physical cores less one)
+    bool                 cached_tp       = false; // ME1: the two cards with the routed experts from the cache
+    bool                 kv_host         = false; // ME1: the host-backed KV tier (with single_card)
+    int32_t              device_cap_mib  = -1;    // ME1: a ceiling on the device's whole use (-1: none)
+    std::string          expert_profile;          // ME2: the expert cache's boot ranking (a STRP file)
+    std::string          expert_profile_save;     // ME2: where the cache saves its learned ranking
+    bool                 expert_swap_overlap = true; // ME2: the swaps' copies overlap decode
+    // ME3: fn/cache_settings.h's settings as given (server spelling, text), --fnfl-expert-executor among them; the
+    // cache's reserve (--fnfl-expert-reserve-mib)
+    std::vector<std::pair<std::string, std::string>> settings;
+    int32_t              expert_reserve_mib = 768;
+    std::string          kv_format;                // KV8: bf16 or q8; empty: the engine's default (bf16)
 };
 
 struct common_params {

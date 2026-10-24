@@ -28,6 +28,7 @@
 #include "fn/model/layer.h"
 #include "fn/model/model.h"
 #include "fn/model/pass.h"
+#include "fn/xchg/xchg.h"
 
 #include <cstdint>
 #include <string>
@@ -59,6 +60,9 @@ struct draft_card {
     // proposal and the retained q (q_list[j]) for verify row j, its Philox position read live from the descriptor
     // (n_before + j + 1); false: the greedy pick over the subset (T = 0, DR1 Stage C)
     bool sampled = false;
+    // ME8: set by draft_pair_enqueue for card 1 while it runs on card 0's device and stream: card 0's routing
+    // (route_view, non-owning), read by this card's experts in place of a second router; null otherwise
+    const route_view * shared_route = nullptr;
     // SP2 (sparse draft attention, temporary at SP2's disposition): the draft's own index (blk.48.indexer, the
     // target QSA's math) on this card. sparse: this capture's mode, in which step 0 adds the index query to its q/k/v
     // product, selects up to 512 whole blocks of the prefix (fn::qsa::select at depth n_before - 1, the query at
@@ -95,5 +99,40 @@ step_status draft_card_enqueue(pass_card & p, draft_card & d, int32_t kind, int3
 // Both cards in phases (every send enqueued before the receive that reads it), eagerly
 step_status draft_pair_enqueue(pass_card * const p[2], draft_card * const d[2], int32_t kind, int32_t rows,
                                use_counters u[2], std::string & err);
+
+// FMU2 (build item 2): the joint draft step. U (2 .. 4) slots' draft steps of d chained steps each (all greedy, or
+// all sampled (FMU4); one draft attention form) run as U rows of one step on lane 0's slot frame: the shared rings,
+// workspaces and draft weights every slot's rounds use, so one weight stream serves every row and a shared piece's
+// error word is in every lane's commit list. Row k is lane k's:
+//   lane k's own: begin and stamp, commit and finish (its descriptor, round state and completion record); DA-TC's
+//                 prepare and attend at its cells, positions and KV cache (its q16 and partials); at SP2's sparse
+//                 step 0 the select over its draft index (its body and offsets in sel_body[k], sel_off[k]).
+//   U rows:       the embedding (its token: desc tok[0], then its step j - 1 pick), X-DRAFT-IN (its hidden input: its
+//                 retained carry at step 0, then its own head output row), eh_proj, both HC sublayers, the q/k/v,
+//                 output, router and expert products, X-A, X-F, the HC head, the logits and the greedy pick (lower ID
+//                 on an exact tie), whose kernels are bitwise per row at B = 1 .. 4 (each row its own launch's bits).
+//   sampled (FMU4): the logits of the U rows in one launch, then lane k's own SM1 pick on row k (its sampler view,
+//                 options, q_list[j], live Philox position, penalty deltas and desc argmax[j]; its list in row k of
+//                 samp_a's slot, samp::pick_lanes_stage), the proposals gathered into tok row j + 1.
+// The picks go to each lane's desc argmax[0 .. d - 1] before its commit. Buffers: tok, carry, h and the device word
+// one (1) on this card, the joint frame's (fn/runtime/joint.h); lane 0's draft_card's input payload, eh_proj
+// buffers and logits rows hold the U rows.
+struct draft_joint {
+    int32_t lanes = 0;
+    pass_card * p[fn::xchg::max_lanes] = {};  // each lane's slot pass on this card
+    draft_card * d[fn::xchg::max_lanes] = {}; // and its draft block
+    int32_t * tok = nullptr;                  // device [draft_max_steps + 1][max_lanes]: step j's tokens row j
+    float * carry = nullptr;                  // [max_lanes][4][1280] the lanes' retained carries (step 0's hidden)
+    float * h = nullptr;                      // [max_lanes][4][1280] the head's output rows (steps 1 .. d - 1)
+    const int32_t * one = nullptr;            // device word 1: X-DRAFT-IN reads hidden row i at h or carry row i
+    uint32_t * sel_body[fn::xchg::max_lanes] = {};
+    int32_t * sel_off[fn::xchg::max_lanes] = {};
+};
+
+// One card's joint draft step of d = rows steps for a graph capture (u: draft_graph_counters(draft_step, rows)), and
+// both cards in phases eagerly (u: the shared rings' counters, continued). False (failed) with nothing enqueued for
+// lanes outside 2 .. 4, rows outside 1 .. 4, lanes with different pick kinds or draft forms, or the host-backed KV.
+step_status draft_joint_enqueue(draft_joint & j, int32_t rows, use_counters & u, std::string & err);
+step_status draft_joint_pair_enqueue(draft_joint * const j[2], int32_t rows, use_counters u[2], std::string & err);
 
 } // namespace fn::model

@@ -3,6 +3,7 @@
 #include "fn/kernels/qsa/attend.h"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/round/round.h"
+#include "fn/quant/kv_q8_ref.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -113,6 +114,7 @@ bool pair_runner::init(model::model & m, int32_t layer0, int32_t layer1, std::st
         cc_[c].n_before = cc_[c].ws.depth;
         cc_[c].pos = cc_[c].ws.pos;
         cc_[c].cur = cc_[c].ws.cur; // SR1: this runner's committed slot, advanced by each step's commit
+        cc_[c].gsel = cc_[c].ws.cur + 1; // ME11: the GDN selector beside it
         for (int32_t k = 0; k < 2; ++k) {
             if (!model::resolve_weights(m, layer_[k], c, w_[k][c], err) ||
                 !model::resolve_state(m, layer_[k], c, s_[k][c], err)) {
@@ -155,9 +157,11 @@ bool pair_runner::reset(std::string & err) {
             };
             bool ok = true;
             if (w_[k][c].gdn) {
-                ok = clear("GDN state", L) && clear("convolution histories", L + " GDN");
+                ok = clear("GDN state", L) && clear("GDN state", L + " records") &&
+                     clear("convolution histories", L + " GDN");
             } else {
                 ok = clear("target KV (K0)", L + " K") && clear("target KV (K0)", L + " V") &&
+                     clear("target KV (K0)", "K scales") && clear("target KV (K0)", "V scales") && // KV8 (q8 only)
                      clear("target index keys and summaries", L + " keys") &&
                      clear("target index keys and summaries", L + " summaries");
             }
@@ -166,7 +170,8 @@ bool pair_runner::reset(std::string & err) {
                 return false;
             }
         }
-        if (!model::clear_workspaces(*m_, c, err) || !cuda_ok(cudaMemset(cc_[c].ws.cur, 0, 4), "cur", err) ||
+        if (!model::clear_workspaces(*m_, c, err) ||
+            !cuda_ok(cudaMemset(cc_[c].ws.cur, 0, 8), "cur and GDN selector", err) ||
             !cuda_ok(cudaDeviceSynchronize(), "reset", err)) {
             return false;
         }
@@ -199,6 +204,23 @@ bool pair_runner::fill_synthetic(int32_t depth, uint64_t seed, std::string & err
         }
         return cuda_ok(cudaMemcpy(dst, h16.data(), n * 2, cudaMemcpyHostToDevice), "synthetic bf16", err);
     };
+    // KV8: the q8 cache of cells < depth from values in [-scale, scale), by the format's CPU quantizer: the codes
+    // [cells][256] and the layer's column of the scale rows
+    std::vector<int8_t> q8c;
+    std::vector<uint16_t> q8s;
+    const auto put_q8 = [&](uint16_t * codes, uint16_t * scales, int64_t cells, float scale) {
+        h32.resize(size_t(cells) * 256);
+        for (float & v : h32) {
+            v = scale * next();
+        }
+        q8c.resize(h32.size());
+        q8s.resize(h32.size() / fn::quant::kv_q8_group);
+        fn::quant::kv_q8_quantize(h32.data(), static_cast<int32_t>(h32.size()), q8c.data(), q8s.data());
+        return cuda_ok(cudaMemcpy(codes, q8c.data(), q8c.size(), cudaMemcpyHostToDevice), "synthetic q8 codes", err) &&
+               (cells == 0 || cuda_ok(cudaMemcpy2D(scales, size_t(model::kv_q8_scale_stride) * 2, q8s.data(), 8, 8,
+                                                   size_t(cells), cudaMemcpyHostToDevice),
+                                      "synthetic q8 scales", err));
+    };
     const auto put32 = [&](float * dst, size_t n, float scale) {
         h32.resize(n);
         for (float & v : h32) {
@@ -218,13 +240,16 @@ bool pair_runner::fill_synthetic(int32_t depth, uint64_t seed, std::string & err
             const model::layer_weights & w = w_[k][c];
             bool ok = true;
             if (w.gdn) {
+                // ME11: bank 0 with no records is then the committed matrix (the selector reset to 0 below)
                 ok = put32(st.gdn, size_t(24) * 128 * 128, 0.05f) && put32(st.conv, size_t(5120) * 3, 1.0f);
             } else {
                 if (depth > st.n_cells) {
                     err = "synthetic depth beyond the reserved cells";
                     return false;
                 }
-                ok = put16(st.k_cache, size_t(depth) * 256, 1.0f) && put16(st.v_cache, size_t(depth) * 256, 1.0f);
+                ok = st.k_scale != nullptr
+                         ? put_q8(st.k_cache, st.k_scale, depth, 1.0f) && put_q8(st.v_cache, st.v_scale, depth, 1.0f)
+                         : put16(st.k_cache, size_t(depth) * 256, 1.0f) && put16(st.v_cache, size_t(depth) * 256, 1.0f);
                 if (ok && c == w.index_owner) {
                     const int32_t nb = fn::qsa::blocks_complete(depth);
                     ok = put16(st.idx_keys, size_t(depth) * fn::qsa::head_dim, 1.0f) &&
@@ -234,6 +259,9 @@ bool pair_runner::fill_synthetic(int32_t depth, uint64_t seed, std::string & err
             if (!ok) {
                 return false;
             }
+        }
+        if (!cuda_ok(cudaMemset(cc_[c].ws.cur + 1, 0, 4), "GDN selector", err)) {
+            return false;
         }
     }
     return reset_exchange(err);
@@ -344,6 +372,8 @@ bool pair_runner::step(int32_t rows, int32_t depth, const float * const in0[2], 
             const model::layer_ws & ws = cc_[c].ws;
             cudaStream_t s = stream(st_[c]);
             const model::layer_weights & w = w_[k][c];
+            // ME8: on one device and stream card 1's FFN ran on card 0's routing (its own buffers unwritten)
+            const int32_t rc = c == 1 && model::one_router(cc_[0], cc_[1]) ? 0 : c;
             bool ok = cuda_ok(cudaMemcpyAsync(r->x, ws.x[1], size_t(rows) * 4 * F * 4, cudaMemcpyDeviceToHost, s), "x",
                               err) &&
                       cuda_ok(cudaMemcpyAsync(r->inject, ws.inject[1], size_t(rows) * 4 * 4, cudaMemcpyDeviceToHost, s),
@@ -352,11 +382,12 @@ bool pair_runner::step(int32_t rows, int32_t depth, const float * const in0[2], 
                               "out1", err) &&
                       cuda_ok(cudaMemcpyAsync(r->out_attn, ws.out[0], size_t(rows) * F * 4, cudaMemcpyDeviceToHost, s),
                               "out0", err) &&
-                      cuda_ok(cudaMemcpyAsync(r->ids, cc_[c].ex.ids, size_t(rows) * 10 * 4, cudaMemcpyDeviceToHost, s),
+                      cuda_ok(cudaMemcpyAsync(r->ids, cc_[rc].ex.ids, size_t(rows) * 10 * 4, cudaMemcpyDeviceToHost, s),
                               "ids", err) &&
-                      cuda_ok(cudaMemcpyAsync(r->wts, cc_[c].ex.wts, size_t(rows) * 10 * 4, cudaMemcpyDeviceToHost, s),
+                      cuda_ok(cudaMemcpyAsync(r->wts, cc_[rc].ex.wts, size_t(rows) * 10 * 4, cudaMemcpyDeviceToHost, s),
                               "wts", err) &&
-                      cuda_ok(cudaMemcpyAsync(r->logits, ws.logits, size_t(rows) * 512 * 4, cudaMemcpyDeviceToHost, s),
+                      cuda_ok(cudaMemcpyAsync(r->logits, cc_[rc].ws.logits, size_t(rows) * 512 * 4,
+                                              cudaMemcpyDeviceToHost, s),
                               "logits", err) &&
                       cuda_ok(cudaMemcpyAsync(&r->ex_status, cc_[c].ex.status, 4, cudaMemcpyDeviceToHost, s), "status",
                               err) &&
@@ -402,7 +433,7 @@ bool pair_runner::step(int32_t rows, int32_t depth, const float * const in0[2], 
     // the commit (SR1): both layers' versioned state share the card's one committed-slot word
     for (int32_t c = 0; c < 2; ++c) {
         cudaSetDevice(m_->device[c]);
-        if (!fn::round::advance(cc_[c].ws.cur, rows, st_[c])) {
+        if (!fn::round::advance(cc_[c].ws.cur, cc_[c].ws.cur + 1, rows, false, st_[c])) {
             return cuda_ok(cudaGetLastError(), "commit", err);
         }
     }

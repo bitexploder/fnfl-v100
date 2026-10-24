@@ -2,6 +2,7 @@
 
 #include "fn/kernels/gdn/gdn.h"
 #include "fn/kernels/gdn/gdn_prompt.h"
+#include "fn/kernels/gdn/gdn_ref.h"
 #include "fn/kernels/round/version.h"
 #include "fn/quant/formats.h"
 #include "fn/tools/prompt_test_util.h"
@@ -117,7 +118,8 @@ double head_error(const float * got, const double * ref, int64_t rows, int64_t r
 struct dev {
     dbuf conv{size_t(RMAX) * NCH * 4}, g{size_t(RMAX) * NH * 4}, beta{size_t(RMAX) * NH * 4}, o{size_t(RMAX) * NV * 4},
         z{size_t(RMAX) * NV * 4}, g16{size_t(RMAX) * NV * 2}, gated{size_t(RMAX) * NV * 4},
-        state{size_t(fn::round::n_version) * SV * 4}, // SP2: every version (6)
+        state{size_t(fn::gdn::n_bank) * SV * 4}, // ME11: the two banks
+        rec{size_t(fn::gdn::n_rec_set) * fn::gdn::rec_set_floats * 4}, // ME11: the two record sets
         st64{size_t(SV) * 8}, o64{size_t(RMAX) * NV * 8}, cur{256}, w{size_t(HD) * 4}, err{256},
         qz16{size_t(RMAX) * LQZ * 2}, wy{static_cast<size_t>(fn::gdn::prompt_wy_bytes(RMAX))},
         o16{size_t(RMAX) * NV * 2};
@@ -127,10 +129,12 @@ struct chain {
     dev & d;
     std::vector<float> w;
     uint32_t cur = 0;
+    uint32_t gsel = 0;   // ME11: the GDN selector (the scan's banks and, at version 0, its replayed records)
     int32_t ver = 0;     // the logical version the next run reads
     bool half_z = false; // PB3: z from the FP16 [rows][qkv | z] array (the reference uses its values)
     bool half_o = false; // PB3: o FP16 (o16) between the scan and the gated norm
     double worst_g = 0, worst_s = 0;
+    std::vector<float> end_state = {}; // the last run's end state (ME11)
 
     // one run of rows from version ver to ver + 1 (the driver's halves; a publication moves cur by 2 after the second)
     bool run(const run_in & in, int32_t rows, std::string & why) {
@@ -138,6 +142,8 @@ struct chain {
         a.rows     = rows;
         a.conv_out = d.conv.as<float>();
         a.state    = d.state.as<float>();
+        a.rec      = d.rec.as<float>();
+        a.gsel     = d.cur.as<uint32_t>() + 1;
         a.cur      = d.cur.as<uint32_t>();
         a.v_in     = ver;
         a.v_out    = ver + 1;
@@ -173,7 +179,7 @@ struct chain {
         a.err      = d.err.as<uint32_t>();
         a.wy       = d.wy.as<float>();
         if (!d.conv.put(in.conv) || !d.g.put(in.g) || !d.beta.put(in.beta) || !d.z.put(in.z) ||
-            !d.cur.put(std::vector<uint32_t>{ cur }) || !fn::gdn::gdn_prompt_recur(a, fn::ptest::test_stream()) ||
+            !d.cur.put(std::vector<uint32_t>{ cur, gsel }) || !fn::gdn::gdn_prompt_recur(a, fn::ptest::test_stream()) ||
             !fn::gdn::gdn_prompt_gate(a, fn::ptest::test_stream()) ||
             !gdp_reference(rows, d.conv.as<float>(), d.g.as<float>(), d.beta.as<float>(), d.st64.as<double>(),
                            d.o64.as<double>(), fn::ptest::test_stream()) ||
@@ -183,7 +189,7 @@ struct chain {
         }
         std::vector<float>  gated, st;
         std::vector<double> o64, s64, gref;
-        const int32_t       slot = fn::round::version_slot(cur, ver + 1);
+        const int32_t       slot = fn::round::gdn_bank_of(gsel, ver + 1); // ME11: the output bank
         if (!d.gated.get(gated, size_t(rows) * NV) || !d.o64.get(o64, size_t(rows) * NV) ||
             !d.st64.get(s64, size_t(SV)) ||
             !cuda_ok(cudaMemcpy((st.resize(static_cast<size_t>(SV)), st.data()),
@@ -197,16 +203,18 @@ struct chain {
         const double es = head_error(st.data(), s64.data(), 1, SV, HD * HD);
         worst_g = std::max(worst_g, eg);
         worst_s = std::max(worst_s, es);
+        end_state = st;
         if (++ver == 2) {
             cur = static_cast<uint32_t>(fn::round::version_slot(cur, 2));
+            gsel = fn::round::gdn_after_prompt(gsel);
             ver = 0;
         }
         return true;
     }
 };
 
-// the state: N(0, 0.5) in version 0 at slot cur, the same values in the FP64 state
-bool init_state(dev & d, uint32_t cur, uint64_t seed, bool zero) {
+// the state: N(0, 0.5) in version 0 (ME11: the committed bank of gsel, no records), the same values in the FP64 state
+bool init_state(dev & d, uint32_t gsel, uint64_t seed, bool zero) {
     rng                 r(seed);
     std::vector<float>  s(static_cast<size_t>(SV));
     std::vector<double> s64(static_cast<size_t>(SV));
@@ -215,7 +223,7 @@ bool init_state(dev & d, uint32_t cur, uint64_t seed, bool zero) {
         s64[i] = s[i];
     }
     return d.state.poison() &&
-           cuda_ok(cudaMemcpy(d.state.as<float>() + int64_t(fn::round::version_slot(cur, 0)) * SV, s.data(),
+           cuda_ok(cudaMemcpy(d.state.as<float>() + int64_t(fn::round::gdn_bank(gsel)) * SV, s.data(),
                               s.size() * 4, cudaMemcpyHostToDevice),
                    "state") &&
            d.st64.put(s64);
@@ -224,13 +232,15 @@ bool init_state(dev & d, uint32_t cur, uint64_t seed, bool zero) {
 bool single(dev & d, int32_t rows, bool zero, verdict & v, const std::vector<float> & w, bool half_z = false,
             bool half_o = false) {
     const uint32_t cur = static_cast<uint32_t>(rows % 5);
-    if (!init_state(d, cur, 0x5a + uint64_t(rows), zero)) {
+    const uint32_t gsel = fn::round::gdn_word(rows & 1, (rows >> 1) & 1, 0); // ME11: both banks in turn
+    if (!init_state(d, gsel, 0x5a + uint64_t(rows), zero)) {
         return false;
     }
     run_in in;
     make_run(rows, 0x700 + uint64_t(rows), zero, in);
     chain c{ d, w };
     c.cur = cur;
+    c.gsel = gsel;
     c.half_z = half_z;
     c.half_o = half_o;
     std::string       why;
@@ -245,9 +255,10 @@ bool single(dev & d, int32_t rows, bool zero, verdict & v, const std::vector<flo
     // a rerun from the same state is bitwise
     chain              c2{ d, w };
     c2.cur       = cur;
+    c2.gsel      = gsel;
     c2.half_z = half_z;
     c2.half_o = half_o;
-    same         = same && init_state(d, cur, 0x5a + uint64_t(rows), zero) && c2.run(in, rows, why) &&
+    same         = same && init_state(d, gsel, 0x5a + uint64_t(rows), zero) && c2.run(in, rows, why) &&
                    d.gated.get(o2, size_t(rows) * NV) && std::memcmp(o1.data(), o2.data(), o1.size() * 4) == 0;
     bool zero_ok = true;
     if (zero) {
@@ -265,11 +276,12 @@ bool single(dev & d, int32_t rows, bool zero, verdict & v, const std::vector<flo
 }
 
 bool chain_case(dev & d, int32_t runs, verdict & v, const std::vector<float> & w) {
-    if (!init_state(d, 2, 0xc4a1 + uint64_t(runs), false)) {
+    if (!init_state(d, fn::round::gdn_word(1, 1, 0), 0xc4a1 + uint64_t(runs), false)) {
         return false;
     }
     chain c{ d, w };
     c.cur = 2;
+    c.gsel = fn::round::gdn_word(1, 1, 0);
     std::string why;
     for (int32_t i = 0; i < runs; ++i) {
         run_in in;
@@ -286,6 +298,84 @@ bool chain_case(dev & d, int32_t runs, verdict & v, const std::vector<float> & w
           std::string("gated output and end state ") + (ok ? "within" : "OUTSIDE") +
               " the loose bug-check tolerance at every run");
     return ok;
+}
+
+// ME11: the scan's replayed start. A chunk of two halves from bank 1 with the first k (0 .. 5) steps of record set 1
+// replayed (synthetic records: normalized k, decays in [0.3, 1), deltas, with denormal decays at k = 5), against the
+// same chunk from bank 0 holding that matrix as the host replay makes it (gdn_ref.h, the device's operations) with no
+// records: the outputs of both halves and the end state bitwise, and the end state against FP64 loosely. The second
+// half works in place in the output bank. Set 0 is poisoned, so a read of the wrong set shows.
+bool replayed_start(dev & d, int32_t k, verdict & v, const std::vector<float> & w) {
+    rng r(0x11e0 + uint64_t(k));
+    std::vector<float> s(static_cast<size_t>(SV)), rec(size_t(fn::gdn::n_rec_set) * fn::gdn::rec_set_floats, NAN);
+    for (float & f : s) {
+        f = static_cast<float>(r.normal() * 0.5);
+    }
+    float * set1 = rec.data() + fn::gdn::rec_set_floats;
+    for (int32_t t = 0; t < fn::gdn::max_rows; ++t) {
+        float * st = set1 + int64_t(t) * fn::gdn::rec_step_floats;
+        for (int32_t g = 0; g < NG; ++g) {
+            double x[HD], ss = 0.0;
+            for (int32_t i = 0; i < HD; ++i) {
+                x[i] = r.normal();
+                ss += x[i] * x[i];
+            }
+            for (int32_t i = 0; i < HD; ++i) {
+                st[fn::gdn::rec_k + g * HD + i] = static_cast<float>(x[i] / std::sqrt(ss));
+            }
+        }
+        for (int32_t h = 0; h < NH; ++h) {
+            st[fn::gdn::rec_decay + h] = t == 4 && h == 5 ? 1e-40f : static_cast<float>(r.uniform(0.3, 1.0));
+        }
+        for (int32_t i = 0; i < NH * HD; ++i) {
+            st[fn::gdn::rec_delta + i] = static_cast<float>(r.normal() * 0.3);
+        }
+    }
+    std::vector<float> m(s.size());
+    fn::gdn::ref::replay_host(s.data(), set1, k, m.data());
+    std::vector<double> m64(m.begin(), m.end());
+    std::vector<run_in> halves(2);
+    make_run(700, 0x11e7 + uint64_t(k), false, halves[0]);
+    make_run(65, 0x11e8 + uint64_t(k), false, halves[1]);
+    std::vector<float> out[2], end[2];
+    double worst_g = 0, worst_s = 0;
+    std::string why;
+    for (int32_t arm = 0; arm < 2; ++arm) {
+        // arm 0: bank 1 and k records of set 1; arm 1: bank 0 holding the replayed matrix, no records
+        const uint32_t gsel = arm == 0 ? fn::round::gdn_word(1, 1, k) : fn::round::gdn_word(0, 1, 0);
+        if (!d.state.poison() ||
+            !cuda_ok(cudaMemcpy(d.state.as<float>() + int64_t(fn::round::gdn_bank(gsel)) * SV,
+                                (arm == 0 ? s : m).data(), size_t(SV) * 4, cudaMemcpyHostToDevice),
+                     "state") ||
+            !d.rec.put(rec) || !d.st64.put(m64)) {
+            return false;
+        }
+        chain c{ d, w };
+        c.cur = 1;
+        c.gsel = gsel;
+        for (int32_t h = 0; h < 2; ++h) {
+            std::vector<float> g;
+            if (!c.run(halves[size_t(h)], static_cast<int32_t>(halves[size_t(h)].g.size() / NH), why) ||
+                !d.gated.get(g, halves[size_t(h)].z.size())) {
+                v.put("replayed start k " + std::to_string(k), false, why);
+                return false;
+            }
+            out[arm].insert(out[arm].end(), g.begin(), g.end());
+        }
+        end[arm] = c.end_state;
+        worst_g = std::max(worst_g, c.worst_g);
+        worst_s = std::max(worst_s, c.worst_s);
+        if (c.gsel != fn::round::gdn_after_prompt(gsel)) {
+            v.put("replayed start k " + std::to_string(k), false, "the chunk's selector");
+            return false;
+        }
+    }
+    const bool same = out[0] == out[1] && std::memcmp(end[0].data(), end[1].data(), end[0].size() * 4) == 0;
+    const bool loose = worst_g <= gdp_loose && worst_s <= gdp_loose;
+    v.put("replayed start k " + std::to_string(k) + " (two halves, the second in place; ME11)", same && loose,
+          std::string("outputs and end state against the materialized start ") + (same ? "bitwise" : "DIFFER") +
+              "; against FP64 " + (loose ? "within" : "OUTSIDE") + " the loose tolerance");
+    return same && loose;
 }
 
 // the convolution against FP64, its new history bitwise; the norms and the gates against FP64
@@ -454,6 +544,9 @@ int fnfl_gdp_test(int device, const char * mode) {
         single(*d, rows, false, v, w, true, true);
     }
     single(*d, san ? 65 : 1536, true, v, w);
+    for (int32_t k = san ? 5 : 0; k <= fn::gdn::max_rows; ++k) {
+        replayed_start(*d, k, v, w);
+    }
     if (!san) {
         chain_case(*d, 6, v, w);
         chain_case(*d, 128, v, w);

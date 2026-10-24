@@ -32,10 +32,13 @@
 // the host and GPU times, with the process's page faults. PL1: optionally after evicting the PLE table (its page counts
 // printed), with the run's inter-token and gather statistics, faults and storage reads.
 
+#include "fn/cache_settings.h"
 #include "fn/kernels/samp/samp.h"
+#include "fn/runtime/expert_cache.h"
 #include "fn/runtime/ple_host.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -61,6 +64,15 @@ struct fnfl_target_args {
     int32_t n_pos = 4096;
     int32_t n_gen = 256;
     int32_t n_cells = 198720;
+    // MU1 (--slots N, model-dry): the slots the engine serves (1..4; above one: resident TP, the KV pool)
+    int32_t n_slots = 1;
+    // KV8 (--kv-format q8, global; the switch ends at KV8's disposition): the target KV in the 8-bit format
+    // (state_params::kv_q8); pool_cells: a multi-slot load's KV pool cells (0: a slot's)
+    bool kv_q8 = false;
+    int32_t pool_cells = 0;
+    // KV8 (model-test full with kv_q8: KV8's load 4): spec's C4a..C4f checks on this prompt after the q8 passes, on the
+    // same loaded model (--spec-ids IDS, with --draft-attention and --decode-s); empty: none
+    std::string spec_ids;
     bool evict_ple = false; // generate (PL1): the PLE table evicted before the run (page_cache.h), its counts printed
     // PN1: --ple-table, the loaded table's residency (refused with evict_ple in full: a pinned table stays resident)
     fn::runtime::ple_residency ple_table = fn::runtime::ple_residency::lazy;
@@ -89,6 +101,76 @@ struct fnfl_target_args {
     // in order; empty: 2:dense,4:sparse; expires at SP2's disposition. SP4: an optional :EX per arm, sp2, sp4 (H1) or
     // h2 (H2), XB3: or xb3 (C1), the target's expert gate/up mapping (target::set_expert_map; sp2 unless given)
     std::string arms;
+    // ME1 (--single-card N, global): both logical cards on CUDA device N with the routed experts through the expert
+    // cache (fn/runtime/expert_cache.h); spec run and model-dry. --cached-tp 1: the two cards
+    // (devices 0 and 1) with the routed experts through the cache. --ex-pool-mib (-1: the free memory less
+    // --ex-reserve-mib), --ex-cpu (CPU product workers; -1: physical cores less one)
+    int32_t single_card = -1;
+    bool cached_tp = false;
+    int64_t ex_pool_mib = -1;
+    int64_t ex_reserve_mib = 768;
+    int32_t ex_cpu = -1;
+    // MEKV (--kv-host 1, with --single-card or --cached-tp): the host-backed KV tier (fn/model/kv_tier.h), the 16 GB
+    // configuration's
+    // KV; --device-cap-mib M: a ceiling on the device's whole use, the pool shrinking under it (the 16 GB plan on a
+    // larger card: expert_cache_options::device_cap_bytes)
+    bool kv_host = false;
+    int64_t device_cap_mib = -1;
+    // ME2 (--ex-profile PATH, --ex-profile-save PATH, --ex-swap-overlap 0|1; expire at ME2's disposition): the
+    // cache's boot ranking (a STRP file; empty: expert order), where the learned ranking is saved, the swaps' overlap
+    std::string ex_profile, ex_profile_save;
+    bool ex_swap_overlap = true;
+    // ME3 (--ex-executor graph|eager, global): the executor of spec run, model-dry and run-dry: the graphs (default) or
+    // the eager paired enqueue (an explicit diagnostic and ME3's base arm), printed at startup
+    bool ex_eager = false;
+    // ME3 (global): the cache's and the K/V tier's settings (fn/cache_settings.h), ex_eager among them
+    fn::settings::values cache;
+    // spec run (ME2, --ex-kl IDS --ex-kl-ref DIR --ex-kl-spread JSON): NC1 section 5's teacher-forced KL check before
+    // the requests, in normal mode then with every miss on the CPU, each from the profile state; the requests then
+    // start from the profile state again
+    std::string ex_kl, ex_kl_ref, ex_kl_spread;
+    // spec run (MX7, --mx7-check IDS --mx7-shares LIST; TEST ONLY, expires at MX7's disposition): the prompt CPU
+    // share's model checks (fn/runtime/mx7_check.h) in place of the requests
+    std::string mx7_check, mx7_shares;
+    int32_t mx7_dry_maxt = 0; // MX7 (run-dry only, --mx7-dry-maxt N): the share's candidates' pair bound (0: MAXT)
+    bool cached() const { return single_card >= 0 || cached_tp; }
+    std::string ex_check; // spec run (ME1, --ex-check IDS): the placement check's prompt before the requests
+    std::string ex_ref;   // --ex-ref TOKENS: an earlier run's tokens of that prompt at T = 0 (information)
+    // spec run (ME2, --next-ids FILE, repeatable): further prompts after PROMPT_IDS in the same process, each with every
+    // setting and run, the engine's state (and the expert cache's) kept between them; expires at ME2's disposition
+    std::vector<std::string> next_ids;
+    // ME3 (--next-append FILE, repeatable, in order with --next-ids; kept): next_append[i] makes next_ids[i] an append
+    // to the slot's state (its history, its pending token, then the file's IDs), required to be a pure extension.
+    // --me3-arms base,final (ME3's comparison switch, driver only, expires at ME3's disposition): the whole sequence
+    // once an arm, each from the boot state; base ME2b's mechanisms on the eager executor, final ME3's on the graphs
+    std::vector<bool> next_append;
+    // ME3 (--next-append-rows N FILE, ME3's cleanup check, expires at ME3's disposition): an append whose read is N
+    // rows: N less the slot's pending token (when it has one) of FILE's first IDs, its processed rows and its path
+    // (short at most the short-read threshold, else bulk) checked; next_rows[i] -1 for the others
+    std::vector<int32_t> next_rows;
+    std::string me3_arms;
+    // ME4 (--me4-arms base,final, ME4's comparison switch, driver only, expires at ME4's disposition): as --me3-arms,
+    // both arms on ME3's mechanisms and the graphs; base ME3's prompt staging (no ring, the parity buffers at the
+    // zone's start, routed-rows; the CPU experts' reconstruction per miss, main's), final ME4's (the ring, the parity
+    // buffers by usage; the native views). Not with --me3-arms
+    std::string me4_arms;
+    // ME4 (--append-close ID, the albums fixture's length-stop rule, driver only, expires at ME4's disposition): when
+    // a request ended at its budget (its pending token a content token, not the turn's end), the next append reads
+    // ID (the template's end of turn) after the pending token and before its recorded IDs, so the history it extends
+    // is a closed turn: one more row than recorded, printed with each request's end. -1: off
+    int32_t append_close = -1;
+    // TEST (--me3-stall, Fable's load G ruling, driver only, expires at ME4's disposition): spec run's stall check
+    // (me3_stall_check) in place of the ME3 checks and the requests, on a cached run
+    bool me3_stall = false;
+    // TEST (--me9-check, ME9, driver only, expires at ME9's disposition): spec run's admission check (me9_check) in
+    // place of the ME3 checks and the requests, on a one-device cached run
+    bool me9_check = false;
+    // TEST (--ex-native-hold, ME4's gate, driver only, expires at ME4's disposition): a dry spec run holds the native
+    // expert pages as the load will (expert_cache_options::native_hold), for the host-memory residency check
+    bool ex_native_hold = false;
+    // TEST (--me3-cancel, Fable's ruling on ME3's completeness gaps, driver only, expires at ME4's disposition): spec
+    // run's cancellation check (me3_cancel_check) in place of the ME3 checks and the requests, on a cached run
+    bool me3_cancel = false;
 };
 
 int fnfl_model_test(const fnfl_target_args & a);
@@ -103,6 +185,10 @@ int fnfl_generate(const fnfl_target_args & a);
 // last step and injected recoverable errors over 512 positions of the reference tokens, against a clean replay at B = 1.
 // mode dry: model-dry's load instead (zero weights, no model data on the cards), a plumbing check before the load
 int fnfl_rollback_test(const fnfl_target_args & a);
+// MU1 (rollback-test IDS OUT mu1 | mu1-dry, fn/runtime/rollback_mu1_test.cpp): a read paused at every layer boundary
+// with other slots' work between its groups against the same read straight through, on a four-slot engine; the
+// short read out of turn, cancellation before, during and while suspended, and the resumed reads
+int fnfl_rollback_mu1(const fnfl_target_args & a);
 
 namespace fn::model {
 class model;
@@ -122,6 +208,8 @@ bool fnfl_state_hashes(fn::runtime::target & t, fn::model::model & m, uint64_t h
 // to EOS or the time limit (C4c), 32 rounds against a clean forced replay bitwise (C4e) and the determinism prefix
 // (C4f). Every segment starts from a fresh prefill. Writes the tokens, the rounds and the report into OUT.
 int fnfl_spec(const fnfl_target_args & a);
+// KV8: spec's checks on a model loaded by the caller (null: spec's own load)
+int fnfl_spec_on(const fnfl_target_args & a, fn::model::model * loaded);
 // SV1, spec run (mode run; run-dry: zero weights, 13 prompt tokens, then the engine's prefix paths): the runtime's
 // engine as the server drives it (fn/runtime/runtime.h), for each setting `runs` requests from a fresh prefill
 // (set_sampling, truncate to 0, prefill, steps until an end of generation or max_tokens), printing each request's
@@ -147,6 +235,7 @@ struct request_options;
 struct fnfl_request_out {
     std::vector<int32_t> toks;
     double               pre_s = 0, gen_s = 0;
+    int32_t              n_processed = 0; // ME3: the prefill's processed tokens
 };
 
 bool fnfl_spec_request(fn::runtime::engine &                e,
@@ -169,6 +258,17 @@ bool fnfl_load(const fnfl_target_args & a, int32_t n_cells, fn::model::model & m
 bool fnfl_fill_synthetic(fn::model::model & m, fn::runtime::target & t, int32_t depth);
 // the draft settings of a and their startup line; false (printed) when the draft is asked for and not buildable
 bool fnfl_draft_settings(const fnfl_target_args & a, bool required, const char * tool, fn::runtime::draft_options & o);
+// ME2: model-test's KL pass (NC1 section 5) on t: forced rounds, B cycling 1..4, over the first 4,096 IDs from empty
+// state; KL(reference || t) at p % 8 == 7 and the top-1 differences against the reference (ref_dir's top.bin and
+// logits.bin), each against 2x the yardstick (spread_json). Prints one line (label), writes OUT/kl-LABEL.tsv; pass
+// set; false (printed) on a failure to run
+bool fnfl_kl_check(fn::runtime::target & t, const std::string & ids_path, const std::string & ref_dir,
+                   const std::string & spread_json, const std::string & out_dir, const std::string & label, bool & pass);
+// ME1: the expert cache of a cached load (a.cached()), after every other allocation; dry: zero backing. Prints
+// the memory plan; null (printed) on failure. ME3: before_pool, the graph executor's capture (service_hook)
+std::unique_ptr<fn::runtime::expert_cache> fnfl_expert_cache(const fnfl_target_args & a, fn::model::model & m,
+                                                             bool dry, const char * tool,
+                                                             const fn::model::service_hook & before_pool = {});
 
 // DR1 Stage C (fn/runtime/draft_cmds.cpp).
 // draft-test: one model load. The draft block against the pinned engine's reference dumps (src/ref_dump_draft.cpp) on

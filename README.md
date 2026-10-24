@@ -20,6 +20,7 @@ These are PCIe cards:
 - Barely moved at depth, 3,391 tokens added to ~196k context took 1.28 seconds
 - Stable enough to run DeepSWE 1.1 all night without leaking or crashing
 - This quant solves DeepSWE at the same rate as the full quant in my single full bench
+- New in 0.2: up to four users at once. Four DeepSWE agents on one server decoded at about 60 t/s each, about 240 t/s together, with no stalls or errors
 
 I care about agentic coding, so that is what I had time to bench so far. It's still fast on other stuff. It may not be as smart, but this quant has proven strong. 
 
@@ -35,6 +36,12 @@ Who doesn't love some benchmaxx metrics that make their engine look good?
 **HumanEval:**
 
 250 t/s per reply on HumanEval
+
+**Four users at once (new in 0.2):**
+
+272 t/s together, about 70 t/s each, with four users writing at once with greedy sampling (short prompts).  
+258 t/s together at temperature 1.0.  
+A lone user is not slowed by having four slots open, and every user gets the same tokens it would get alone.
 
 **Synthetic prefill:**
 
@@ -65,11 +72,11 @@ You can create an issue. If it is relevant to the project's goals I might work o
 
 # The rest of the README
 
-It is deliberately narrow. It runs one model file, one draft head, one pair of GPUs and one conversation at a time. Anything else is refused when the server starts or when a request arrives. If you have that machine, this should be the fastest way to run this model on it. Here is what to know:
+It is deliberately narrow. It runs one model file, one draft head, one pair of GPUs and up to four conversations at a time. Anything else is refused when the server starts or when a request arrives. If you have that machine, this should be the fastest way to run this model on it. Here is what to know:
 
 - It runs exactly the one model
 - 2xV100 32GB
-- One decode stream only
+- One to four users at once (`-np 1` to `-np 4`); one user alone gets the fastest replies
 - Standard OpenAI HTTP inference endpoint
 
 I intend to support other quants and configurations of this model. 
@@ -82,14 +89,17 @@ This repository began as a fork of llama.cpp. Upstream llama.cpp's own README is
   - It is mixed-bit despite its name. The routed experts' gate and up weights use five 2- and 3-bit formats that change layer by layer (IQ3_XXS in only 6 of the 48 layers), their down weights are Q2_0 or IQ4_NL, and the rest of the model is kept at higher precision.
   - The server checks the file's architecture (`qwen4exp`) and shapes at load and refuses any other model.
 - **Draft model:** Unsloth's shared MTP head, `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.79 GB). The draft is required, since speculative decoding is the only decode path.
-- **Context:** up to 262,144 tokens in one conversation (one slot).
+- **Context:** up to 262,144 tokens a conversation. With more than one user, `-c` is a pool the users share (409,600 tokens fits four users), and each conversation can still grow to 262,144.
+- **Several users:** up to four conversations decode together in one step on both cards, which is where the extra throughput comes from. Every user gets exactly the tokens it would get alone.
+- **KV cache:** 8-bit (int8 with a scale every 64 values) by default: about 2.5 GiB a card at the full 262,144 tokens instead of 3.9. It passed the same KL bounds the rest of the engine is held to against llama.cpp. `--fnfl-kv-format bf16` selects the 16-bit cache.
 - **Sampling:** temperature, top-k (1 to 256), top-p and min-p, with the model's recommended defaults (T 1.0, top-k 20, top-p 0.95, min-p 0.05). Speculative decoding samples exactly from the model's own distribution.
 
 ## Requirements
 
 - **Two Tesla V100 32 GB cards** (Volta, `sm_70`) that can reach each other peer to peer. Check with `nvidia-smi topo -p2p r`.
   - It has been built and run on two PG500-216 32 GB cards on PCIe 3.0 x8 each, with no NVLink.
-  - 16 GB cards do not fit, since each card holds 23.2 GiB of weights. At the full 262,144-token context a 32 GB card has about 1.5 GiB to spare.
+  - 16 GB cards do not fit the two-card engine, since each card holds 23.2 GiB of weights. With four users and `-c 409600`, each 32 GB card has about 0.57 GiB to spare after load, and about 0.2 GiB once the multi-user graphs are captured.
+  - The experimental expert cache also runs on one card, or on two 16 GB cards (see [Which setup for your cards](#which-setup-for-your-cards)).
 - **On AMD platforms, boot with `iommu=pt`.** On the test machine, peer access between the cards worked only after that boot setting.
 - **NVIDIA driver 580.** That series is the last to support Volta.
 - **CUDA 12.x**, with 12.8 tested. CUDA 13 dropped `sm_70`.
@@ -135,6 +145,19 @@ build-fnfl/bin/llama-server --host 127.0.0.1 --port 8190 -np 1 --jinja \
 - The last line gives the model's full context and the settings the project serves with: four draft proposals a step and sparse draft attention.
 - Startup prints the memory left on each card and the engine's settings. The server is ready when it logs `listening on`.
 
+For up to four users at once, change `-np 1` to `-np 4` and `-c 262144` to `-c 409600`:
+
+```sh
+build-fnfl/bin/llama-server --host 127.0.0.1 --port 8190 -np 4 --jinja \
+-m models/flash-next/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+-md models/flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+--fnfl-draft-subset models/draft-vocab-qwen3.8-flash-next.txt \
+-c 409600 --fnfl-spec-d 4 --fnfl-draft-attention sparse
+```
+
+- With more than one user, `-c` must be a multiple of 16,384 (the KV pool's page).
+- Leaving `-np` out gives four slots.
+
 ### 4. Try it
 
 ```sh
@@ -147,7 +170,7 @@ The web UI is at `http://127.0.0.1:8190/` when the build embedded it. Any OpenAI
 ## What it does not do
 
 - Any other model, quantization or draft head, or any GPU other than a V100 pair.
-- More than one request at a time (`-np` must be 1).
+- More than four requests at a time (`-np` is 1 to 4). Further requests wait for a free slot.
 - Embeddings, reranking, multimodal input or LoRA adapters. The server refuses to start with them.
 - Per request:
   - repetition, frequency or presence penalties
@@ -161,6 +184,19 @@ The web UI is at `http://127.0.0.1:8190/` when the build embedded it. Any OpenAI
   - constrained output: a grammar, a JSON schema, or `response_format` of type `json_object` or `json_schema`
 
   A request that asks for any of these is refused with a message naming it. Tool calls work; they are parsed from the model's text.
+
+## Which setup for your cards
+
+The two-card engine above keeps every weight on the cards. With less GPU memory, the expert cache (new in 0.2, experimental) keeps the routed experts in host memory, about 40 GiB page-locked, and holds the most used ones in a GPU cache. Experts that miss are copied over PCIe or computed on the CPU. It needs plenty of host RAM (128 GB tested) and serves one user (two on one card with `--fnfl-kv-host`).
+
+What we measured on the test machine (Ryzen 5 5600, 6 cores; PCIe 3.0 x8 per card; 128 GB RAM), on development builds just before 0.2. "Poetry" is a long generated reply at shallow depth; "DeepSWE" is a whole coding-agent task run to completion, averaged over its depth.
+
+- **Two 32 GB cards (the main engine):** 218 t/s poetry; DeepSWE 208 t/s decode, 1,573 t/s prefill. With four users, about 240 to 272 t/s together.
+- **Two 16 GB cards:** `--fnfl-cached-tp`, KV on the cards: 107 t/s poetry, 2,176 t/s prefill on a 36K prompt. With the KV in host memory (`--fnfl-kv-host`), DeepSWE ran at 101 t/s decode and 483 t/s prefill.
+- **One 32 GB card:** `--fnfl-single-card 0`, KV on the card: 106 t/s poetry, the fastest one-card setup. With `--fnfl-kv-host` instead: 102.5 t/s poetry; DeepSWE 79 t/s decode, 346 t/s prefill. Use `--fnfl-kv-host` only for two users on the card (`-np 2`) or when the KV does not fit.
+- **One 16 GB card:** `--fnfl-single-card 0 --fnfl-kv-host`: about 59 t/s poetry; DeepSWE 48.5 t/s decode, 173 t/s prefill.
+
+[`docs/fnfl/server.md`](docs/fnfl/server.md#the-expert-cache-experimental) has the exact commands and every expert-cache setting. The expert-cache setups use the 16-bit KV cache; the 8-bit format is refused there.
 
 ## Documentation
 

@@ -3,9 +3,13 @@
 #include "fn/kernels/qsa/attend.h"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/qsa/qsa_prompt.h"
+#include "fn/model/state.h"
 #include "fn/quant/formats.h"
+#include "fn/quant/kv_q8_ref.h"
 #include "fn/tools/prompt_test_util.h"
+#include "fn/tools/test_dump.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
@@ -153,9 +157,38 @@ bool select_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, const char 
     return bad == 0 && rerun;
 }
 
-// K and V of n rows at pos0 against FP64 (K within one BF16 step, V bitwise), then attention of those rows over the
-// prompt path's own selection against FP64 (PB3: a loose bug-check tolerance)
-bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
+// KV8: QSA layer 7's column of the scale rows (fn/model/state.h kv_q8_scale_stride)
+constexpr int32_t SS = fn::model::kv_q8_scale_stride, q8_col = 4 * 7;
+
+// the caches of a case in either format: BF16 [cells][256], or KV8's codes [cells][256] and scale rows [cells][SS]
+struct caches {
+    bool q8 = false;
+    std::vector<uint16_t> k, v; // BF16, or (q8) the scale rows
+    std::vector<int8_t> k8, v8; // q8: the codes
+
+    double kval(int64_t c, int32_t e) const {
+        return q8 ? double(fn::quant::kv_q8_value(k8[size_t(c * HD + e)], k[size_t(c * SS + q8_col + e / 64)]))
+                  : double(fn::quant::bf16_to_f32(k[size_t(c * HD + e)]));
+    }
+
+    double vval(int64_t c, int32_t e) const {
+        return q8 ? double(fn::quant::kv_q8_value(v8[size_t(c * HD + e)], v[size_t(c * SS + q8_col + e / 64)]))
+                  : double(fn::quant::bf16_to_f32(v[size_t(c * HD + e)]));
+    }
+
+    // q8: a row's group scale (the decode's s)
+    double kscale(int64_t c, int32_t e) const {
+        return double(fn::quant::f16_value(k[size_t(c * SS + q8_col + e / 64)]));
+    }
+};
+
+// K and V of n rows at pos0 against FP64 (K within one BF16 step, V bitwise; KV8: K decoded within half a
+// quantization step of FP64 (plus 1e-5 of the row's largest value for the kernel's F32 k), V's codes and scales
+// bitwise the CPU quantizer's), then attention of those rows over the prompt path's own selection against FP64 over
+// the decoded cache (PB3: a loose bug-check tolerance). vrows (optional): the rows' v (the quantizer's stress rows; the
+// write checked alone, the attention run for the dumps only)
+bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8, const float * vrows = nullptr,
+                    const char * tag = "") {
     rng                r(0xa77 + uint64_t(pos0));
     const int32_t      cells = pos0 + n;
     std::vector<float> kk(size_t(n) * HD), vv(size_t(n) * HD), kn(HD), qn(HD), qfull(size_t(n) * NH * QS);
@@ -164,6 +197,9 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
     }
     for (float & f : vv) {
         f = static_cast<float>(r.normal());
+    }
+    if (vrows != nullptr) {
+        std::copy(vrows, vrows + size_t(n) * HD, vv.begin());
     }
     for (float & f : kn) {
         f = static_cast<float>(r.uniform(0.5, 1.5));
@@ -174,17 +210,37 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
     for (float & f : qfull) {
         f = static_cast<float>(r.normal());
     }
-    // the caches below pos0: random BF16 (earlier rows' cells)
-    std::vector<uint16_t> kc(size_t(fx.cells) * HD, 0), vc(size_t(fx.cells) * HD, 0);
-    for (int64_t i = 0; i < int64_t(pos0) * HD; ++i) {
-        kc[size_t(i)] = fn::quant::f32_to_bf16(static_cast<float>(r.normal()));
-        vc[size_t(i)] = fn::quant::f32_to_bf16(static_cast<float>(r.normal()));
+    // the caches below pos0: random (earlier rows' cells), BF16 or (KV8) quantized by the CPU reference
+    caches h;
+    h.q8 = q8;
+    if (q8) {
+        h.k8.assign(size_t(fx.cells) * HD, 0);
+        h.v8.assign(size_t(fx.cells) * HD, 0);
+        h.k.assign(size_t(fx.cells) * SS, 0);
+        h.v.assign(size_t(fx.cells) * SS, 0);
+        std::vector<float> rk(HD), rv(HD);
+        for (int64_t c = 0; c < pos0; ++c) {
+            for (int32_t e = 0; e < HD; ++e) {
+                rk[size_t(e)] = static_cast<float>(r.normal());
+                rv[size_t(e)] = static_cast<float>(r.normal());
+            }
+            fn::quant::kv_q8_quantize(rk.data(), HD, h.k8.data() + c * HD, h.k.data() + c * SS + q8_col);
+            fn::quant::kv_q8_quantize(rv.data(), HD, h.v8.data() + c * HD, h.v.data() + c * SS + q8_col);
+        }
+    } else {
+        h.k.assign(size_t(fx.cells) * HD, 0);
+        h.v.assign(size_t(fx.cells) * HD, 0);
+        for (int64_t i = 0; i < int64_t(pos0) * HD; ++i) {
+            h.k[size_t(i)] = fn::quant::f32_to_bf16(static_cast<float>(r.normal()));
+            h.v[size_t(i)] = fn::quant::f32_to_bf16(static_cast<float>(r.normal()));
+        }
     }
-    dbuf dk(kk.size() * 4), dv(vv.size() * 4), dkn(size_t(HD) * 4), dqn(size_t(HD) * 4), dkc(kc.size() * 2),
-        dvc(vc.size() * 2), dq(qfull.size() * 4), out(size_t(n) * NH * HD * 4), out16(size_t(n) * NH * HD * 2),
-        err(256);
-    if (!dk.put(kk) || !dv.put(vv) || !dkn.put(kn) || !dqn.put(qn) || !dkc.put(kc) || !dvc.put(vc) || !dq.put(qfull) ||
-        !out.poison() || !err.zero()) {
+    dbuf dk(kk.size() * 4), dv(vv.size() * 4), dkn(size_t(HD) * 4), dqn(size_t(HD) * 4), dkc(size_t(fx.cells) * HD * 2),
+        dvc(size_t(fx.cells) * HD * 2), dks(size_t(fx.cells) * SS * 2), dvs(size_t(fx.cells) * SS * 2),
+        dq(qfull.size() * 4), out(size_t(n) * NH * HD * 4), out16(size_t(n) * NH * HD * 2), err(256);
+    const bool up = q8 ? dkc.put(h.k8) && dvc.put(h.v8) && dks.put(h.k) && dvs.put(h.v) : dkc.put(h.k) && dvc.put(h.v);
+    if (!dk.put(kk) || !dv.put(vv) || !dkn.put(kn) || !dqn.put(qn) || !up || !dq.put(qfull) || !out.poison() ||
+        !err.zero()) {
         return false;
     }
     const float      ts = qsa::attn::rope_theta_scale();
@@ -197,27 +253,56 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
     ka.max_cells = fx.cells;
     ka.k_cache   = dkc.as<uint16_t>();
     ka.v_cache   = dvc.as<uint16_t>();
-    std::vector<uint16_t> kc2, vc2;
-    if (!qsa::qsp_kv(ka, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "qsp_kv") ||
-        !dkc.get(kc2, kc.size()) || !dvc.get(vc2, vc.size())) {
-        v.put("kv", false, "launch failed");
+    if (q8) {
+        ka.k_scale = dks.as<uint16_t>() + q8_col;
+        ka.v_scale = dvs.as<uint16_t>() + q8_col;
+    }
+    caches g; // the caches as the launch left them
+    g.q8 = q8;
+    const bool got = qsa::qsp_kv(ka, fn::ptest::test_stream()) && cuda_ok(cudaDeviceSynchronize(), "qsp_kv") &&
+                     (q8 ? dkc.get(g.k8, h.k8.size()) && dvc.get(g.v8, h.v8.size()) && dks.get(g.k, h.k.size()) &&
+                               dvs.get(g.v, h.v.size())
+                         : dkc.get(g.k, h.k.size()) && dvc.get(g.v, h.v.size()));
+    if (!got) {
+        v.put(std::string(tag) + "kv", false, "launch failed");
         return false;
     }
     int64_t kbad = 0, vbad = 0;
     for (int32_t t = 0; t < n; ++t) {
         double y[HD];
         norm_rope_ref(kk.data() + size_t(t) * HD, kn.data(), pos0 + t, ts, y);
+        const int64_t cell = int64_t(pos0) + t;
+        if (q8) {
+            double ymax = 0.0;
+            for (int32_t e = 0; e < HD; ++e) {
+                ymax = std::max(ymax, std::fabs(y[e]));
+            }
+            for (int32_t e = 0; e < HD; ++e) {
+                kbad += std::fabs(g.kval(cell, e) - y[e]) <= 0.5 * g.kscale(cell, e) + 1e-5 * ymax ? 0 : 1;
+            }
+            int8_t rc[HD];
+            uint16_t rs[4];
+            fn::quant::kv_q8_quantize(vv.data() + size_t(t) * HD, HD, rc, rs);
+            vbad += std::memcmp(rc, g.v8.data() + cell * HD, HD) == 0 &&
+                            std::memcmp(rs, g.v.data() + cell * SS + q8_col, 8) == 0
+                        ? 0
+                        : 1;
+            continue;
+        }
         for (int32_t e = 0; e < HD; ++e) {
-            const size_t at  = (size_t(pos0) + t) * HD + e;
-            const double got = fn::quant::bf16_to_f32(kc2[at]);
+            const size_t at = size_t(cell) * HD + e;
+            const double gk = fn::quant::bf16_to_f32(g.k[at]);
             const double ulp = std::ldexp(1.0, std::ilogb(std::max(std::fabs(y[e]), 1e-30)) - 7);
-            kbad += std::fabs(got - y[e]) <= ulp ? 0 : 1;
-            vbad += vc2[at] == fn::quant::f32_to_bf16(vv[size_t(t) * HD + e]) ? 0 : 1;
+            kbad += std::fabs(gk - y[e]) <= ulp ? 0 : 1;
+            vbad += g.v[at] == fn::quant::f32_to_bf16(vv[size_t(t) * HD + e]) ? 0 : 1;
         }
     }
-    v.put("K/V write rows " + std::to_string(pos0) + " + " + std::to_string(n), kbad == 0 && vbad == 0,
-          std::to_string(kbad) + " K values beyond one BF16 step of FP64, " + std::to_string(vbad) +
-              " V values not bf16(v)");
+    v.put(std::string(tag) + "K/V write rows " + std::to_string(pos0) + " + " + std::to_string(n),
+          kbad == 0 && vbad == 0,
+          q8 ? std::to_string(kbad) + " K values beyond half a quantization step of FP64, " + std::to_string(vbad) +
+                   " V rows not the CPU quantizer's codes and scales (q8)"
+             : std::to_string(kbad) + " K values beyond one BF16 step of FP64, " + std::to_string(vbad) +
+                   " V values not bf16(v)");
     // the selection of the rows (the prompt path's own; checked against decode's above)
     std::vector<float> iq(size_t(n) * 4 * KD);
     for (float & f : iq) {
@@ -242,24 +327,50 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
     aa.offsets   = ia.offsets;
     aa.k_cache   = dkc.as<uint16_t>();
     aa.v_cache   = dvc.as<uint16_t>();
+    aa.k_scale = ka.k_scale;
+    aa.v_scale = ka.v_scale;
     aa.rows      = n;
     aa.pos0      = pos0;
     aa.max_cells = fx.cells;
     aa.out       = out.as<float>();
     aa.out16     = out16.as<uint16_t>();
     aa.err       = err.as<uint32_t>();
-    std::vector<float>    got, got2;
+    std::vector<float> gout, gout2;
     std::vector<uint32_t> bodies, ew;
     if (!diq.put(iq) || !qsa::qsp_select(ia, fn::ptest::test_stream()) ||
         !qsa::qsp_attend(aa, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "attend") ||
-        !out.get(got, size_t(n) * NH * HD) || !body.get(bodies, size_t(qsa::prompt_sel_bytes / 4)) || !err.get(ew, 1) ||
-        !qsa::qsp_attend(aa, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "attend") ||
-        !out.get(got2, size_t(n) * NH * HD)) {
-        v.put("attend", false, "launch failed");
+        !out.get(gout, size_t(n) * NH * HD) || !body.get(bodies, size_t(qsa::prompt_sel_bytes / 4)) ||
+        !err.get(ew, 1) || !qsa::qsp_attend(aa, fn::ptest::test_stream()) ||
+        !cuda_ok(cudaDeviceSynchronize(), "attend") || !out.get(gout2, size_t(n) * NH * HD)) {
+        v.put(std::string(tag) + "attend", false, "launch failed");
         return false;
     }
+    // KV8's correction check: the caches written and both launches' outputs, for a byte comparison across binaries
+    // (test_dump: FNFL_TEST_DUMP set)
+    {
+        std::vector<uint16_t> g16;
+        const std::string d = std::string("qsp-") + (q8 ? "q8" : "bf16") + (vrows != nullptr ? "-stress" : "") + "-" +
+                              std::to_string(pos0) + "+" + std::to_string(n);
+        const bool dumped = out16.get(g16, size_t(n) * NH * HD) &&
+                            fn::tools::test_dump(d + "-out", gout.data(), gout.size() * 4) &&
+                            fn::tools::test_dump(d + "-out-rerun", gout2.data(), gout2.size() * 4) &&
+                            fn::tools::test_dump(d + "-out16", g16.data(), g16.size() * 2) &&
+                            fn::tools::test_dump(d + "-k", g.k.data(), g.k.size() * 2) &&
+                            fn::tools::test_dump(d + "-v", g.v.data(), g.v.size() * 2) &&
+                            (!q8 || (fn::tools::test_dump(d + "-k8", g.k8.data(), g.k8.size()) &&
+                                     fn::tools::test_dump(d + "-v8", g.v8.data(), g.v8.size())));
+        if (!dumped) {
+            v.put(std::string(tag) + "dump", false, "a dump failed");
+            return false;
+        }
+    }
+    if (vrows != nullptr) {
+        // the stress rows' large groups pass FP16's range: the prompt attention (FP16 operands) is out of contract;
+        // its outputs are dumped for the byte comparison only, the write checked alone
+        return kbad == 0 && vbad == 0;
+    }
     const int32_t *     offs = reinterpret_cast<const int32_t *>(bodies.data() + qsa::prompt_body_words);
-    std::vector<double> ref(got.size());
+    std::vector<double> ref(gout.size());
     parallel_for(n, [&](int64_t t) {
         const int32_t pos = pos0 + static_cast<int32_t>(t);
         const int32_t s = static_cast<int32_t>(t) / qsa::prompt_slab, rr = static_cast<int32_t>(t) % qsa::prompt_slab;
@@ -274,15 +385,15 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
         for (uint32_t i = 0; i < b[1]; ++i) {
             sel.push_back(static_cast<int32_t>(b[2 + b[0] + i]));
         }
-        for (int32_t h = 0; h < NH; ++h) {
+        for (int32_t hh = 0; hh < NH; ++hh) {
             double q[HD];
-            norm_rope_ref(qfull.data() + (size_t(t) * NH + h) * QS, qn.data(), pos, ts, q);
+            norm_rope_ref(qfull.data() + (size_t(t) * NH + hh) * QS, qn.data(), pos, ts, q);
             std::vector<double> sc(sel.size());
             double              mx = -HUGE_VAL;
             for (size_t c = 0; c < sel.size(); ++c) {
                 double d = 0.0;
                 for (int32_t e = 0; e < HD; ++e) {
-                    d += q[e] / 16.0 * fn::quant::bf16_to_f32(kc2[size_t(sel[c]) * HD + e]);
+                    d += q[e] / 16.0 * g.kval(sel[c], e);
                 }
                 sc[c] = d;
                 mx    = std::max(mx, d);
@@ -295,19 +406,19 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
             for (int32_t e = 0; e < HD; ++e) {
                 double o = 0.0;
                 for (size_t c = 0; c < sel.size(); ++c) {
-                    o += sc[c] * fn::quant::bf16_to_f32(vc2[size_t(sel[c]) * HD + e]);
+                    o += sc[c] * g.vval(sel[c], e);
                 }
-                const double gate                  = qfull[(size_t(t) * NH + h) * QS + HD + e];
-                ref[(size_t(t) * NH + h) * HD + e] = o / l / (1.0 + std::exp(-gate));
+                const double gate = qfull[(size_t(t) * NH + hh) * QS + HD + e];
+                ref[(size_t(t) * NH + hh) * HD + e] = o / l / (1.0 + std::exp(-gate));
             }
         }
     });
-    const double ea   = unit_error(got.data(), ref.data(), int64_t(n) * NH, HD);
-    const bool   same = std::memcmp(got.data(), got2.data(), got.size() * 4) == 0;
+    const double ea = unit_error(gout.data(), ref.data(), int64_t(n) * NH, HD);
+    const bool same = std::memcmp(gout.data(), gout2.data(), gout.size() * 4) == 0;
     // PB3 Amendment 2: a loose bug check (FP16 operands), the error printed on a failure only
     const bool loose = ea <= 2e-2;
     const bool ok = loose && same && ew[0] == 0;
-    v.put("attention rows " + std::to_string(pos0) + " + " + std::to_string(n), ok,
+    v.put(std::string(tag) + "attention rows " + std::to_string(pos0) + " + " + std::to_string(n), ok,
           std::string("against FP64 ") + (loose ? "within" : "OUTSIDE") +
               " the loose bug-check tolerance (2e-2 a row and head)" + (loose ? "" : " [" + e3(ea) + "]") + "; rerun " +
               (same ? "bitwise" : "DIFFERS") + "; error word " + std::to_string(ew[0]));
@@ -317,9 +428,21 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v) {
 
 }  // namespace
 
-int fnfl_qsp_test(int device, const char * mode) {
+int fnfl_qsp_test(int device, const char * mode, bool q8) {
     const bool san = mode != nullptr && std::strcmp(mode, "san") == 0;
     verdict    v("qsp-test");
+    printf("qsp-test: KV format %s\n", q8 ? "q8 (KV8)" : "bf16");
+    for (const int32_t which : {1, 2, 3, 4}) {
+        qsa::qsp_resources rs{};
+        if (qsa::qsp_kernel_resources(which, rs)) {
+            printf("qsp-test: %s: %d registers, %d B local, %d B shared\n",
+                   which == 1   ? "attend (bf16)"
+                   : which == 2 ? "kv (bf16)"
+                   : which == 3 ? "attend (q8)"
+                                : "kv (q8)",
+                   rs.regs, rs.local_bytes, rs.shared_bytes);
+        }
+    }
     if (!cuda_ok(cudaSetDevice(device), "device")) {
         v.put("setup", false, "a launch or copy failed");
         return v.finish();
@@ -368,15 +491,21 @@ int fnfl_qsp_test(int device, const char * mode) {
         v.put("setup", false, "a launch or copy failed");
         return v.finish();
     }
+    // KV8's quantizer stress rows (fn/quant/kv_q8_ref.h) as the rows' v: in q8 the codes and scales bitwise the CPU
+    // quantizer's, in BF16 bitwise bf16(v)
+    const std::vector<float> stress = fn::quant::kv_q8_stress_rows(0x6b5638ull, san ? 0 : 8);
+    const int32_t n_stress = static_cast<int32_t>(stress.size() / HD);
     if (san) {
         select_case(fx, 2040, 20, v);
-        kv_attend_case(fx, 2100, 8, v);
+        kv_attend_case(fx, 2100, 8, v, q8);
+        kv_attend_case(fx, 3000, n_stress, v, q8, stress.data(), "quantizer stress: ");
     } else {
         select_case(fx, 1990, 130, v);   // rows crossing 512 visible blocks (position 2,047)
         select_case(fx, 8000, 300, v);   // three slabs, deep rows
         select_case(fx, 15000, 129, v);  // a slab and one row
-        kv_attend_case(fx, 1000, 64, v);
-        kv_attend_case(fx, 9000, 130, v);
+        kv_attend_case(fx, 1000, 64, v, q8);
+        kv_attend_case(fx, 9000, 130, v, q8);
+        kv_attend_case(fx, 3000, n_stress, v, q8, stress.data(), "quantizer stress: ");
     }
     // deterministic ties and pathological inputs: cells 0 .. 4,095 rewritten, the summaries recomputed, the selection
     // against the decode select. Ties: every key the same value, so every block's summary and score tie. Pathological:

@@ -969,7 +969,8 @@ struct cr3_layer {
 
     bool make_gdn() {
         namespace gd = fn::gdn;
-        g_state = std::make_unique<dev_mem>(size_t(gd::n_version) * gd::state_version_floats * 4);
+        // ME11: gdn_core's two banks and two record sets
+        g_state = std::make_unique<dev_mem>(size_t(gd::banks_bytes + gd::records_bytes));
         // conv [B][5120], z [B][3072], alpha, beta [B][24], dt, a [24], ssm_norm [128] (F32, 256-byte aligned each)
         g_in = std::make_unique<dev_mem>(size_t(1) << 20);
         // gated [B][3072], its codes and scales
@@ -994,7 +995,8 @@ struct cr3_layer {
         a.a = f((size_t(2) << 17) + 12288);
         a.norm_w = f((size_t(2) << 17) + 16384);
         a.state = g_state->as<float>();
-        a.cur = g_cur->as<uint32_t>();
+        a.rec = reinterpret_cast<float *>(g_state->p + gd::banks_bytes);
+        a.gsel = g_cur->as<uint32_t>(); // ME11: selector 0 (bank 0, no records)
         a.gated = g_out->as<float>();
         a.gated_q = {reinterpret_cast<int8_t *>(g_out->p + (size_t(1) << 17)),
                      reinterpret_cast<float *>(g_out->p + (size_t(3) << 17)), cr3_B, gd::n_value};

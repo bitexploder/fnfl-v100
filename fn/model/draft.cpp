@@ -11,6 +11,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/round/round.h"
 #include "fn/kernels/samp/samp.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/shapes.h"
 #include "fn/xchg/xchg.h"
 
@@ -106,8 +107,10 @@ bool check_round(int32_t kind, int32_t rows, std::string & err) {
 
 bool begin(pass_card & p, std::string & err) {
     const fn::round::begin_args a = {p.host_ring, p.flag, p.desc, p.rstate, p.c.rings->err(p.c.card)};
-    return fn::round::begin(a, p.c.stream) && fn::round::stamp(p.rstate, p.c.stream) ? true
-                                                                                     : fail(err, "draft round begin");
+    // ME3: the failure names the pending CUDA error (the launch check peeks at it)
+    return fn::round::begin(a, p.c.stream) && fn::round::stamp(p.rstate, p.c.stream)
+               ? true
+               : fail(err, std::string("draft round begin: ") + cudaGetErrorString(cudaPeekAtLastError()));
 }
 
 bool finish(pass_card & p, std::string & err) {
@@ -230,6 +233,12 @@ bool prepare(pass_card & p, draft_card & d, int32_t rows, int32_t row0, bool cat
     a.theta_scale = fn::qsa::attn::rope_theta_scale();
     a.k_cache = d.k_cache;
     a.v_cache = d.v_cache;
+    const int64_t * shift = nullptr;
+    if (p.c.kv != nullptr) { // ME1: the host-backed KV's decode window (kv_tier.h)
+        a.k_cache = p.c.kv->k(r, kv_tier::draft_attn);
+        a.v_cache = p.c.kv->v(r, kv_tier::draft_attn);
+        shift = p.c.kv->shift(r); // ME3: the graphs' window start (null for eager)
+    }
     a.max_cells = d.max_cells;
     a.q16 = d.q16;
     a.q_f32 = nullptr;
@@ -240,7 +249,7 @@ bool prepare(pass_card & p, draft_card & d, int32_t rows, int32_t row0, bool cat
     const int32_t s = hc_slot_of(u, u.sub);
     a.release_hc = catchup ? rg.slot(r, fn::xchg::msg::hc, s) : nullptr;
     a.release_hmix = catchup ? rg.slot(r, fn::xchg::msg::hmix, s) : nullptr;
-    if (!fn::draft::datc_prepare(rows, a, p.c.stream)) {
+    if (!fn::draft::datc_prepare(rows, a, p.c.stream, shift)) {
         return fail(err, "datc_prepare");
     }
     note_piece(p.c, "draft.datc.prepare");
@@ -304,7 +313,23 @@ bool attn_body(pass_card & p, draft_card & d, int32_t j, const use_counters & u,
     a.scales = ws.mid_scales;
     a.err = p.c.rings->err(p.c.card);
     a.body = d.sparse ? ws.sel_body : nullptr;
-    if (!fn::draft::datc_attend(a, p.c.stream)) {
+    const int64_t * shift = nullptr;
+    if (p.c.kv != nullptr) {
+        // ME1: the host-backed KV: step 0 gathers its selection's older blocks, the chain's later steps reuse them
+        a.k_cache = p.c.kv->k(p.c.card, kv_tier::draft_attn);
+        a.v_cache = p.c.kv->v(p.c.card, kv_tier::draft_attn);
+        if (!d.sparse) {
+            return fail(err, "the host-backed KV tier serves the sparse draft only");
+        }
+        if (sel && !p.c.kv->select(p.c.card, kv_tier::draft_attn, 1, ws.sel_body, ws.sel_off, a.err, p.c.stream,
+                                   a.body, err)) {
+            return false;
+        }
+        a.body = sel ? a.body : p.c.kv->draft_body(p.c.card);
+        shift = p.c.kv->shift(p.c.card);
+        note_piece(p.c, "draft.kv.gather");
+    }
+    if (!fn::draft::datc_attend(a, p.c.stream, shift)) {
         return fail(err, "datc_attend");
     }
     note_piece(p.c, "draft.datc.attend");
@@ -318,50 +343,59 @@ bool attn_body(pass_card & p, draft_card & d, int32_t j, const use_counters & u,
            half_exchange(p.c, 0, 1, use_slot_of(u, u.a, u.graph_a), true, err);
 }
 
-// the FFN body after its HC sublayer: the F32 router and shared gate (acquiring X-HMIX), the Q8_0 experts, X-F's send
-bool ffn_body(pass_card & p, draft_card & d, const use_counters & u, std::string & err) {
+// the FFN body after its HC sublayer: the F32 router and shared gate (acquiring X-HMIX), the routed experts (Q8_0, or
+// ME7's opt-in Q2_0: the draft file's, draft_weights::ex_fmt) with the Q8_0 shared expert, X-F's send
+bool ffn_body(pass_card & p, draft_card & d, int32_t rows, const use_counters & u, std::string & err) {
     card_ctx & c = p.c;
     layer_ws & ws = c.ws;
-    fn::dense::product_args rt;
-    rt.k = D;
-    rt.n_mats = 2;
-    rt.mats[0] = fmat(d.w.router, NE, ws.logits);
-    rt.mats[1] = fmat(d.w.sh_gate_w, 1, ws.sg_logit);
-    rt.route.logits = 0;
-    rt.route.gate = 1;
-    rt.route.ids = c.ex.ids;
-    rt.route.wts = c.ex.wts;
-    rt.route.sg = ws.sg;
-    if (!dense_run(c, rt, 1, dense_site::draft_router, true, u, "draft.router", err)) {
-        return false;
+    // ME8: on one device and stream, card 1 reads card 0's routing (d.shared_route) and runs no router of its own
+    const route_view own = {c.ex.ids, c.ex.wts, ws.sg};
+    const route_view & rv = d.shared_route != nullptr ? *d.shared_route : own;
+    if (d.shared_route == nullptr) {
+        fn::dense::product_args rt;
+        rt.k = D;
+        rt.n_mats = 2;
+        rt.mats[0] = fmat(d.w.router, NE, ws.logits);
+        rt.mats[1] = fmat(d.w.sh_gate_w, 1, ws.sg_logit);
+        rt.route.logits = 0;
+        rt.route.gate = 1;
+        rt.route.ids = c.ex.ids;
+        rt.route.wts = c.ex.wts;
+        rt.route.sg = ws.sg;
+        if (!dense_run(c, rt, rows, dense_site::draft_router, true, u, "draft.router", err)) {
+            return false;
+        }
     }
     const fn::act::out_view glu = {c.ex.glu_codes, c.ex.glu_scales, fn::experts::glu_slots, FFS};
     const fn::act::view glu_in = {c.ex.glu_codes, c.ex.glu_scales, fn::experts::glu_slots, FFS};
-    fn::experts::gate_up_args ga = {d.w.ex_gate_up, d.w.sh_gate.w, d.w.sh_up.w, c.grids, {nullptr, nullptr, 1, D},
+    fn::experts::gate_up_args ga = {d.w.ex_gate_up, d.w.sh_gate.w, d.w.sh_up.w, c.grids, {nullptr, nullptr, rows, D},
                                     c.ex.ids,       c.ex.meta,     glu,         nullptr, c.ex.status};
-    ga.cw = fn::experts::class_weights(fn::experts::fmt::q8_0, static_cast<fn::dense::fmt>(d.w.sh_gate.fmt),
+    const auto rf = static_cast<fn::experts::fmt>(d.w.ex_fmt); // ME7: the routed format
+    ga.cw = fn::experts::class_weights(rf, static_cast<fn::dense::fmt>(d.w.sh_gate.fmt),
                                        static_cast<fn::dense::fmt>(d.w.sh_up.fmt)); // XB3: the unit order's weights
     ga.hmix = hmix_slot(c, u);
     ga.hmix_peer_half = 1 - c.card;
     ga.err = c.rings->err(c.card);
+    fn::experts::down_args da = {d.w.ex_down, d.w.ex_sh_down, c.grids, glu_in,     c.ex.ids,
+                                 c.ex.meta,   c.ex.wts,       ws.sg,   ws.partial, c.ex.status};
+    fn::experts::use_route(rv, ga, da); // ME8: card 0's routing on one device and stream, else this card's own
     const auto q8 = fn::experts::fmt::q8_0;
-    if (!fn::experts::gate_up(q8, static_cast<fn::dense::fmt>(d.w.sh_gate.fmt),
-                              static_cast<fn::dense::fmt>(d.w.sh_up.fmt), 1, ga, c.stream)) {
+    if (!fn::experts::gate_up(rf, static_cast<fn::dense::fmt>(d.w.sh_gate.fmt),
+                              static_cast<fn::dense::fmt>(d.w.sh_up.fmt), rows, ga, c.stream)) {
         return fail(err, "draft experts gate_up");
     }
     note_piece(c, "draft.ex_gate_up");
-    const fn::experts::down_args da = {d.w.ex_down, d.w.ex_sh_down, c.grids, glu_in,     c.ex.ids,
-                                       c.ex.meta,   c.ex.wts,       ws.sg,   ws.partial, c.ex.status};
-    if (!fn::experts::down(q8, q8, 1, da, c.stream)) {
+    if (!fn::experts::down(rf, q8, rows, da, c.stream)) {
         return fail(err, "draft experts down");
     }
     note_piece(c, "draft.ex_down");
-    return half_exchange(c, 1, 1, use_slot_of(u, u.f, u.graph_f), true, err);
+    return half_exchange(c, 1, rows, use_slot_of(u, u.f, u.graph_f), true, err);
 }
 
-// the draft's HC head (sublayer u.sub): part 0 down2 (its streams into h_nextn; sends X-HC), 1 up2 (the mixed row
-// into X-HMIX on both cards)
-bool head(pass_card & p, draft_card & d, int32_t part, const use_counters & u, std::string & err) {
+// the draft's HC head (sublayer u.sub): part 0 down2 (its streams into h: h_nextn, or the joint step's rows; sends
+// X-HC), 1 up2 (the mixed rows into X-HMIX on both cards)
+bool head(pass_card & p, draft_card & d, int32_t part, int32_t rows, float * h, const use_counters & u,
+          std::string & err) {
     const int32_t r = p.c.card;
     const fn::xchg::rings & rg = *p.c.rings;
     const layer_ws & ws = p.c.ws;
@@ -369,12 +403,12 @@ bool head(pass_card & p, draft_card & d, int32_t part, const use_counters & u, s
     if (part == 0) {
         const int32_t s_prev = hc_prev_slot_of(u, u.sub);
         fn::hc::down2_q8_args a;
-        a.a.d = {nullptr, ws.x[1], ws.out[1], ws.inject[1], d.w.head.gamma, d.h_nextn, p.head_mom};
+        a.a.d = {nullptr, ws.x[1], ws.out[1], ws.inject[1], d.w.head.gamma, h, p.head_mom};
         a.a.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
         a.a.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
         a.a.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
         a.w = d.w.head.q8_down;
-        if (!fn::hc::head_down2_q8(1, a, p.c.stream)) {
+        if (!fn::hc::head_down2_q8(rows, a, p.c.stream)) {
             return fail(err, "draft head down2");
         }
         note_piece(p.c, "draft.head.down2");
@@ -384,7 +418,7 @@ bool head(pass_card & p, draft_card & d, int32_t part, const use_counters & u, s
     a.a = {nullptr,
            p.head_mom,
            rg.slot(r, fn::xchg::msg::hc, s),
-           d.h_nextn,
+           h,
            d.w.head.gamma,
            nullptr,
            rg.slot(r, fn::xchg::msg::hmix, s),
@@ -393,7 +427,7 @@ bool head(pass_card & p, draft_card & d, int32_t part, const use_counters & u, s
            rg.err(r),
            r};
     a.w = d.w.head.q8_up;
-    if (!fn::hc::head_up2_q8(1, a, p.c.stream)) {
+    if (!fn::hc::head_up2_q8(rows, a, p.c.stream)) {
         return fail(err, "draft head up2");
     }
     note_piece(p.c, "draft.head.up2");
@@ -465,6 +499,10 @@ bool index_update(pass_card & p, draft_card & d, int32_t rows, std::string & err
     ua.depth = &p.desc->n_before;
     ua.rows = rows;
     ua.max_cells = d.max_cells;
+    if (p.c.kv != nullptr) { // ME6: the host-backed tier's key window (kv_tier.h)
+        ua.keys = p.c.kv->keys(p.c.card, kv_tier::draft_attn);
+        ua.shift = p.c.kv->shift(p.c.card);
+    }
     if (!fn::qsa::summary_update(ua, p.c.stream)) {
         return fail(err, "draft summary_update");
     }
@@ -535,16 +573,16 @@ bool phase(pass_card & p, draft_card & d, int32_t kind, int32_t rows, int32_t ph
         case 5:
             return hc_sublayer(p.c, d.w.hc_ffn, 1, ffn_input(p), 1, u, 1, err);
         case 6:
-            return ffn_body(p, d, u, err);
+            return ffn_body(p, d, 1, u, err);
         case 7:
             if (!half_exchange(p.c, 1, 1, use_slot_of(u, u.f, u.graph_f), false, err)) {
                 return false;
             }
             u.sub++;
             u.f++;
-            return head(p, d, 0, u, err);
+            return head(p, d, 0, 1, d.h_nextn, u, err);
         case 8:
-            return head(p, d, 1, u, err);
+            return head(p, d, 1, 1, d.h_nextn, u, err);
         case 9:
             return pick(p, d, j, false, u, err);
         default:
@@ -558,6 +596,329 @@ bool phase(pass_card & p, draft_card & d, int32_t kind, int32_t rows, int32_t ph
 
 int32_t n_phases(int32_t kind, int32_t rows) {
     return is_step(kind) ? rows * step_phases : catchup_phases;
+}
+
+// ---- FMU2 (build item 2): the joint draft step (draft.h draft_joint) ----
+
+constexpr int32_t L = fn::xchg::max_lanes;
+constexpr int32_t IQ = fn::qsa::n_idx_head * fn::qsa::head_dim; // the index query's floats a row
+
+bool joint_check(const draft_joint & j, int32_t rows, std::string & err) {
+    if (j.lanes < 2 || j.lanes > L || rows < 1 || rows > draft_max_steps || j.tok == nullptr || j.carry == nullptr ||
+        j.h == nullptr || j.one == nullptr) {
+        return fail(err, "joint draft: lanes outside 2 .. 4, rows outside 1 .. 4, or its buffers missing");
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        const pass_card * p = j.p[k];
+        const draft_card * d = j.d[k];
+        if (p == nullptr || d == nullptr || j.p[0] == nullptr || j.d[0] == nullptr || d->sampled != j.d[0]->sampled ||
+            d->sparse != j.d[0]->sparse || d->shared_route != nullptr || p->c.kv != nullptr ||
+            p->c.rings != j.p[0]->c.rings || p->c.card != j.p[0]->c.card || p->c.device != j.p[0]->c.device ||
+            p->c.stream != j.p[0]->c.stream || (d->sparse && (j.sel_body[k] == nullptr || j.sel_off[k] == nullptr))) {
+            return fail(err, "joint draft: lane " + std::to_string(k) +
+                                 " has another pick kind or draft form, is on the host-backed KV, or not on lane 0's "
+                                 "frame");
+        }
+    }
+    return true;
+}
+
+// step j's X-DRAFT-IN send of the U rows: row k's hidden input is carry row k (lane k's retained carry) at step 0,
+// then its head output row (hsrc = 1, not chained)
+bool joint_in_send(draft_joint & J, int32_t j, const use_counters & u, std::string & err) {
+    pass_card & p = *J.p[0];
+    draft_card & d = *J.d[0];
+    const int32_t r = p.c.card;
+    fn::draft::send_args a;
+    a.emb = p.emb_hres;
+    a.emb_stride = 4 * F;
+    a.carry = j == 0 ? J.carry : J.h;
+    a.carry_prev = d.carry_prev; // not read: hidden row hsrc + i - 1 >= 0
+    a.h_nextn = d.h_nextn;
+    a.hsrc = J.one;
+    a.chained = false;
+    a.g_e = d.w.enorm;
+    a.g_h = d.w.hnorm;
+    a.peer = p.c.rings->slot(1 - r, fn::xchg::msg::draft, use_slot_of(u, u.draft, u.graph_draft));
+    a.own = d.in_own;
+    if (!fn::draft::draft_in_send(J.lanes, a, p.c.stream)) {
+        return fail(err, "joint draft_in_send");
+    }
+    note_piece(p.c, "draft.in.send");
+    return true;
+}
+
+// step j's attention body of the U rows: q/k/v (acquiring X-HMIX), then each lane's DA-TC prepare, SP2 select (sparse
+// step 0) and attend on its own cells and history, the output product and X-A's send
+bool joint_attn(draft_joint & J, int32_t j, const use_counters & u, std::string & err) {
+    pass_card & p = *J.p[0];
+    draft_card & d = *J.d[0];
+    layer_ws & ws = p.c.ws;
+    const int32_t U = J.lanes;
+    const bool sel = d.sparse && j == 0;
+    fn::dense::product_args in;
+    in.k = D;
+    in.n_mats = sel ? 4 : 3;
+    in.mats[0] = qmat(d.w.wq, ws.qfull);
+    in.mats[1] = qmat(d.w.wk, ws.kv_k);
+    in.mats[2] = qmat(d.w.wv, ws.kv_v);
+    if (sel) {
+        in.mats[3] = bmat16(d.iw.q_proj, IQ, ws.iq);
+    }
+    if (!dense_run(p.c, in, U, sel ? dense_site::draft_qkv_idx : dense_site::draft_qkv, true, u, "draft.qkv", err)) {
+        return false;
+    }
+    for (int32_t k = 0; k < U; ++k) {
+        pass_card & pk = *J.p[k];
+        draft_card & dk = *J.d[k];
+        uint32_t * e = pk.c.rings->err(pk.c.card);
+        fn::draft::prepare_args a;
+        a.qfull = ws.qfull + int64_t(k) * QF;
+        a.kv_k = ws.kv_k + int64_t(k) * HD;
+        a.kv_v = ws.kv_v + int64_t(k) * HD;
+        a.q_norm = d.w.q_norm;
+        a.k_norm = d.w.k_norm;
+        a.n_before = &pk.desc->n_before;
+        a.pos = pk.desc->pos;
+        a.stride = &pk.desc->rows;
+        a.row0 = j;
+        a.theta_scale = fn::qsa::attn::rope_theta_scale();
+        a.k_cache = dk.k_cache;
+        a.v_cache = dk.v_cache;
+        a.max_cells = dk.max_cells;
+        a.q16 = dk.q16;
+        a.q_f32 = nullptr;
+        a.k_f32 = nullptr;
+        a.err = e;
+        a.release_hc = nullptr;
+        a.release_hmix = nullptr;
+        if (!fn::draft::datc_prepare(1, a, p.c.stream)) {
+            return fail(err, "joint datc_prepare");
+        }
+        note_piece(p.c, "draft.datc.prepare");
+        if (sel) {
+            if (!fn::draft::select_depth(&pk.desc->n_before, dk.sel_depth, p.c.stream)) {
+                return fail(err, "joint draft select depth");
+            }
+            fn::qsa::select_args sa;
+            sa.summaries = dk.idx_summ;
+            sa.q = ws.iq + int64_t(k) * IQ;
+            sa.q_norm = d.iw.q_norm;
+            sa.depth = dk.sel_depth;
+            sa.max_cells = dk.max_cells;
+            sa.rope = fn::qsa::model_rope();
+            sa.ws = fn::qsa::carve(p.c.qsa_ws);
+            sa.body = J.sel_body[k];
+            sa.offsets = J.sel_off[k];
+            sa.q_ahead = 1;
+            if (!fn::qsa::select(1, sa, p.c.stream)) {
+                return fail(err, "joint draft select");
+            }
+            note_piece(p.c, "draft.select");
+        }
+        fn::draft::attend_args t;
+        t.q16 = dk.q16;
+        t.qfull = ws.qfull + int64_t(k) * QF;
+        t.k_cache = dk.k_cache;
+        t.v_cache = dk.v_cache;
+        t.n_before = &pk.desc->n_before;
+        t.row0 = j;
+        t.max_cells = dk.max_cells;
+        t.part = dk.part;
+        t.out = ws.attn + int64_t(k) * fn::draft::out_width;
+        t.codes = ws.mid_codes + fn::act::codes_bytes(k, fn::draft::out_width);
+        t.scales = ws.mid_scales + fn::act::scales_bytes(k, fn::draft::out_width) / sizeof(float);
+        t.err = e;
+        t.body = d.sparse ? J.sel_body[k] : nullptr;
+        if (!fn::draft::datc_attend(t, p.c.stream)) {
+            return fail(err, "joint datc_attend");
+        }
+        note_piece(p.c, "draft.datc.attend");
+    }
+    fn::dense::product_args out;
+    out.k = QH * HD;
+    out.n_mats = 1;
+    out.mats[0] = qmat(d.w.wo, ws.partial);
+    out.x_codes = ws.mid_codes;
+    out.x_scales = ws.mid_scales;
+    return dense_run(p.c, out, U, dense_site::draft_out, false, u, "draft.out", err) &&
+           half_exchange(p.c, 0, U, use_slot_of(u, u.a, u.graph_a), true, err);
+}
+
+// FMU4: step j's sampled pick of the U rows (every lane sampled): stage 0 (select) or 1 (tk_decide) of lane k's lone
+// pick (draft.cpp pick) on logits row k, with its own sampler view, q_list row j, live position, deltas and proposal
+// slot desc argmax[j]; its list in row k of samp_a's slot (samp::pick_lanes_stage), as the lanes share lane 0's rings.
+// After the decides the proposals are gathered into tok row j + 1 for the next step's embedding.
+bool joint_pick_sampled(draft_joint & J, int32_t j, int32_t stage, int32_t rows, std::string & err) {
+    pass_card & p = *J.p[0];
+    draft_card & d = *J.d[0];
+    const int32_t U = J.lanes;
+    const fn::samp::card_view * v[L] = {};
+    fn::samp::pick_io io[L];
+    for (int32_t k = 0; k < U; ++k) {
+        v[k] = &J.p[k]->samp;
+        io[k].logits = d.logits + int64_t(k) * NV;
+        io[k].n = NV;
+        io[k].ids = d.head_ids;
+        io[k].live = J.p[k]->desc;
+        io[k].live_offset = j + 1;
+        io[k].t = j;
+        io[k].dtok = J.p[k]->desc->argmax;
+        io[k].n_dtok = j;
+        io[k].proposal = J.p[k]->desc->argmax + j;
+    }
+    if (!fn::samp::pick_lanes_stage(v, io, U, stage, p.c.stream)) {
+        return fail(err, stage == 0 ? "joint draft sampled pick select" : "joint draft sampled pick decide");
+    }
+    note_piece(p.c, stage == 0 ? "draft.pick.select" : "draft.pick.tk_decide");
+    if (stage == 0 || j == rows - 1) {
+        return true;
+    }
+    fn::draft::copy_seg g[fn::draft::max_copy_segs];
+    for (int32_t k = 0; k < U; ++k) {
+        g[k] = {reinterpret_cast<const uint32_t *>(J.p[k]->desc->argmax + j),
+                reinterpret_cast<uint32_t *>(J.tok + (j + 1) * L + k), 1, 1};
+    }
+    if (!fn::draft::lanes_copy(U, g, p.c.stream)) {
+        return fail(err, "joint draft proposals gather");
+    }
+    note_piece(p.c, "draft.joint.gather");
+    return true;
+}
+
+// step j's logits of the U rows and greedy's reduce (T-GREEDY slot 0), or its decide into tok row j + 1; sampled
+// lanes: the logits, then each lane's select, or each lane's decide (joint_pick_sampled)
+bool joint_pick(draft_joint & J, int32_t j, bool decide, int32_t rows, const use_counters & u, std::string & err) {
+    pass_card & p = *J.p[0];
+    draft_card & d = *J.d[0];
+    const int32_t r = p.c.card;
+    const fn::xchg::rings & rg = *p.c.rings;
+    if (d.sampled) {
+        if (!decide) {
+            const fn::head::logits_args la = {rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
+                                              rg.err(r),
+                                              r,
+                                              d.head_w,
+                                              NV,
+                                              d.logits,
+                                              d.logits_work};
+            if (!fn::head::logits(J.lanes, la, p.c.stream)) {
+                return fail(err, "joint draft logits");
+            }
+        }
+        return joint_pick_sampled(J, j, decide ? 1 : 0, rows, err);
+    }
+    if (!decide) {
+        const fn::head::logits_args la = {
+            rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)), rg.err(r), r, d.head_w, NV, d.logits, d.logits_work};
+        fn::head::reduce_args ra = {d.logits,     NV, 0, p.pair_own, rg.slot(1 - r, fn::xchg::msg::greedy, 0),
+                                    p.greedy_work};
+        ra.ids = d.head_ids;
+        if (!fn::head::logits(J.lanes, la, p.c.stream) || !fn::head::greedy_reduce(J.lanes, ra, p.c.stream)) {
+            return fail(err, "joint draft logits / reduce");
+        }
+        note_piece(p.c, "draft.pick.reduce");
+        return true;
+    }
+    const fn::head::decide_args da = {
+        p.pair_own, rg.slot(r, fn::xchg::msg::greedy, 0), J.tok + (j + 1) * L, rg.err(r), nullptr, r};
+    if (!fn::head::greedy_decide(J.lanes, da, p.c.stream)) {
+        return fail(err, "joint draft decide");
+    }
+    note_piece(p.c, "draft.pick.decide");
+    return true;
+}
+
+// Phase ph of the joint step on one card, in the lone step's phase order (draft.cpp phase)
+bool joint_phase(draft_joint & J, int32_t rows, int32_t ph, use_counters & u, std::string & err) {
+    pass_card & p = *J.p[0];
+    draft_card & d = *J.d[0];
+    const int32_t U = J.lanes;
+    if (!cuda_ok(cudaSetDevice(p.c.device), "cudaSetDevice", err)) {
+        return false;
+    }
+    const int32_t j = ph / step_phases;
+    switch (ph % step_phases) {
+        case 0:
+            if (j == 0) {
+                // every lane's round begun; its token and retained carry gathered into row k
+                fn::draft::copy_seg g[fn::draft::max_copy_segs];
+                for (int32_t k = 0; k < U; ++k) {
+                    if (!begin(*J.p[k], err)) {
+                        return false;
+                    }
+                    g[2 * k] = {reinterpret_cast<const uint32_t *>(J.p[k]->desc->tok),
+                                reinterpret_cast<uint32_t *>(J.tok + k), 1, 1};
+                    g[2 * k + 1] = {reinterpret_cast<const uint32_t *>(J.d[k]->carry_prev),
+                                    reinterpret_cast<uint32_t *>(J.carry + int64_t(k) * 4 * F), 4 * F, 1};
+                }
+                if (!fn::draft::lanes_copy(2 * U, g, p.c.stream)) {
+                    return fail(err, "joint draft gather");
+                }
+                note_piece(p.c, "draft.joint.gather");
+            }
+            return embed(p, J.tok + j * L, U, err) && joint_in_send(J, j, u, err);
+        case 1:
+            if (!draft_in(p, d, U, false, false, false, u, err)) {
+                return false;
+            }
+            u.draft++;
+            return eh_proj(p, d, U, err) && hc_sublayer(p.c, d.w.hc_attn, 0, attn_input(p, d), U, u, 0, err);
+        case 2:
+            return hc_sublayer(p.c, d.w.hc_attn, 0, attn_input(p, d), U, u, 1, err);
+        case 3:
+            return joint_attn(J, j, u, err);
+        case 4:
+            if (!half_exchange(p.c, 0, U, use_slot_of(u, u.a, u.graph_a), false, err)) {
+                return false;
+            }
+            u.sub++;
+            u.a++;
+            return hc_sublayer(p.c, d.w.hc_ffn, 1, ffn_input(p), U, u, 0, err);
+        case 5:
+            return hc_sublayer(p.c, d.w.hc_ffn, 1, ffn_input(p), U, u, 1, err);
+        case 6:
+            return ffn_body(p, d, U, u, err);
+        case 7:
+            if (!half_exchange(p.c, 1, U, use_slot_of(u, u.f, u.graph_f), false, err)) {
+                return false;
+            }
+            u.sub++;
+            u.f++;
+            return head(p, d, 0, U, J.h, u, err);
+        case 8:
+            return head(p, d, 1, U, J.h, u, err);
+        case 9:
+            return joint_pick(J, j, false, rows, u, err);
+        default: {
+            if (!joint_pick(J, j, true, rows, u, err)) {
+                return false;
+            }
+            u.sub++;
+            if (j < rows - 1) {
+                return true;
+            }
+            // each lane's picks into its descriptor's argmax[0 .. d - 1] (sampled picks are there already), then its
+            // commit and finish
+            if (!d.sampled) {
+                fn::draft::copy_seg g[fn::draft::max_copy_segs];
+                for (int32_t k = 0; k < U; ++k) {
+                    g[k] = {reinterpret_cast<const uint32_t *>(J.tok + L + k),
+                            reinterpret_cast<uint32_t *>(J.p[k]->desc->argmax), rows, L};
+                }
+                if (!fn::draft::lanes_copy(U, g, p.c.stream)) {
+                    return fail(err, "joint draft scatter");
+                }
+                note_piece(p.c, "draft.joint.scatter");
+            }
+            for (int32_t k = 0; k < U; ++k) {
+                if (!finish(*J.p[k], err)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
 }
 
 uint8_t * class_part(const model & m, const char * cls, const char * name, int32_t card, std::string & err) {
@@ -579,7 +940,9 @@ int64_t class_part_bytes(const model & m, const char * cls, const char * name, i
 // SP2: the draft index's buffers on this card; card 1 copies the indexer's weights from card 0's regions
 bool draft_index_init(model & m, int32_t card, draft_card & d, std::string & err) {
     const char * X = "draft index (SP2)";
-    d.idx_keys = reinterpret_cast<uint16_t *>(class_part(m, X, "L48 keys", card, err));
+    // ME6: with the host-backed tier the keys' class is their host history
+    const char * XK = m.state_class("draft index keys (ME6)") != nullptr ? "draft index keys (ME6)" : X;
+    d.idx_keys = reinterpret_cast<uint16_t *>(class_part(m, XK, "L48 keys", card, err));
     d.idx_summ = reinterpret_cast<float *>(class_part(m, X, "L48 summaries", card, err));
     d.sel_depth = reinterpret_cast<int32_t *>(class_part(m, X, "select depth", card, err));
     draft_index_weights w0;
@@ -587,7 +950,7 @@ bool draft_index_init(model & m, int32_t card, draft_card & d, std::string & err
         !resolve_draft_index_weights(m, w0, err)) {
         return false;
     }
-    if (class_part_bytes(m, X, "L48 keys", card) < int64_t(d.max_cells) * fn::qsa::head_dim * 2 ||
+    if (class_part_bytes(m, XK, "L48 keys", card) < int64_t(d.max_cells) * fn::qsa::head_dim * 2 ||
         class_part_bytes(m, X, "L48 summaries", card) <
             static_cast<int64_t>(fn::qsa::summary_bytes(fn::qsa::blocks_complete(d.max_cells)))) {
         return fail(err, "draft index: keys or summaries smaller than the draft KV's cells");
@@ -770,9 +1133,52 @@ step_status draft_pair_enqueue(pass_card * const p[2], draft_card * const d[2], 
     if (!check_round(kind, rows, err)) {
         return step_status::failed;
     }
+    // ME8: on one device and stream card 1's FFN reads card 0's routing; each phase runs card 0 before card 1, so
+    // card 0's router precedes both cards' experts in the stream. Set for this call only, cleared on every exit
+    const card_ctx & c0 = p[0]->c, & c1 = p[1]->c;
+    const bool one = c0.device == c1.device && c0.stream == c1.stream && c0.stream != nullptr;
+    const route_view r0 = {c0.ex.ids, c0.ex.wts, c0.ws.sg};
+    struct clear_route {
+        draft_card & d;
+        ~clear_route() { d.shared_route = nullptr; }
+    } clear{*d[1]};
+    d[1]->shared_route = one ? &r0 : nullptr;
     for (int32_t ph = 0; ph < n_phases(kind, rows); ++ph) {
         for (int32_t k = 0; k < 2; ++k) {
             if (!phase(*p[k], *d[k], kind, rows, ph, u[k], err)) {
+                return step_status::failed;
+            }
+        }
+    }
+    return step_status::ok;
+}
+
+step_status draft_joint_enqueue(draft_joint & j, int32_t rows, use_counters & u, std::string & err) {
+    if (!joint_check(j, rows, err)) {
+        return step_status::failed;
+    }
+    for (int32_t ph = 0; ph < rows * step_phases; ++ph) {
+        if (!joint_phase(j, rows, ph, u, err)) {
+            return step_status::failed;
+        }
+    }
+    return step_status::ok;
+}
+
+step_status draft_joint_pair_enqueue(draft_joint * const j[2], int32_t rows, use_counters u[2], std::string & err) {
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!joint_check(*j[c], rows, err)) {
+            return step_status::failed;
+        }
+    }
+    if (j[0]->lanes != j[1]->lanes || j[0]->p[0]->c.card != 0 || j[1]->p[0]->c.card != 1 ||
+        j[0]->p[0]->c.device == j[1]->p[0]->c.device) {
+        fail(err, "joint draft: the cards' lanes differ, or both cards on one device");
+        return step_status::failed;
+    }
+    for (int32_t ph = 0; ph < rows * step_phases; ++ph) {
+        for (int32_t c = 0; c < 2; ++c) {
+            if (!joint_phase(*j[c], rows, ph, u[c], err)) {
                 return step_status::failed;
             }
         }

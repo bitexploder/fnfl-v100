@@ -121,4 +121,11 @@ bool stats(int32_t rows, const step_args & a, void * stream);
 bool update(int32_t rows, const step_args & a, void * stream);
 bool step(int32_t rows, const step_args & a, void * stream);
 
+// FMU2 (build item 4): every lane's products in one fn::dense::product_joint launch, each weight loaded once: lanes 2..4,
+// lane u's a[u] at fn::dense::lane_rows (5) rows, its own e and workspace, the same weights. Lane u's key and value are
+// bitwise its products(5, a[u]) (the joint product's contract, dense.h). work: joint_products_work_bytes(), zeroed
+// once, private to these launches. Enqueued on stream; false as products.
+size_t joint_products_work_bytes();
+bool products_joint(int32_t lanes, const step_args * const a[], uint8_t * work, void * stream);
+
 } // namespace fn::ple

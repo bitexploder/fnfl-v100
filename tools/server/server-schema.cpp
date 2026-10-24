@@ -64,6 +64,11 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("n") // alias "n" as fallback (OpenAI completions API)
         ->set_desc("Number of completions to generate; FNFL generates one per prompt"));
 
+    // (ticket TU2; MU1)
+    add((new field_num("priority", params.priority))
+        ->set_hard_limits(INT32_MIN, INT32_MAX)
+        ->set_desc("Two-user scheduling (more than one slot): among the requests reading their prompts, the higher priority is read first (default 0). Decode rounds always go first"));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

@@ -27,18 +27,25 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
 
 } // namespace
 
-void slot_versions::bind(int32_t card, int32_t device, void * stream, uint32_t * cur_dev) {
+void slot_versions::bind(int32_t card, int32_t device, void * stream, uint32_t * cur_dev, uint32_t * gdn_dev) {
     device_[card] = device;
     stream_[card] = stream;
     cur_dev_[card] = cur_dev;
+    gdn_dev_[card] = gdn_dev;
 }
 
-bool slot_versions::write_cur(uint32_t cur, std::string & err) {
+// cur and the GDN selector together on both cards, between rounds (FC-G8)
+bool slot_versions::write_cur(uint32_t cur, uint32_t gdn, std::string & err) {
+    if (!fn::round::gdn_valid(gdn)) {
+        return fail(err, "GDN selector " + std::to_string(gdn) + " outside the contract");
+    }
     for (int32_t c = 0; c < 2; ++c) {
         cudaStream_t s = static_cast<cudaStream_t>(stream_[c]);
-        const uint32_t v = cur;
-        if (cur_dev_[c] == nullptr || !cuda_ok(cudaSetDevice(device_[c]), "cudaSetDevice", err) ||
-            !cuda_ok(cudaMemcpyAsync(cur_dev_[c], &v, 4, cudaMemcpyHostToDevice, s), "cur", err) ||
+        const uint32_t v[2] = {cur, gdn};
+        if (cur_dev_[c] == nullptr || gdn_dev_[c] == nullptr ||
+            !cuda_ok(cudaSetDevice(device_[c]), "cudaSetDevice", err) ||
+            !cuda_ok(cudaMemcpyAsync(cur_dev_[c], &v[0], 4, cudaMemcpyHostToDevice, s), "cur", err) ||
+            !cuda_ok(cudaMemcpyAsync(gdn_dev_[c], &v[1], 4, cudaMemcpyHostToDevice, s), "GDN selector", err) ||
             !cuda_ok(cudaStreamSynchronize(s), "cur", err)) {
             return err.empty() ? fail(err, "cur: card not bound") : false;
         }
@@ -47,10 +54,16 @@ bool slot_versions::write_cur(uint32_t cur, std::string & err) {
 }
 
 bool slot_versions::read_cur(uint32_t out[2], std::string & err) const {
+    uint32_t gdn[2] = {0, 0};
+    return read_words(out, gdn, err);
+}
+
+bool slot_versions::read_words(uint32_t cur[2], uint32_t gdn[2], std::string & err) const {
     for (int32_t c = 0; c < 2; ++c) {
         cudaStream_t s = static_cast<cudaStream_t>(stream_[c]);
         if (!cuda_ok(cudaSetDevice(device_[c]), "cudaSetDevice", err) ||
-            !cuda_ok(cudaMemcpyAsync(&out[c], cur_dev_[c], 4, cudaMemcpyDeviceToHost, s), "cur", err) ||
+            !cuda_ok(cudaMemcpyAsync(&cur[c], cur_dev_[c], 4, cudaMemcpyDeviceToHost, s), "cur", err) ||
+            !cuda_ok(cudaMemcpyAsync(&gdn[c], gdn_dev_[c], 4, cudaMemcpyDeviceToHost, s), "GDN selector", err) ||
             !cuda_ok(cudaStreamSynchronize(s), "cur", err)) {
             return false;
         }
@@ -61,13 +74,23 @@ bool slot_versions::read_cur(uint32_t out[2], std::string & err) const {
 bool slot_versions::reset(ledger & l, std::string & err) {
     l = ledger();
     last_ = step_record();
-    return write_cur(0, err);
+    return write_cur(0, 0, err);
+}
+
+bool slot_versions::set_gdn(ledger & l, uint32_t gdn, std::string & err) {
+    if (!write_cur(l.cur, gdn, err)) {
+        return false;
+    }
+    l.gdn = gdn;
+    last_ = step_record();
+    return true;
 }
 
 void slot_versions::begin_step(ledger & l, bool head) {
     l.a = l.o; // the previous step is acknowledged by this one's start (RS1 section 3)
     last_ = step_record();
     last_.cur_pre = l.cur;
+    last_.gdn_pre = l.gdn;
     last_.n_before = l.n;
     last_.l_before = static_cast<int64_t>(l.tok.size());
     last_.o_before = l.o;
@@ -77,31 +100,57 @@ void slot_versions::begin_step(ledger & l, bool head) {
     last_.head = head;
 }
 
-bool slot_versions::committed(ledger & l, int32_t k, const uint32_t reported[2], std::string & err) {
+namespace {
+
+// the commit's check of both cards' words against the host's rule (version.h)
+bool commit_words(ledger & l, int32_t k, uint32_t want_gdn, const uint32_t reported[2], const uint32_t reported_gdn[2],
+                  std::string & err) {
     const uint32_t want = static_cast<uint32_t>(fn::round::version_slot(l.cur, k));
     if (k < 0 || k > fn::round::max_rows || reported[0] != want || reported[1] != want) {
         return fail(err, "commit: the cards' committed slots " + std::to_string(reported[0]) + " and " +
                              std::to_string(reported[1]) + " are not slot " + std::to_string(want) + " (k " +
                              std::to_string(k) + " from slot " + std::to_string(l.cur) + ")");
     }
+    if (reported_gdn[0] != want_gdn || reported_gdn[1] != want_gdn) {
+        return fail(err, "commit: the cards' GDN selectors " + std::to_string(reported_gdn[0]) + " and " +
+                             std::to_string(reported_gdn[1]) + " are not " + std::to_string(want_gdn) + " (k " +
+                             std::to_string(k) + " from " + std::to_string(l.gdn) + ")");
+    }
     l.cur = want;
+    l.gdn = want_gdn;
+    return true;
+}
+
+} // namespace
+
+bool slot_versions::committed(ledger & l, int32_t k, const uint32_t reported[2], const uint32_t reported_gdn[2],
+                              std::string & err) {
+    const uint32_t want_gdn = k >= 1 ? fn::round::gdn_after_round(l.gdn, k) : l.gdn;
+    if (!commit_words(l, k, want_gdn, reported, reported_gdn, err)) {
+        return false;
+    }
     last_.k = k;
     last_.kept = k;
     last_.valid = true;
     return true;
 }
 
-bool slot_versions::committed_prompt(ledger & l, int32_t k, const uint32_t reported[2], std::string & err) {
-    if (!committed(l, k, reported, err)) {
+bool slot_versions::committed_prompt(ledger & l, int32_t k, const uint32_t reported[2],
+                                     const uint32_t reported_gdn[2], std::string & err) {
+    const uint32_t want_gdn = k >= 1 ? fn::round::gdn_after_prompt(l.gdn) : l.gdn;
+    if (!commit_words(l, k, want_gdn, reported, reported_gdn, err)) {
         return false;
     }
+    last_.k      = k;
     last_.kept   = 0;
+    last_.valid  = true;
     last_.prompt = true;
     return true;
 }
 
 bool slot_versions::restore(ledger & l, std::string & err) {
-    if (!write_cur(l.cur, err)) {
+    // the ledger still holds the pre-step words (committed was not called): the bank and set the round did not write
+    if (!write_cur(l.cur, l.gdn, err)) {
         return false;
     }
     last_.k = 0;
@@ -136,10 +185,14 @@ bool slot_versions::cut(ledger & l, int32_t j, int64_t n_keep, std::string & err
         return fail(err, "cut: with outputs kept, exactly the pending token stays unprocessed (FC-SLOT1)");
     }
     const uint32_t cur = static_cast<uint32_t>(fn::round::version_slot(last_.cur_pre, j));
-    if (!write_cur(cur, err)) {
+    // ME11: j = 0 the pre-step selector; j >= 1 rows of a target step: the pre-step matrix the step stored into the
+    // other bank with its first j records (a prompt step keeps no rows, so only j = 0 reaches it)
+    const uint32_t gdn = j == 0 ? last_.gdn_pre : fn::round::gdn_after_round(last_.gdn_pre, j);
+    if (!write_cur(cur, gdn, err)) {
         return false;
     }
     l.cur = cur;
+    l.gdn = gdn;
     l.n = n_after;
     l.tok.resize(static_cast<size_t>(n_keep));
     l.prompt_len = std::min(l.prompt_len, n_keep); // a cut inside the prompt shortens it
@@ -173,12 +226,13 @@ bool slot_versions::check(ledger & l, std::string & err) {
     ++l.checks;
     if (static_cast<int64_t>(l.tok.size()) != l.n + l.u) {
         ++l.failures;
-        return fail(err, "ledger: L != N + U");
+        return fail(err, "ledger: L != N + U (L " + std::to_string(l.tok.size()) + ", N " + std::to_string(l.n) +
+                             ", U " + std::to_string(l.u) + ", O " + std::to_string(l.o) + ")");
     }
     if (l.summaries.n_valid != fn::qsa::blocks_complete(static_cast<int32_t>(l.n)) ||
-        l.cur >= static_cast<uint32_t>(fn::round::n_version) || l.a > l.o) {
+        l.cur >= static_cast<uint32_t>(fn::round::n_version) || !fn::round::gdn_valid(l.gdn) || l.a > l.o) {
         ++l.failures;
-        return fail(err, "ledger: summaries' valid blocks != N / 4, cur out of range, or A > O");
+        return fail(err, "ledger: summaries' valid blocks != N / 4, cur or the GDN selector out of range, or A > O");
     }
     return true;
 }

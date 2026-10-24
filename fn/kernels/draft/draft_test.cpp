@@ -386,6 +386,44 @@ bool test_in(int32_t dev0, int32_t dev1, tally & t) {
                     k.name + ": a rerun is not bitwise identical");
         }
     }
+    // FMU2 (build item 2, the joint draft step): rows 2 .. 4 at hsrc 1, not chained (row i's hidden: carry row i), each
+    // row bitwise the same row alone at B = 1 in the lone step's two forms (step 0 on the retained carry; the later
+    // steps chained on h_nextn): its F32 row, codes and scales on both cards
+    int32_t n_alone = 0, n_alone_same = 0;
+    for (int32_t U = 2; U <= 4 && ok; ++U) {
+        const in_case kj = {"draft-in joint rows " + std::to_string(U), U, 1, U % 3, false, false};
+        in_out oj[2];
+        ok = run_in(d, rg, ci, kj, oj);
+        for (int32_t i = 0; i < U && ok; ++i) {
+            for (const bool chained : {false, true}) {
+                card_in c1[2] = {ci[0], ci[1]};
+                const size_t row = size_t(dr::n_stream) * H;
+                for (int32_t c = 0; c < 2; ++c) {
+                    std::copy_n(ci[c].emb.begin() + std::ptrdiff_t(size_t(i) * row), row, c1[c].emb.begin());
+                    std::copy_n(ci[c].carry.begin() + std::ptrdiff_t(size_t(i) * row), row,
+                                (chained ? c1[c].h_nextn : c1[c].carry_prev).begin());
+                }
+                const in_case k1 = {"draft-in row alone", 1, 0, (i + 1) % 3, chained, false};
+                in_out o1[2];
+                ok = run_in(d, rg, c1, k1, o1);
+                bool same = ok;
+                const size_t nf = size_t(dr::n_stream) * dr::in_width, ns = size_t(dr::n_stream) * dr::in_runs * 2;
+                for (int32_t c = 0; c < 2 && ok; ++c) {
+                    same = same && memcmp(oj[c].f32.data() + size_t(i) * nf, o1[c].f32.data(), nf * 4) == 0 &&
+                           memcmp(oj[c].codes.data() + size_t(i) * nf, o1[c].codes.data(), nf) == 0 &&
+                           memcmp(oj[c].scales.data() + size_t(i) * ns, o1[c].scales.data(), ns * 4) == 0 &&
+                           oj[c].err == 0u && o1[c].err == 0u;
+                }
+                ++n_alone;
+                n_alone_same += same ? 1 : 0;
+                t.check(same, kj.name + ": row " + std::to_string(i) + (chained ? " (chained)" : " (retained carry)") +
+                                  " is not bitwise the row alone");
+            }
+        }
+    }
+    printf("draft-kernel-test: FMU2 joint rows 2 .. 4 (hsrc 1), each row against the row alone in both lone forms: %d "
+           "of %d bitwise\n",
+           n_alone_same, n_alone);
     // rejects: nothing enqueued
     if (ok) {
         dr::send_args a = {};

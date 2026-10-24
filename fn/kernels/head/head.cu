@@ -217,6 +217,11 @@ fn::dense::product_args vocab_args(const logits_args & a) {
     return p;
 }
 
+bool logits_ok(const logits_args & a, const void * stream) {
+    return stream != nullptr && a.n >= 8 && a.n % 8 == 0 && a.n <= n_vocab_card && aligned(a.hmix, 16) &&
+           a.err != nullptr && (a.card == 0 || a.card == 1) && aligned(a.w, 16) && aligned(a.logits, 16);
+}
+
 template <int B> bool launch_reduce(const reduce_args & a, cudaStream_t st) {
     greedy_reduce_kernel<B><<<n_block, n_thread, 0, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
@@ -285,9 +290,7 @@ bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * id
 }
 
 bool logits(int32_t rows, const logits_args & a, void * stream) {
-    if (stream == nullptr || rows < 1 || rows > max_rows || a.n < 8 || a.n % 8 != 0 || a.n > n_vocab_card ||
-        !aligned(a.hmix, 16) || a.err == nullptr || (a.card != 0 && a.card != 1) || !aligned(a.w, 16) ||
-        !aligned(a.logits, 16)) {
+    if (rows < 1 || rows > max_rows || !logits_ok(a, stream)) {
         return false;
     }
     fn::dense::product_args p = vocab_args(a);
@@ -296,6 +299,28 @@ bool logits(int32_t rows, const logits_args & a, void * stream) {
     }
     p.work = a.work;
     return fn::dense::product(rows, p, stream);
+}
+
+bool logits_joint(int32_t lanes, const logits_args * a, int32_t hmix_lane_floats, uint32_t * err, void * stream) {
+    if (a == nullptr || lanes < 2 || lanes > fn::dense::max_lanes || err == nullptr) {
+        return false;
+    }
+    fn::dense::joint_args j;
+    j.lanes = lanes;
+    j.hmix_lane_floats = hmix_lane_floats;
+    for (int32_t k = 0; k < lanes; ++k) {
+        if (!logits_ok(a[k], stream) || a[k].card != a[0].card || a[k].w != a[0].w || a[k].n != a[0].n ||
+            a[k].work != nullptr || a[k].hmix != a[0].hmix + int64_t(k) * hmix_lane_floats) {
+            return false;
+        }
+        j.out[0][k] = a[k].logits;
+    }
+    fn::dense::product_args p = vocab_args(a[0]);
+    p.err = err;
+    if (fn::dense::joint_work_bytes(p) > 0) {
+        return false;
+    }
+    return fn::dense::product_joint(p, j, stream);
 }
 
 bool greedy_reduce(int32_t rows, const reduce_args & a, void * stream) {

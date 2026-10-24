@@ -1071,6 +1071,34 @@ bool run_draft_head_cases(card_v * c[2], const fn::xchg::rings & rg, const std::
     }
     const std::string label = "draft head B" + std::to_string(rc.rows);
     pass = check_head_round(ref, wdec, rc, oa, hres, hx, hpost, label.c_str()) && pass;
+    // FMU2 (build item 2, the joint draft step: lane k is row k of one step): each row alone at B = 1 bitwise as in
+    // B = rows (its full row, logits over the subset copy with the ID map, pairs and token; both cards)
+    if (!san) {
+        int32_t same_b1 = 0;
+        for (int32_t b = 0; b < rc.rows && ok; ++b) {
+            inputs i1 = in;
+            std::copy_n(&in.hres[size_t(b) * S * D], size_t(S) * D, i1.hres.begin());
+            std::copy_n(&in.hx[size_t(b) * D], size_t(D), i1.hx.begin());
+            std::copy_n(&in.hpost[size_t(b) * S], size_t(S), i1.hpost.begin());
+            round_cfg r1 = rc;
+            r1.rows = 1;
+            std::vector<float> h1[2], x1[2], p1;
+            round_out o1;
+            ok = rg.reset_all() && put_inputs(c, i1, h1, x1, p1) && enqueue_round(c, rg, r1) &&
+                 read_round(c, rg, r1, o1);
+            bool same = ok && (o1.err[0] | o1.err[1]) == 0u;
+            for (int32_t r = 0; r < 2 && ok; ++r) {
+                same = same && same_rows(o1.full[r], 0, oa.full[r], size_t(b), D) &&
+                       same_rows(o1.logits[r], 0, oa.logits[r], size_t(b), size_t(rc.n)) &&
+                       o1.pair[r][0] == oa.pair[r][2 * size_t(b)] && o1.pair[r][1] == oa.pair[r][2 * size_t(b) + 1] &&
+                       o1.token[r][0] == oa.token[r][size_t(b)];
+            }
+            same_b1 += same ? 1 : 0;
+        }
+        pass = report((label + ": each row alone at B1 bitwise (full row, subset logits, pairs, token)").c_str(),
+                      ok && same_b1 == rc.rows, std::to_string(same_b1) + " of " + std::to_string(rc.rows)) &&
+               pass;
+    }
 
     // planted cross-card ties: row b's winner (card cw, ID idw) gets an exact copy on the other card, at a lower ID
     // (b even: the other card must win) or a higher one (b odd: the winner's card keeps it); target columns are no

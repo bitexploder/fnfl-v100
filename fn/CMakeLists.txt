@@ -37,6 +37,7 @@ add_library(fnfl-kernels-draft STATIC
     kernels/draft/draft.h
     kernels/draft/draft_eh.cpp
     kernels/draft/draft_in.cu
+    kernels/draft/draft_lanes.cu
     kernels/draft/draft_prompt.cu
     kernels/draft/draft_prompt.h)
 fnfl_target_flags(fnfl-kernels-draft)
@@ -49,6 +50,10 @@ add_dependencies(fnfl-kernels-draft fnfl-check-includes)
 add_library(fnfl-model STATIC
     model/draft.cpp
     model/draft.h
+    model/kv_pool.cpp
+    model/kv_pool.h
+    model/kv_tier.cpp
+    model/kv_tier.h
     model/layer.cpp
     model/layer.h
     model/model.cpp
@@ -70,6 +75,8 @@ add_dependencies(fnfl-model fnfl-check-includes)
 
 # the runtime: request flow per slot; it holds the loaded model (R1)
 add_library(fnfl-runtime STATIC
+    runtime/joint.cpp
+    runtime/joint.h
     runtime/layer_run.cpp
     runtime/layer_run.h
     runtime/page_cache.cpp
@@ -79,6 +86,8 @@ add_library(fnfl-runtime STATIC
     runtime/prefill.cpp
     runtime/prefill.h
     runtime/runtime.cpp
+    runtime/slots_test.cpp
+    runtime/slots_test.h
     runtime/runtime.h
     runtime/target.cpp
     runtime/target.h
@@ -153,6 +162,8 @@ add_library(fnfl-quant STATIC
     quant/decode.h
     quant/formats.cpp
     quant/formats.h
+    quant/kv_q8_ref.cpp
+    quant/kv_q8_ref.h
     quant/synth.cpp
     quant/synth.h)
 fnfl_target_flags(fnfl-quant)
@@ -187,6 +198,9 @@ add_library(fnfl-kernels-qsa-attn STATIC
     kernels/act/act_warp.cuh
     kernels/qsa/attend.cu
     kernels/qsa/attend.h
+    kernels/qsa/kv_q8.cuh
+    kernels/qsa/kv_tier.cu
+    kernels/qsa/kv_tier.h
     kernels/qsa/qsa_prompt_attn.cu)
 fnfl_target_flags(fnfl-kernels-qsa-attn)
 target_compile_options(fnfl-kernels-qsa-attn PRIVATE
@@ -200,19 +214,38 @@ add_library(fnfl-kernels-experts STATIC
     kernels/dense/dense_dec.cuh
     kernels/experts/experts.cu
     kernels/experts/experts.h
+    kernels/experts/experts_cache.cu
+    kernels/experts/experts_cache.h
     kernels/experts/experts_dev.cuh
     kernels/experts/experts_gu.cuh
+    kernels/experts/experts_gu_u_body.inc
     kernels/experts/experts_gu_iq2.cu
     kernels/experts/experts_gu_iq3.cu
+    kernels/experts/experts_gu_lanes.cu
     kernels/experts/experts_gu_q8_0.cu
+    kernels/experts/experts_gu_q2_0.cu
+    kernels/experts/experts_gu_q4_k.cu
+    kernels/experts/experts_gu_q5_k.cu
     kernels/experts/experts_inst.h
     kernels/experts/experts_meta.cuh
     kernels/experts/experts_calib.cu
     kernels/experts/experts_calib.h
     kernels/experts/experts_prompt.cu
-    kernels/experts/experts_prompt.h)
+    kernels/experts/experts_prompt.h
+    kernels/experts/experts_share.cu
+    kernels/experts/experts_share.h
+    kernels/experts/experts_cpu.cpp
+    kernels/experts/experts_cpu.h
+    kernels/experts/cpu_kernels.h
+    kernels/experts/cpu_iq_avx2.cpp
+    kernels/experts/cpu_kq_avx2.cpp
+    kernels/experts/cpu_q2_avx2.cpp)
 fnfl_target_flags(fnfl-kernels-experts)
-target_link_libraries(fnfl-kernels-experts PUBLIC fnfl-grids)
+target_link_libraries(fnfl-kernels-experts PUBLIC fnfl-grids fnfl-quant)
+# ME2: the CPU miss path, Strata-V100 3d4ce4e0's AVX2 expert kernels and pool (experts_cpu.h, cpu_kernels.h), with
+# Strata's GCC flags for them (its CMakeLists.txt: -mavx2 -mfma -mf16c)
+set_source_files_properties(kernels/experts/experts_cpu.cpp kernels/experts/cpu_iq_avx2.cpp
+    kernels/experts/cpu_kq_avx2.cpp kernels/experts/cpu_q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
 target_compile_options(fnfl-kernels-experts PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
 add_dependencies(fnfl-kernels-experts fnfl-check-includes)
@@ -295,7 +328,8 @@ target_compile_options(fnfl-kernels-round PRIVATE
 target_link_libraries(fnfl-kernels-round PUBLIC fnfl-xchg CUDA::cudart)
 add_dependencies(fnfl-kernels-round fnfl-check-includes)
 
-# the loader: the deployed GGUF onto both cards, the placement check and load-check (R1)
+# the loader: the deployed GGUF onto both cards, the placement check and load-check (R1); ME1's expert cache, which
+# packs its backing through the loader (ME3's cleanup: its units, cache_*.h, service_loop.h)
 add_library(fnfl-loader STATIC
     loader/load_check.cpp
     loader/load_check.h
@@ -304,7 +338,39 @@ add_library(fnfl-loader STATIC
     loader/run_load.cpp
     loader/run_load.h
     loader/sha256.cpp
-    loader/sha256.h)
+    loader/sha256.h
+    runtime/cache_counters.h
+    runtime/cache_loan.cpp
+    runtime/cache_loan.h
+    runtime/cache_parts.h
+    runtime/cache_passes.h
+    runtime/cache_report.cpp
+    runtime/cache_residency.cpp
+    runtime/cache_residency.h
+    runtime/cache_service.cpp
+    runtime/miss_split.cpp
+    runtime/miss_split.h
+    runtime/admission.cpp
+    runtime/admission.h
+    runtime/json_check.cpp
+    runtime/json_check.h
+    runtime/cache_service.h
+    runtime/cache_util.cpp
+    runtime/cache_util.h
+    runtime/cache_window.cpp
+    runtime/expert_cache.cpp
+    runtime/expert_policy.cpp
+    runtime/expert_policy.h
+    runtime/expert_cache.h
+    runtime/loan.h
+    runtime/native_pages.cpp
+    runtime/native_pages.h
+    runtime/mx7_shadow.cpp
+    runtime/mx7_shadow.h
+    runtime/prompt_share.cpp
+    runtime/prompt_share.h
+    runtime/service_loop.cpp
+    runtime/service_loop.h)
 fnfl_target_flags(fnfl-loader)
 target_link_libraries(fnfl-loader PUBLIC fnfl-model fnfl-runtime fnfl-borrowed fnfl-kernels-experts fnfl-kernels-hc
     fnfl-xchg CUDA::cudart)
@@ -358,6 +424,8 @@ add_executable(fnfl-drive
     kernels/draft/draft_bench.h
     kernels/draft/draft_test.cpp
     kernels/draft/draft_test.h
+    kernels/experts/experts_cpu_test.cpp
+    kernels/experts/experts_cpu_test.h
     kernels/experts/experts_test.cpp
     kernels/experts/experts_test.h
     kernels/experts/experts_bench.cpp
@@ -370,6 +438,8 @@ add_executable(fnfl-drive
     kernels/experts/grids_test.h
     kernels/gdn/gdn_bench.cu
     kernels/gdn/gdn_bench.h
+    kernels/gdn/gdn_ref.cu
+    kernels/gdn/gdn_ref.h
     kernels/gdn/gdn_test.cpp
     kernels/gdn/gdn_test.h
     kernels/ple/ple_bench.cpp
@@ -388,6 +458,8 @@ add_executable(fnfl-drive
     kernels/dense/layer_stand.h
     kernels/dense/dense_test.cpp
     kernels/dense/dense_test.h
+    kernels/dense/dense_joint_test.cpp
+    kernels/dense/dense_joint_test.h
     kernels/dense/dense_prompt_test.cpp
     kernels/dense/dense_prompt_test.h
     kernels/hc/hc_prompt_test.cpp
@@ -410,6 +482,8 @@ add_executable(fnfl-drive
     kernels/samp/samp_bench.h
     kernels/samp/samp_harness.cpp
     kernels/samp/samp_harness.h
+    kernels/samp/samp_joint_test.cpp
+    kernels/samp/samp_joint_test.h
     kernels/samp/samp_ref.cpp
     kernels/samp/samp_ref.h
     kernels/samp/samp_test.cpp
@@ -422,9 +496,23 @@ add_executable(fnfl-drive
     runtime/layer_test.cpp
     runtime/layer_test.h
     runtime/prefill_cmds.cpp
+    runtime/prompt_plan_test.cpp
+    runtime/prompt_plan_test.h
+    runtime/miss_split_test.cpp
+    runtime/miss_split_test.h
+    runtime/admission_test.cpp
+    runtime/admission_test.h
+    model/kv_tier_test.cpp
+    model/kv_tier_test.h
     runtime/rollback_test.cpp
+    runtime/mx7_check.cpp
+    runtime/mx7_check.h
     runtime/spec_cmds.cpp
+    runtime/split_test.cpp
+    runtime/split_test.h
     runtime/state_test.cpp
+    runtime/slots_gpu_test.cpp
+    runtime/rollback_mu1_test.cpp
     runtime/state_test.h
     runtime/draft_cmds.cpp
     runtime/target_cmds.cpp
@@ -452,6 +540,10 @@ set_source_files_properties(kernels/dense/layer_stand.cu PROPERTIES COMPILE_OPTI
     "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
 # GD1's bench: its fill kernel and the copied instruction-cache evictor (scaffolding). Math flags are declared: no fast
 # math
+# ME11's test reference (the pre-ME11 gdn_core and the host replay; gd-test, gdp-test, state-test, rollback-test,
+# prefill-test). Math flags are declared: no fast math, the production kernel's flags
+set_source_files_properties(kernels/gdn/gdn_ref.cu PROPERTIES COMPILE_OPTIONS
+    "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
 # PB1's gdp-test FP64 reference recurrence (test support). Math flags are declared: no fast math
 set_source_files_properties(kernels/gdn/gdn_prompt_ref.cu PROPERTIES COMPILE_OPTIONS
     "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
@@ -463,7 +555,7 @@ set_source_files_properties(kernels/gdn/gdn_bench.cu PROPERTIES COMPILE_OPTIONS
 # DR1's draft-kernel bench: its fill kernels (scaffolding). Math flags are declared: no fast math
 set_source_files_properties(kernels/draft/draft_bench.cu PROPERTIES COMPILE_OPTIONS
     "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
-target_link_libraries(fnfl-drive PRIVATE fnfl-loader fnfl-runtime fnfl-borrowed fnfl-quant fnfl-kernels-act
+target_link_libraries(fnfl-drive PRIVATE fnfl-glue fnfl-loader fnfl-runtime fnfl-borrowed fnfl-quant fnfl-kernels-act
     fnfl-kernels-gdn fnfl-kernels-hc fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts fnfl-kernels-dense
     fnfl-xchg fnfl-proto-xp1 fnfl-kernels-embed fnfl-kernels-ple fnfl-kernels-head fnfl-kernels-draft fnfl-kernels-samp
     CUDA::cudart)

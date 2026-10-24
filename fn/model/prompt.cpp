@@ -5,6 +5,7 @@
 #include "fn/kernels/embed/embed.h"
 #include "fn/kernels/experts/experts.h"
 #include "fn/kernels/experts/experts_prompt.h"
+#include "fn/kernels/experts/experts_share.h"
 #include "fn/kernels/gdn/gdn_prompt.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/hc/hc_prompt.h"
@@ -14,6 +15,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/round/version.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/shapes.h"
 #include "fn/xchg/prompt_xchg.h"
 
@@ -64,31 +66,63 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     return true;
 }
 
-// the slot sizes (header and payload)
-constexpr int64_t p_slot    = 256 + int64_t(RH) * D * 2;
-constexpr int64_t emb_slot  = 256 + int64_t(RC) * F * 4;
+// the slot sizes (header and payload); ME3: for a layout of rc chunk rows in halves of rh (prompt_path::layout)
+constexpr int64_t p_slot(int64_t rh) {
+    return 256 + rh * D * 2;
+}
+constexpr int64_t emb_slot(int64_t rc) {
+    return 256 + rc * F * 4;
+}
 constexpr int64_t sel_slot  = 256 + fn::qsa::prompt_sel_bytes;
-constexpr int64_t mom_slot  = 256 + int64_t(RH) * fn::hc::hcp_mom * 4;
-constexpr int64_t dmix_slot = 256 + int64_t(RH) * F * 4;
+constexpr int64_t mom_slot(int64_t rh) {
+    return 256 + rh * fn::hc::hcp_mom * 4;
+}
+constexpr int64_t dmix_slot(int64_t rh) {
+    return 256 + rh * F * 4;
+}
 
-// the family scratch's size: the largest family (design note section 5)
-int64_t family_bytes() {
-    const int64_t H = RH;
+// the family scratch's size for halves of H rows: the largest family (design note section 5); each family carves it
+// by the half's own rows
+int64_t hc_base_bytes(int64_t H) {
+    return al(H * fn::hc::hcp_mom * 4) + al(H * 320 * 4) + al(H * 4 * 4) + al(fn::hc::hct_scratch_bytes(int32_t(H)));
+}
+
+int64_t family_bytes(int64_t H) {
     const int64_t gdn = al(H * (GC + GV) * 2) + al(H * GC * 4) + al(H * GV * 2) + 4 * al(H * 24 * 4) + al(H * GV * 2) +
-                        al(fn::gdn::prompt_wy_bytes(RH));
+                        al(fn::gdn::prompt_wy_bytes(int32_t(H)));
     const int64_t qsa = al(H * QF * 4) + 2 * al(H * 256 * 4) + al(H * 512 * 4) + al(H * 128 * 4) +
                         al(static_cast<int64_t>(fn::qsa::prompt_ws_bytes(fn::qsa::max_cells))) + al(H * GV * 2);
     const int64_t ffn = al(int64_t(H) * NE * 4) + al(int64_t(H) * 8 * 4) + 2 * al(int64_t(H) * 4) +
                         al(int64_t(H) * NU * 4) * 2 + al(int64_t(513) * 4) + 2 * al(int64_t(H) * NU * 4) +
-                        al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) +
+                        al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) + al(int64_t(513) * 4) +
                         al(int64_t(H) * NU * 320 * 2) + al(H * NU * D * 2) + al(H * D * 4) + 2 * al(H * 320 * 4) +
                         al(H * 320 * 2);
     const int64_t ple = al(H * 4 * D * 4) * 2 + al(H * D * 4) + al(H * 8 * 4);
     const int64_t drf = al(H * D * 2) + al(H * 4 * D * 2) + al(H * 4 * F * 4) + al(H * 320 * 4) + 2 * al(H * 4 * 4) +
                         al(H * D * 2) + 2 * al(H * 256 * 4) + al(H * 128 * 4); // SP2: the draft's index key
-    const int64_t hc =
-        al(H * fn::hc::hcp_mom * 4) + al(H * 320 * 4) + al(H * 4 * 4) + al(fn::hc::hct_scratch_bytes(RH));
-    return std::max({ gdn, qsa, ffn, ple, drf, hc });
+    const int64_t hc = hc_base_bytes(H);
+    return std::max({gdn, qsa, ffn, ple, drf, hc});
+}
+
+int64_t family_bytes_single(int64_t rc, int64_t H, int32_t card) {
+    const int64_t emb = al(emb_slot(rc));
+    const int64_t gdn_c0 =
+        al(H * (GC + GV) * 2) + al(H * GC * 4) + al(H * GV * 2) + 4 * al(H * 24 * 4) + al(H * GV * 2);
+    const int64_t gdn_c1 = al(fn::gdn::prompt_wy_bytes(int32_t(H)));
+    const int64_t qsa = al(H * QF * 4) + 2 * al(H * 256 * 4) + al(H * 512 * 4) + al(H * 128 * 4) +
+                        al(static_cast<int64_t>(fn::qsa::prompt_ws_bytes(fn::qsa::max_cells))) + al(H * GV * 2);
+    const int64_t ffn_rt = al(int64_t(H) * NE * 4) + al(int64_t(H) * 8 * 4) + 2 * al(int64_t(H) * 4) +
+                           al(int64_t(H) * NU * 4) * 2 + al(int64_t(513) * 4) + 2 * al(int64_t(H) * NU * 4) +
+                           al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) + al(int64_t(513) * 4);
+    const int64_t ffn_bdy = al(int64_t(H) * NU * 320 * 2) + al(H * NU * D * 2) + al(H * D * 4);
+    const int64_t ffn_sh = 2 * al(H * 320 * 4) + al(H * 320 * 2);
+    const int64_t ple_c0 = al(H * 4 * D * 4) + al(H * D * 4) + al(H * 8 * 4);
+    const int64_t ple_c1 = al(H * 4 * D * 4);
+    const int64_t drf = al(H * D * 2) + al(H * 4 * D * 2) + al(H * 4 * F * 4) + al(H * 320 * 4) + 2 * al(H * 4 * 4) +
+                        al(H * D * 2) + 2 * al(H * 256 * 4) + al(H * 128 * 4);
+    const int64_t hc_c0 = hc_base_bytes(H) + al(H * D * 4);
+    return card == 0 ? std::max({emb, gdn_c0, qsa, ffn_rt + ffn_bdy + ffn_sh, ple_c0, drf, hc_c0})
+                     : std::max({emb, gdn_c1, qsa, ffn_bdy, ple_c1, drf});
 }
 
 // PB3's conversion region: a sublayer's FP16 weights (fn::hc::hct_convert's, then pd_convert's and
@@ -121,8 +155,9 @@ constexpr int64_t draft_ik_at = draft_wv_at + al(int64_t(256) * D * 2) / 2;
 constexpr int64_t draft_ik_s_at = draft_ik_at + al(int64_t(128) * D * 2) / 2;
 constexpr int64_t draft_end = draft_ik_s_at + al(int64_t(128) * 4) / 2;
 
-int64_t conv_bytes() {
-    return al(fn::hc::hct_weight_bytes()) + std::max({gdn_end, qsa_end, ffn_end, draft_end}) * 2;
+int64_t conv_bytes(bool single = false, int32_t card = 0) {
+    return (single && card == 1 ? 0 : al(fn::hc::hct_weight_bytes())) +
+           std::max({gdn_end, qsa_end, ffn_end, draft_end}) * 2;
 }
 
 // a bump allocator over a region
@@ -144,13 +179,12 @@ struct prompt_path::card_arena {
     float *             S         = nullptr;  // [RC][4][2560]
     float *             E         = nullptr;  // [RC][2560]
     int32_t *           tok       = nullptr;  // [RC]
-    float *             inject    = nullptr;
-    float *             mixed     = nullptr;  // [RH][2560]
-    uint16_t *          mixed16   = nullptr;
-    float *             partial   = nullptr;  // [RH][2560]
-    uint8_t *           p_send[2] = {}, *p_recv[2] = {};
-    uint8_t *           emb_send = nullptr, *emb_recv = nullptr;
-    uint8_t *           sel_send[2] = {}, *sel_recv[2] = {};
+    float * inject = nullptr;
+    float * mixed = nullptr; // [RH][2560]
+    uint16_t * mixed16 = nullptr;
+    uint8_t *p_send[2] = {}, *p_recv[2] = {};
+    uint8_t *emb_send = nullptr, *emb_recv = nullptr;
+    uint8_t *sel_send[2] = {}, *sel_recv[2] = {};
     uint8_t *           mom_send = nullptr, *mom_recv = nullptr;
     uint8_t *           dmix_send = nullptr, *dmix_recv = nullptr;
     float *             pred        = nullptr;  // [4][2560]
@@ -195,26 +229,43 @@ namespace {
 
 enum link_id : int32_t { lk_p0, lk_p1, lk_emb, lk_sel0, lk_sel1, lk_mom, lk_dmix, n_links };
 
-int64_t arena_bytes_a() {
+int64_t arena_bytes_a(int64_t rc, int64_t rh, bool single, int32_t card) {
+    if (!single) {
+        int64_t n = 0;
+        n += al(rc * 4 * D * 4) + al(rc * D * 4) + al(rc * 4) + al(rc * 4 * 4);
+        n += al(rh * D * 4) + al(rh * D * 2) + al(rh * D * 4);
+        n +=
+            4 * al(p_slot(rh)) + 2 * al(emb_slot(rc)) + 4 * al(sel_slot) + 2 * al(mom_slot(rh)) + 2 * al(dmix_slot(rh));
+        n += al(int64_t(4) * D * 4) + 2 * al(int64_t(4) * D * 9 * 4) + al(ple_hist_card * 4) + al(64);
+        n += al(family_bytes(rh)) + al(conv_bytes());
+        return n;
+    }
     int64_t n = 0;
-    n += al(int64_t(RC) * 4 * D * 4) + al(int64_t(RC) * D * 4) + al(int64_t(RC) * 4) + al(int64_t(RC) * 4 * 4);
-    n += al(int64_t(RH) * D * 4) + al(int64_t(RH) * D * 2) + al(int64_t(RH) * D * 4);
-    n += 4 * al(p_slot) + 2 * al(emb_slot) + 4 * al(sel_slot) + 2 * al(mom_slot) + 2 * al(dmix_slot);
-    n += al(int64_t(4) * D * 4) + 2 * al(int64_t(4) * D * 9 * 4) + al(ple_hist_card * 4) + al(64);
-    n += al(family_bytes()) + al(conv_bytes());
+    if (card == 0) {
+        n += al(rc * 4 * D * 4) + al(rc * D * 4) + al(rc * 4) + al(rc * 4 * 4);
+        n += al(rh * D * 2);
+    }
+    n += 2 * al(p_slot(rh)) + 2 * al(sel_slot) + al(mom_slot(rh)) + al(dmix_slot(rh));
+    if (card == 0) {
+        n += al(int64_t(4) * D * 4) + 2 * al(int64_t(4) * D * 9 * 4);
+    }
+    n += al(64) + al(family_bytes_single(rc, rh, card)) + al(conv_bytes(true, card));
     return n;
 }
 
-}  // namespace
+} // namespace
 
-int64_t prompt_arena_bytes() {
-    return arena_bytes_a();
+int64_t prompt_arena_bytes(int32_t chunk_rows, int32_t half_rows, bool single, int32_t card) {
+    return arena_bytes_a(chunk_rows, half_rows, single, card);
 }
 
-int64_t prompt_replica_bytes() {
+int64_t prompt_replica_bytes(bool single) {
+    const int64_t norms = al(int64_t(D) * 4) + al(int64_t(4) * D * 4);
+    if (single) {
+        return norms;
+    }
     return int64_t(2) * fn::n_layer * al(hc_down_bytes + hc_up_bytes + hc_gamma_bytes) + al(ple_key_bytes) +
-           al(ple_value_bytes) + 3 * al(ple_norm_bytes) + al(ple_conv_bytes) + al(int64_t(D) * 4) +
-           al(int64_t(4) * D * 4);
+           al(ple_value_bytes) + 3 * al(ple_norm_bytes) + al(ple_conv_bytes) + norms;
 }
 
 const char * psite_name(psite s) {
@@ -260,105 +311,107 @@ uint8_t * class_part0(const model & m, const char * cls, int32_t card) {
 
 }  // namespace
 
-bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2], std::string & err) {
-    m_ = &m;
-    a_.assign(2, card_arena());
-    for (int32_t c = 0; c < 2; ++c) {
-        p_[c]          = p[c];
-        d_[c]          = d[c];
-        uint8_t * base = class_part0(m, "prefill arena (PB1)", c);
-        uint8_t * rep  = class_part0(m, "HC and PLE replicas (PB1)", c);
-        if (base == nullptr || rep == nullptr) {
-            return fail(err, "prompt: the prefill arena or the replicas are not reserved (PB1)");
+// the arena's row-dependent views for chunks of rc rows in halves of rh, from its base: every view the prompt writes
+// lies in [base, base + prompt_arena_bytes(rc, rh)) (ME3: a smaller layout is a prefix, so a loan sized to it covers
+// every write)
+bool prompt_path::carve(card_arena & a, int32_t rc, int32_t rh, bool single, int32_t card, std::string & err) {
+    bump b{a.base};
+    if (!single || card == 0) {
+        a.S = b.take<float>(int64_t(rc) * 4 * D * 4);
+        a.E = b.take<float>(int64_t(rc) * D * 4);
+        a.tok = b.take<int32_t>(int64_t(rc) * 4);
+        a.inject = b.take<float>(int64_t(rc) * 4 * 4);
+        if (!single) {
+            a.mixed = b.take<float>(int64_t(rh) * D * 4);
         }
-        card_arena & a = a_[size_t(c)];
-        a.base         = base;
-        bump b{ base };
-        a.S       = b.take<float>(int64_t(RC) * 4 * D * 4);
-        a.E       = b.take<float>(int64_t(RC) * D * 4);
-        a.tok     = b.take<int32_t>(int64_t(RC) * 4);
-        a.inject  = b.take<float>(int64_t(RC) * 4 * 4);
-        a.mixed   = b.take<float>(int64_t(RH) * D * 4);
-        a.mixed16 = b.take<uint16_t>(int64_t(RH) * D * 2);
-        a.partial = b.take<float>(int64_t(RH) * D * 4);
-        for (int32_t h = 0; h < 2; ++h) {
-            a.p_send[h] = b.take<uint8_t>(p_slot);
-            a.p_recv[h] = b.take<uint8_t>(p_slot);
+        a.mixed16 = b.take<uint16_t>(int64_t(rh) * D * 2);
+        if (!single) {
+            (void)b.take<float>(int64_t(rh) * D * 4);
         }
-        a.emb_send = b.take<uint8_t>(emb_slot);
-        a.emb_recv = b.take<uint8_t>(emb_slot);
-        for (int32_t h = 0; h < 2; ++h) {
-            a.sel_send[h] = b.take<uint8_t>(sel_slot);
+    }
+    for (int32_t h = 0; h < 2; ++h) {
+        a.p_send[h] = b.take<uint8_t>(p_slot(rh));
+        if (!single) {
+            a.p_recv[h] = b.take<uint8_t>(p_slot(rh));
+        }
+    }
+    if (!single) {
+        a.emb_send = b.take<uint8_t>(emb_slot(rc));
+        a.emb_recv = b.take<uint8_t>(emb_slot(rc));
+    }
+    for (int32_t h = 0; h < 2; ++h) {
+        a.sel_send[h] = b.take<uint8_t>(sel_slot);
+        if (!single) {
             a.sel_recv[h] = b.take<uint8_t>(sel_slot);
         }
-        a.mom_send    = b.take<uint8_t>(mom_slot);
-        a.mom_recv    = b.take<uint8_t>(mom_slot);
-        a.dmix_send   = b.take<uint8_t>(dmix_slot);
-        a.dmix_recv   = b.take<uint8_t>(dmix_slot);
-        a.pred        = b.take<float>(int64_t(4) * D * 4);
+    }
+    a.mom_send = b.take<uint8_t>(mom_slot(rh));
+    if (!single) {
+        a.mom_recv = b.take<uint8_t>(mom_slot(rh));
+    }
+    a.dmix_send = b.take<uint8_t>(dmix_slot(rh));
+    if (!single) {
+        a.dmix_recv = b.take<uint8_t>(dmix_slot(rh));
+    }
+    if (!single || card == 0) {
+        a.pred = b.take<float>(int64_t(4) * D * 4);
         a.ple_hist[0] = b.take<float>(int64_t(4) * D * 9 * 4);
         a.ple_hist[1] = b.take<float>(int64_t(4) * D * 9 * 4);
-        a.ple_stage   = b.take<float>(ple_hist_card * 4);
-        a.err         = b.take<uint32_t>(64);
-        a.scratch     = b.take<uint8_t>(family_bytes());
-        uint8_t * cv  = b.take<uint8_t>(conv_bytes());
-        a.hct         = fn::hc::hct_carve(cv);
-        a.w16         = reinterpret_cast<uint16_t *>(cv + al(fn::hc::hct_weight_bytes()));
-        if (b.off > prompt_arena_bytes()) {
-            return fail(err, "prompt: the arena's carve exceeds its reservation");
+        if (!single) {
+            a.ple_stage = b.take<float>(ple_hist_card * 4);
         }
-        // the replicas' places (filled below): per layer and sublayer the peer's down, up and gamma, then PLE's, then the
-        // draft's full norms
-        bump r{ rep };
-        a.hc_attn.resize(fn::n_layer);
-        a.hc_ffn.resize(fn::n_layer);
-        for (int32_t l = 0; l < fn::n_layer; ++l) {
-            for (int32_t sub = 0; sub < 2; ++sub) {
-                card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
-                const hc_module &       own = sub == 0 ? p[c]->w[l].hc_attn : p[c]->w[l].hc_ffn;
-                uint8_t *               blk = r.take<uint8_t>(hc_down_bytes + hc_up_bytes + hc_gamma_bytes);
-                hh.down[c]                  = own.w_down;
-                hh.up[c]                    = own.w_up;
-                hh.gamma[c]                 = own.gamma;
-                hh.down[1 - c]              = reinterpret_cast<const uint16_t *>(blk);
-                hh.up[1 - c]                = reinterpret_cast<const uint16_t *>(blk + hc_down_bytes);
-                hh.gamma[1 - c]             = reinterpret_cast<const float *>(blk + hc_down_bytes + hc_up_bytes);
-            }
-        }
-        a.ple_key[c]       = reinterpret_cast<const uint16_t *>(p[c]->ple_w.key);
-        a.ple_value[c]     = reinterpret_cast<const uint16_t *>(p[c]->ple_w.value);
-        a.ple_nk[c]        = p[c]->ple_w.norm_key;
-        a.ple_nq[c]        = p[c]->ple_w.norm_query;
-        a.ple_nc[c]        = p[c]->ple_w.norm_conv;
-        a.ple_conv[c]      = p[c]->ple_w.conv;
-        a.ple_key[1 - c]   = r.take<const uint16_t>(ple_key_bytes);
-        a.ple_value[1 - c] = r.take<const uint16_t>(ple_value_bytes);
-        a.ple_nk[1 - c]    = r.take<const float>(ple_norm_bytes);
-        a.ple_nq[1 - c]    = r.take<const float>(ple_norm_bytes);
-        a.ple_nc[1 - c]    = r.take<const float>(ple_norm_bytes);
-        a.ple_conv[1 - c]  = r.take<const uint16_t>(ple_conv_bytes);
-        a.enorm            = r.take<float>(int64_t(D) * 4);
-        a.hnorm            = r.take<float>(int64_t(4) * D * 4);
-        if (r.off > prompt_replica_bytes()) {
-            return fail(err, "prompt: the replicas' carve exceeds their reservation");
-        }
-        void * th = nullptr;
-        if (!cuda_ok(cudaSetDevice(m.device[c]), "device", err) ||
-            !cuda_ok(cudaHostAlloc(&th, size_t(2) * RC * 4, cudaHostAllocPortable), "pinned tokens", err)) {
-            return false;
-        }
-        a.tok_host      = static_cast<int32_t *>(th);
-        cudaStream_t cs = nullptr;
-        if (!cuda_ok(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "copy stream", err) ||
-            !cuda_ok(cudaMemset(a.err, 0, 64), "error words", err)) {
-            return false;
-        }
-        copy_[c] = cs;
     }
-    links_.assign(n_links, link());
+    a.err = b.take<uint32_t>(64);
+    a.scratch = b.take<uint8_t>(single ? family_bytes_single(rc, rh, card) : family_bytes(rh));
+    if (single) {
+        a.emb_send = a.scratch;
+        if (card == 0) {
+            a.mixed = reinterpret_cast<float *>(a.scratch + hc_base_bytes(rh));
+        }
+    }
+    uint8_t * cv = b.take<uint8_t>(conv_bytes(single, card));
+    if (!single || card == 0) {
+        a.hct = fn::hc::hct_carve(cv);
+        a.w16 = reinterpret_cast<uint16_t *>(cv + al(fn::hc::hct_weight_bytes()));
+    } else {
+        a.hct = {};
+        a.w16 = reinterpret_cast<uint16_t *>(cv);
+    }
+    if (b.off != prompt_arena_bytes(rc, rh, single, card) ||
+        b.off > prompt_arena_bytes(rc_max_, rh_max_, single, card)) {
+        return fail(err, "prompt: the arena's carve disagrees with its size");
+    }
+    return true;
+}
+
+void prompt_path::set_links() {
+    if (m_ != nullptr && m_->single) {
+        a_[1].S = a_[0].S;
+        a_[1].E = a_[0].E;
+        a_[1].tok = a_[0].tok;
+        a_[1].inject = a_[0].inject;
+        a_[1].mixed = a_[0].mixed;
+        a_[1].mixed16 = a_[0].mixed16;
+        a_[1].pred = a_[0].pred;
+        a_[1].ple_hist[0] = a_[0].ple_hist[0];
+        a_[1].ple_hist[1] = a_[0].ple_hist[1];
+        a_[0].ple_stage = nullptr;
+        a_[1].ple_stage = nullptr;
+        for (int32_t c = 0; c < 2; ++c) {
+            card_arena & a = a_[size_t(c)];
+            const card_arena & p = a_[size_t(1 - c)];
+            for (int32_t h = 0; h < 2; ++h) {
+                a.p_recv[h] = p.p_send[h];
+                a.sel_recv[h] = p.sel_send[h];
+            }
+            a.emb_recv = p.emb_send;
+            a.mom_recv = p.mom_send;
+            a.dmix_recv = p.dmix_send;
+        }
+    }
     for (int32_t c = 0; c < 2; ++c) {
-        card_arena & a          = a_[size_t(c)];
-        links_[lk_p0].send[c]   = a.p_send[0];
+        card_arena & a = a_[size_t(c)];
+        links_[lk_p0].send[c] = a.p_send[0];
         links_[lk_p0].recv[c]   = a.p_recv[0];
         links_[lk_p1].send[c]   = a.p_send[1];
         links_[lk_p1].recv[c]   = a.p_recv[1];
@@ -372,6 +425,144 @@ bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2
         links_[lk_mom].recv[c]  = a.mom_recv;
         links_[lk_dmix].send[c] = a.dmix_send;
         links_[lk_dmix].recv[c] = a.dmix_recv;
+    }
+}
+
+bool prompt_path::layout(int32_t rc, int32_t rh, std::string & err) {
+    if (rc < 1 || rc > rc_max_ || rh < 1 || rh > rh_max_ || (held_ && !held_whole_)) {
+        return fail(err, "prompt: a layout outside 1 .. 8,192 rows in halves of at most 4,096, or under a sized loan");
+    }
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!carve(a_[size_t(c)], rc, rh, m_->single, c, err)) {
+            return false;
+        }
+    }
+    set_links();
+    rc_ = rc;
+    rh_ = rh;
+    return true;
+}
+
+void prompt_path::bind(pass_card * const p[2], draft_card * const d[2]) {
+    for (int32_t c = 0; c < 2; ++c) {
+        p_[c] = p[c];
+        d_[c] = d[c];
+    }
+}
+
+void prompt_path::arena_spans(std::vector<byte_span> & out) const {
+    for (int32_t c = 0; c < 2; ++c) {
+        out.push_back({a_[size_t(c)].base, prompt_arena_bytes(rc_, rh_, m_->single, c)});
+    }
+}
+
+expert_service * prompt_path::service() const {
+    return p_[0] != nullptr ? p_[0]->c.ex_service : nullptr;
+}
+
+bool prompt_path::loan_check(const std::vector<byte_span> & need, std::string & err) const {
+    expert_service * x = p_[0]->c.ex_service;
+    return x == nullptr || x->prompt_loan_check(need, err);
+}
+
+bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2], std::string & err,
+                       const char * arena_class, int32_t rc_max, int32_t rh_max) {
+    m_ = &m;
+    a_.assign(2, card_arena());
+    if (rc_max < 1 || rc_max > RC || rh_max < 1 || rh_max > RH) {
+        return fail(err, "prompt: an arena layout outside 8,192 rows in halves of 4,096");
+    }
+    rc_max_ = rc_max;
+    rh_max_ = rh_max;
+    for (int32_t c = 0; c < 2; ++c) {
+        p_[c]          = p[c];
+        d_[c]          = d[c];
+        uint8_t * base = class_part0(m, arena_class, c);
+        uint8_t * rep  = class_part0(m, "HC and PLE replicas (PB1)", c);
+        const reserved_class * ac = m.state_class(arena_class);
+        if (base == nullptr || rep == nullptr ||
+            ac->plan.parts[0].bytes[c] < prompt_arena_bytes(rc_max, rh_max, m.single, c)) {
+            return fail(err, std::string("prompt: the arena (") + arena_class +
+                                 ") or the replicas are not reserved at their size (PB1)");
+        }
+        card_arena & a = a_[size_t(c)];
+        a.base = base;
+        if (!carve(a, rc_max, rh_max, m.single, c, err)) {
+            return false;
+        }
+        // the replicas' places (filled below): per layer and sublayer the peer's down, up and gamma, then PLE's, then the
+        // draft's full norms; ME1, one device: the peer's resident HC and PLE tensors themselves, no copy
+        bump r{ rep };
+        const bool one = m.single;
+        a.hc_attn.resize(fn::n_layer);
+        a.hc_ffn.resize(fn::n_layer);
+        for (int32_t l = 0; l < fn::n_layer; ++l) {
+            for (int32_t sub = 0; sub < 2; ++sub) {
+                card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
+                const hc_module &       own = sub == 0 ? p[c]->w[l].hc_attn : p[c]->w[l].hc_ffn;
+                hh.down[c]                  = own.w_down;
+                hh.up[c]                    = own.w_up;
+                hh.gamma[c]                 = own.gamma;
+                if (one) {
+                    const hc_module & pw = sub == 0 ? p[1 - c]->w[l].hc_attn : p[1 - c]->w[l].hc_ffn;
+                    hh.down[1 - c]       = pw.w_down;
+                    hh.up[1 - c]         = pw.w_up;
+                    hh.gamma[1 - c]      = pw.gamma;
+                    continue;
+                }
+                uint8_t * blk   = r.take<uint8_t>(hc_down_bytes + hc_up_bytes + hc_gamma_bytes);
+                hh.down[1 - c]  = reinterpret_cast<const uint16_t *>(blk);
+                hh.up[1 - c]    = reinterpret_cast<const uint16_t *>(blk + hc_down_bytes);
+                hh.gamma[1 - c] = reinterpret_cast<const float *>(blk + hc_down_bytes + hc_up_bytes);
+            }
+        }
+        a.ple_key[c]       = reinterpret_cast<const uint16_t *>(p[c]->ple_w.key);
+        a.ple_value[c]     = reinterpret_cast<const uint16_t *>(p[c]->ple_w.value);
+        a.ple_nk[c]        = p[c]->ple_w.norm_key;
+        a.ple_nq[c]        = p[c]->ple_w.norm_query;
+        a.ple_nc[c]        = p[c]->ple_w.norm_conv;
+        a.ple_conv[c]      = p[c]->ple_w.conv;
+        if (one) {
+            const fn::ple::weights & pw = p[1 - c]->ple_w;
+            a.ple_key[1 - c]            = reinterpret_cast<const uint16_t *>(pw.key);
+            a.ple_value[1 - c]          = reinterpret_cast<const uint16_t *>(pw.value);
+            a.ple_nk[1 - c]             = pw.norm_key;
+            a.ple_nq[1 - c]             = pw.norm_query;
+            a.ple_nc[1 - c]             = pw.norm_conv;
+            a.ple_conv[1 - c]           = pw.conv;
+        } else {
+            a.ple_key[1 - c]   = r.take<const uint16_t>(ple_key_bytes);
+            a.ple_value[1 - c] = r.take<const uint16_t>(ple_value_bytes);
+            a.ple_nk[1 - c]    = r.take<const float>(ple_norm_bytes);
+            a.ple_nq[1 - c]    = r.take<const float>(ple_norm_bytes);
+            a.ple_nc[1 - c]    = r.take<const float>(ple_norm_bytes);
+            a.ple_conv[1 - c]  = r.take<const uint16_t>(ple_conv_bytes);
+        }
+        a.enorm = r.take<float>(int64_t(D) * 4);
+        a.hnorm = r.take<float>(int64_t(4) * D * 4);
+        if (r.off > prompt_replica_bytes(one)) {
+            return fail(err, "prompt: the replicas' carve exceeds their reservation");
+        }
+        void * th = nullptr;
+        if (!cuda_ok(cudaSetDevice(m.device[c]), "device", err) ||
+            !cuda_ok(cudaHostAlloc(&th, size_t(2) * RC * 4, cudaHostAllocPortable), "pinned tokens", err)) {
+            return false;
+        }
+        a.tok_host      = static_cast<int32_t *>(th);
+        // ME2b: a lent arena holds expert slots now (the pool's); its error words are cleared at each borrow (hold)
+        const bool lent = p[0]->c.ex_service != nullptr && p[0]->c.ex_service->prompt_lent();
+        cudaStream_t cs = nullptr;
+        if (!cuda_ok(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking), "copy stream", err) ||
+            (!lent && !cuda_ok(cudaMemset(a.err, 0, 64), "error words", err))) {
+            return false;
+        }
+        copy_[c] = cs;
+    }
+    rc_ = rc_max;
+    rh_ = rh_max;
+    links_.assign(n_links, link());
+    set_links();
+    for (int32_t c = 0; c < 2; ++c) {
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device", err)) {
             return false;
         }
@@ -395,7 +586,8 @@ bool prompt_path::fill_replicas(std::string & err) {
         const auto    peer = [&](const void * dst, const void * src, int64_t n, const char * what) {
             return cuda_ok(cudaMemcpyPeer(const_cast<void *>(dst), dc, src, dp, size_t(n)), what, err);
         };
-        for (int32_t l = 0; l < fn::n_layer; ++l) {
+        // ME1, one device: the HC and PLE pointers are the peer's resident tensors (init); the draft's norms only
+        for (int32_t l = 0; l < fn::n_layer && !m_->single; ++l) {
             for (int32_t sub = 0; sub < 2; ++sub) {
                 const card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
                 const hc_module &             src = sub == 0 ? p_[pc]->w[l].hc_attn : p_[pc]->w[l].hc_ffn;
@@ -407,12 +599,12 @@ bool prompt_path::fill_replicas(std::string & err) {
             }
         }
         const fn::ple::weights & pw = p_[pc]->ple_w;
-        if (!peer(a.ple_key[pc], pw.key, ple_key_bytes, "PLE key replica") ||
+        if (!m_->single && (!peer(a.ple_key[pc], pw.key, ple_key_bytes, "PLE key replica") ||
             !peer(a.ple_value[pc], pw.value, ple_value_bytes, "PLE value replica") ||
             !peer(a.ple_nk[pc], pw.norm_key, ple_norm_bytes, "PLE norm replica") ||
             !peer(a.ple_nq[pc], pw.norm_query, ple_norm_bytes, "PLE norm replica") ||
             !peer(a.ple_nc[pc], pw.norm_conv, ple_norm_bytes, "PLE norm replica") ||
-            !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes, "PLE conv replica")) {
+            !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes, "PLE conv replica"))) {
             return false;
         }
         if (d_[c] != nullptr) {
@@ -451,12 +643,41 @@ const float * prompt_path::pred_row(int32_t card) const {
     return a_[size_t(card)].pred;
 }
 
+bool prompt_path::hold(bool on, std::string & err, const std::vector<byte_span> * need) {
+    expert_service * x = p_[0]->c.ex_service;
+    if (x == nullptr) {
+        return true;
+    }
+    // ME3: the service takes its loan here with nothing lent too (the zone's staging, sized to the prompt)
+    void * const s[2] = { p_[0]->c.stream, p_[1]->c.stream };
+    if (!x->prompt_hold(on, s, need, err)) {
+        return false;
+    }
+    if (!x->prompt_lent()) {
+        return true;
+    }
+    held_       = on;
+    held_whole_ = on && need == nullptr;
+    for (int32_t c = 0; c < 2 && on; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+            !cuda_ok(cudaMemsetAsync(a_[size_t(c)].err, 0, 64, static_cast<cudaStream_t>(s[c])), "error words", err) ||
+            !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(s[c])), "error words", err)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool prompt_path::test_poison(std::string & err) {
     // every arena byte 0xFF (an F32, FP16 and BF16 NaN), then the error words cleared; the replicas stay
+    if (!hold(true, err)) {
+        return false;
+    }
     for (int32_t c = 0; c < 2; ++c) {
         const card_arena & a = a_[size_t(c)];
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
-            !cuda_ok(cudaMemset(a.base, 0xff, size_t(prompt_arena_bytes())), "poison", err) ||
+            !cuda_ok(cudaMemset(a.base, 0xff, size_t(prompt_arena_bytes(rc_max_, rh_max_, m_->single, c))), "poison",
+                     err) ||
             !cuda_ok(cudaMemset(a.err, 0, 64), "poison", err) || !cuda_ok(cudaDeviceSynchronize(), "poison", err)) {
             return false;
         }
@@ -469,10 +690,10 @@ bool prompt_path::run_start(uint32_t cur, std::string & err) {
     // the compute streams are non-blocking, so a copy on the legacy default stream (cudaMemcpyPeer, a device-to-device
     // cudaMemcpy2D) is not ordered before them and a kernel could read the staging buffer's previous contents (PB1's
     // model-load nondeterminism: the peer's PLE history from an earlier run)
-    for (int32_t c = 0; c < 2; ++c) {
-        const int32_t      pc = 1 - c;
-        card_arena &       a  = a_[size_t(c)];
-        const cudaStream_t s  = static_cast<cudaStream_t>(p_[c]->c.stream);
+    for (int32_t c = 0; c < (m_->single ? 1 : 2); ++c) {
+        const int32_t pc = 1 - c;
+        card_arena & a = a_[size_t(c)];
+        const cudaStream_t s = static_cast<cudaStream_t>(p_[c]->c.stream);
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err)) {
             return false;
         }
@@ -489,17 +710,18 @@ bool prompt_path::run_start(uint32_t cur, std::string & err) {
             return false;
         }
         const float * peer_hist = p_[pc]->ple_hist + int64_t(fn::round::version_slot(cur, 0)) * ple_hist_card;
-        if (!cuda_ok(cudaMemcpyPeerAsync(a.ple_stage, m_->device[c], peer_hist, m_->device[pc],
-                                         size_t(ple_hist_card) * 4, s),
-                     "PLE history", err)) {
+        if (!m_->single && !cuda_ok(cudaMemcpyPeerAsync(a.ple_stage, m_->device[c], peer_hist, m_->device[pc],
+                                                        size_t(ple_hist_card) * 4, s),
+                                    "PLE history", err)) {
             return false;
         }
         fn::ple::prompt_args pa;
         pa.hist_out = a.ple_hist[0];
-        pa.state    = p_[c]->ple_hist;
-        pa.cur      = p_[c]->c.cur;
-        pa.card     = c;
-        if (!fn::ple::ple_prompt_hist_in(pa, a.ple_stage, s) || !cuda_ok(cudaStreamSynchronize(s), "run start", err)) {
+        pa.state = p_[c]->ple_hist;
+        pa.cur = p_[c]->c.cur;
+        pa.card = c;
+        if (!fn::ple::ple_prompt_hist_in(pa, m_->single ? peer_hist : a.ple_stage, s) ||
+            !cuda_ok(cudaStreamSynchronize(s), "run start", err)) {
             return err.empty() ? fail(err, "prompt: PLE history in") : false;
         }
     }
@@ -525,22 +747,30 @@ fn::dense::pd_act act1(const uint16_t * x, int64_t ld) {
 }  // namespace
 
 bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
-    if (c.rows < 1 || c.rows > RC || c.half[0] < 1 || c.half[0] > RH || c.half[1] < 0 || c.half[1] > RH ||
+    return chunk_begin(c, err) && chunk_layers(c, 0, fn::n_layer, err) && chunk_end(c, err);
+}
+
+bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
+    if (c.rows < 1 || c.rows > rc_ || c.half[0] < 1 || c.half[0] > rh_ || c.half[1] < 0 || c.half[1] > rh_ ||
         c.half[0] + c.half[1] != c.rows || c.tok == nullptr || c.e[0] == nullptr || c.e[1] == nullptr) {
-        return fail(err, "prompt: a chunk outside 1 .. 8,192 rows in halves of at most 4,096");
+        return fail(err, "prompt: a chunk outside the layout's " + std::to_string(rc_) + " rows in halves of at most " +
+                             std::to_string(rh_));
     }
-    const int32_t nh = c.half[1] > 0 ? 2 : 1;
     // the tokens to both cards (a pinned slot a chunk parity: the slot two chunks back has been copied, the chunk
     // end's join having passed)
     for (int32_t k = 0; k < 2; ++k) {
-        card_arena & a  = a_[size_t(k)];
-        int32_t *    th = a.tok_host + (c.index & 1) * RC;
-        std::memcpy(th, c.tok, size_t(c.rows) * 4);
-        if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
-            !cuda_ok(cudaMemcpyAsync(a.tok, th, size_t(c.rows) * 4, cudaMemcpyHostToDevice,
-                                     static_cast<cudaStream_t>(p_[k]->c.stream)),
-                     "tokens", err)) {
+        card_arena & a = a_[size_t(k)];
+        if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err)) {
             return false;
+        }
+        if (!m_->single || k == 0) {
+            int32_t * th = a.tok_host + (c.index & 1) * RC;
+            std::memcpy(th, c.tok, size_t(c.rows) * 4);
+            if (!cuda_ok(cudaMemcpyAsync(a.tok, th, size_t(c.rows) * 4, cudaMemcpyHostToDevice,
+                                         static_cast<cudaStream_t>(p_[k]->c.stream)),
+                         "tokens", err)) {
+                return false;
+            }
         }
         if (test_fail_ == k) {
             const uint32_t one = 1u << 30;
@@ -553,11 +783,11 @@ bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
         }
     }
     test_fail_ = -1;
-    // the embedding: each card's half, the message, the peer's half
-    for (int32_t phase = 0; phase < 3; ++phase) {
+    // the embedding: each card's half, the message, the peer's half (MX6: on single, phase 0 populates both halves in a_[0])
+    for (int32_t phase = 0; phase < (m_->single ? 1 : 3); ++phase) {
         for (int32_t k = 0; k < 2; ++k) {
-            card_arena &   a   = a_[size_t(k)];
-            link &         lk  = links_[lk_emb];
+            card_arena & a = a_[size_t(k)];
+            link & lk = links_[lk_emb];
             const uint64_t gen = fn::xchg::pgen(c.seq, 0, 0, 0, fn::xchg::pkind::emb);
             cudaStream_t   s   = static_cast<cudaStream_t>(p_[k]->c.stream);
             if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err)) {
@@ -572,15 +802,16 @@ bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
             ea.own     = reinterpret_cast<float *>(a.emb_send + fn::xchg::pmsg_payload_at);
             ea.full    = a.E;
             ea.streams = a.S;
-            ea.err     = a.err;
+            ea.err = a.err;
             if (phase == 0) {
-                if (lk.any_copied[k] &&
+                if (!m_->single && lk.any_copied[k] &&
                     !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lk.copied[k]), 0), "emb reuse", err)) {
                     return false;
                 }
                 if (!fn::embed::embed_rows(ea, s) ||
-                    !fn::xchg::pstamp(a.emb_send, gen, c.rows, fn::xchg::pkind::emb, s) ||
-                    !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.prod[k]), s), "emb produced", err)) {
+                    (!m_->single &&
+                     (!fn::xchg::pstamp(a.emb_send, gen, c.rows, fn::xchg::pkind::emb, s) ||
+                      !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.prod[k]), s), "emb produced", err)))) {
                     return err.empty() ? fail(err, "prompt: embed") : false;
                 }
                 lk.g_prod[k] = gen;
@@ -614,8 +845,16 @@ bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
             }
         }
     }
+    return true;
+}
+
+bool prompt_path::chunk_layers(const prompt_chunk & c, int32_t lo, int32_t hi, std::string & err) {
+    if (lo < 0 || hi > fn::n_layer || lo > hi) {
+        return fail(err, "prompt: layers " + std::to_string(lo) + " .. " + std::to_string(hi) + " outside 0 .. 48");
+    }
+    const int32_t nh = c.half[1] > 0 ? 2 : 1;
     // the layers, sublayer-major in halves
-    for (int32_t l = 0; l < fn::n_layer; ++l) {
+    for (int32_t l = lo; l < hi; ++l) {
         for (int32_t sub = 0; sub < 2; ++sub) {
             for (int32_t h = 0; h < nh; ++h) {
                 for (int32_t phase = 0; phase < 4; ++phase) {
@@ -626,6 +865,11 @@ bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
             }
         }
     }
+    return true;
+}
+
+bool prompt_path::chunk_end(const prompt_chunk & c, std::string & err) {
+    const int32_t nh = c.half[1] > 0 ? 2 : 1;
     // the target's end: layer 47's FFN exchange into the final streams (phase 0 of a layer 48 attention sublayer)
     for (int32_t h = 0; h < nh; ++h) {
         if (!layer_half(c, fn::n_layer, 0, h, 0, err)) {
@@ -687,33 +931,57 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             if (phase == 1 && k != p_[0]->w[l].index_owner) {
                 continue;
             }
-            cudaStream_t cs = static_cast<cudaStream_t>(copy_[k]);
             if (lk.g_prod[k] != g) {
                 return fail(err, "prompt: a message copied before its generation was produced");
             }
-            if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
-                !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.prod[k]), 0), "copy wait", err) ||
-                (lk.any_freed[1 - k] &&
-                 !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.freed[1 - k]), 0), "copy free", err)) ||
-                !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k], m_->device[1 - k], lk.send[k], m_->device[k],
-                                             size_t(phase == 1 ? sel_used : bytes), cs),
-                         "copy", err) ||
-                // SEL (PB3): the used slabs' bodies above, then their offsets (the payload's two regions)
-                (phase == 1 &&
-                 !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k] + sel_offs_at, m_->device[1 - k], lk.send[k] + sel_offs_at,
-                                              m_->device[k], size_t(sel_offs_used), cs),
-                          "copy", err)) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.copied[k]), cs), "copied", err)) {
-                return false;
+            if (!m_->single) {
+                cudaStream_t cs = static_cast<cudaStream_t>(copy_[k]);
+                if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
+                    !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.prod[k]), 0), "copy wait", err) ||
+                    (lk.any_freed[1 - k] &&
+                     !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.freed[1 - k]), 0), "copy free",
+                              err)) ||
+                    !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k], m_->device[1 - k], lk.send[k], m_->device[k],
+                                                 size_t(phase == 1 ? sel_used : bytes), cs),
+                             "copy", err) ||
+                    // SEL (PB3): the used slabs' bodies above, then their offsets (the payload's two regions)
+                    (phase == 1 &&
+                     !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k] + sel_offs_at, m_->device[1 - k],
+                                                  lk.send[k] + sel_offs_at, m_->device[k], size_t(sel_offs_used), cs),
+                              "copy", err)) ||
+                    !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.copied[k]), cs), "copied", err)) {
+                    return false;
+                }
             }
-            lk.g_copied[k]   = g;
+            lk.g_copied[k] = g;
             lk.any_copied[k] = true;
         }
         return true;
     }
+    // ME4: a ring layer's expert launches, deferred from each logical card's FFN body to the group loop after both
+    struct ring_card {
+        bool                         on = false;
+        fn::experts::fmt             gf = fn::experts::fmt::q2_0, df = fn::experts::fmt::q2_0;
+        fn::experts::ep_gate_up_args gu;
+        fn::experts::ep_down_args    dn;
+        fn::experts::ep_sum_args     sa;
+        int32_t * toff = nullptr;
+    };
+    ring_card rcard[2];
+    // MX7: the CPU share's job joined on every exit of the layer once begun (prompt_share_settle)
+    struct share_settle {
+        expert_service * xs = nullptr;
+        int32_t l = -1;
+        ~share_settle() {
+            if (xs != nullptr) {
+                xs->prompt_share_settle(l);
+            }
+        }
+    } settle;
+    settle.l = l;
     for (int32_t k = 0; k < 2; ++k) {
         card_arena & a = a_[size_t(k)];
-        pass_card &  p = *p_[k];
+        pass_card & p = *p_[k];
         cudaStream_t s = static_cast<cudaStream_t>(p.c.stream);
         if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err)) {
             return false;
@@ -724,21 +992,22 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             // 0a: the previous sublayer's exchange. PB3: folded into HC's prescale (hct_mix reads the streams once),
             // except at the end and before layer 1's PLE (which changes the streams between them); the slots are
             // freed after their reader
-            const bool          fold = !first && !end && !(l == 1 && sub == 0);
+            const bool fold = !first && !end && !(l == 1 && sub == 0);
             fn::hc::hct_combine cb;
-            const auto          freed = [&]() {
-                if (!cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.freed[k]), s), "freed", err)) {
+            const auto freed = [&]() {
+                if (!m_->single && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.freed[k]), s), "freed", err)) {
                     return false;
                 }
-                lp.g_freed[k]   = gen_prev;
+                lp.g_freed[k] = gen_prev;
                 lp.any_freed[k] = true;
                 return true;
             };
-            if (!first) {
+            if (!first && (!m_->single || k == 0)) {
                 if (lp.g_copied[1 - k] != gen_prev) {
                     return fail(err, "prompt: a partial received before its generation was copied");
                 }
-                if (!cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[1 - k]), 0), "recv", err)) {
+                if (!m_->single &&
+                    !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[1 - k]), 0), "recv", err)) {
                     return false;
                 }
                 if (fold) {
@@ -758,15 +1027,16 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 continue;
             }
             const layer_weights & w  = p.w[l];
-            const layer_state &   st = p.s[l];
-            uint8_t *             sc = a.scratch;
+            const layer_state & st = p.s[l];
+            uint8_t * sc = a.scratch;
             // 0b: PLE before layer 1's first HC
-            if (l == 1 && sub == 0) {
-                bump               b{ sc };
-                float *            key   = b.take<float>(int64_t(n) * 4 * D * 4);
-                float *            x     = b.take<float>(int64_t(n) * 4 * D * 4);
-                float *            value = b.take<float>(int64_t(n) * D * 4);
-                float *            scal  = b.take<float>(int64_t(n) * 8 * 4);
+            if (l == 1 && sub == 0 && (!m_->single || k == 0)) {
+                bump b{sc};
+                float * key = b.take<float>(int64_t(n) * 4 * D * 4);
+                float * x =
+                    m_->single ? reinterpret_cast<float *>(a_[1].scratch) : b.take<float>(int64_t(n) * 4 * D * 4);
+                float * value = b.take<float>(int64_t(n) * D * 4);
+                float * scal = b.take<float>(int64_t(n) * 8 * 4);
                 fn::dense::pb_args kb;
                 kb.w_lo               = a.ple_key[0];
                 kb.w_hi               = a.ple_key[1];
@@ -809,13 +1079,22 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     !fn::ple::ple_prompt_hist(pa, s)) {
                     return fail(err, "prompt: PLE");
                 }
+                if (m_->single) {
+                    fn::ple::prompt_args pa1 = pa;
+                    pa1.state = p_[1]->ple_hist;
+                    pa1.cur = p_[1]->c.cur;
+                    pa1.card = 1;
+                    if (!fn::ple::ple_prompt_hist(pa1, s)) {
+                        return fail(err, "prompt: PLE");
+                    }
+                }
                 count(psite::ple);
             }
             // 0c: HC
-            {
+            if (!m_->single || k == 0) {
                 const card_arena::hc_halves & hh = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
-                bump                          b{ sc };
-                fn::hc::hcp_args              ha;
+                bump b{sc};
+                fn::hc::hcp_args ha;
                 ha.w.form = fn::hc::hcp_form::replicated;
                 for (int32_t q = 0; q < 2; ++q) {
                     ha.w.down[q]  = hh.down[q];
@@ -852,7 +1131,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             }
             // 0d: the body's first part. PB3: the sublayer's producer (GDN out, the experts' sum, QSA wo) writes the P
             // message's FP16 payload itself, so the send slot's previous message has been copied out before the body
-            if (lp.any_copied[k] &&
+            if (!m_->single && lp.any_copied[k] &&
                 !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[k]), 0), "slot reuse", err)) {
                 return false;
             }
@@ -898,17 +1177,18 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                                                             reinterpret_cast<float *>(a.w16 + s_at), s);
             };
             if (sub == 0 && gdn) {
-                bump       b{ sc };
+                bump b{m_->single ? a_[0].scratch : sc};
                 // PB3: qkv and z as the product's FP16 output, one [n][GC + GV] array (z from column GC)
                 uint16_t * qz16 = b.take<uint16_t>(int64_t(n) * (GC + GV) * 2);
-                float *    conv    = b.take<float>(int64_t(n) * GC * 4);
+                float * conv = b.take<float>(int64_t(n) * GC * 4);
                 uint16_t * o16 = b.take<uint16_t>(int64_t(n) * GV * 2); // PB3: o FP16
-                float *    al      = b.take<float>(int64_t(n) * 24 * 4);
-                float *    be      = b.take<float>(int64_t(n) * 24 * 4);
-                float *    g       = b.take<float>(int64_t(n) * 24 * 4);
-                float *    beta    = b.take<float>(int64_t(n) * 24 * 4);
+                float * al = b.take<float>(int64_t(n) * 24 * 4);
+                float * be = b.take<float>(int64_t(n) * 24 * 4);
+                float * g = b.take<float>(int64_t(n) * 24 * 4);
+                float * beta = b.take<float>(int64_t(n) * 24 * 4);
                 uint16_t * gated16 = b.take<uint16_t>(int64_t(n) * GV * 2);
-                float *    wy      = b.take<float>(fn::gdn::prompt_wy_bytes(n));
+                float * wy =
+                    m_->single ? reinterpret_cast<float *>(a_[1].scratch) : b.take<float>(fn::gdn::prompt_wy_bytes(n));
                 if (w.qkv.n_out != GC || w.z.n_out != GV || w.ssm_out.n_out != D || w.ssm_out.k != GV) {
                     return fail(err, "prompt: GDN weight shapes");
                 }
@@ -932,6 +1212,8 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 ga.conv_w   = w.conv1d;
                 ga.hist     = st.conv;
                 ga.state    = st.gdn;
+                ga.rec      = st.rec;    // ME11: half 0 replays the selector's records
+                ga.gsel     = p.c.gsel;
                 ga.cur      = p.c.cur;
                 ga.v_in     = h;
                 ga.v_out    = h + 1;
@@ -982,14 +1264,24 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 }
                 count(psite::qsa_input);
                 if (k == w.index_owner) {
-                    if (ls.any_copied[k] &&
+                    if (!m_->single && ls.any_copied[k] &&
                         !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ls.copied[k]), 0), "sel reuse", err)) {
                         return false;
                     }
                     const int32_t        b0 = static_cast<int32_t>(pos0 / fn::qsa::ratio);
                     const int32_t        b1 = static_cast<int32_t>((pos0 + n) / fn::qsa::ratio);
+                    // ME6 (the host-backed tier, kv_tier.h): the chunk's keys in the key arena, from its first
+                    // block's cells (staged once a chunk), each half's new cells written back below
+                    uint16_t *      keys = st.idx_keys;
+                    kv_tier * const kt   = p.c.kv;
+                    if (kt != nullptr) {
+                        if (h == 0 && !kt->stage_keys(k, st.kv_attn, c.start, c.rows, s, err)) {
+                            return false;
+                        }
+                        keys = kt->stage_keys_ptr(k);
+                    }
                     fn::qsa::update_args ua;
-                    ua.keys      = st.idx_keys;
+                    ua.keys      = keys;
                     ua.k_norm    = w.idx_k_norm;
                     ua.summaries = st.idx_summaries;
                     ua.first     = b0;
@@ -1007,10 +1299,13 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     ia.ws.error  = a.err + 1;
                     ia.body      = reinterpret_cast<uint32_t *>(a.sel_send[h] + fn::xchg::pmsg_payload_at);
                     ia.offsets   = reinterpret_cast<int32_t *>(ia.body + fn::qsa::prompt_body_words);
-                    if (!fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, st.idx_keys, st.n_cells, s) ||
-                        (ua.count > 0 && !fn::qsa::summary_update(ua, s)) || !fn::qsa::qsp_select(ia, s) ||
+                    if (!fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, keys, st.n_cells, s) ||
+                        (ua.count > 0 && !fn::qsa::summary_update(ua, s)) ||
+                        (kt != nullptr && !kt->write_back_keys(k, st.kv_attn, pos0, n, s, err)) ||
+                        !fn::qsa::qsp_select(ia, s) ||
                         !fn::xchg::pstamp(a.sel_send[h], gen_sel, n, fn::xchg::pkind::sel, s) ||
-                        !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.prod[k]), s), "sel produced", err)) {
+                        (!m_->single &&
+                         !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.prod[k]), s), "sel produced", err))) {
                         return err.empty() ? fail(err, "prompt: QSA index") : false;
                     }
                     ls.g_prod[k] = gen_sel;
@@ -1018,43 +1313,48 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 }
             } else {
                 // the FFN: the router and shared gate (both cards, the full row), EP1, the shared expert
-                bump    b{ sc };
-                float * logits = b.take<float>(int64_t(n) * NE * 4);
-                float * sgl = b.take<float>(int64_t(n) * 8 * 4); // [n][8]: column 512 of the router's product
-                float * sg     = b.take<float>(int64_t(n) * 4);
-                (void) b.take<float>(int64_t(n) * 4);
-                int32_t *             ids = b.take<int32_t>(int64_t(n) * NU * 4);
-                float *               wts = b.take<float>(int64_t(n) * NU * 4);
+                bump b0{m_->single ? a_[0].scratch : sc};
+                float * logits = b0.take<float>(int64_t(n) * NE * 4);
+                float * sgl = b0.take<float>(int64_t(n) * 8 * 4); // [n][8]: column 512 of the router's product
+                float * sg = b0.take<float>(int64_t(n) * 4);
+                (void)b0.take<float>(int64_t(n) * 4);
+                int32_t * ids = b0.take<int32_t>(int64_t(n) * NU * 4);
+                float * wts = b0.take<float>(int64_t(n) * NU * 4);
                 fn::experts::ep_route rt;
-                rt.offsets        = b.take<int32_t>(int64_t(513) * 4);
-                rt.sorted         = b.take<int32_t>(int64_t(n) * NU * 4);
-                rt.pos            = b.take<int32_t>(int64_t(n) * NU * 4);
-                rt.tasks          = b.take<int32_t>(int64_t(fn::experts::ep_max_tasks) * 16);
-                rt.counters       = b.take<int32_t>(int64_t(8) * 4);
-                uint16_t * glu    = b.take<uint16_t>(int64_t(n) * NU * 320 * 2);
+                rt.offsets = b0.take<int32_t>(int64_t(513) * 4);
+                rt.sorted = b0.take<int32_t>(int64_t(n) * NU * 4);
+                rt.pos = b0.take<int32_t>(int64_t(n) * NU * 4);
+                rt.tasks = b0.take<int32_t>(int64_t(fn::experts::ep_max_tasks) * 16);
+                rt.counters = b0.take<int32_t>(int64_t(8) * 4);
+                int32_t * toff = b0.take<int32_t>(int64_t(513) * 4); // ME4: a ring layer's task offsets
+                bump b{sc, !m_->single || k == 0 ? b0.off : 0};
+                uint16_t * glu = b.take<uint16_t>(int64_t(n) * NU * 320 * 2);
                 uint16_t * part16 = b.take<uint16_t>(int64_t(n) * NU * D * 2); // PB3: the partials FP16
-                float *    shared = b.take<float>(int64_t(n) * D * 4);
-                float *    sh_g   = b.take<float>(int64_t(n) * 320 * 4);
-                float *    sh_u   = b.take<float>(int64_t(n) * 320 * 4);
-                uint16_t * sh_glu = b.take<uint16_t>(int64_t(n) * 320 * 2);
+                float * shared = b.take<float>(int64_t(n) * D * 4);
+                bump bs{m_->single ? a_[0].scratch : sc, m_->single && k == 1 ? b0.off + b.off : b.off};
+                float * sh_g = bs.take<float>(int64_t(n) * 320 * 4);
+                float * sh_u = bs.take<float>(int64_t(n) * 320 * 4);
+                uint16_t * sh_glu = bs.take<uint16_t>(int64_t(n) * 320 * 2);
 
                 // PB3: the shared gate's BF16 row converted after the router's, then 7 zero rows (scales 0), so one
                 // tensor product gives the logits and the gate logit (column 512) from the FP16 mixed row
-                float * const rsc = reinterpret_cast<float *>(a.w16 + ffn_router_s_at);
-                const fn::dense::pt_seg rs[2] = {{logits, NE, NE}, {sgl, 8, NE + 8}};
-                if ((h == 0 &&
-                     (!cuda_ok(cudaMemsetAsync(a.w16 + ffn_router_at + int64_t(NE + 1) * D, 0, size_t(7) * D * 2, s),
-                               "gate pad", err) ||
-                      !cuda_ok(cudaMemsetAsync(rsc + NE + 1, 0, size_t(7) * 4, s), "gate pad", err))) ||
-                    !to16b(w.router, NE, ffn_router_at, ffn_router_s_at) ||
-                    !to16b(w.sh_gate_w, 1, ffn_router_at + int64_t(NE) * D, ffn_router_s_at + 2 * NE) ||
-                    !tprod(ffn_router_at, NE + 8, D, mx, rs, 2, ffn_router_s_at) ||
-                    !fn::dense::pd_route(n, logits, sgl, ids, wts, sg, s, 8)) {
-                    return fail(err, "prompt: router");
+                if (!m_->single || k == 0) {
+                    float * const rsc = reinterpret_cast<float *>(a.w16 + ffn_router_s_at);
+                    const fn::dense::pt_seg rs[2] = {{logits, NE, NE}, {sgl, 8, NE + 8}};
+                    if ((h == 0 && (!cuda_ok(cudaMemsetAsync(a.w16 + ffn_router_at + int64_t(NE + 1) * D, 0,
+                                                             size_t(7) * D * 2, s),
+                                             "gate pad", err) ||
+                                    !cuda_ok(cudaMemsetAsync(rsc + NE + 1, 0, size_t(7) * 4, s), "gate pad", err))) ||
+                        !to16b(w.router, NE, ffn_router_at, ffn_router_s_at) ||
+                        !to16b(w.sh_gate_w, 1, ffn_router_at + int64_t(NE) * D, ffn_router_s_at + 2 * NE) ||
+                        !tprod(ffn_router_at, NE + 8, D, mx, rs, 2, ffn_router_s_at) ||
+                        !fn::dense::pd_route(n, logits, sgl, ids, wts, sg, s, 8)) {
+                        return fail(err, "prompt: router");
+                    }
+                    count(psite::ffn_router);
                 }
-                count(psite::ffn_router);
-                const auto                   gf = static_cast<fn::experts::fmt>(w.ex_gu_fmt);
-                const auto                   df = static_cast<fn::experts::fmt>(w.ex_down_fmt);
+                const auto gf = static_cast<fn::experts::fmt>(w.ex_gu_fmt);
+                const auto df = static_cast<fn::experts::fmt>(w.ex_down_fmt);
                 fn::experts::ep_gate_up_args gu;
                 gu.w       = w.ex_gate_up;
                 gu.grids   = p.c.grids;
@@ -1071,8 +1371,42 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 dn.part16 = part16;
                 dn.err = a.err;
                 dn.err_bit = fn::xchg::err_prange;
-                if (!fn::experts::ep_group(n, fn::experts::ep_task_rows(gf), ids, rt, a.err + 2, s) ||
-                    !fn::experts::ep_gate_up(gf, n, gu, s)) {
+                // ME1: the expert cache's staged layer (a one-half chunk: its routed experts, from card 0's routing)
+                expert_service * const xs = w.ex_gate_up == nullptr ? p.c.ex_service : nullptr;
+                bool ring = false; // ME4: the layer's experts come through the service's ring, group by group
+                if (xs != nullptr) {
+                    void * const streams[2] = { p_[0]->c.stream, p_[1]->c.stream };
+                    const int32_t * const rid = c.half[1] == 0 ? ids : nullptr;
+                    if (h == 0 && k == 0 && !xs->prompt_layer(l, n, rid, c.more, streams, err)) {
+                        return err.empty() ? fail(err, "prompt: expert staging") : false;
+                    }
+                    ring = xs->prompt_groups(l) > 0;
+                    // MX7: the CPU share's experts posted (their rows gathered from card 0's input; one device)
+                    if (ring && k == 0) {
+                        settle.xs = xs; // from here every exit of the layer joins the share's job
+                        if (!xs->prompt_share_begin(l, a.mixed16, streams, err)) {
+                            return err.empty() ? fail(err, "prompt: the CPU share") : false;
+                        }
+                    }
+                    gu.w = xs->prompt_bank(k);
+                    dn.w = xs->prompt_bank(k);
+                    if (!ring) {
+                        gu.wt = xs->prompt_table(l, k, false);
+                        dn.wt = xs->prompt_table(l, k, true);
+                        if (gu.wt == nullptr || dn.wt == nullptr) {
+                            return fail(err, "prompt: the expert cache has no staged table of the layer");
+                        }
+                    }
+                }
+                // MX7: on a ring layer the CPU share's experts' tasks dropped, so the groups launch only the GPU's.
+                // MX6 (single card): card 1 reads card 0's routing tables, so the grouping, the drop and the
+                // offsets run once, on card 0
+                const uint8_t * const skip = ring ? xs->prompt_share_skip(l) : nullptr;
+                const bool own = !m_->single || k == 0;
+                if ((own && !fn::experts::ep_group(n, fn::experts::ep_task_rows(gf), ids, rt, a.err + 2, s)) ||
+                    (own && skip != nullptr && !fn::experts::es_drop(rt, skip, s)) ||
+                    (ring ? (own && !fn::experts::ep_task_offsets(rt, toff, s))
+                          : !fn::experts::ep_gate_up(gf, n, gu, s))) {
                     return fail(err, "prompt: experts gate/up");
                 }
                 // the shared expert: gate and up (DP2's packing), the GLU, its down (EX1's) scaled by sg
@@ -1116,10 +1450,14 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 sa.out16 = pay;
                 sa.err = a.err;
                 sa.err_bit = fn::xchg::err_prange;
-                if (!fn::experts::ep_down(df, n, dn, s) || !fn::experts::ep_sum(n, sa, s)) {
-                    return fail(err, "prompt: experts down");
+                if (ring) {
+                    rcard[k] = { true, gf, df, gu, dn, sa, toff };
+                } else {
+                    if (!fn::experts::ep_down(df, n, dn, s) || !fn::experts::ep_sum(n, sa, s)) {
+                        return fail(err, "prompt: experts down");
+                    }
+                    count(psite::ffn_experts);
                 }
-                count(psite::ffn_experts);
             }
         } else {
             // phase 2: the body's rest, then the partial into the P message
@@ -1139,6 +1477,18 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 uint16_t *      att16 = b.take<uint16_t>(int64_t(n) * GV * 2);
                 const bool      owner = k == w.index_owner;
                 const uint8_t * sel   = owner ? a.sel_send[h] : a.sel_recv[h];
+                // ME1 (the host-backed KV, kv_tier.h): the layer's history below the chunk staged into the card's
+                // arenas before the first half, which then serve as its whole cache; each half's new cells go back
+                uint16_t *      kc = st.k_cache;
+                uint16_t *      vc = st.v_cache;
+                kv_tier * const kt = p.c.kv;
+                if (kt != nullptr) {
+                    if (h == 0 && !kt->stage(k, st.kv_attn, pos0, s, err)) {
+                        return false;
+                    }
+                    kc = kt->stage_k(k);
+                    vc = kt->stage_v(k);
+                }
                 // PB3: the K/V cache writes need no selection: on the peer they run ahead of its wait for SEL
                 fn::qsa::qsp_kv_args ka;
                 ka.kv_k = kk;
@@ -1147,17 +1497,22 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 ka.rows = n;
                 ka.pos0 = static_cast<int32_t>(pos0);
                 ka.max_cells = st.n_cells;
-                ka.k_cache = st.k_cache;
-                ka.v_cache = st.v_cache;
+                ka.k_cache = kc;
+                ka.v_cache = vc;
+                ka.k_scale = st.k_scale; // KV8: set in q8 (never with the host-backed tier)
+                ka.v_scale = st.v_scale;
                 if (!fn::qsa::qsp_kv(ka, s)) {
                     return fail(err, "prompt: QSA K/V");
+                }
+                if (kt != nullptr && !kt->write_back(k, st.kv_attn, pos0, n, s, err)) {
+                    return false;
                 }
                 if (!owner) {
                     if (ls.g_copied[1 - k] != gen_sel) {
                         return fail(err, "prompt: a selection received before its generation was copied");
                     }
-                    if (!cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ls.copied[1 - k]), 0), "sel recv",
-                                 err) ||
+                    if ((!m_->single && !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ls.copied[1 - k]), 0),
+                                                 "sel recv", err)) ||
                         !fn::xchg::pcheck(sel, gen_sel, a.err, s)) {
                         return err.empty() ? fail(err, "prompt: sel check") : false;
                     }
@@ -1168,8 +1523,10 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 aa.q_norm    = w.q_norm;
                 aa.body      = body;
                 aa.offsets   = reinterpret_cast<const int32_t *>(body + fn::qsa::prompt_body_words);
-                aa.k_cache   = st.k_cache;
-                aa.v_cache   = st.v_cache;
+                aa.k_cache   = kc;
+                aa.v_cache   = vc;
+                aa.k_scale = st.k_scale;
+                aa.v_scale = st.v_scale;
                 aa.rows      = n;
                 aa.pos0      = static_cast<int32_t>(pos0);
                 aa.max_cells = st.n_cells;
@@ -1179,10 +1536,11 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     return fail(err, "prompt: QSA attention");
                 }
                 if (!owner) {
-                    if (!cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.freed[k]), s), "sel freed", err)) {
+                    if (!m_->single &&
+                        !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.freed[k]), s), "sel freed", err)) {
                         return false;
                     }
-                    ls.g_freed[k]   = gen_sel;
+                    ls.g_freed[k] = gen_sel;
                     ls.any_freed[k] = true;
                 }
                 count(psite::qsa_attend);
@@ -1205,10 +1563,64 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             }
             // the payload written by the sublayer's producer (phase 0 waited for the slot's previous copy)
             if (!fn::xchg::pseal(n, a.p_send[h], gen, s) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.prod[k]), s), "produced", err)) {
+                (!m_->single && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.prod[k]), s), "produced", err))) {
                 return err.empty() ? fail(err, "prompt: pack") : false;
             }
             lp.g_prod[k] = gen;
+        }
+    }
+    if (rcard[0].on || rcard[1].on) {
+        // ME4: the ring layer's groups in order. Each: its weights and tables acquired on every device (their copies
+        // after every earlier reader of those ring bytes), both logical cards' gate/up and down over the group's tasks,
+        // then its release after those readers. The groups partition the experts and so ep_group's tasks: each task
+        // runs once, and each card's ep_sum after the last group adds all ten routed terms in route order
+        expert_service * const xs        = p_[0]->c.ex_service;
+        void * const           streams[2] = { p_[0]->c.stream, p_[1]->c.stream };
+        const int32_t          ng         = xs != nullptr ? xs->prompt_groups(l) : 0;
+        if (!rcard[0].on || !rcard[1].on || ng < 1) {
+            return fail(err, "prompt: a ring layer without both logical cards or its groups");
+        }
+        for (int32_t g = 0; g < ng; ++g) {
+            prompt_group_view v;
+            if (!xs->prompt_group(l, g, streams, v, err)) {
+                return err.empty() ? fail(err, "prompt: ring group") : false;
+            }
+            for (int32_t k = 0; k < 2; ++k) {
+                const ring_card & r  = rcard[k];
+                const cudaStream_t s = static_cast<cudaStream_t>(p_[k]->c.stream);
+                const int64_t      tr = fn::experts::ep_task_rows(r.gf);
+                const int64_t      tasks = int64_t(v.e_hi - v.e_lo) + (v.pairs + tr - 1) / tr;
+                fn::experts::ep_gate_up_args gu = r.gu;
+                fn::experts::ep_down_args    dn = r.dn;
+                gu.wt       = v.table[k][0];
+                dn.wt       = v.table[k][1];
+                gu.task_off = dn.task_off = r.toff;
+                gu.e_lo = dn.e_lo = v.e_lo;
+                gu.e_hi = dn.e_hi = v.e_hi;
+                gu.grid = dn.grid = static_cast<int32_t>(std::min<int64_t>(fn::experts::ep_max_tasks, tasks));
+                if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) || !fn::experts::ep_gate_up(r.gf, n, gu, s) ||
+                    !fn::experts::ep_down(r.df, n, dn, s)) {
+                    return err.empty() ? fail(err, "prompt: ring group experts") : false;
+                }
+            }
+            if (!xs->prompt_group_done(l, g, streams, err)) {
+                return err.empty() ? fail(err, "prompt: ring group release") : false;
+            }
+        }
+        // MX7: the CPU share's products into each card's partials (card 0 the whole products, card 1 zeros)
+        prompt_share_card sc[2];
+        for (int32_t k = 0; k < 2; ++k) {
+            sc[k] = {rcard[k].sa.route.pos, rcard[k].dn.part16, rcard[k].dn.err, rcard[k].dn.err_bit, rcard[k].sa.wts};
+        }
+        if (!xs->prompt_share_end(l, sc, streams, err)) {
+            return err.empty() ? fail(err, "prompt: the CPU share's add-back") : false;
+        }
+        for (int32_t k = 0; k < 2; ++k) {
+            if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
+                !fn::experts::ep_sum(n, rcard[k].sa, static_cast<cudaStream_t>(p_[k]->c.stream))) {
+                return err.empty() ? fail(err, "prompt: experts sum") : false;
+            }
+            count(psite::ffn_experts);
         }
     }
     if (phase == 0 && l == 1 && sub == 0) {
@@ -1233,24 +1645,27 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
     const uint64_t gmix = fn::xchg::pgen(c.seq, fn::n_layer, 0, h, fn::xchg::pkind::dmix);
     if (phase == 1 || phase == 3) {
         link &         lk    = phase == 1 ? lm : ld;
-        const uint64_t g     = phase == 1 ? gmom : gmix;
-        const int64_t  bytes = fn::xchg::pmsg_bytes(phase == 1 ? int64_t(n) * fn::hc::hcp_mom * 4 : int64_t(n) * F * 4);
+        const uint64_t g = phase == 1 ? gmom : gmix;
+        const int64_t bytes = fn::xchg::pmsg_bytes(phase == 1 ? int64_t(n) * fn::hc::hcp_mom * 4 : int64_t(n) * F * 4);
         for (int32_t k = 0; k < 2; ++k) {
-            cudaStream_t cs = static_cast<cudaStream_t>(copy_[k]);
             if (lk.g_prod[k] != g) {
                 return fail(err, "prompt: a draft message copied before it was produced");
             }
-            if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
-                !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.prod[k]), 0), "copy wait", err) ||
-                (lk.any_freed[1 - k] &&
-                 !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.freed[1 - k]), 0), "copy free", err)) ||
-                !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k], m_->device[1 - k], lk.send[k], m_->device[k],
-                                             size_t(bytes), cs),
-                         "copy", err) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.copied[k]), cs), "copied", err)) {
-                return false;
+            if (!m_->single) {
+                cudaStream_t cs = static_cast<cudaStream_t>(copy_[k]);
+                if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
+                    !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.prod[k]), 0), "copy wait", err) ||
+                    (lk.any_freed[1 - k] &&
+                     !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.freed[1 - k]), 0), "copy free",
+                              err)) ||
+                    !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k], m_->device[1 - k], lk.send[k], m_->device[k],
+                                                 size_t(bytes), cs),
+                             "copy", err) ||
+                    !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.copied[k]), cs), "copied", err)) {
+                    return false;
+                }
             }
-            lk.g_copied[k]   = g;
+            lk.g_copied[k] = g;
             lk.any_copied[k] = true;
         }
         return true;
@@ -1337,11 +1752,11 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                 cv = cv && fn::dense::pd_convert_bf16(d.iw.k_proj, 128, D, a.w16 + draft_ik_at,
                                                       reinterpret_cast<float *>(a.w16 + draft_ik_s_at), s);
             }
-            if (lm.any_copied[k] &&
+            if (!m_->single && lm.any_copied[k] &&
                 !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lm.copied[k]), 0), "mom reuse", err)) {
                 return false;
             }
-            if (test_h_ != nullptr &&
+            if (test_h_ != nullptr && (!m_->single || k == 0) &&
                 (pos0 + n > test_h_rows_ || !cuda_ok(cudaMemcpyAsync(a.S + int64_t(r0) * 4 * D, test_h_ + pos0 * 4 * D,
                                                                      size_t(n) * 4 * D * 4, cudaMemcpyHostToDevice, s),
                                                      "test hidden rows", err))) {
@@ -1349,7 +1764,8 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             }
             if (!cv || !fn::draft::dcp_norm(na, s) || !fn::dense::pd_tc(pt, s) || !fn::hc::hcp_down(ha, s) ||
                 !fn::xchg::pstamp(a.mom_send, gmom, n, fn::xchg::pkind::mom, s) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lm.prod[k]), s), "mom produced", err)) {
+                (!m_->single &&
+                 !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lm.prod[k]), s), "mom produced", err))) {
                 return err.empty() ? fail(err, "prompt: draft input") : false;
             }
             lm.g_prod[k] = gmom;
@@ -1364,18 +1780,21 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             if (lm.g_copied[1 - k] != gmom) {
                 return fail(err, "prompt: draft moments received before they were copied");
             }
-            if (ld.any_copied[k] &&
+            if (!m_->single && ld.any_copied[k] &&
                 !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ld.copied[k]), 0), "dmix reuse", err)) {
                 return false;
             }
-            if (!cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lm.copied[1 - k]), 0), "mom recv", err) ||
+            if ((!m_->single &&
+                 !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lm.copied[1 - k]), 0), "mom recv", err)) ||
                 !fn::xchg::pcheck(a.mom_recv, gmom, a.err, s) || !fn::hc::hcp_mid(ha, s) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lm.freed[k]), s), "mom freed", err) ||
+                (!m_->single &&
+                 !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lm.freed[k]), s), "mom freed", err)) ||
                 !fn::hc::hcp_up(ha, s) || !fn::xchg::pstamp(a.dmix_send, gmix, n, fn::xchg::pkind::dmix, s) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ld.prod[k]), s), "dmix produced", err)) {
+                (!m_->single &&
+                 !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ld.prod[k]), s), "dmix produced", err))) {
                 return err.empty() ? fail(err, "prompt: draft HC") : false;
             }
-            lm.g_freed[k]   = gmom;
+            lm.g_freed[k] = gmom;
             lm.any_freed[k] = true;
             ld.g_prod[k]    = gmix;
             if (test_low_[k] != nullptr &&
@@ -1407,15 +1826,17 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             kp.kv_k        = kk;
             kp.kv_v        = vv;
             kp.k_norm      = d.w.k_norm;
-            kp.k_cache     = d.k_cache;
-            kp.v_cache     = d.v_cache;
+            kp.k_cache = d.k_cache;
+            kp.v_cache = d.v_cache;
             kp.theta_scale = fn::qsa::attn::rope_theta_scale();
-            if (!cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ld.copied[1 - k]), 0), "dmix recv", err) ||
+            if ((!m_->single &&
+                 !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ld.copied[1 - k]), 0), "dmix recv", err)) ||
                 !fn::xchg::pcheck(a.dmix_recv, gmix, a.err, s) ||
                 !fn::draft::dcp_mixed(n, k, reinterpret_cast<const float *>(a.dmix_send + fn::xchg::pmsg_payload_at),
                                       reinterpret_cast<const float *>(a.dmix_recv + fn::xchg::pmsg_payload_at), mixed16,
                                       a.err, s) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ld.freed[k]), s), "dmix freed", err) ||
+                (!m_->single &&
+                 !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ld.freed[k]), s), "dmix freed", err)) ||
                 !q8(draft_wk_at, kk) || !q8(draft_wv_at, vv) || !fn::draft::dcp_prepare(kp, s)) {
                 return err.empty() ? fail(err, "prompt: draft K/V") : false;
             }
@@ -1439,17 +1860,27 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                 pt.col_scale = reinterpret_cast<const float *>(a.w16 + draft_ik_s_at);
                 const int32_t        b0 = static_cast<int32_t>(pos0 / fn::qsa::ratio);
                 const int32_t        b1 = static_cast<int32_t>((pos0 + n) / fn::qsa::ratio);
+                // ME6: the draft's keys in the key arena, as the target's
+                uint16_t *      keys = d.idx_keys;
+                kv_tier * const kt   = p.c.kv;
+                if (kt != nullptr) {
+                    if (h == 0 && !kt->stage_keys(k, kv_tier::draft_attn, c.start, c.rows, s, err)) {
+                        return false;
+                    }
+                    keys = kt->stage_keys_ptr(k);
+                }
                 fn::qsa::update_args ua;
-                ua.keys      = d.idx_keys;
+                ua.keys      = keys;
                 ua.k_norm    = d.iw.k_norm;
                 ua.summaries = d.idx_summ;
                 ua.first     = b0;
                 ua.count     = b1 - b0;
                 ua.rope      = fn::qsa::model_rope();
                 if (!fn::dense::pd_tc(pt, s) ||
-                    !fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, d.idx_keys, d.max_cells, s) ||
-                    (ua.count > 0 && !fn::qsa::summary_update(ua, s))) {
-                    return fail(err, "prompt: draft index");
+                    !fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, keys, d.max_cells, s) ||
+                    (ua.count > 0 && !fn::qsa::summary_update(ua, s)) ||
+                    (kt != nullptr && !kt->write_back_keys(k, kv_tier::draft_attn, pos0, n, s, err))) {
+                    return err.empty() ? fail(err, "prompt: draft index") : false;
                 }
             }
             ld.g_freed[k]   = gmix;
@@ -1490,10 +1921,11 @@ bool prompt_path::publish(const prompt_chunk & c, std::string & err) {
     const int32_t last = c.rows - 1;
     for (int32_t k = 0; k < 2; ++k) {
         card_arena &  a   = a_[size_t(k)];
-        cudaStream_t  s   = static_cast<cudaStream_t>(p_[k]->c.stream);
+        cudaStream_t s = static_cast<cudaStream_t>(p_[k]->c.stream);
         const float * row = a.S + int64_t(last) * 4 * D;
         if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
-            !cuda_ok(cudaMemcpyAsync(a.pred, row, size_t(4) * D * 4, cudaMemcpyDeviceToDevice, s), "pred", err) ||
+            ((!m_->single || k == 0) &&
+             !cuda_ok(cudaMemcpyAsync(a.pred, row, size_t(4) * D * 4, cudaMemcpyDeviceToDevice, s), "pred", err)) ||
             (d_[k] != nullptr &&
              !cuda_ok(cudaMemcpy2DAsync(d_[k]->carry_prev, size_t(F) * 4, row + ptrdiff_t(k) * F, size_t(D) * 4,
                                         size_t(F) * 4, 4, cudaMemcpyDeviceToDevice, s),

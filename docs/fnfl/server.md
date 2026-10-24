@@ -42,7 +42,7 @@ To stop the server, send it SIGTERM. Both cards should then return to 0 MiB.
   - The engine reads the file's metadata and refuses it unless the architecture is `qwen4exp` and every shape matches Qwen3.8-Flash-Next ([`fn/model/shapes.h`](../../fn/model/shapes.h)).
   - It also expects the tensor formats of the ISTA-DASLab GSQ-RCO IQ3_XXS file. A different quantization of the same model fails the load with a message naming the first tensor that differs.
 - **`-md FILE`:** the MTP draft GGUF, `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`. Without it the load stops with "FNFL needs the MTP draft (-md)". There is no decode path without the draft.
-- **`-np 1`:** one slot. Any other value stops the load with "FNFL serves one slot". Leaving `-np` out also fails, since the server's default is automatic (4).
+- **`-np N`:** the slots, 1 to 4 on the two-card engine; leaving `-np` out gives 4. One slot gives a lone user the fastest replies; more slots let up to that many conversations decode together ([One to four requests at a time](#one-to-four-requests-at-a-time)). The expert-cache configurations (`--fnfl-single-card`, `--fnfl-cached-tp`, `--fnfl-kv-host`) serve one slot, or two on one card with `--fnfl-kv-host`; other counts stop the load with a message naming the rule.
 - **`--fnfl-draft-subset FILE`:** the draft head's vocabulary. This is a list of exactly 65,536 distinct token IDs, separated by whitespace (the shipped file has one per line).
   - The draft proposes tokens only from this list. The target model still verifies against its full 248,320-token vocabulary, so the subset affects how often drafts are accepted, not what can be generated.
   - Use `models/draft-vocab-qwen3.8-flash-next.txt` from this repository.
@@ -52,8 +52,9 @@ To stop the server, send it SIGTERM. Both cards should then return to 0 MiB.
 
 - **`--jinja`:** renders chats with the model's own Jinja template from the GGUF. That template handles thinking and tool calls; without `--jinja` the server falls back to a generic template.
 - **`-c N`:** the context, in tokens (the engine calls them cells).
-  - The slot gets `min(N, 262,144)`. `-c 0` or no `-c` gives the full 262,144.
-  - The engine reserves the whole context at load. More context leaves less free memory on each card: 198,720 cells leave 2.41 GiB free per card, and 262,144 leave 1.47 GiB.
+  - With one slot, the slot gets `min(N, 262,144)`. `-c 0` or no `-c` gives the full 262,144.
+  - With more than one slot and the default 8-bit KV, `-c` is a pool of cells the slots share, and each slot's conversation can still reach 262,144. `-c` must then be a multiple of 16,384 (the pool's page). Four slots with `-c 409600` is the tested setting; it leaves about 0.57 GiB free a card after load, and about 0.2 GiB once the multi-user graphs are captured.
+  - The engine reserves the whole context at load. The 8-bit KV takes about 2.5 GiB a card for 262,144 cells, against 3.9 GiB for the 16-bit format (`--fnfl-kv-format`).
   - When a conversation reaches the end of its context, generation stops with the length reason. There is no context shift, and a prompt longer than the context is refused.
 - **`--host` and `--port`:** as in llama.cpp. The default is `127.0.0.1:8080`. Use `--api-key` if the port is reachable by others.
 
@@ -72,6 +73,7 @@ To stop the server, send it SIGTERM. Both cards should then return to 0 MiB.
   - `dense` reads every cell.
   - `sparse` reads only the 512 blocks the target's own sparse-attention indexer picked, which is much cheaper at depth.
   - The development machine serves with `sparse`, together with `--fnfl-spec-d 4`, and `fnfl-serve.sh` starts with both by default.
+- **`--fnfl-kv-format q8|bf16`** (default `q8` on the two-card engine): the KV cache's format. `q8` is int8 with an FP16 scale every 64 values and passed the engine's KL bounds; `bf16` is the 16-bit cache. The expert-cache configurations use `bf16` and refuse `q8`.
 - **`--fnfl-ple-table lazy|full`** (default `lazy`): what happens to the model's 26.9 GiB per-layer-embedding table.
   - `lazy` leaves it memory-mapped and hints the pages each step will read, so the first requests may fault some in from disk.
   - `full` reads the whole table into RAM at startup and pins it there. That makes startup longer and needs about 27 GiB of free host memory.
@@ -102,6 +104,61 @@ llama.cpp's options for its own backend are parsed and then ignored, because FNF
 - `-b`, `-ub` and `--threads`
 - `--fit`
 - speculative-decoding options other than `-md`
+
+## The expert cache (experimental)
+
+New in 0.2. Without it, each card holds 23.2 GiB of weights, which needs two 32 GB cards. The expert cache keeps the routed experts (about 40 GiB) page-locked in host memory and holds the most used ones in a pool on the GPU. A step's expert that misses the pool is either copied over PCIe or computed on the CPU, split adaptively between the two. Everything else stays on the cards. It is less tested than the two-card engine and serves one user, or two on one card with `--fnfl-kv-host`.
+
+### What it needs
+
+- **Host RAM:** the 40 GiB of page-locked experts, the experts' file pages for the CPU's products (about 40 GiB more, evictable), and the 26.9 GiB per-layer-embedding table. With `--fnfl-kv-host`, add the pinned KV history: about 7.4 GiB a slot at 262,144 tokens, in proportion for less. The test machine has 128 GB, which fits one such server but not two.
+- **CPU:** the miss path runs on CPU workers, one per physical core less one by default, each pinned. The test machine has 6 cores.
+- **The 16-bit KV cache.** `--fnfl-kv-format q8` is refused with the expert cache.
+
+### Commands
+
+Each starts from the quick-start command (`-m`, `-md`, `--fnfl-draft-subset`, `--jinja`, `--fnfl-spec-d 4 --fnfl-draft-attention sparse`) and adds:
+
+- **One 32 GB card, KV on the card (fastest one-card setup):** `-np 1 -c 131072 --fnfl-single-card 0`.
+- **One 32 GB card, two users:** `-np 2 -c 262144 --fnfl-single-card 0 --fnfl-kv-host`.
+- **One 16 GB card:** `-np 1 -c 262144 --fnfl-single-card 0 --fnfl-kv-host`.
+- **Two 16 GB cards:** `-np 1 -c 131072 --fnfl-cached-tp`. Add `--fnfl-kv-host` if the KV does not fit.
+
+The measured runs also passed `--fnfl-expert-reserve-mib 640 --fnfl-expert-lend-pct 98 --fnfl-expert-min-keep 64`, and a learned expert ranking (`--fnfl-expert-profile`, below). The 16 GB figures were taken on 32 GB cards held to 16 GB with `--fnfl-device-cap-mib 16160`. The one-card runs used a draft head whose routed experts were repacked to Q2_0, which saves about 0.9 GiB a card. That file is not distributed. The standard Q8_0 head loads in every setup and takes that much more card memory.
+
+Measured speeds are in the [README](../../README.md#which-setup-for-your-cards).
+
+### Expert-cache arguments
+
+- **`--fnfl-single-card N`:** serve on device N alone, with the expert cache.
+- **`--fnfl-cached-tp`:** the two-card engine with the expert cache.
+- **`--fnfl-kv-host`:** keep the KV history in pinned host memory. A window of recent tokens (`--fnfl-kv-window`, default 32,768) and the blocks the sparse attention selects are on the card. It is needed for two users on one card, and for a 16 GB card at long context. On the two-card engine it serves one slot.
+- **`--fnfl-device-cap-mib N`:** a ceiling on each card's total use; the pool shrinks to fit under it (default: none).
+- **`--fnfl-expert-pool-mib N`:** the GPU pool's size (default: the free memory after load, less the reserve).
+- **`--fnfl-expert-reserve-mib N`:** MiB each card keeps free beside the pool (default 768).
+- **`--fnfl-expert-cpu N`:** the CPU expert workers (default: one per physical core less one, pinned).
+- **`--fnfl-expert-profile PATH`:** the pool's starting ranking (default: expert order). Without it the pool starts cold and learns as it runs.
+- **`--fnfl-expert-profile-save PATH`:** where to save the learned ranking, after each prompt's decode and at exit. Run once with `-save`, then start later servers with `--fnfl-expert-profile` on the saved file.
+- **`--fnfl-expert-swap-overlap 0|1`:** whether the pool's swaps overlap decode (default 1).
+
+**Tuning settings.** Each is checked against its range at startup, and the startup log echoes every value. The defaults are what the measured runs used, apart from the three settings named above.
+
+- **Residency:** `--fnfl-expert-swap-every N` (rounds between swap choices, default 4); `--fnfl-expert-swap-cap N` (swaps a choice admits, 96); `--fnfl-expert-swap-min-gain X` (1.5); `--fnfl-expert-swap-min-use X` (2.0); `--fnfl-expert-swap-decay X` (0.7).
+- **The miss split** (the share of misses copied over PCIe rather than computed on the CPU): `--fnfl-expert-split F` (the starting share, 0.30); `--fnfl-expert-split-fixed F` (a fixed share, refinement off); `--fnfl-expert-split-auto 0|1` (refinement, on); `--fnfl-expert-split-windows LIST` (rounds before each refinement, 48,96,96); `--fnfl-expert-split-min-cpu N`; `--fnfl-expert-split-off-after N`; `--fnfl-expert-split-round X`; `--fnfl-expert-split-min-change X`; `--fnfl-expert-split-clamp LO,HI` (0.10,0.60); `--fnfl-expert-split-k K`.
+- **Threads:** `--fnfl-expert-worker-cpus LIST` (the workers' CPUs; default each core's first CPU but core 0's); `--fnfl-expert-service-cpu N`; `--fnfl-expert-decode-cpu N`; `--fnfl-expert-helper-cpus LIST`; `--fnfl-expert-park-ms N` (the workers' spin before they sleep, 20).
+- **Prompts:**
+  - `--fnfl-expert-short-read N`: a prompt part of at most N tokens reads without borrowing the pool. Default 64.
+  - `--fnfl-expert-routed-rows N`: a prompt half of at most N rows stages only the experts it routes to. Default 256.
+  - `--fnfl-expert-prompt-chunk N`: the largest chunk. Default 8,192.
+  - `--fnfl-expert-lend-pct N`: the share of the pool a long prompt may borrow. Default 85.
+  - `--fnfl-expert-min-keep N`: slots never lent. Default 128.
+  - `--fnfl-expert-lend-region 0|1`.
+  - `--fnfl-expert-refill-overlap 0|1`.
+  - `--fnfl-expert-refill-batch-layers N`.
+  - `--fnfl-expert-ring-mib N`, `--fnfl-expert-group-mib N` and `--fnfl-expert-route-cover N`: how one-card prompts stream their experts.
+  - `--fnfl-prompt-cpu-share auto|X` and `--fnfl-prompt-cpu-share-max N`: on one card, the share of a short prompt chunk's missing experts computed on the CPU. The default `auto` measures it.
+- **Executor:** `--fnfl-expert-executor graph|eager`. Default `graph`; `eager` is a diagnostic.
+- **Host KV:** `--fnfl-kv-window CELLS` (the on-card window, 32,768) and `--fnfl-kv-gather CELLS` (fixed at 10,240).
 
 ## Requests
 
@@ -163,11 +220,15 @@ The request is refused with `not supported by FNFL: ...`, naming each field, if 
 
 Tool calls still work. The chat template's own tool-call grammar travels with the request but is not enforced; tool calls are parsed from the model's text by the template's parser, as in llama.cpp.
 
-### One request at a time
+### One to four requests at a time
 
-There is one slot. A second request waits until the first ends.
+With `-np 1` there is one slot, and a second request waits until the first ends. With `-np N` up to N requests run at once, and further requests wait for a free slot.
 
-The server keeps the conversation it last processed and reuses as much of it as the next prompt shares:
+- Slots that are generating decode together: one draft step and one verification step serve all of them, so the cards' weight reads are shared. Each user gets exactly the tokens it would get alone, at any temperature and seed.
+- A long prompt is read in slices between the writers' steps, so replies keep flowing while another user's prompt loads. Prompts read beside writers go more slowly than alone.
+- A lone active user runs on the single-user path at its full speed, whatever `-np` is.
+
+Each slot keeps the conversation it last processed and reuses as much of it as the next prompt shares:
 
 - **An exact extension** of what the slot holds, which is the normal case for a chat follow-up, processes only the new tokens.
 - **A prompt that diverges inside the held conversation** restores the latest checkpoint before the divergence and re-reads from there.

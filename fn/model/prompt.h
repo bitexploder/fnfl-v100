@@ -9,7 +9,9 @@
 // (its resident half and the peer's replica) and the full streams S [rows][4][2560] F32. After layer 47 the draft's
 // catch-up runs over the chunk's positions, half by half (the eh_proj product, the split Q8_0 HC with its two
 // messages, K and V into the draft cache). The state objects keep decode's layout and SR1's versions: half A writes
-// logical version 1, half B version 2; the caller publishes the chunk (fn::round::advance by the chunk's halves)
+// logical version 1, half B version 2 (ME11: the GDN matrices as banks: half A from the committed bank and records into
+// the other bank, half B in place there); the caller publishes the chunk (fn::round::advance by the chunk's halves,
+// the GDN selector by gdn_after_prompt)
 // after both cards' work joined clean, so a failed chunk publishes nothing (design note, section 7).
 //
 // Host code only. Every launch is enqueued directly (no graph); the host computes each launch's rows and positions
@@ -35,11 +37,15 @@ namespace fn::model {
 constexpr int32_t prompt_chunk_rows = 8192; // PB3: a whole 8,192 span (was 3,072 in halves of 1,536)
 constexpr int32_t prompt_half_rows = 4096;
 
-// the arena's bytes a card (n_cells sizes nothing here: the QSA slab is the full 262,144-cell scratch, 32 MiB)
-int64_t prompt_arena_bytes();
+// the arena's bytes a card (n_cells sizes nothing here: the QSA slab is the full 262,144-cell scratch, 32 MiB); ME3:
+// for a layout of chunks of at most chunk_rows rows in halves of at most half_rows (prompt_path::layout); MX6: single
+// omits peer receive buffers and card 1's shared buffers (aliased to card 0 in set_links)
+int64_t prompt_arena_bytes(int32_t chunk_rows = prompt_chunk_rows, int32_t half_rows = prompt_half_rows,
+                           bool single = false, int32_t card = 0);
 // the replicas' bytes a card: the peer's half of the 96 target HC sublayers' coefficients and of PLE's, and the draft's
-// full enorm and hnorm
-int64_t prompt_replica_bytes();
+// full enorm and hnorm; single (ME1, both logical cards on one device): the draft's full norms only, the peer's HC
+// and PLE tensors being read where they are resident
+int64_t prompt_replica_bytes(bool single = false);
 
 // the declared bulk call sites (design note section 4): host counters, one an enqueue
 enum class psite : int32_t {
@@ -75,6 +81,7 @@ struct prompt_chunk {
     const int32_t * tok     = nullptr;               // host: the chunk's tokens
     const float *   e[2]    = { nullptr, nullptr };  // device: each card's PLE input rows [rows][2560] (PF1's staging)
     bool            draft   = true;
+    bool            more    = false;  // ME4: another chunk of the run follows (expert_service::prompt_layer)
 };
 
 // what the HC dump (PB2's inputs) takes from one chunk: layers, and every stride-th row of each half
@@ -93,8 +100,32 @@ class prompt_path {
     prompt_path & operator=(const prompt_path &) = delete;
 
     // the arenas, replicas (filled now, card to card), copy streams and events; p[c] is the target's pass on card c
-    // (its stream is the compute stream), d[c] its draft (null: no draft). Synchronous.
-    bool init(model & m, pass_card * const p[2], draft_card * const d[2], std::string & err);
+    // (its stream is the compute stream), d[c] its draft (null: no draft). Synchronous. MU1: arena_class names the
+    // arena (the other-reader lane's, "other-reader arena (MU1)"), laid out for chunks of at most rc_max rows in
+    // halves of at most rh_max (the largest layout this path takes)
+    bool init(model & m, pass_card * const p[2], draft_card * const d[2], std::string & err,
+              const char * arena_class = "prefill arena (PB1)", int32_t rc_max = prompt_chunk_rows,
+              int32_t rh_max = prompt_half_rows);
+    // MU1: the slot whose chunks run next: its passes and drafts (a slot's frame; the replicas and weights are every
+    // slot's). Between chunks only (no chunk of this path in flight); the next chunk's run_start reads its state.
+    void bind(pass_card * const p[2], draft_card * const d[2]);
+
+    // ME2b: the arena (and PF1's staging) borrowed from the expert pool (on), or returned (off), through the cards'
+    // expert service (layer.h expert_service::prompt_hold; nothing without one, or with nothing lent). A borrow
+    // clears the error words (the region held expert slots since the last prompt). Synchronous. ME3: need, the bytes
+    // the prompt writes (the arena's layout, arena_spans, and the caller's staging); null: the whole region
+    bool hold(bool on, std::string & err, const std::vector<byte_span> * need = nullptr);
+
+    // ME3: the arena's views carved for chunks of at most rc rows in halves of at most rh (from its base, so the
+    // layout's writes are a prefix of the arena: arena_spans); not under a sized loan. Host only. init's is the full
+    // 8,192 / 4,096
+    bool layout(int32_t rc, int32_t rh, std::string & err);
+    void arena_spans(std::vector<byte_span> & out) const;
+    // ME3: the loan's startup check through the cards' expert service (layer.h prompt_loan_check)
+    bool loan_check(const std::vector<byte_span> & need, std::string & err) const;
+    expert_service * service() const;
+    int32_t layout_rows() const { return rc_; }
+    int32_t layout_half() const { return rh_; }
 
     // a run's start, both cards drained: the predecessor row (the draft's retained carry, both halves) and PLE's full
     // history from the committed version (cur: the cards' committed slot). Synchronous.
@@ -102,6 +133,15 @@ class prompt_path {
 
     // enqueue one chunk on both cards (no wait); the caller joins both compute streams, then checks errors
     bool chunk(const prompt_chunk & c, std::string & err);
+    // MU1: chunk's three parts, in order, for a chunk run in layer groups: its tokens and the embedding (begin), the
+    // layers lo .. hi - 1 (layers; groups in order, covering 0 .. 47 once), then layer 47's last exchange and the
+    // draft's catch-up (end). The kernels and their order are chunk's; between two parts the host may wait for the
+    // cards and run other slots' rounds, which touch none of this path's arena, links or the bound slot's state.
+    bool chunk_begin(const prompt_chunk & c, std::string & err);
+    bool chunk_layers(const prompt_chunk & c, int32_t lo, int32_t hi, std::string & err);
+    bool chunk_end(const prompt_chunk & c, std::string & err);
+    // MU1: this path's copy stream on card c (a layer group's completion waits for it as for the compute streams)
+    void * copy_stream(int32_t c) const { return copy_[c]; }
 
     // after a clean join: both cards' prompt error words and the selection's and EP1's words; cleared after reading.
     // A set word fails the chunk (the caller publishes nothing).
@@ -120,7 +160,7 @@ class prompt_path {
 
     // TEST ONLY (prefill-test dry, PB1's determinism follow-up): every arena byte set to 0xFF (a NaN in F32, FP16
     // and BF16) and the error words cleared, so a run that reads arena data an earlier run left shows it even on zero
-    // weights. Synchronous.
+    // weights. Synchronous. ME2b: borrows a lent arena first and keeps it (the next prefill run returns it).
     bool test_poison(std::string & err);
 
     // TEST ONLY: the device final streams of chunk row r on card c (the draft check's hidden rows)
@@ -163,6 +203,8 @@ class prompt_path {
   private:
     struct card_arena;
     struct link;
+    bool carve(card_arena & a, int32_t rc, int32_t rh, bool single, int32_t card, std::string & err);
+    void set_links();
     bool fill_replicas(std::string & err);
     bool layer_half(const prompt_chunk & c, int32_t layer, int32_t sub, int32_t h, int32_t phase, std::string & err);
     bool draft_half(const prompt_chunk & c, int32_t h, int32_t phase, std::string & err);
@@ -178,6 +220,9 @@ class prompt_path {
     std::vector<link>             links_;
     std::array<int64_t, n_psites> sites_{};
     int32_t                       hist_cur_  = 0;  // which of the two PLE full histories holds the latest
+    int32_t                       rc_ = prompt_chunk_rows, rh_ = prompt_half_rows;  // ME3: the layout
+    int32_t rc_max_ = prompt_chunk_rows, rh_max_ = prompt_half_rows;                // MU1: the arena's largest layout
+    bool                          held_ = false, held_whole_ = false;  // ME3: borrowed (hold), the whole region
     int32_t                       test_fail_ = -1;
     const float *                 test_h_      = nullptr;
     int64_t                       test_h_rows_ = 0;

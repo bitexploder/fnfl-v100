@@ -25,9 +25,10 @@ enum class wfmt : int32_t {
     bf16,
     f16,
     f32,
+    q5_1, // ME1: the Unsloth Q4 candidate's routed down (not in the deployed model)
 };
 
-constexpr int32_t n_wfmt = 15;
+constexpr int32_t n_wfmt = 16;
 
 struct wfmt_info {
     const char * name;    // "iq2_xxs", ..., "f32"

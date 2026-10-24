@@ -7,4 +7,6 @@
 // model: the GGUF's first shard (layer 11's attn_q_norm and attn_k_norm and the rope and attention keys, read on the
 // CPU); fixture: QA1's HX7 selection (hx7-l3-w0.bin). Prints "qa2-test: PASS" with the worst normalized errors and
 // returns 0 when every check passes.
-int fnfl_qa2_test(int device, const std::string & mode, const std::string & model, const std::string & fixture);
+// KV8: q8 runs every case with the caches in the 8-bit format
+int fnfl_qa2_test(int device, const std::string & mode, const std::string & model, const std::string & fixture,
+                  bool q8 = false);

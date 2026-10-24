@@ -105,7 +105,11 @@ __device__ __forceinline__ void put8(float * dst, const float (&y)[8], int32_t l
     d[1] = make_float4(y[4], y[5], y[6], y[7]);
 }
 
-__global__ void __launch_bounds__(prep_threads) prepare_kernel(const prepare_args a, int32_t rows) {
+// H (ME3, the host-backed KV's graphs): cell c at k_cache + (c - *shift) * 256 (v_cache alike), the window's start
+// read on the device; H false: the resident launch, shift unused
+template <bool H>
+__global__ void __launch_bounds__(prep_threads)
+    prepare_kernel(const prepare_args a, int32_t rows, const int64_t * shift) {
     const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32, lane = static_cast<int32_t>(threadIdx.x) % 32;
     const int32_t t = static_cast<int32_t>(blockIdx.x);
     if (t == rows) {
@@ -146,11 +150,12 @@ __global__ void __launch_bounds__(prep_threads) prepare_kernel(const prepare_arg
     if (a.k_f32 != nullptr) {
         put8(a.k_f32 + t * head_dim, y, lane);
     }
-    reinterpret_cast<uint4 *>(a.k_cache + cell * head_dim)[lane] = pack_f16(y, 1.0f);
+    const int64_t at = H ? (cell - *shift) * head_dim : cell * head_dim;
+    reinterpret_cast<uint4 *>(a.k_cache + at)[lane] = pack_f16(y, 1.0f);
     const float4 va = __ldg(reinterpret_cast<const float4 *>(a.kv_v + t * head_dim) + 2 * lane);
     const float4 vb = __ldg(reinterpret_cast<const float4 *>(a.kv_v + t * head_dim) + 2 * lane + 1);
     const float v[8] = {va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w};
-    reinterpret_cast<uint4 *>(a.v_cache + cell * head_dim)[lane] = pack_f16(v, 1.0f);
+    reinterpret_cast<uint4 *>(a.v_cache + at)[lane] = pack_f16(v, 1.0f);
 }
 
 // ---- attend ----
@@ -197,13 +202,18 @@ struct smem_sp : smem_t {
 struct kargs {
     attend_args a;
     int32_t grid;
+    const int64_t * shift; // ME3: attend_kernel<SP, true>'s window start (datc_attend's shift)
 };
 
 // SP (SP2, sparse): the logical cells i < 4 K are cells 4 body[2 + i / 4] + i % 4 (the selected blocks), then the
 // prefix's tail and the chain's cells 4 (N / 4) .. N + row0 in order; n counts logical cells and the tile's physical
 // cells are staged in shared memory. SP false: cell i is cell i (DR1's dense form, unchanged).
-template <bool SP> __global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs ka) {
+// H (ME3, the host-backed KV's graphs): the K and V pointers less the window's start (*ka.shift cells), read once
+template <bool SP, bool H = false> __global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs ka) {
     const attend_args & a = ka.a;
+    const int64_t sh = H ? *ka.shift * head_dim : 0;
+    const uint16_t * const k_cache = H ? a.k_cache - sh : a.k_cache;
+    const uint16_t * const v_cache = H ? a.v_cache - sh : a.v_cache;
     __shared__ std::conditional_t<SP, smem_sp, smem_t> sm;
     const int32_t tid = static_cast<int32_t>(threadIdx.x);
     const int32_t warp = tid / 32, lane = tid % 32;
@@ -269,7 +279,7 @@ template <bool SP> __global__ void __launch_bounds__(threads, 2) attend_kernel(c
         if constexpr (SP) {
             kcell = sm.cells[kl - base];
         }
-        const uint2 * kp = reinterpret_cast<const uint2 *>(a.k_cache + static_cast<int64_t>(kcell) * head_dim);
+        const uint2 * kp = reinterpret_cast<const uint2 *>(k_cache + static_cast<int64_t>(kcell) * head_dim);
         uint2 kb[16], vb[16];
 #pragma unroll
         for (int32_t j = 0; j < 16; ++j) {
@@ -284,7 +294,7 @@ template <bool SP> __global__ void __launch_bounds__(threads, 2) attend_kernel(c
             }
             vb[kc] =
                 vl < n
-                    ? __ldg(reinterpret_cast<const uint2 *>(a.v_cache + static_cast<int64_t>(vcell) * head_dim + d0))
+                    ? __ldg(reinterpret_cast<const uint2 *>(v_cache + static_cast<int64_t>(vcell) * head_dim + d0))
                     : make_uint2(0u, 0u);
         }
         // S = Q K^T: quadpair qp sums its 16 k-chunks for both M-blocks, then the quadpairs are added (xor 4, 8)
@@ -429,21 +439,29 @@ bool aligned(const void * p, uintptr_t n) {
     return p != nullptr && reinterpret_cast<uintptr_t>(p) % n == 0;
 }
 
-int32_t ctas_per_sm(int32_t device) {
-    static int32_t cache[16] = {}; // per device (R14)
+int32_t ctas_per_sm(int32_t device, bool h = false) {
+    static int32_t cache[2][16] = {}; // per device (R14); ME3: [1] the host-K/V instantiation's
     if (device < 0 || device >= 16) {
         return 0;
     }
-    if (cache[device] == 0) {
+    if (cache[h][device] == 0) {
         int nb = 0;
         int ns = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, attend_kernel<false>, threads, 0) != cudaSuccess ||
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ns, attend_kernel<true>, threads, 0) != cudaSuccess) {
+        if (h) {
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, attend_kernel<true, true>, threads, 0) !=
+                cudaSuccess) {
+                return 0;
+            }
+            ns = nb;
+        } else if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, attend_kernel<false>, threads, 0) !=
+                       cudaSuccess ||
+                   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ns, attend_kernel<true>, threads, 0) !=
+                       cudaSuccess) {
             return 0;
         }
-        cache[device] = nb < ns ? nb : ns;
+        cache[h][device] = nb < ns ? nb : ns;
     }
-    return cache[device];
+    return cache[h][device];
 }
 
 int32_t sm_count(int32_t device) {
@@ -457,7 +475,7 @@ size_t part_bytes() {
     return sizeof(float) * size_t(n_cta) * part_floats;
 }
 
-bool datc_prepare(int32_t rows, const prepare_args & a, void * stream) {
+bool datc_prepare(int32_t rows, const prepare_args & a, void * stream, const int64_t * shift) {
     if (rows < 1 || rows > max_rows || a.row0 < 0 || a.row0 + rows > max_rows || stream == nullptr || a.max_cells < 1 ||
         !aligned(a.kv_k, 16) || !aligned(a.kv_v, 16) || a.k_norm == nullptr || a.n_before == nullptr ||
         a.pos == nullptr || a.stride == nullptr || !aligned(a.k_cache, 16) || !aligned(a.v_cache, 16) ||
@@ -469,12 +487,19 @@ bool datc_prepare(int32_t rows, const prepare_args & a, void * stream) {
         return false;
     }
     const int32_t blocks = rows + (a.release_hc != nullptr || a.release_hmix != nullptr ? 1 : 0);
-    prepare_kernel<<<blocks, prep_threads, 0, static_cast<cudaStream_t>(stream)>>>(a, rows);
+    if (shift != nullptr) {
+        prepare_kernel<true><<<blocks, prep_threads, 0, static_cast<cudaStream_t>(stream)>>>(a, rows, shift);
+    } else {
+        prepare_kernel<false><<<blocks, prep_threads, 0, static_cast<cudaStream_t>(stream)>>>(a, rows, nullptr);
+    }
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-bool datc_attend(const attend_args & a, void * stream) {
+bool datc_attend(const attend_args & a, void * stream, const int64_t * shift) {
     const bool sp = a.body != nullptr;
+    if (shift != nullptr && !sp) {
+        return false; // ME3: the host-backed KV serves the sparse draft only
+    }
     if (stream == nullptr || a.row0 < 0 || a.row0 >= (sp ? max_sparse_steps : max_rows) || a.max_cells < 1 ||
         !aligned(a.q16, 16) ||
         !aligned(a.qfull, 16) || !aligned(a.k_cache, 16) || !aligned(a.v_cache, 16) || a.n_before == nullptr ||
@@ -487,13 +512,14 @@ bool datc_attend(const attend_args & a, void * stream) {
         return false;
     }
     const int32_t grid = sp ? sparse_cta : n_cta;
-    if (ctas_per_sm(device) * sm_count(device) < grid || grid * n_warp < n_fold) {
+    if (ctas_per_sm(device, shift != nullptr) * sm_count(device) < grid || grid * n_warp < n_fold) {
         return false; // the grid barrier needs every CTA co-resident
     }
-    kargs k = {a, grid};
+    kargs k = {a, grid, shift};
     void * params[] = {&k};
-    const void * f = sp ? reinterpret_cast<const void *>(attend_kernel<true>)
-                        : reinterpret_cast<const void *>(attend_kernel<false>);
+    const void * f = shift != nullptr ? reinterpret_cast<const void *>(attend_kernel<true, true>)
+                     : sp             ? reinterpret_cast<const void *>(attend_kernel<true>)
+                                      : reinterpret_cast<const void *>(attend_kernel<false>);
     return cudaLaunchCooperativeKernel(f, dim3(grid), dim3(threads), params, 0, static_cast<cudaStream_t>(stream)) ==
            cudaSuccess;
 }
@@ -515,7 +541,7 @@ bool kernel_resources(int32_t which, resources & r) {
     }
     cudaFuncAttributes fa = {};
     int device = -1;
-    const void * f = which == 2   ? reinterpret_cast<const void *>(prepare_kernel)
+    const void * f = which == 2   ? reinterpret_cast<const void *>(prepare_kernel<false>)
                      : which == 3 ? reinterpret_cast<const void *>(attend_kernel<false>)
                                   : reinterpret_cast<const void *>(attend_kernel<true>);
     if (cudaFuncGetAttributes(&fa, f) != cudaSuccess || cudaGetDevice(&device) != cudaSuccess) {
@@ -528,7 +554,7 @@ bool kernel_resources(int32_t which, resources & r) {
         r.ctas_per_sm = ctas_per_sm(device);
     } else {
         int nb = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, prepare_kernel, prep_threads, 0) != cudaSuccess) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, prepare_kernel<false>, prep_threads, 0) != cudaSuccess) {
             return false;
         }
         r.ctas_per_sm = nb;

@@ -84,8 +84,19 @@ rings::rings(int32_t dev0, int32_t dev1) {
     ok_ = ok && reset_all();
 }
 
-rings::~rings() {
+rings::rings(int32_t dev0, int32_t dev1, float * const buf[2], uint32_t * const err[2]) {
+    dev_[0] = dev0;
+    dev_[1] = dev1;
+    owns_ = false;
     for (int32_t c = 0; c < 2; ++c) {
+        buf_[c] = buf[c];
+        err_[c] = err[c];
+    }
+    ok_ = buf_[0] != nullptr && buf_[1] != nullptr && err_[0] != nullptr && err_[1] != nullptr;
+}
+
+rings::~rings() {
+    for (int32_t c = 0; c < 2 && owns_; ++c) {
         if (buf_[c] == nullptr && err_[c] == nullptr) {
             continue;
         }
@@ -136,6 +147,88 @@ bool rings::read_err(int32_t card, uint32_t & out) const {
     }
     device_scope ds(dev_[card]);
     return ds.ok && cuda_ok(cudaMemcpy(&out, err_[card], sizeof(out), cudaMemcpyDeviceToHost), "read err");
+}
+
+// ---- FMU2: the joint round's exchange memory ----
+
+namespace {
+
+constexpr int64_t joint_slot_words = int64_t(joint_rows) * words_half;
+// a card's buffer: the lane rings, then X-A's slots, then X-F's
+constexpr int64_t joint_card_words = max_lanes * card_words + 2 * n_slot * joint_slot_words;
+constexpr int32_t joint_err_words = max_lanes + 1;
+static_assert(card_words % 4 == 0 && joint_slot_words % 4 == 0, "lane rings and joint slots stay 16-byte aligned");
+
+} // namespace
+
+int64_t joint_rings::lane_floats() {
+    return card_words;
+}
+
+int64_t joint_rings_card_bytes() {
+    return joint_card_words * int64_t(sizeof(float)) + joint_err_words * int64_t(sizeof(uint32_t));
+}
+
+joint_rings::joint_rings(int32_t dev0, int32_t dev1) {
+    dev_[0] = dev0;
+    dev_[1] = dev1;
+    bool ok = true;
+    for (int32_t c = 0; c < 2 && ok; ++c) {
+        device_scope ds(dev_[c]);
+        ok = ds.ok && cuda_ok(cudaMalloc(&buf_[c], size_t(joint_card_words) * sizeof(float)), "cudaMalloc joint") &&
+             cuda_ok(cudaMalloc(&err_[c], size_t(joint_err_words) * sizeof(uint32_t)), "cudaMalloc joint err");
+    }
+    for (int32_t u = 0; u < max_lanes && ok; ++u) {
+        float * const b[2] = {buf_[0] + u * card_words, buf_[1] + u * card_words};
+        uint32_t * const e[2] = {err_[0] + u, err_[1] + u};
+        lane_[u] = std::make_unique<rings>(dev_[0], dev_[1], b, e);
+        ok = lane_[u]->ok();
+    }
+    ok_ = ok && reset_all();
+}
+
+joint_rings::~joint_rings() {
+    for (int32_t u = 0; u < max_lanes; ++u) {
+        lane_[u].reset();
+    }
+    for (int32_t c = 0; c < 2; ++c) {
+        if (buf_[c] == nullptr && err_[c] == nullptr) {
+            continue;
+        }
+        device_scope ds(dev_[c]);
+        if (buf_[c] != nullptr) {
+            cudaFree(buf_[c]);
+        }
+        if (err_[c] != nullptr) {
+            cudaFree(err_[c]);
+        }
+    }
+}
+
+float * joint_rings::slot(int32_t card, msg m, int32_t s) const {
+    if (card < 0 || card > 1 || (m != msg::a && m != msg::f) || s < 0 || s >= n_slot || buf_[card] == nullptr) {
+        return nullptr;
+    }
+    return buf_[card] + max_lanes * card_words + ((m == msg::f ? n_slot : 0) + s) * joint_slot_words;
+}
+
+bool joint_rings::reset_all() const {
+    for (int32_t c = 0; c < 2; ++c) {
+        device_scope ds(dev_[c]);
+        if (!ds.ok || buf_[c] == nullptr || err_[c] == nullptr ||
+            !cuda_ok(cudaMemset(buf_[c] + max_lanes * card_words, 0xff,
+                                size_t(2 * n_slot * joint_slot_words) * sizeof(float)),
+                     "joint prefill") ||
+            !cuda_ok(cudaMemset(err_[c], 0, size_t(joint_err_words) * sizeof(uint32_t)), "joint err clear")) {
+            return false;
+        }
+    }
+    for (int32_t u = 0; u < max_lanes; ++u) {
+        if (lane_[u] == nullptr || !lane_[u]->reset_all()) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // ---- xchg-test stand-ins ----

@@ -1,15 +1,23 @@
 #include "fn/runtime/target.h"
 
 #include "fn/kernels/draft/draft.h"
+#include "fn/kernels/gdn/gdn.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/head/head.h"
+#include "fn/kernels/round/version.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/layer.h"
 #include "fn/xchg/xchg.h"
 
+#include <cuda.h>
 #include <cuda_runtime.h>
+#include <immintrin.h>
+#include <sys/prctl.h>
+#include <time.h>
 
 #include <algorithm>
 #include <atomic>
+#include <memory>
 #include <chrono>
 #include <cstring>
 #include <string>
@@ -33,6 +41,24 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
         return false;
     }
     return true;
+}
+
+// ME3: a graph node's type read from the driver (CUgraphNodeType, numbered as cudaGraphNodeType), through the
+// runtime's entry point (no driver link); -1 when it cannot be read
+int32_t driver_node_type(cudaGraphNode_t node) {
+    void * fn = nullptr;
+    cudaDriverEntryPointQueryResult q = cudaDriverEntryPointSymbolNotFound;
+    if (cudaGetDriverEntryPointByVersion("cuGraphNodeGetType", &fn, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess || fn == nullptr) {
+        cudaGetLastError();
+        return -1;
+    }
+    CUgraphNodeType t = CU_GRAPH_NODE_TYPE_EMPTY;
+    const auto get = reinterpret_cast<CUresult (*)(CUgraphNode, CUgraphNodeType *)>(fn);
+    if (get(reinterpret_cast<CUgraphNode>(node), &t) != CUDA_SUCCESS) {
+        return -1;
+    }
+    return static_cast<int32_t>(t);
 }
 
 double seconds(clock_t_::time_point a, clock_t_::time_point b) {
@@ -88,7 +114,9 @@ target::~target() {
             break;
         }
         cudaSetDevice(m_->device[c]);
-        if (st_[c] != nullptr) {
+        // ME3: one device's card 1 shares card 0's stream, destroyed at c = 0 (below): synchronized once, not after.
+        // MU1: the engine's shared streams are synchronized here too (this slot's queued work), destroyed by the engine
+        if (st_[c] != nullptr && (c == 0 || st_[c] != st_[0])) {
             cudaStreamSynchronize(static_cast<cudaStream_t>(st_[c]));
         }
         for (int32_t v = 0; v < 2; ++v) {
@@ -118,7 +146,7 @@ target::~target() {
                 cudaEventDestroy(static_cast<cudaEvent_t>(e));
             }
         }
-        if (st_[c] != nullptr) {
+        if (own_streams_ && st_[c] != nullptr && (c == 0 || st_[c] != st_[0])) { // ME1: one device shares card 0's
             cudaStreamDestroy(static_cast<cudaStream_t>(st_[c]));
         }
     }
@@ -137,6 +165,13 @@ target::~target() {
 bool target::init(model::model & m, const target_options & o, std::string & err) {
     m_ = &m;
     o_ = o;
+    if (o.slot < 0 || o.slot >= m.n_slots) {
+        return fail(err, "target: slot " + std::to_string(o.slot) + " of " + std::to_string(m.n_slots));
+    }
+    const model::slot_scope bind(m, o.slot); // MU1: this slot's classes
+    ple_use_ = o.ple_use != nullptr ? o.ple_use : &own_ple_use_;
+    u_ = o.eager_uses != nullptr ? o.eager_uses : own_u_;
+    own_streams_ = o.streams[0] == nullptr;
     o_.pass.sampling = o_.sample ? &o_.sampling : nullptr; // SM1: the decision's sampler, or V1's greedy
     if (!read_ple_params(o.model_path, ple_, err)) {
         return false;
@@ -153,8 +188,9 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
                          "draft's full-path pick (q_shard) is not built (SP1); use top-k 1 .. 256");
     }
     std::vector<int32_t> subset;
+    // MU1: the draft head copy is the engine's (one a load): slot 0's init fills it
     if (o.draft.on && (!model::pack_draft(m, err) || !model::read_draft_subset(o.draft.subset, subset, err) ||
-                       !model::draft_head_fill(m, subset, err))) {
+                       (o.slot == 0 && !model::draft_head_fill(m, subset, err)))) {
         return false;
     }
     // mapped host memory, visible to both devices (portable)
@@ -181,9 +217,11 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
         return false;
     }
     for (int32_t c = 0; c < 2; ++c) {
-        cudaStream_t s = nullptr;
+        cudaStream_t s = static_cast<cudaStream_t>(o.streams[c]);
         if (!cuda_ok(cudaSetDevice(m.device[c]), "cudaSetDevice", err) ||
-            !cuda_ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream", err)) {
+            (s == nullptr &&
+             (c == 1 && m.single ? (s = static_cast<cudaStream_t>(st_[0]), false)
+                                 : !cuda_ok(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream", err)))) {
             return false;
         }
         st_[c] = s;
@@ -197,7 +235,7 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
         if (!model::pass_init(m, c, s, ring_dev, flag_dev, done_dev + c, next_round_, p_[c], err)) {
             return false;
         }
-        v_.bind(c, m.device[c], s, &p_[c].rstate->cur);
+        v_.bind(c, m.device[c], s, &p_[c].rstate->cur, &p_[c].rstate->gdn);
         if (o.draft.on && !model::draft_init(m, p_[c], dc_[c], err)) {
             return false;
         }
@@ -211,6 +249,11 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
             dc_[c].sampled =
                 o_.sample && o_.sampling.temp > 0.0f && fn::samp::path_of(o_.sampling) == fn::samp::path::topk;
         }
+    }
+    // ME12: one device's target HC is the paired cooperative launch (hc::pair, head_pair): its support and every
+    // instance's residency on this device, before any capture
+    if (m.single && (!cuda_ok(cudaSetDevice(m.device[0]), "cudaSetDevice", err) || !fn::hc::pair_prepare())) {
+        return err.empty() ? fail(err, "the paired HC launch is not co-resident on this device") : false;
     }
     if (o_.sample) {
         // SM1: the request's options (refused when FNFL does not honour them) on both cards
@@ -227,12 +270,53 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
         }
     }
     sparse_built_ = o.draft.on && o.draft.attention == "sparse"; // SP2
-    if (o.eager) {
-        dmode_ = sparse_built_ ? 1 : 0;
-        for (int32_t c = 0; c < 2 && o.draft.on; ++c) {
-            dc_[c].sparse = sparse_built_;
+    if (m.kv_host) {
+        if (!m.single && !m.expert_cache) {
+            return fail(err, "two-device host KV needs the expert cache (--cached-tp)");
         }
-        return reset(err);
+        // ME1: the host-backed KV tier needs the draft's attention sparse (a dense draft step reads every
+        // cell). ME3: either executor (the graphs read the window's position from the tier's device word)
+        if (o.draft.on && !sparse_built_) {
+            return fail(err, "the host-backed KV tier needs the sparse draft");
+        }
+        tier_ = std::make_unique<model::kv_tier>();
+        if (!tier_->init(m, m.kv_window, err, st_)) { // ME3: --kv-window
+            return false;
+        }
+        for (int32_t c = 0; c < 2; ++c) {
+            p_[c].c.kv = tier_.get();
+        }
+    }
+    dmode_ = sparse_built_ ? 1 : 0;
+    for (int32_t c = 0; c < 2 && o.draft.on; ++c) {
+        dc_[c].sparse = sparse_built_;
+    }
+    eager_ = o.eager;
+    if (tier_ != nullptr) {
+        tier_->set_graph(!eager_);
+    }
+    if (!o.eager && !o.defer_capture && !capture(err)) {
+        return false;
+    }
+    return reset(err);
+}
+
+bool target::capture(std::string & err) {
+    if (captured_) {
+        return fail(err, "capture: the graphs are captured");
+    }
+    const int32_t nd = m_->single ? 1 : 2;
+    size_t free0[2] = {0, 0}, free1[2] = {0, 0}, total = 0;
+    for (int32_t c = 0; c < nd; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+            !cuda_ok(cudaMemGetInfo(&free0[c], &total), "memory info", err)) {
+            return false;
+        }
+    }
+    const target_options & o = o_;
+    model::model & m = *m_;
+    if (tier_ != nullptr) {
+        tier_->set_graph(true); // the graphs read the window's position on the device
     }
     // one graph per card per B, captured once, and the draft's step graphs; SV1: the other decision variant too
     var_ = variant_of(o_);
@@ -253,10 +337,10 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
         } else {
             other.temp = 0.0f;
         }
-        size_t free0[2] = {0, 0}, free1[2] = {0, 0}, total = 0;
-        for (int32_t c = 0; c < 2; ++c) {
+        size_t vf0[2] = {0, 0}, vf1[2] = {0, 0};
+        for (int32_t c = 0; c < nd; ++c) {
             if (!cuda_ok(cudaSetDevice(m.device[c]), "cudaSetDevice", err) ||
-                !cuda_ok(cudaMemGetInfo(&free0[c], &total), "memory info", err)) {
+                !cuda_ok(cudaMemGetInfo(&vf0[c], &total), "memory info", err)) {
                 return false;
             }
         }
@@ -272,27 +356,50 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
         }
         var_capture_s_ = seconds(t0, clock_t_::now());
         var_captures_ = captures_ - n0;
-        for (int32_t c = 0; c < 2; ++c) {
+        for (int32_t c = 0; c < nd; ++c) {
             if (!cuda_ok(cudaSetDevice(m.device[c]), "cudaSetDevice", err) ||
-                !cuda_ok(cudaMemGetInfo(&free1[c], &total), "memory info", err)) {
+                !cuda_ok(cudaMemGetInfo(&vf1[c], &total), "memory info", err)) {
                 return false;
             }
-            var_bytes_[c] = static_cast<int64_t>(free0[c]) - static_cast<int64_t>(free1[c]);
+            var_bytes_[c] = static_cast<int64_t>(vf0[c]) - static_cast<int64_t>(vf1[c]);
         }
     }
     // the draft's catch-up graph per B_c (1..5) per card: no pick, one variant (SP2: each captured form)
     if (o.draft.on && !capture_draft_kind(catchup_kind, fn::draft::max_rows, 0, err)) {
         return false;
     }
-    dmode_ = sparse_built_ ? 1 : 0;
-    for (int32_t c = 0; c < 2 && o.draft.on; ++c) {
-        dc_[c].sparse = sparse_built_;
+    for (int32_t c = 0; c < nd; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+            !cuda_ok(cudaMemGetInfo(&free1[c], &total), "memory info", err)) {
+            return false;
+        }
+        graph_bytes_[c] = static_cast<int64_t>(free0[c]) - static_cast<int64_t>(free1[c]);
+    }
+    if (tier_ != nullptr) {
+        tier_->set_graph(!eager_);
+    }
+    captured_ = true;
+    return true;
+}
+
+bool target::set_executor(bool graph, std::string & err) {
+    if (graph && !captured_) {
+        return fail(err, "set_executor: the graph executor without its graphs (capture)");
+    }
+    eager_ = !graph;
+    if (tier_ != nullptr) {
+        tier_->set_graph(graph);
+    }
+    if (p_[0].c.ex_service != nullptr) {
+        p_[0].c.ex_service->set_executor(graph);
     }
     return reset(err);
 }
 
 bool target::capture_draft_kind(int32_t kind, int32_t max_rows, int32_t v, std::string & err) {
-    for (int32_t f = 0; f <= (sparse_built_ ? 1 : 0); ++f) {
+    // ME3: with the host-backed KV tier only the sparse form (the tier serves no dense draft; set_draft_sparse refuses
+    // the switch)
+    for (int32_t f = tier_ != nullptr ? 1 : 0; f <= (sparse_built_ ? 1 : 0); ++f) {
         for (int32_t c = 0; c < 2; ++c) {
             dc_[c].sparse = f == 1; // SP2: the form this capture records
         }
@@ -314,6 +421,9 @@ bool target::set_draft_sparse(bool on, std::string & err) {
     if (!o_.draft.on || (on && !sparse_built_)) {
         return fail(err, "set_draft_sparse: no draft, or the sparse form not captured (draft attention sparse, SP2)");
     }
+    if (!on && tier_ != nullptr) {
+        return fail(err, "set_draft_sparse: the host-backed KV tier serves the sparse draft only");
+    }
     dmode_ = on ? 1 : 0;
     for (int32_t c = 0; c < 2; ++c) {
         dc_[c].sparse = on;
@@ -321,19 +431,34 @@ bool target::set_draft_sparse(bool on, std::string & err) {
     return true;
 }
 
+int64_t target::ready_bytes(const ready_region & r) {
+    switch (r.kind) {
+        case region_kind::versioned:
+            return r.bytes / fn::round::n_version;
+        case region_kind::gdn_banks:
+            return r.bytes / fn::gdn::n_bank;
+        case region_kind::gdn_records:
+            return r.bytes / fn::gdn::n_rec_set;
+        default:
+            return r.bytes;
+    }
+}
+
 bool target::ready_regions(int32_t c, std::vector<ready_region> & out, std::string & err) const {
     out.clear();
+    const model::slot_scope bind(*m_, o_.slot); // MU1
     struct want {
         const char * cls;
         const char * part; // null: every part
-        bool versioned;
+        region_kind kind;
     };
-    const want wants[] = {{"GDN state", nullptr, true},
-                          {"convolution histories", nullptr, true},
-                          {"draft round (DR1)", nullptr, false},
-                          {"sampler (SM1)", nullptr, false},
-                          {"round and pass (TG1)", "logits (B <= 5)", false},
-                          {"round and pass (TG1)", "hidden carry (FC-HEAD3, B <= 5)", false}};
+    // ME11: the GDN state's parts are each layer's banks and records (region_of below)
+    const want wants[] = {{"GDN state", nullptr, region_kind::gdn_banks},
+                          {"convolution histories", nullptr, region_kind::versioned},
+                          {"draft round (DR1)", nullptr, region_kind::plain},
+                          {"sampler (SM1)", nullptr, region_kind::plain},
+                          {"round and pass (TG1)", "logits (B <= 5)", region_kind::plain},
+                          {"round and pass (TG1)", "hidden carry (FC-HEAD3, B <= 5)", region_kind::plain}};
     for (const want & w : wants) {
         const model::reserved_class * rc = m_->state_class(w.cls);
         if (rc == nullptr) {
@@ -345,11 +470,21 @@ bool target::ready_regions(int32_t c, std::vector<ready_region> & out, std::stri
             if (n <= 0 || (w.part != nullptr && rc->plan.parts[p].name != w.part)) {
                 continue;
             }
-            if (w.versioned && n % fn::round::n_version != 0) {
+            region_kind k = w.kind;
+            if (k == region_kind::gdn_banks) {
+                const std::string & nm = rc->plan.parts[p].name;
+                k = nm.size() > 8 && nm.compare(nm.size() - 8, 8, " records") == 0 ? region_kind::gdn_records
+                                                                                   : region_kind::gdn_banks;
+                if ((k == region_kind::gdn_banks && n != fn::gdn::banks_bytes) ||
+                    (k == region_kind::gdn_records && n != fn::gdn::records_bytes)) {
+                    return fail(err, "GDN state / " + nm + ": not two banks or two record sets (ME11)");
+                }
+            }
+            if (k == region_kind::versioned && n % fn::round::n_version != 0) {
                 return fail(err, std::string(w.cls) + ": a part is not " + std::to_string(fn::round::n_version) +
                                      " versions");
             }
-            out.push_back({rc->part_ptr(p, c), n, w.versioned});
+            out.push_back({rc->part_ptr(p, c), n, k});
             ++found;
         }
         if (found == 0) {
@@ -372,13 +507,18 @@ bool target::save_ready(ready_state & s, std::string & err) {
         }
         int64_t total = 0;
         for (const ready_region & r : rg) {
-            total += r.versioned ? r.bytes / fn::round::n_version : r.bytes;
+            total += ready_bytes(r);
         }
         s.dev[c].assign(static_cast<size_t>(total), 0);
         int64_t off = 0;
         for (const ready_region & r : rg) {
-            const int64_t n = r.versioned ? r.bytes / fn::round::n_version : r.bytes;
-            const uint8_t * src = r.p + (r.versioned ? int64_t(l_.cur) * n : 0);
+            const int64_t n = ready_bytes(r);
+            // the committed slice: cur's version, the selector's bank or record set (ME11), or the whole region
+            const int64_t at = r.kind == region_kind::versioned     ? int64_t(l_.cur)
+                               : r.kind == region_kind::gdn_banks   ? fn::round::gdn_bank(l_.gdn)
+                               : r.kind == region_kind::gdn_records ? fn::round::gdn_set(l_.gdn)
+                                                                    : 0;
+            const uint8_t * src = r.p + at * n;
             if (!cuda_ok(cudaMemcpy(s.dev[c].data() + off, src, size_t(n), cudaMemcpyDeviceToHost), "save_ready",
                          err)) {
                 return false;
@@ -409,13 +549,14 @@ bool target::restore_ready(const ready_state & s, std::string & err) {
         }
         int64_t off = 0;
         for (const ready_region & r : rg) {
-            const int64_t n = r.versioned ? r.bytes / fn::round::n_version : r.bytes;
+            const int64_t n = ready_bytes(r);
             if (off + n > static_cast<int64_t>(s.dev[c].size()) ||
                 !cuda_ok(cudaMemcpy(r.p, s.dev[c].data() + off, size_t(n), cudaMemcpyHostToDevice), "restore_ready",
                          err)) {
                 return err.empty() ? fail(err, "restore_ready: the saved state does not match the regions") : false;
             }
-            off += n; // a versioned object's committed version goes to version 0 (cur 0 after the rewind)
+            off += n; // a versioned object's committed version goes to version 0 (cur 0 after the rewind); ME11: the
+                      // GDN bank and record set to bank 0 and set 0
         }
         if (off != static_cast<int64_t>(s.dev[c].size())) {
             return fail(err, "restore_ready: the saved state does not match the regions");
@@ -423,6 +564,11 @@ bool target::restore_ready(const ready_state & s, std::string & err) {
     }
     l_ = s.l;
     l_.cur = 0;
+    l_.gdn = 0;
+    // ME11: the selector normalized to bank 0 and set 0, with the saved state's live steps
+    if (!v_.set_gdn(l_, fn::round::gdn_word(0, 0, fn::round::gdn_steps(s.l.gdn)), err)) {
+        return false;
+    }
     draft_n_ = s.draft_n;
     batch_start_ = s.batch_start;
     index_n_ = s.index_n;
@@ -440,13 +586,25 @@ void target::index_written(int64_t first, int64_t rows) {
 }
 
 bool target::capture_target(int32_t v, int32_t b, int32_t c, std::string & err) {
+    if (m_->single && c == 1) {
+        return true; // ME3: one device's graph (card 0's) holds both cards' passes
+    }
     cudaStream_t s = static_cast<cudaStream_t>(st_[c]);
     if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
         !cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture", err)) {
         return false;
     }
-    model::use_counters u = model::pass_graph_counters(o_.pass);
-    const model::step_status ss = model::pass_card_enqueue(p_[c], b, o_.pass, u, err);
+    model::step_status ss = model::step_status::ok;
+    if (m_->single) {
+        // ME3: the pair order (layer_pair_step: both cards' phases, each peer wait after the peer's send), each card
+        // with a graph's slot rules
+        model::pass_card * pp[2] = {&p_[0], &p_[1]};
+        model::use_counters u[2] = {model::pass_graph_counters(o_.pass), model::pass_graph_counters(o_.pass)};
+        ss = model::pass_pair_enqueue(pp, b, o_.pass, u, err);
+    } else {
+        model::use_counters u = model::pass_graph_counters(o_.pass);
+        ss = model::pass_card_enqueue(p_[c], b, o_.pass, u, err);
+    }
     cudaGraph_t g = nullptr;
     const cudaError_t e = cudaStreamEndCapture(s, &g);
     if (ss != model::step_status::ok || !cuda_ok(e, "end capture", err)) {
@@ -481,7 +639,7 @@ bool target::set_expert_map(int32_t map, std::string & err) {
     for (int32_t c = 0; c < 2; ++c) {
         p_[c].c.ex_map = map;
     }
-    if (o_.eager) {
+    if (!captured_) {
         return true; // eager steps enqueue with the current map
     }
     // each captured variant's graphs again under the options it was captured with (init's both_paths capture)
@@ -553,7 +711,7 @@ bool target::set_sampling(const fn::samp::options & o, std::string & err) {
                          "draft's full-path pick (q_shard) is not built (SP1); use top-k 1 .. 256");
     }
     const int32_t v = sp_path(o) == fn::samp::path::greedy ? 0 : 1;
-    if (var_key_[v] != static_cast<int32_t>(sp_path(o))) {
+    if (captured_ && var_key_[v] != static_cast<int32_t>(sp_path(o))) { // ME1: eager steps enqueue either path
         return fail(err, "set_sampling: this decision path's graphs were not captured (target_options::both_paths)");
     }
     const fn::samp::params prm = fn::samp::make_params(o, cells);
@@ -583,13 +741,24 @@ bool target::keep_processed(std::string & err) {
 }
 
 bool target::capture_draft(int32_t card, int32_t kind, int32_t rows, std::string & err, int32_t v, int32_t mode) {
+    if (m_->single && card == 1) {
+        return true; // ME3: one device's graph (card 0's) holds both cards' phases
+    }
     cudaStream_t s = static_cast<cudaStream_t>(st_[card]);
     if (!cuda_ok(cudaSetDevice(m_->device[card]), "cudaSetDevice", err) ||
         !cuda_ok(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal), "begin capture", err)) {
         return false;
     }
-    model::use_counters u = model::draft_graph_counters(kind, rows);
-    const model::step_status ss = model::draft_card_enqueue(p_[card], dc_[card], kind, rows, u, err);
+    model::step_status ss = model::step_status::ok;
+    if (m_->single) {
+        model::pass_card * pp[2] = {&p_[0], &p_[1]};
+        model::draft_card * dd[2] = {&dc_[0], &dc_[1]};
+        model::use_counters u[2] = {model::draft_graph_counters(kind, rows), model::draft_graph_counters(kind, rows)};
+        ss = model::draft_pair_enqueue(pp, dd, kind, rows, u, err);
+    } else {
+        model::use_counters u = model::draft_graph_counters(kind, rows);
+        ss = model::draft_card_enqueue(p_[card], dc_[card], kind, rows, u, err);
+    }
     cudaGraph_t g = nullptr;
     const cudaError_t e = cudaStreamEndCapture(s, &g);
     if (ss != model::step_status::ok || !cuda_ok(e, "end capture", err)) {
@@ -611,7 +780,13 @@ bool target::capture_draft(int32_t card, int32_t kind, int32_t rows, std::string
     }
     dexec_[mode][v][k][rows][card] = x;
     ++captures_;
-    return true;
+    // ME3: the draft's and the catch-up's listings beside the target's (SR1)
+    return o_.graph_nodes.empty() ||
+           write_graph_nodes(g,
+                             o_.graph_nodes + "/graph-nodes-" + (k == 0 ? "draft" : "catchup") + "-" +
+                                 (mode == 1 ? "sparse-" : "dense-") + "v" + std::to_string(v) + "-B" +
+                                 std::to_string(rows) + "-card" + std::to_string(card) + ".txt",
+                             err);
 }
 
 bool target::reset(std::string & err) {
@@ -626,6 +801,12 @@ bool target::prompt_begin(std::string & err) {
     if (invalid_) {
         return fail(err, "the slot is invalidated (a decision-hash mismatch, FC-RD2): reset and re-prefill");
     }
+    if (released_) {
+        return fail(err, "refused: a completion timeout released the expert cache's GPU waits; restart the engine");
+    }
+    if (tier_ != nullptr && !tier_->prompt(st_[0], err)) { // ME1: host memory takes the window (kv_tier.h)
+        return false;
+    }
     v_.begin_step(l_, true);  // the previous step is acknowledged; a chunk overwrites no retained logits until the head
     return true;
 }
@@ -637,13 +818,15 @@ bool target::prompt_commit(int32_t rows, int32_t k, std::string & err) {
     }
     for (int32_t c = 0; c < 2; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-            !(fn::round::advance(&p_[c].rstate->cur, k, st_[c]) ? true : fail(err, "prompt commit: advance")) ||
+            !(fn::round::advance(&p_[c].rstate->cur, &p_[c].rstate->gdn, k, true, st_[c])
+                  ? true
+                  : fail(err, "prompt commit: advance")) ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(st_[c])), "prompt commit", err)) {
             return false;
         }
     }
-    uint32_t reported[2] = { 0, 0 };
-    if (!v_.read_cur(reported, err) || !v_.committed_prompt(l_, k, reported, err)) {
+    uint32_t reported[2] = { 0, 0 }, reported_gdn[2] = { 0, 0 };
+    if (!v_.read_words(reported, reported_gdn, err) || !v_.committed_prompt(l_, k, reported, reported_gdn, err)) {
         return false;
     }
     index_written(l_.n, rows); // SP2: the chunk's draft index cells (the sparse form's prompt path)
@@ -675,6 +858,27 @@ bool target::prompt_head(std::string & err) {
         return fail(err, "prompt head: rings reset");
     }
     constexpr int32_t s = 2;
+    const auto head_args = [&](int32_t c) {
+        const model::pass_card & p  = p_[c];
+        const model::layer_input in = model::layer_output(p.c);
+        fn::hc::sub_args         a  = {};
+        a.w_down                    = p.head.w_down;
+        a.w_up                      = p.head.w_up;
+        a.hres                      = in.hres;
+        a.hx                        = in.hx;
+        a.hpost                     = in.hpost;
+        a.gamma                     = p.head.gamma;
+        a.x                         = p.carry;
+        a.hc_ring                   = rg.slot(c, fn::xchg::msg::hc, s);
+        a.hc_peer                   = rg.slot(1 - c, fn::xchg::msg::hc, s);
+        a.hc_reset                  = nullptr;
+        a.hmix_reset                = nullptr;
+        a.hmix_own                  = rg.slot(c, fn::xchg::msg::hmix, s);
+        a.hmix_peer                 = rg.slot(1 - c, fn::xchg::msg::hmix, s);
+        a.err                       = rg.err(c);
+        a.card                      = c;
+        return a;
+    };
     for (int32_t part = 0; part < 3; ++part) {
         for (int32_t c = 0; c < 2; ++c) {
             model::pass_card & p = p_[c];
@@ -682,25 +886,13 @@ bool target::prompt_head(std::string & err) {
                 return false;
             }
             bool ok = false;
-            if (part < 2) {
-                const model::layer_input in = model::layer_output(p.c);
-                fn::hc::sub_args         a  = {};
-                a.w_down                    = p.head.w_down;
-                a.w_up                      = p.head.w_up;
-                a.hres                      = in.hres;
-                a.hx                        = in.hx;
-                a.hpost                     = in.hpost;
-                a.gamma                     = p.head.gamma;
-                a.x                         = p.carry;
-                a.hc_ring                   = rg.slot(c, fn::xchg::msg::hc, s);
-                a.hc_peer                   = rg.slot(1 - c, fn::xchg::msg::hc, s);
-                a.hc_reset                  = nullptr;
-                a.hmix_reset                = nullptr;
-                a.hmix_own                  = rg.slot(c, fn::xchg::msg::hmix, s);
-                a.hmix_peer                 = rg.slot(1 - c, fn::xchg::msg::hmix, s);
-                a.err                       = rg.err(c);
-                a.card                      = c;
-                ok                          = fn::hc::head_sub(1, part + 1, a, st_[c]);
+            if (part < 2 && m_->single) {
+                // ME12: one device's head HC is one launch (hc::head_pair) at part 0, its scratch card 0's ws.mom[1]
+                // (pass.cpp pass_pair_enqueue); the streams were synchronized above
+                ok = part == 1 || c == 1 ||
+                     fn::hc::head_pair(1, { { head_args(0), head_args(1) }, p_[0].c.ws.mom[1] }, st_[0]);
+            } else if (part < 2) {
+                ok = fn::hc::head_sub(1, part + 1, head_args(c), st_[c]);
             } else {
                 const fn::head::logits_args la = {
                     rg.slot(c, fn::xchg::msg::hmix, s), rg.err(c), c, p.out_w, fn::head::n_vocab_card, p.logits, nullptr
@@ -711,6 +903,11 @@ bool target::prompt_head(std::string & err) {
                 return fail(err, "prompt head: part " + std::to_string(part));
             }
         }
+    }
+    // MEKV: publish both decode windows before prefill reports ready; the joins below include their copies.
+    if (tier_ != nullptr && !m_->single &&
+        !tier_->decode(l_.n - 1, l_.n, l_.n, st_[0], err)) {
+        return false;
     }
     uint32_t e[2] = { 0, 0 };
     for (int32_t c = 0; c < 2; ++c) {
@@ -731,9 +928,15 @@ bool target::prompt_head(std::string & err) {
     return check_ledger(err);
 }
 
-bool target::restored(int64_t n, const std::vector<int32_t> & tokens, std::string & err) {
-    if (n < 1 || n >= static_cast<int64_t>(tokens.size()) || l_.n != 0 || !l_.tok.empty()) {
-        return fail(err, "restored: position " + std::to_string(n) + " outside 1 .. L - 1, or the slot not rewound");
+bool target::restored(int64_t n, const std::vector<int32_t> & tokens, int32_t gdn_steps, std::string & err) {
+    if (n < 1 || n >= static_cast<int64_t>(tokens.size()) || l_.n != 0 || !l_.tok.empty() || gdn_steps < 0 ||
+        gdn_steps > fn::round::gdn_max_steps) {
+        return fail(err, "restored: position " + std::to_string(n) + " outside 1 .. L - 1, the slot not rewound, or "
+                         "GDN steps " + std::to_string(gdn_steps) + " outside 0 .. 5");
+    }
+    // ME11: the checkpoint's bank and records were loaded into bank 0 and set 0
+    if (!v_.set_gdn(l_, fn::round::gdn_word(0, 0, gdn_steps), err)) {
+        return false;
     }
     set_prompt(tokens);
     l_.n = n;
@@ -747,9 +950,11 @@ bool target::restored(int64_t n, const std::vector<int32_t> & tokens, std::strin
 }
 
 bool target::clear_slot(bool zero_state, std::string & err) {
-    const char * classes[] = {"target KV (K0)", "target index keys and summaries",
-                              "GDN state",      "convolution histories",
-                              "draft KV (F16)", "draft round (DR1)"};
+    const model::slot_scope bind(*m_, o_.slot); // MU1: this slot's classes
+    const char * classes[] = {"target KV (K0)",          "target index keys and summaries",
+                              "target index keys (ME6)", "GDN state",
+                              "convolution histories",   "draft KV (F16)",
+                              "draft round (DR1)"};
     for (int32_t c = 0; c < 2; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(st_[c])), "sync", err)) {
@@ -762,12 +967,17 @@ bool target::clear_slot(bool zero_state, std::string & err) {
                 continue;
             }
             const model::reserved_class * rc = m_->state_class(cls);
+            if (rc == nullptr && std::strcmp(cls, "target index keys (ME6)") == 0) {
+                continue; // ME6: the keys' host class exists with the host-backed tier only
+            }
             if (rc == nullptr) {
                 return fail(err, std::string(cls) + ": not reserved");
             }
             for (int32_t p = 0; p < (int32_t)rc->plan.parts.size(); ++p) {
-                const int64_t n = rc->plan.parts[p].bytes[c];
-                if (n > 0 && !cuda_ok(cudaMemset(rc->part_ptr(p, c), 0, size_t(n)), cls, err)) {
+                const int64_t n = rc->live_bytes(p, c); // MU1: a pooled part's mapped prefix
+                if (n > 0 && rc->buf[c].host()) { // ME1: the host-backed KV's history (the stream synchronized above)
+                    std::memset(rc->part_ptr(p, c), 0, size_t(n));
+                } else if (n > 0 && !cuda_ok(cudaMemset(rc->part_ptr(p, c), 0, size_t(n)), cls, err)) {
                     return false;
                 }
             }
@@ -786,6 +996,9 @@ bool target::clear_slot(bool zero_state, std::string & err) {
     draft_n_ = 0;
     if (zero_state) {
         index_n_ = 0; // SP2: rewind keeps the draft index with the KV (restored cuts it back)
+        if (tier_ != nullptr) {
+            tier_->zeroed();
+        }
     }
     batch_start_ = 0;
     carry_save_n_ = -1;
@@ -804,9 +1017,11 @@ bool target::clear_slot(bool zero_state, std::string & err) {
 }
 
 void target::set_prompt(const std::vector<int32_t> & tokens) {
-    const uint32_t cur = l_.cur; // the cards' committed slot stays
+    const uint32_t cur = l_.cur; // the cards' committed slot and GDN selector stay
+    const uint32_t gdn = l_.gdn;
     l_ = ledger();
     l_.cur = cur;
+    l_.gdn = gdn;
     l_.tok = tokens;
     l_.u = static_cast<int64_t>(tokens.size());
     l_.prompt_len = l_.u;
@@ -836,9 +1051,26 @@ bool target::clear_errors(std::string & err) {
     return true;
 }
 
+int64_t target::graph_node_count(int32_t rows, int32_t card) const {
+    size_t n = 0;
+    if (rows < 1 || rows > fn::round::max_rows || card < 0 || card > 1 || graph_[var_][rows][card] == nullptr ||
+        cudaGraphGetNodes(static_cast<cudaGraph_t>(graph_[var_][rows][card]), nullptr, &n) != cudaSuccess) {
+        return -1;
+    }
+    return static_cast<int64_t>(n);
+}
+
 // one line a node: its index, type, and for a kernel its function's name and launch shape (SR1: the commit's node)
 bool target::write_nodes(int32_t v, int32_t rows, int32_t card, std::string & err) const {
-    cudaGraph_t g = static_cast<cudaGraph_t>(graph_[v][rows][card]);
+    const std::string path = o_.graph_nodes + "/graph-nodes-" + (v == var_ ? "" : "v" + std::to_string(v) + "-") + "B" +
+                             std::to_string(rows) + "-card" + std::to_string(card) + ".txt";
+    return write_graph_nodes(graph_[v][rows][card], path, err);
+}
+
+// SR1's listing of one captured graph: a line a node, kernels with their names and shapes. ME3: the other nodes'
+// types named (the cache's descriptor copies, its event records and waits, its flag waits as memory operations)
+bool target::write_graph_nodes(void * graph, const std::string & path, std::string & err) const {
+    cudaGraph_t g = static_cast<cudaGraph_t>(graph);
     size_t n = 0;
     if (!cuda_ok(cudaGraphGetNodes(g, nullptr, &n), "graph nodes", err)) {
         return false;
@@ -847,32 +1079,75 @@ bool target::write_nodes(int32_t v, int32_t rows, int32_t card, std::string & er
     if (!cuda_ok(cudaGraphGetNodes(g, nodes.data(), &n), "graph nodes", err)) {
         return false;
     }
-    const std::string path = o_.graph_nodes + "/graph-nodes-" + (v == var_ ? "" : "v" + std::to_string(v) + "-") + "B" +
-                             std::to_string(rows) + "-card" + std::to_string(card) + ".txt";
     FILE * f = fopen(path.c_str(), "w");
     if (f == nullptr) {
         return fail(err, "cannot write " + path);
     }
     for (size_t i = 0; i < n; ++i) {
         cudaGraphNodeType t = cudaGraphNodeTypeEmpty;
-        cudaGraphNodeGetType(nodes[i], &t);
+        int32_t ti = 0;
+        if (cudaGraphNodeGetType(nodes[i], &t) == cudaSuccess) {
+            ti = static_cast<int32_t>(t);
+        } else {
+            // ME3: a node the runtime cannot type (the cache's stream memory operations): its error consumed (or the
+            // next launch check, cudaPeekAtLastError, reports it), its type read from the driver (-1: unread)
+            cudaGetLastError();
+            ti = driver_node_type(nodes[i]);
+            t = ti >= 0 ? static_cast<cudaGraphNodeType>(ti) : cudaGraphNodeTypeEmpty;
+        }
         if (t == cudaGraphNodeTypeKernel) {
             cudaKernelNodeParams kp = {};
             const char * name = "?";
             if (cudaGraphKernelNodeGetParams(nodes[i], &kp) != cudaSuccess ||
                 cudaFuncGetName(&name, kp.func) != cudaSuccess) {
                 name = "?";
+                // ME3: a node the runtime cannot describe (the cache's) is listed unnamed; its error is consumed
+                // here, or the next launch check (cudaPeekAtLastError) reports it
+                cudaGetLastError();
             }
             fprintf(f, "%zu kernel %s grid %u,%u,%u block %u,%u,%u\n", i, name, kp.gridDim.x, kp.gridDim.y,
                     kp.gridDim.z, kp.blockDim.x, kp.blockDim.y, kp.blockDim.z);
         } else {
-            fprintf(f, "%zu type %d%s\n", i, static_cast<int32_t>(t),
-                    t == cudaGraphNodeTypeMemcpy   ? " memcpy"
-                    : t == cudaGraphNodeTypeMemset ? " memset"
-                                                   : "");
+            fprintf(f, "%zu type %d%s\n", i, ti,
+                    ti < 0                              ? " unread"
+                    : t == cudaGraphNodeTypeMemcpy      ? " memcpy"
+                    : t == cudaGraphNodeTypeMemset      ? " memset"
+                    : t == cudaGraphNodeTypeHost        ? " host"
+                    : t == cudaGraphNodeTypeEmpty       ? " empty"
+                    : t == cudaGraphNodeTypeWaitEvent   ? " event-wait"
+                    : t == cudaGraphNodeTypeEventRecord ? " event-record"
+                    : ti == 12                          ? " memory-operation" // CU_GRAPH_NODE_TYPE_BATCH_MEM_OP
+                                                        : "");
         }
     }
     fclose(f);
+    // ME11: the graph's dependencies beside it (graph-edges-*.txt: one "from to" line an edge, node indices as above),
+    // for comparing two builds' graphs; a separate file, so the node files' readers are unchanged
+    size_t ne = 0;
+    if (!cuda_ok(cudaGraphGetEdges(g, nullptr, nullptr, &ne), "graph edges", err)) {
+        return false;
+    }
+    std::vector<cudaGraphNode_t> from(ne), to(ne);
+    if (ne > 0 && !cuda_ok(cudaGraphGetEdges(g, from.data(), to.data(), &ne), "graph edges", err)) {
+        return false;
+    }
+    std::string ep = path;
+    const size_t at = ep.rfind("graph-nodes-");
+    if (at == std::string::npos) {
+        return true;
+    }
+    ep.replace(at, 12, "graph-edges-");
+    FILE * fe = fopen(ep.c_str(), "w");
+    if (fe == nullptr) {
+        return fail(err, "cannot write " + ep);
+    }
+    const auto index = [&](cudaGraphNode_t x) {
+        return static_cast<long long>(std::find(nodes.begin(), nodes.end(), x) - nodes.begin());
+    };
+    for (size_t i = 0; i < ne; ++i) {
+        fprintf(fe, "%lld %lld\n", index(from[i]), index(to[i]));
+    }
+    fclose(fe);
     return true;
 }
 
@@ -892,6 +1167,21 @@ bool target::check_ledger(std::string & err) {
 
 bool target::wait(uint64_t round, double timeout_s, std::string & err) {
     const auto t0 = clock_t_::now();
+    // ME2b item 3 (Amendment 1): with the expert cache on one card, the wait backs off instead of spinning, so the CPU
+    // expert pool's threads (the service drains on core 0, this thread on its sibling) keep the core: 64 checks, then
+    // sleeps doubling from 5 to 50 us between checks, the thread's timer slack 1 us so a sleep is near its length.
+    // Every check, the completion records' acquire, the stream queries and the watchdog stay as they are; cache-off and
+    // two-card runs spin as before.
+    const bool backoff = p_[0].c.ex_service != nullptr && m_->single;
+    if (backoff) {
+        static thread_local bool slack = false;
+        if (!slack) {
+            prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
+            slack = true;
+        }
+    }
+    int32_t checks = 0;
+    long nap_ns = 5000;
     for (;;) {
         const uint64_t a = reinterpret_cast<volatile uint64_t *>(&done_[0].round)[0];
         const uint64_t b = reinterpret_cast<volatile uint64_t *>(&done_[1].round)[0];
@@ -907,18 +1197,40 @@ bool target::wait(uint64_t round, double timeout_s, std::string & err) {
             }
         }
         if (seconds(t0, clock_t_::now()) > timeout_s) {
-            return fail(err, "round " + std::to_string(round) + ": no completion record in " +
-                                 std::to_string(timeout_s) + " s (card 0 at " + std::to_string(a) + ", card 1 at " +
-                                 std::to_string(b) + ")");
+            fail(err, "round " + std::to_string(round) + ": no completion record in " + std::to_string(timeout_s) +
+                          " s (card 0 at " + std::to_string(a) + ", card 1 at " + std::to_string(b) + ")");
+            // ME3 (Fable's load G ruling, Strata #267): the cache's waits released, so the streams drain and the
+            // teardown's synchronizes end; every later round refused (the engine is restarted)
+            if (p_[0].c.ex_service != nullptr) {
+                std::string note;
+                p_[0].c.ex_service->release_gpu_waits(5000, false, note);
+                released_ = true;
+                err += "; the expert cache: " + note;
+            }
+            return false;
+        }
+        if (backoff) {
+            if (++checks <= 64) {
+                _mm_pause();
+                continue;
+            }
+            const timespec ts{0, nap_ns};
+            nanosleep(&ts, nullptr);
+            nap_ns = std::min(nap_ns * 2, 50000L);
         }
     }
 }
 
-bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_result & r, std::string & err,
-                   int32_t test_k, int32_t test_fail, int32_t budget, const float * const * staged) {
-    r = round_result();
+// the round's staging (FMU2: also a joint round's lane, ple_use the lane ring's): the checks, the descriptor into the
+// host ring, the PLE rows gathered and uploaded on the streams, the versions' step begun; eagerly the start flag too
+bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k, int32_t test_fail,
+                         int32_t budget, const float * const * staged, uint64_t ple_use, staged_round & sr,
+                         std::string & err) {
     if (invalid_) {
         return fail(err, "the slot is invalidated (a decision-hash mismatch, FC-RD2): reset and re-prefill");
+    }
+    if (released_) {
+        return fail(err, "refused: a completion timeout released the expert cache's GPU waits; restart the engine");
     }
     const auto t0 = clock_t_::now();
     const uint64_t rd = next_round_;
@@ -928,6 +1240,10 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
         return fail(err, "round refused before launch: B " + std::to_string(rows) + " at N " +
                              std::to_string(n_before) + " beyond " + std::to_string(cells) + " cells (FC-RD1)");
     }
+    // ME1: the host-backed KV's decode window covers the round's cells (kv_tier.h)
+    if (tier_ != nullptr && !tier_->decode(n_before, n_before + rows, std::max(n_before, draft_n_), st_[0], err)) {
+        return false;
+    }
     // the round's tokens: the next ledger tokens (forced) or the pending token (generate)
     int32_t tok[max_b] = {};
     for (int32_t t = 0; t < rows; ++t) {
@@ -936,7 +1252,7 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
     // the descriptor slot: free, since every earlier round has completed (this driver waits for each)
     fn::round::desc d = {};
     d.round = rd;
-    d.ple_use = ple_use_;
+    d.ple_use = ple_use;
     d.kind = kind;
     d.rows = rows;
     d.n_before = static_cast<int32_t>(n_before);
@@ -975,7 +1291,10 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
     carry_save_n_ = -1;      // the next catch-up takes a new pre-step copy of the retained carry
     std::memcpy(&ring_[rd % fn::round::ring], &d, sizeof(d));
     std::atomic_thread_fence(std::memory_order_release);
-    const bool eager = o_.eager;
+    const bool eager = eager_;
+    if (!eager && !captured_) {
+        return fail(err, "round refused before launch: the graph executor without its graphs (capture)");
+    }
     if (eager) {
         // the start condition first: the phased enqueue below runs card by card
         reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
@@ -992,44 +1311,24 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
             return false;
         }
     }
-    const auto t2 = clock_t_::now();
-    if (eager) {
-        for (int32_t c = 0; c < 2 && timed; ++c) {
-            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][2]), static_cast<cudaStream_t>(st_[c])),
-                         "event", err)) {
-                return false;
-            }
-        }
-        model::pass_card * pp[2] = {&p_[0], &p_[1]};
-        const model::step_status ss = model::pass_pair_enqueue(pp, rows, o_.pass, u_, err);
-        if (ss != model::step_status::ok) {
-            return err.empty() ? fail(err, "pass enqueue") : false;
-        }
-        for (int32_t c = 0; c < 2 && timed; ++c) {
-            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][3]), static_cast<cudaStream_t>(st_[c])),
-                         "event", err)) {
-                return false;
-            }
-        }
-    } else {
-        for (int32_t c = 0; c < 2; ++c) {
-            cudaStream_t s = static_cast<cudaStream_t>(st_[c]);
-            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-                (timed && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][2]), s), "event", err)) ||
-                !cuda_ok(cudaGraphLaunch(static_cast<cudaGraphExec_t>(exec_[var_][rows][c]), s), "graph launch", err) ||
-                (timed && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][3]), s), "event", err))) {
-                return false;
-            }
-        }
-        // both cards' work is enqueued: release them together (RT-9)
-        std::atomic_thread_fence(std::memory_order_release);
-        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
-    }
-    const auto t3 = clock_t_::now();
-    next_round_ = rd + 1;
-    ++ple_use_;
+    sr.rd = rd;
+    sr.n_before = n_before;
+    sr.t0 = t0;
+    sr.t1 = t1;
+    sr.t2 = clock_t_::now();
+    return true;
+}
+
+// the round's completion (FMU2: also a joint round's lane): the wait for both cards' records, the result, FC-RD2's
+// recovery on an error word, the verify output's checks and the versions' commit
+bool target::round_collect(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k,
+                           const staged_round & sr, round_result & r, std::string & err) {
+    const uint64_t rd = sr.rd;
+    const int64_t n_before = sr.n_before;
+    const auto t0 = sr.t0;
+    const auto t1 = sr.t1;
+    const auto t2 = sr.t2;
+    const auto t3 = sr.t3;
     if (!wait(rd, o_.timeout_s, err)) {
         return false;
     }
@@ -1050,6 +1349,7 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
         r.t_end[c] = dn.t_end;
         r.t_logits[c] = dn.t_logits;
         r.cur[c] = dn.cur;
+        r.gdn[c] = dn.gdn;
     }
     for (int32_t t = 0; t < max_b; ++t) {
         r.out[t] = done_[0].out[t];
@@ -1103,7 +1403,8 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
                                  std::to_string(r.n_out) + " is outside 1 .. B");
         }
     }
-    if (!v_.committed(l_, fn::round::commit_versions(kind, rows, verify ? r.n_out - 1 : 0, test_k), r.cur, err)) {
+    if (!v_.committed(l_, fn::round::commit_versions(kind, rows, verify ? r.n_out - 1 : 0, test_k), r.cur, r.gdn,
+                      err)) {
         return false;
     }
     // both cards decide the same tokens (T-GREEDY)
@@ -1113,6 +1414,76 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
         }
     }
     return true;
+}
+
+bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_result & r, std::string & err,
+                   int32_t test_k, int32_t test_fail, int32_t budget, const float * const * staged) {
+    r = round_result();
+    staged_round sr;
+    if (!round_stage(kind, rows, upload_e, timed, test_k, test_fail, budget, staged, *ple_use_, sr, err)) {
+        return false;
+    }
+    const uint64_t rd = sr.rd;
+    const bool eager = eager_;
+    if (eager) {
+        for (int32_t c = 0; c < 2 && timed; ++c) {
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][2]), static_cast<cudaStream_t>(st_[c])),
+                         "event", err)) {
+                return false;
+            }
+        }
+        model::pass_card * pp[2] = {&p_[0], &p_[1]};
+        const model::step_status ss = model::pass_pair_enqueue(pp, rows, o_.pass, u_, err);
+        if (ss != model::step_status::ok) {
+            return err.empty() ? fail(err, "pass enqueue") : false;
+        }
+        ++sub_.eager_rounds;
+        for (int32_t c = 0; c < 2 && timed; ++c) {
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][3]), static_cast<cudaStream_t>(st_[c])),
+                         "event", err)) {
+                return false;
+            }
+        }
+    } else {
+        // ME3: the expert cache's replay boundary (its round start, published ahead of the launch on the streams),
+        // then the replay's service jobs (one a layer, each waiting for its window's stamp) and the start condition,
+        // all before the launches (as the phased enqueue's start): a cached replay's launch can block until the GPU
+        // has run part of it, which needs the start and the service's flags
+        model::expert_service * const svc = p_[0].c.ex_service;
+        if (svc != nullptr) {
+            if (!svc->pass_begin(st_, err) || !svc->pass_posted(rows, err)) {
+                return false;
+            }
+            std::atomic_thread_fence(std::memory_order_release);
+            reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
+        }
+        for (int32_t c = 0; c < 2; ++c) {
+            cudaStream_t s = static_cast<cudaStream_t>(st_[c]);
+            const bool launch = !(m_->single && c == 1); // ME3: one device's graph holds both cards' passes
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+                (timed && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][2]), s), "event", err)) ||
+                (launch && !cuda_ok(cudaGraphLaunch(static_cast<cudaGraphExec_t>(exec_[var_][rows][c]), s),
+                                    "graph launch", err)) ||
+                (timed && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ev_[c][3]), s), "event", err))) {
+                if (svc != nullptr) {
+                    svc->pass_abandon(err); // ME3: the posted jobs end failed
+                }
+                return false;
+            }
+            sub_.target_graphs += launch ? 1 : 0;
+        }
+        if (svc == nullptr) {
+            // both cards' work is enqueued: release them together (RT-9)
+            std::atomic_thread_fence(std::memory_order_release);
+            reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
+        }
+    }
+    sr.t3 = clock_t_::now();
+    next_round_ = rd + 1;
+    ++*ple_use_;
+    return round_collect(kind, rows, upload_e, timed, test_k, sr, r, err);
 }
 
 bool target::forced(int32_t rows, round_result & r, std::string & err, bool upload_e, bool timed) {
@@ -1173,11 +1544,23 @@ bool target::verify(int32_t d, const int32_t * prop, int32_t budget, round_resul
     for (int32_t t = 0; t < d; ++t) {
         l_.tok.push_back(prop[t]);
     }
-    const bool ok = round(static_cast<int32_t>(fn::round::kind::verify), d + 1, true, timed, r, err, 0, 0, budget);
-    l_.tok.resize(len);
+    // R9-12: an error word's recovery (after_error, inside the round) takes the proposals off before its ledger check,
+    // so the check sees the pre-step ledger and the round reports the error word itself
+    verify_extra_ = d;
+    const int32_t tf = test_fail_verify_;
+    test_fail_verify_ = 0;
+    const bool ok = round(static_cast<int32_t>(fn::round::kind::verify), d + 1, true, timed, r, err, 0, tf, budget);
+    if (verify_extra_ > 0) {
+        l_.tok.resize(len);
+        verify_extra_ = 0;
+    }
     if (!ok) {
         return false;
     }
+    return verify_accept(prop, r, err);
+}
+
+bool target::verify_accept(const int32_t * prop, const round_result & r, std::string & err) {
     const int32_t a = r.n_out - 1;
     for (int32_t t = 0; t < a; ++t) {
         if (r.out[t] != prop[t]) {
@@ -1202,6 +1585,53 @@ bool target::verify(int32_t d, const int32_t * prop, int32_t budget, round_resul
         return fail(err, "ledger: U != 1 after a verify round");
     }
     return true;
+}
+
+bool target::joint_verify_begin(int32_t d, const int32_t * prop, int32_t budget, uint64_t ple_use, staged_round & sr,
+                                std::string & err) {
+    if (!o_.sample || (!eager_ && !captured_)) {
+        return fail(err, "joint verify: needs the sampler, and the graph executor's graphs when not eager");
+    }
+    if (l_.u != 1 || l_.pending < 0 || d < 1 || d > fn::samp::max_drafts || prop == nullptr || d + 1 > budget) {
+        return fail(err, "joint verify: no pending token, d outside 1 .. 4, or B beyond the budget");
+    }
+    for (int32_t t = 0; t < d; ++t) {
+        l_.tok.push_back(prop[t]);
+    }
+    verify_extra_ = d;
+    const int32_t tf = test_fail_verify_;
+    test_fail_verify_ = 0;
+    if (!round_stage(static_cast<int32_t>(fn::round::kind::verify), d + 1, true, false, 0, tf, budget, nullptr, ple_use,
+                     sr, err)) {
+        joint_abandon();
+        return false;
+    }
+    return true;
+}
+
+void target::joint_release(const staged_round & sr) {
+    std::atomic_thread_fence(std::memory_order_release);
+    reinterpret_cast<volatile uint64_t *>(flag_)[0] = sr.rd;
+    next_round_ = sr.rd + 1;
+}
+
+void target::joint_abandon() {
+    if (verify_extra_ > 0) {
+        l_.tok.resize(l_.tok.size() - size_t(verify_extra_));
+        verify_extra_ = 0;
+    }
+}
+
+bool target::joint_verify_end(int32_t d, const int32_t * prop, staged_round & sr, round_result & r, std::string & err) {
+    r = round_result();
+    sr.t3 = clock_t_::now();
+    const bool ok = round_collect(static_cast<int32_t>(fn::round::kind::verify), d + 1, true, false, 0, sr, r, err);
+    joint_abandon(); // the proposals off the ledger (after_error took them off already on an error word)
+    if (!ok) {
+        return false;
+    }
+    ++sub_.joint_rounds;
+    return verify_accept(prop, r, err);
 }
 
 bool target::save_carry(std::string & err) {
@@ -1294,6 +1724,10 @@ bool target::after_error(round_result & r, std::string & err) {
             return err.empty() ? fail(err, "sampler discard") : false;
         }
     }
+    if (verify_extra_ > 0) { // R9-12: a verify round's proposals are not the ledger's
+        l_.tok.resize(l_.tok.size() - size_t(verify_extra_));
+        verify_extra_ = 0;
+    }
     r.recovered = clear_errors(err) && v_.restore(l_, err) && check_ledger(err);
     return r.recovered;
 }
@@ -1341,6 +1775,9 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
     if (invalid_) {
         return fail(err, "the slot is invalidated (a decision-hash mismatch, FC-RD2): reset and re-prefill");
     }
+    if (released_) {
+        return fail(err, "refused: a completion timeout released the expert cache's GPU waits; restart the engine");
+    }
     if (o_.sample && o_.sampling.penalties()) {
         // SM1: the penalty window from the prompt (the pinned server accepts the prompt into the sampler)
         const int32_t cap = fn::samp::make_params(o_.sampling, p_[0].s[3].n_cells).cap;
@@ -1357,7 +1794,7 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
     const uint64_t rd = next_round_;
     fn::round::desc d = {};
     d.round = rd;
-    d.ple_use = ple_use_;
+    d.ple_use = *ple_use_;
     d.kind = static_cast<int32_t>(fn::round::kind::bootstrap);
     d.rows = 1;
     d.n_before = static_cast<int32_t>(l_.n);
@@ -1393,6 +1830,7 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
         r.t_start[c] = done_[c].t_start;
         r.t_end[c] = done_[c].t_end;
         r.cur[c] = done_[c].cur;
+        r.gdn[c] = done_[c].gdn;
     }
     // FC-RD2, as every round: an error word on either card clears the words and restores (the bootstrap ran no head,
     // so the retained row stays); the ledger is unchanged and the round reports its failure
@@ -1407,7 +1845,7 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
             }
         }
     }
-    if (!v_.committed(l_, 0, r.cur, err)) { // the bootstrap commits no version (k = 0)
+    if (!v_.committed(l_, 0, r.cur, r.gdn, err)) { // the bootstrap commits no version (k = 0)
         return false;
     }
     if (r.n_out != 1 || r.out[0] < 0 || r.argmax[0][0] != r.argmax[1][0]) {
@@ -1467,7 +1905,7 @@ bool target::draft_catchup(int32_t rows, round_result & r, std::string & err) {
     return true;
 }
 
-bool target::draft_step(int32_t d, round_result & r, std::string & err) {
+bool target::draft_step_check(int32_t d, std::string & err) const {
     const int64_t pos = draft_n_;
     if (!o_.draft.on || pos < 0 || d < 1 || d > model::draft_max_steps || pos > l_.n ||
         pos >= static_cast<int64_t>(l_.tok.size())) {
@@ -1478,7 +1916,23 @@ bool target::draft_step(int32_t d, round_result & r, std::string & err) {
         return fail(err, "sparse draft step refused: the draft index holds " + std::to_string(index_n_) +
                              " cells, the draft " + std::to_string(pos) + " (SP2: a dense write since)");
     }
-    return draft_round(step_kind, d, pos, 0, r, err);
+    return true;
+}
+
+bool target::draft_step(int32_t d, round_result & r, std::string & err) {
+    return draft_step_check(d, err) && draft_round(step_kind, d, draft_n_, 0, r, err);
+}
+
+bool target::joint_draft_begin(int32_t d, staged_round & sr, std::string & err) {
+    return draft_step_check(d, err) && draft_stage(step_kind, d, draft_n_, 0, sr, err);
+}
+
+bool target::joint_draft_end(int32_t d, const staged_round & sr, round_result & r, std::string & err) {
+    if (!draft_collect(step_kind, d, sr, r, err)) {
+        return false;
+    }
+    ++sub_.joint_drafts;
+    return true;
 }
 
 // A draft round, framed as round() frames a target round without its versions: no step acknowledgment and no commit
@@ -1486,18 +1940,59 @@ bool target::draft_step(int32_t d, round_result & r, std::string & err) {
 // either card is cleared and the round fails (the draft's K and V cells it wrote are rewritten by a later catch-up).
 bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, round_result & r, std::string & err) {
     r = round_result();
+    staged_round sr;
+    if (!draft_stage(kind, rows, first, hsrc, sr, err)) {
+        return false;
+    }
+    const uint64_t rd = sr.rd;
+    const bool step = kind == step_kind;
+    const int32_t k = step ? 0 : 1;
+    if (eager_) {
+        model::pass_card * pp[2] = {&p_[0], &p_[1]};
+        model::draft_card * dd[2] = {&dc_[0], &dc_[1]};
+        if (model::draft_pair_enqueue(pp, dd, kind, rows, u_, err) != model::step_status::ok) {
+            return err.empty() ? fail(err, "draft enqueue") : false;
+        }
+        ++sub_.eager_draft_rounds;
+    } else {
+        for (int32_t c = 0; c < (m_->single ? 1 : 2); ++c) { // ME3: one device's graph holds both cards' phases
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+                !cuda_ok(cudaGraphLaunch(static_cast<cudaGraphExec_t>(dexec_[dmode_][k == 0 ? var_ : 0][k][rows][c]),
+                                         static_cast<cudaStream_t>(st_[c])),
+                         "graph launch", err)) {
+                return false;
+            }
+            (step ? sub_.draft_graphs : sub_.catchup_graphs) += 1;
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
+    }
+    sr.t1 = clock_t_::now();
+    next_round_ = rd + 1;
+    return draft_collect(kind, rows, sr, r, err);
+}
+
+bool target::draft_stage(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, staged_round & sr,
+                         std::string & err) {
     if (invalid_) {
         return fail(err, "the slot is invalidated (a decision-hash mismatch, FC-RD2): reset and re-prefill");
+    }
+    if (released_) {
+        return fail(err, "refused: a completion timeout released the expert cache's GPU waits; restart the engine");
     }
     if (first + rows > dc_[0].max_cells) {
         return fail(err, "draft round refused before launch: cells " + std::to_string(first) + " + " +
                              std::to_string(rows) + " beyond " + std::to_string(dc_[0].max_cells));
     }
+    // ME1: the host-backed KV's decode window covers the draft round's cells (kv_tier.h)
+    if (tier_ != nullptr && !tier_->decode(first, first + rows, std::max(l_.n, draft_n_), st_[0], err)) {
+        return false;
+    }
     const uint64_t rd = next_round_;
     const bool step = kind == step_kind;
     fn::round::desc d = {};
     d.round = rd;
-    d.ple_use = ple_use_;
+    d.ple_use = *ple_use_;
     d.kind = kind;
     d.rows = rows;
     d.n_before = static_cast<int32_t>(first);
@@ -1513,31 +2008,26 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
         d.out[t] = -1;
         d.argmax[t] = -1;
     }
-    const auto t0 = clock_t_::now();
+    sr.t0 = clock_t_::now();
     std::memcpy(&ring_[rd % fn::round::ring], &d, sizeof(d));
     std::atomic_thread_fence(std::memory_order_release);
-    const int32_t k = step ? 0 : 1;
-    if (o_.eager) {
-        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
-        model::pass_card * pp[2] = {&p_[0], &p_[1]};
-        model::draft_card * dd[2] = {&dc_[0], &dc_[1]};
-        if (model::draft_pair_enqueue(pp, dd, kind, rows, u_, err) != model::step_status::ok) {
-            return err.empty() ? fail(err, "draft enqueue") : false;
-        }
-    } else {
-        for (int32_t c = 0; c < 2; ++c) {
-            if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-                !cuda_ok(cudaGraphLaunch(static_cast<cudaGraphExec_t>(dexec_[dmode_][k == 0 ? var_ : 0][k][rows][c]),
-                                         static_cast<cudaStream_t>(st_[c])),
-                         "graph launch", err)) {
-                return false;
-            }
-        }
-        std::atomic_thread_fence(std::memory_order_release);
+    if (!eager_ && !captured_) {
+        return fail(err, "draft round refused before launch: the graph executor without its graphs (capture)");
+    }
+    if (eager_) {
         reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
     }
-    const auto t1 = clock_t_::now();
-    next_round_ = rd + 1;
+    sr.rd = rd;
+    sr.n_before = first;
+    sr.t1 = sr.t0;
+    return true;
+}
+
+bool target::draft_collect(int32_t kind, int32_t rows, const staged_round & sr, round_result & r, std::string & err) {
+    r = round_result();
+    const uint64_t rd = sr.rd;
+    const bool step = kind == step_kind;
+    const auto t1 = sr.t1;
     if (!wait(rd, o_.timeout_s, err)) {
         return false;
     }
@@ -1545,7 +2035,7 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
     r.round = rd;
     r.kind = kind;
     r.rows = rows;
-    r.n_before = d.n_before;
+    r.n_before = static_cast<int32_t>(sr.n_before);
     r.n_out = done_[0].n_out;
     for (int32_t c = 0; c < 2; ++c) {
         const fn::round::done & dn = done_[c];
@@ -1557,8 +2047,9 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
         r.t_start[c] = dn.t_start;
         r.t_end[c] = dn.t_end;
         r.cur[c] = dn.cur;
+        r.gdn[c] = dn.gdn;
     }
-    r.host_launch_s = seconds(t0, t1);
+    r.host_launch_s = seconds(sr.t0, t1);
     r.host_wait_s = seconds(t1, t2);
     r.t_done_s = std::chrono::duration<double>(t2.time_since_epoch()).count();
     for (int32_t c = 0; c < 2; ++c) {
@@ -1573,8 +2064,9 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
             }
         }
     }
-    if (r.n_out != 0 || r.cur[0] != l_.cur || r.cur[1] != l_.cur) {
-        return fail(err, "draft round " + std::to_string(rd) + ": an output or a committed slot changed");
+    if (r.n_out != 0 || r.cur[0] != l_.cur || r.cur[1] != l_.cur || r.gdn[0] != l_.gdn || r.gdn[1] != l_.gdn) {
+        return fail(err, "draft round " + std::to_string(rd) + ": an output, a committed slot or the GDN selector "
+                         "changed");
     }
     for (int32_t t = 0; step && t < rows; ++t) {
         if (r.argmax[0][t] != r.argmax[1][t] || r.argmax[0][t] < 0) {

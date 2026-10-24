@@ -11,6 +11,7 @@
 // state in forced rounds at B = 1 checks them all: its state at each recorded N, and its logits (both cards' shards)
 // at the continuation rounds' positions, bitwise.
 
+#include "fn/kernels/gdn/gdn_ref.h"
 #include "fn/kernels/head/head.h"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/round/round.h"
@@ -108,12 +109,26 @@ struct state_hash {
 
 template <typename T> bool get(std::vector<T> & v, const T * src, size_t n) {
     v.resize(n);
-    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+    // cudaMemcpyDefault: a source in device or (ME1: the host-backed KV, the PF1 checkpoints) pinned host memory
+    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDefault), "download");
+}
+
+// KV8: a layer's 4 FP16 scales of each of cells < n, out of the scale rows (kv_q8_scale_stride a cell)
+bool get_scales(std::vector<uint16_t> & v, const uint16_t * col, int64_t n) {
+    v.resize(size_t(n) * 4);
+    return n == 0 ||
+           cuda_ok(cudaMemcpy2D(v.data(), 8, col, size_t(md::kv_q8_scale_stride) * 2, 8, size_t(n), cudaMemcpyDefault),
+                   "download scales");
 }
 
 bool snapshot(rt::target & t, md::model & m, state_hash & s) {
     const rt::ledger & l = t.slot();
     s = state_hash();
+    std::string ferr;
+    if (!t.kv_flush(ferr)) { // ME1: the host-backed KV's history made whole (the KV classes are read below)
+        fprintf(stderr, "%s\n", ferr.c_str());
+        return false;
+    }
     s.n = l.n;
     for (int32_t i = 0; i < n_class; ++i) {
         s.h[i] = uint64_t(i) + 1;
@@ -121,18 +136,22 @@ bool snapshot(rt::target & t, md::model & m, state_hash & s) {
     const int64_t n = l.n;
     const int32_t blocks = fn::qsa::blocks_complete(static_cast<int32_t>(n));
     std::vector<float> f;
-    std::vector<uint16_t> u;
+    std::vector<uint16_t> u, sc;
+    std::vector<uint8_t> b8;
     std::vector<float> one(fn::qsa::head_dim);
     for (int32_t c = 0; c < 2; ++c) {
         md::pass_card & p = t.card(c);
-        uint32_t cur = 0;
+        uint32_t cur = 0, gsel = 0;
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device") ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "sync") ||
-            !cuda_ok(cudaMemcpy(&cur, &p.rstate->cur, 4, cudaMemcpyDeviceToHost), "cur")) {
+            !cuda_ok(cudaMemcpy(&cur, &p.rstate->cur, 4, cudaMemcpyDeviceToHost), "cur") ||
+            !cuda_ok(cudaMemcpy(&gsel, &p.rstate->gdn, 4, cudaMemcpyDeviceToHost), "GDN selector")) {
             return false;
         }
-        if (cur != l.cur) {
-            fprintf(stderr, "rollback-test: card %d's committed slot %u is not the ledger's %u\n", c, cur, l.cur);
+        if (cur != l.cur || gsel != l.gdn) {
+            fprintf(stderr,
+                    "rollback-test: card %d's committed slot %u / GDN selector %u are not the ledger's %u / %u\n", c,
+                    cur, gsel, l.cur, l.gdn);
             return false;
         }
         const int64_t s0 = rd::version_slot(cur, 0);
@@ -140,7 +159,8 @@ bool snapshot(rt::target & t, md::model & m, state_hash & s) {
             const md::layer_state & st = p.s[layer];
             const uint64_t tag = uint64_t(c) << 8 | uint64_t(layer);
             if (p.w[layer].gdn) {
-                if (!get(f, st.gdn + s0 * gdn_floats, size_t(gdn_floats))) {
+                // ME11: the committed matrix, the selector's bank with its records replayed (gdn_ref.h)
+                if (!fn::gdn::ref::read_committed(st.gdn, st.rec, gsel, f)) {
                     return false;
                 }
                 s.h[0] = hash_bytes(s.h[0] ^ tag, f.data(), f.size() * 4);
@@ -150,14 +170,29 @@ bool snapshot(rt::target & t, md::model & m, state_hash & s) {
                 s.h[1] = hash_bytes(s.h[1] ^ tag, f.data(), f.size() * 4);
                 continue;
             }
-            if (!get(u, st.k_cache, size_t(n) * md::kv_head_dim)) {
-                return false;
+            if (st.k_scale != nullptr) {
+                // KV8: the codes of cells < n (a byte a value) and the layer's 4 scales of each (its column of the
+                // cell-major scale rows), each by its actual size
+                if (!get(b8, reinterpret_cast<const uint8_t *>(st.k_cache), size_t(n) * md::kv_head_dim) ||
+                    !get_scales(sc, st.k_scale, n)) {
+                    return false;
+                }
+                s.h[3] = hash_bytes(hash_bytes(s.h[3] ^ tag, b8.data(), b8.size()), sc.data(), sc.size() * 2);
+                if (!get(b8, reinterpret_cast<const uint8_t *>(st.v_cache), size_t(n) * md::kv_head_dim) ||
+                    !get_scales(sc, st.v_scale, n)) {
+                    return false;
+                }
+                s.h[4] = hash_bytes(hash_bytes(s.h[4] ^ tag, b8.data(), b8.size()), sc.data(), sc.size() * 2);
+            } else {
+                if (!get(u, st.k_cache, size_t(n) * md::kv_head_dim)) {
+                    return false;
+                }
+                s.h[3] = hash_bytes(s.h[3] ^ tag, u.data(), u.size() * 2);
+                if (!get(u, st.v_cache, size_t(n) * md::kv_head_dim)) {
+                    return false;
+                }
+                s.h[4] = hash_bytes(s.h[4] ^ tag, u.data(), u.size() * 2);
             }
-            s.h[3] = hash_bytes(s.h[3] ^ tag, u.data(), u.size() * 2);
-            if (!get(u, st.v_cache, size_t(n) * md::kv_head_dim)) {
-                return false;
-            }
-            s.h[4] = hash_bytes(s.h[4] ^ tag, u.data(), u.size() * 2);
             if (st.idx_keys != nullptr) {
                 if (!get(u, st.idx_keys, size_t(n) * fn::qsa::head_dim) ||
                     !get(f, st.idx_summaries, fn::qsa::summary_bytes(blocks) / 4)) {
@@ -346,6 +381,9 @@ bool fnfl_state_hashes(fn::runtime::target & t, fn::model::model & m, uint64_t h
 }
 
 int fnfl_rollback_test(const fnfl_target_args & a) {
+    if (a.mode == "mu1" || a.mode == "mu1-dry" || a.mode == "mu1-joint" || a.mode == "mu1-joint-eager") {
+        return fnfl_rollback_mu1(a); // MU1 (rollback_mu1_test.cpp)
+    }
     std::vector<int32_t> pool;
     if (!read_ids(a.ids, pool) || pool.size() < size_t{4} * n_positions) {
         fprintf(stderr, "rollback-test: %s holds too few tokens\n", a.ids.c_str());
@@ -464,15 +502,18 @@ int fnfl_rollback_test(const fnfl_target_args & a) {
         }
         append(c.B);
         const int64_t n0 = t.slot().n;
-        const uint32_t pre = t.slot().cur;
+        const uint32_t pre = t.slot().cur, pre_gdn = t.slot().gdn;
         if (c.fail != 0) {
-            // FC-RD2: the injected error on c.fail's cards; both cards must end at the pre-step slot
+            // FC-RD2: the injected error on c.fail's cards; both cards must end at the pre-step slot (ME11: and the
+            // pre-step GDN selector)
             const bool committed = t.forced_k(c.B, c.k, c.fail, r, err);
-            uint32_t now[2] = {0, 0};
-            ok = ok && !committed && r.recovered && t.versions().read_cur(now, err);
-            const bool back = ok && now[0] == pre && now[1] == pre && t.slot().cur == pre && t.slot().n == n0;
+            uint32_t now[2] = {0, 0}, now_gdn[2] = {0, 0};
+            ok = ok && !committed && r.recovered && t.versions().read_words(now, now_gdn, err);
+            const bool back = ok && now[0] == pre && now[1] == pre && t.slot().cur == pre && t.slot().n == n0 &&
+                              now_gdn[0] == pre_gdn && now_gdn[1] == pre_gdn && t.slot().gdn == pre_gdn;
             for (int32_t card = 0; card < 2; ++card) {
-                if (((c.fail >> card) & 1) == 0 && r.cur[card] == static_cast<uint32_t>(rd::version_slot(pre, c.k))) {
+                if (((c.fail >> card) & 1) == 0 && r.cur[card] == static_cast<uint32_t>(rd::version_slot(pre, c.k)) &&
+                    r.gdn[card] == rd::gdn_after_round(pre_gdn, c.k)) {
                     ++healthy_committed;
                 }
             }

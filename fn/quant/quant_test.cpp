@@ -114,6 +114,10 @@ int fnfl_decode_check(const char * dir) {
     for (int32_t i = 0; i < fn::quant::n_wfmt; ++i) {
         const fmt_tally & ft = t[i];
         const wfmt f = static_cast<wfmt>(i);
+        if (f == wfmt::q5_1 && !ft.loaded) { // ME1: the Q4 candidate's format, not in the deployed model's dump
+            printf("decode-check %-8s not in the deployed dump (ME1's Q4 candidate format)\n", fn::quant::info(f).name);
+            continue;
+        }
         const size_t need_tensors = f == wfmt::f16 ? 1 : 2;
         const bool all_read = ft.blocks_at == ft.blocks_raw.size() && ft.f32_at == ft.f32_raw.size();
         const bool ok =
@@ -174,6 +178,10 @@ int fnfl_synth_check() {
             case wfmt::iq4_nl:
             case wfmt::iq4_xs:
                 scale_at = {0};
+                positive = false;
+                break;
+            case wfmt::q5_1:
+                scale_at = {0, 2};
                 positive = false;
                 break;
             case wfmt::bf16:

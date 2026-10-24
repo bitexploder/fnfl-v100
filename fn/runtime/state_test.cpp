@@ -3,6 +3,7 @@
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/dense/dense.h"
 #include "fn/kernels/gdn/gdn.h"
+#include "fn/kernels/gdn/gdn_ref.h"
 #include "fn/kernels/ple/ple.h"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/round/round.h"
@@ -117,7 +118,7 @@ struct card {
     int8_t * mid_codes = nullptr;
     float * mid_scales = nullptr;
     void *dense_work = nullptr, *gdn_ws = nullptr;
-    float *gdn_state = nullptr, *gdn_hist = nullptr;
+    float *gdn_state = nullptr, *gdn_rec = nullptr, *gdn_hist = nullptr; // ME11: two banks, two record sets
     fn::dense::product_args gin;
     // PLE
     fn::ple::weights pw;
@@ -188,7 +189,7 @@ class rig {
     bool restore(const std::vector<std::vector<uint8_t>> & blob);
     // a clean replay of l's first N tokens at B = 1 from zero state, its snapshot and rows; the device state restored
     bool replay(const ledger & l, slot_versions & v, snap & s, std::map<int64_t, row_hash> & rows);
-    bool write_cur(uint32_t cur);
+    bool write_cur(uint32_t cur, uint32_t gdn);
     slot_versions bind_versions();
 
   private:
@@ -207,6 +208,9 @@ class rig {
     rd::done * done_dev_ = nullptr;
     uint64_t next_round_ = 1;
     uint64_t ple_use_ = 0;
+
+  public:
+    uint32_t reported_gdn_[2] = {0, 0}; // ME11: each card's GDN selector in the last round's completion record
 };
 
 rig::~rig() {
@@ -239,7 +243,7 @@ rig::~rig() {
 slot_versions rig::bind_versions() {
     slot_versions v;
     for (card & c : c_) {
-        v.bind(c.r, c.dev, c.st, &c.rst->cur);
+        v.bind(c.r, c.dev, c.st, &c.rst->cur, &c.rst->gdn);
     }
     return v;
 }
@@ -309,7 +313,8 @@ bool rig::init() {
              c.alloc(c.mid_codes, fn::act::codes_bytes(max_rows, GV), "mid codes") &&
              c.alloc(c.mid_scales, fn::act::scales_bytes(max_rows, GV), "mid scales") &&
              c.alloc(c.gdn_ws, fn::gdn::workspace_bytes(), "gdn ws") &&
-             c.alloc(c.gdn_state, size_t(rd::n_version) * sv * 4, "gdn state") &&
+             c.alloc(c.gdn_state, size_t(fn::gdn::n_bank) * sv * 4, "gdn banks") &&
+             c.alloc(c.gdn_rec, size_t(fn::gdn::records_bytes), "gdn records") &&
              c.alloc(c.gdn_hist, size_t(rd::n_version) * hv * 4, "gdn history");
         if (!ok) {
             return false;
@@ -393,6 +398,7 @@ bool rig::init() {
         rd::state s0 = {};
         s0.next_round = next_round_;
         s0.cur = 0;
+        s0.gdn = 0;
         const uint32_t * err_list[1] = {rg_.err(c.r)};
         ok = ok && cuda_ok(cudaMemcpy(c.rst, &s0, sizeof(s0), cudaMemcpyHostToDevice), "round state") &&
              cuda_ok(cudaMemcpy(c.errs, err_list, sizeof(err_list), cudaMemcpyHostToDevice), "error list") &&
@@ -463,7 +469,8 @@ bool rig::enqueue_phase(card & c, int32_t rows, int32_t ph) {
             g.a = c.ga;
             g.norm_w = c.norm;
             g.state = c.gdn_state;
-            g.cur = &c.rst->cur;
+            g.rec = c.gdn_rec;
+            g.gsel = &c.rst->gdn;
             g.gated = c.gated;
             g.gated_q = {c.mid_codes, c.mid_scales, rows, GV};
             g.ws = c.gdn_ws;
@@ -652,6 +659,7 @@ int32_t rig::round(ledger & l, slot_versions & v, int32_t kind, int32_t rows, in
             return -1;
         }
         reported[c.r] = done_[c.r].cur;
+        reported_gdn_[c.r] = done_[c.r].gdn;
     }
     if (out_rows != nullptr && !rows_out(rows, n_before, *out_rows)) {
         return -1;
@@ -677,7 +685,7 @@ int32_t rig::round(ledger & l, slot_versions & v, int32_t kind, int32_t rows, in
         return 1;
     }
     const int32_t k = rd::commit_versions(kind, rows, 0, test_k);
-    if (!v.committed(l, k, reported, err)) {
+    if (!v.committed(l, k, reported, reported_gdn_, err)) {
         fprintf(stderr, "state-test: %s\n", err.c_str());
         return -1;
     }
@@ -691,38 +699,40 @@ int32_t rig::round(ledger & l, slot_versions & v, int32_t kind, int32_t rows, in
     return 0;
 }
 
-bool rig::write_cur(uint32_t cur) {
+bool rig::write_cur(uint32_t cur, uint32_t gdn) {
     for (card & c : c_) {
         if (!cuda_ok(cudaSetDevice(c.dev), "device") ||
-            !cuda_ok(cudaMemcpy(&c.rst->cur, &cur, 4, cudaMemcpyHostToDevice), "cur")) {
+            !cuda_ok(cudaMemcpy(&c.rst->cur, &cur, 4, cudaMemcpyHostToDevice), "cur") ||
+            !cuda_ok(cudaMemcpy(&c.rst->gdn, &gdn, 4, cudaMemcpyHostToDevice), "GDN selector")) {
             return false;
         }
     }
     return true;
 }
 
-// the logical state: each object's version 0 (slot cur, read back from each card's round state), keys of cells < N,
+// the logical state: each object's version 0 (slot cur, read back from each card's round state; ME11: the GDN matrix
+// its selector names, bank and records replayed, gdn_ref.h), keys of cells < N,
 // summaries of blocks < N / 4 (one block's 128 values gathered from the tiled layout)
 bool rig::snapshot(const ledger & l, snap & s) {
     s = snap();
     s.n = l.n;
     s.n_valid = l.summaries.n_valid;
     for (card & c : c_) {
-        uint32_t cur = 0;
+        uint32_t cur = 0, gsel = 0;
         std::vector<float> a(static_cast<size_t>(sv)), b(static_cast<size_t>(hv)), p(static_cast<size_t>(pv));
         if (!cuda_ok(cudaSetDevice(c.dev), "device") ||
             !cuda_ok(cudaMemcpy(&cur, &c.rst->cur, 4, cudaMemcpyDeviceToHost), "cur") || cur != l.cur ||
-            !cuda_ok(
-                cudaMemcpy(a.data(), c.gdn_state + rd::version_slot(cur, 0) * sv, a.size() * 4, cudaMemcpyDeviceToHost),
-                "state") ||
+            !cuda_ok(cudaMemcpy(&gsel, &c.rst->gdn, 4, cudaMemcpyDeviceToHost), "GDN selector") || gsel != l.gdn ||
+            !fn::gdn::ref::read_committed(c.gdn_state, c.gdn_rec, gsel, a) ||
             !cuda_ok(
                 cudaMemcpy(b.data(), c.gdn_hist + rd::version_slot(cur, 0) * hv, b.size() * 4, cudaMemcpyDeviceToHost),
                 "history") ||
             !cuda_ok(
                 cudaMemcpy(p.data(), c.ple_hist + rd::version_slot(cur, 0) * pv, p.size() * 4, cudaMemcpyDeviceToHost),
                 "ple history")) {
-            if (cur != l.cur) {
-                fprintf(stderr, "state-test: card %d's cur %u is not the ledger's %u\n", c.r, cur, l.cur);
+            if (cur != l.cur || gsel != l.gdn) {
+                fprintf(stderr, "state-test: card %d's cur %u / GDN selector %u are not the ledger's %u / %u\n", c.r,
+                        cur, gsel, l.cur, l.gdn);
             }
             return false;
         }
@@ -755,7 +765,8 @@ bool rig::snapshot(const ledger & l, snap & s) {
 bool rig::zero_state() {
     for (card & c : c_) {
         if (!cuda_ok(cudaSetDevice(c.dev), "device") ||
-            !cuda_ok(cudaMemset(c.gdn_state, 0, size_t(rd::n_version) * sv * 4), "zero") ||
+            !cuda_ok(cudaMemset(c.gdn_state, 0, size_t(fn::gdn::n_bank) * sv * 4), "zero") ||
+            !cuda_ok(cudaMemset(c.gdn_rec, 0, size_t(fn::gdn::records_bytes)), "zero") ||
             !cuda_ok(cudaMemset(c.gdn_hist, 0, size_t(rd::n_version) * hv * 4), "zero") ||
             !cuda_ok(cudaMemset(c.ple_hist, 0, size_t(rd::n_version) * pv * 4), "zero") ||
             (c.r == 0 && (!cuda_ok(cudaMemset(c.keys, 0, size_t(cap) * IK * 2), "zero") ||
@@ -771,10 +782,11 @@ bool rig::save(std::vector<std::vector<uint8_t>> & blob) {
     blob.clear();
     for (card & c : c_) {
         const std::pair<const void *, size_t> parts[] = {
-            {c.gdn_state, size_t(rd::n_version) * sv * 4},
+            {c.gdn_state, size_t(fn::gdn::n_bank) * sv * 4},
+            {c.gdn_rec, size_t(fn::gdn::records_bytes)},
             {c.gdn_hist, size_t(rd::n_version) * hv * 4},
             {c.ple_hist, size_t(rd::n_version) * pv * 4},
-            {&c.rst->cur, 4},
+            {&c.rst->cur, 8}, // cur, then the GDN selector (rd::state)
             {c.keys, c.r == 0 ? size_t(cap) * IK * 2 : 0},
             {c.summ, c.r == 0 ? fn::qsa::summary_bytes(cap / fn::qsa::ratio) : 0}};
         for (const auto & [p, n] : parts) {
@@ -791,7 +803,7 @@ bool rig::save(std::vector<std::vector<uint8_t>> & blob) {
 bool rig::restore(const std::vector<std::vector<uint8_t>> & blob) {
     size_t i = 0;
     for (card & c : c_) {
-        void * parts[] = {c.gdn_state, c.gdn_hist, c.ple_hist, &c.rst->cur, c.keys, c.summ};
+        void * parts[] = {c.gdn_state, c.gdn_rec, c.gdn_hist, c.ple_hist, &c.rst->cur, c.keys, c.summ};
         for (void * p : parts) {
             const std::vector<uint8_t> & b = blob[i++];
             if (!b.empty() && (!cuda_ok(cudaSetDevice(c.dev), "device") ||
@@ -839,6 +851,8 @@ struct tally {
     int32_t k_seen[max_rows + 1][max_rows + 1] = {};                // [B][k]
     int32_t j_seen[max_rows + 1][max_rows + 1][max_rows + 1] = {}; // [B][k][j]
     uint32_t slots = 1;           // bit s: the committed slot was s
+    uint32_t orient = 1;          // ME11: bit bank + 2 set of the committed GDN selector
+    int32_t gdn_steps_seen = 1;   // ME11: bit k: a check ran with k live records
     int32_t errors_ok = 0, errors_bad = 0, healthy_committed = 0;
     bool control_detected = false, control_run = false, summary_case = false;
 };
@@ -894,6 +908,8 @@ class script {
             }
         }
         t_.slots |= 1u << l_.cur;
+        t_.orient |= 1u << (rd::gdn_bank(l_.gdn) + 2 * rd::gdn_set(l_.gdn));
+        t_.gdn_steps_seen |= 1 << rd::gdn_steps(l_.gdn);
         return true;
     }
 
@@ -920,15 +936,18 @@ class script {
         if (control && j < k) {
             // the negative control: cur on the uncut version k must not match the replay of N_before + j
             t_.control_run = true;
-            const uint32_t good = l_.cur;
-            if (!g_.write_cur(static_cast<uint32_t>(rd::version_slot(v_.last().cur_pre, k)))) {
+            const uint32_t good = l_.cur, good_gdn = l_.gdn;
+            const uint32_t bad = static_cast<uint32_t>(rd::version_slot(v_.last().cur_pre, k));
+            const uint32_t bad_gdn = rd::gdn_after_round(v_.last().gdn_pre, k);
+            if (!g_.write_cur(bad, bad_gdn)) {
                 return false;
             }
             ledger saved = l_;
-            l_.cur = static_cast<uint32_t>(rd::version_slot(v_.last().cur_pre, k));
+            l_.cur = bad;
+            l_.gdn = bad_gdn;
             t_.control_detected = check("control", nullptr, false);
             l_ = saved;
-            if (!g_.write_cur(good)) {
+            if (!g_.write_cur(good, good_gdn)) {
                 return false;
             }
         }
@@ -947,28 +966,33 @@ class script {
     bool error_case(int32_t B, int32_t k, int32_t mask) {
         uint32_t rep[2];
         append(B);
-        const uint32_t pre = l_.cur;
+        const uint32_t pre = l_.cur, pre_gdn = l_.gdn;
         const int64_t n0 = l_.n;
         if (g_.round(l_, v_, static_cast<int32_t>(rd::kind::forced_k), B, k, mask, nullptr, rep) != 1) {
             fprintf(stderr, "state-test: the injected error was not seen\n");
             return false;
         }
-        uint32_t now[2] = {0, 0};
+        uint32_t now[2] = {0, 0}, now_gdn[2] = {0, 0};
         std::string err;
-        if (!v_.read_cur(now, err)) {
+        if (!v_.read_words(now, now_gdn, err)) {
             return false;
         }
-        const bool back = now[0] == pre && now[1] == pre && l_.cur == pre && l_.n == n0;
-        // the card whose words were clear did commit before the host restored it (the hazard FC-RD2 closes)
+        // ME11: the GDN selectors back at the pre-step word too
+        const bool back = now[0] == pre && now[1] == pre && l_.cur == pre && l_.n == n0 && now_gdn[0] == pre_gdn &&
+                          now_gdn[1] == pre_gdn && l_.gdn == pre_gdn;
+        // the card whose words were clear did commit before the host restored it (the hazard FC-RD2 closes), its GDN
+        // selector moved with cur
         for (int32_t c = 0; c < 2; ++c) {
-            if (((mask >> c) & 1) == 0 && k > 0 && rep[c] == static_cast<uint32_t>(rd::version_slot(pre, k))) {
+            if (((mask >> c) & 1) == 0 && k > 0 && rep[c] == static_cast<uint32_t>(rd::version_slot(pre, k)) &&
+                g_.reported_gdn_[c] == rd::gdn_after_round(pre_gdn, k)) {
                 t_.healthy_committed++;
             }
         }
         (back ? t_.errors_ok : t_.errors_bad)++;
-        printf("state-test: error on card mask %d (B %d, k %d): reported cur %u / %u, both cards back at cur_pre %u: "
-               "%s\n",
-               mask, B, k, rep[0], rep[1], pre, back ? "yes" : "NO");
+        printf("state-test: error on card mask %d (B %d, k %d): reported cur %u / %u, GDN selector %u / %u; both cards "
+               "back at cur_pre %u and GDN selector %u: %s\n",
+               mask, B, k, rep[0], rep[1], g_.reported_gdn_[0], g_.reported_gdn_[1], pre, pre_gdn,
+               back ? "yes" : "NO");
         if (!check("error", nullptr)) {
             return false;
         }
@@ -1016,12 +1040,35 @@ class script {
 
 } // namespace
 
-int fnfl_state_test(int argc, char ** argv) {
+int fnfl_state_test_mu1(const std::string & run, int32_t dev0, int32_t dev1, bool kv_q8); // slots_gpu_test.cpp
+int fnfl_state_test_mxmu1(const std::string & run, int32_t dev);                          // slots_gpu_test.cpp (MXMU1)
+
+int fnfl_state_test(int argc, char ** argv, bool kv_q8) {
     const std::string mode = argc >= 3 ? argv[2] : "all";
     const std::string run = argc >= 4 ? argv[3] : "graph";
     const int32_t dev0 = argc >= 5 ? atoi(argv[4]) : 0;
     const int32_t dev1 = argc >= 6 ? atoi(argv[5]) : 1;
     const bool san = mode == "san";
+    if (mode == "mu1-one") {
+        // MXMU1: two slots on one card (the expert cache, the host-backed KV; slots_gpu_test.cpp part C)
+        if (run != "graph" && run != "eager" && run != "c0") {
+            fprintf(stderr, "state-test: mu1-one [graph|eager|c0] [DEV]\n");
+            return 2;
+        }
+        return fnfl_state_test_mxmu1(run, dev0);
+    }
+    if (mode == "mu1") {
+        // MU1: the multi-slot engine's pool and frames (slots_gpu_test.cpp)
+        // peer access is enabled by part B's load (part A's peer copy needs none)
+        if ((run != "graph" && run != "eager" && run != "read" && run != "joint" && run != "joint-eager" &&
+             run != "joint-san") ||
+            dev0 == dev1) {
+            fprintf(stderr, "state-test: mu1 [graph|eager|read|joint|joint-eager|joint-san] [DEV0] [DEV1] "
+                            "(two distinct cards)\n");
+            return 2;
+        }
+        return fnfl_state_test_mu1(run, dev0, dev1, kv_q8);
+    }
     if ((mode != "all" && !san) || (run != "graph" && run != "eager") || dev0 == dev1) {
         fprintf(stderr, "state-test: [all|san] [graph|eager] [DEV0] [DEV1] (two distinct cards)\n");
         return 2;
@@ -1091,6 +1138,9 @@ int fnfl_state_test(int argc, char ** argv) {
            : covered ? "yes"
                      : "NO",
            slots, rd::n_version);
+    printf("state-test: GDN selector (ME11): bank and set orientations committed %d (of the 2 a target round's flip "
+           "reaches), live record counts seen 0..5: %s\n",
+           __builtin_popcount(t.orient), t.gdn_steps_seen == 63 ? "all" : san ? "some (san)" : "NOT ALL");
     printf("state-test: injected errors: %d with both cards back at cur_pre, %d not; a clear card had committed before "
            "the restore in %d of them\n",
            t.errors_ok, t.errors_bad, t.healthy_committed);
@@ -1100,6 +1150,7 @@ int fnfl_state_test(int argc, char ** argv) {
     printf("state-test: %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     const bool pass = t.mismatches == 0 && t.row_mismatches == 0 && t.checks > 0 && covered &&
                       (san || slots == rd::n_version) && t.errors_bad == 0 && t.errors_ok > 0 &&
+                      (san || (t.gdn_steps_seen == 63 && __builtin_popcount(t.orient) >= 2)) &&
                       t.healthy_committed > 0 && t.summary_case &&
                       (!t.control_run || t.control_detected) && (san || t.control_run);
     printf("state-test: %s\n", pass ? "PASS" : "FAIL");

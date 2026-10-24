@@ -11,6 +11,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -64,9 +65,11 @@ bool set_device(const pass_card & p, std::string & err) {
 
 bool round_begin(pass_card & p, std::string & err) {
     const fn::round::begin_args a = {p.host_ring, p.flag, p.desc, p.rstate, p.c.rings->err(p.c.card)};
+    // ME3: the failure names the pending CUDA error (the launch check peeks at it)
     return set_device(p, err) &&
-           (fn::round::begin(a, p.c.stream) && fn::round::stamp(p.rstate, p.c.stream) ? true
-                                                                                      : fail(err, "round begin"));
+           (fn::round::begin(a, p.c.stream) && fn::round::stamp(p.rstate, p.c.stream)
+                ? true
+                : fail(err, std::string("round begin: ") + cudaGetErrorString(cudaPeekAtLastError())));
 }
 
 bool embed(pass_card & p, int32_t rows, std::string & err) {
@@ -222,6 +225,32 @@ bool decision_part_enqueue(pass_card & p, int32_t rows, const float * logits, co
     return fn::samp::enqueue(d.s, rows, p.samp, io, p.c.stream);
 }
 
+// the head HC's arguments on card p (hc::head_sub; ME12's hc::head_pair takes both cards')
+fn::hc::sub_args head_sub_args(const pass_card & p, const use_counters & u) {
+    const int32_t r = p.c.card;
+    const fn::xchg::rings & rg = *p.c.rings;
+    const int32_t s = hc_slot_of(u, u.sub); // the head is HC sublayer u.sub (96 of a whole round in a graph)
+    const layer_input in = layer_output(p.c); // layer 47's output boundary, only read (FC-HEAD3)
+    const bool first = !u.graph && u.sub == 0;
+    fn::hc::sub_args a = {};
+    a.w_down = p.head.w_down;
+    a.w_up = p.head.w_up;
+    a.hres = in.hres;
+    a.hx = in.hx;
+    a.hpost = in.hpost;
+    a.gamma = p.head.gamma;
+    a.x = p.carry;
+    a.hc_ring = rg.slot(r, fn::xchg::msg::hc, s);
+    a.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
+    a.hc_reset = first ? nullptr : rg.slot(r, fn::xchg::msg::hc, hc_slot_of(u, u.sub - 1));
+    a.hmix_reset = first ? nullptr : rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub - 1));
+    a.hmix_own = rg.slot(r, fn::xchg::msg::hmix, s);
+    a.hmix_peer = rg.slot(1 - r, fn::xchg::msg::hmix, s);
+    a.err = rg.err(r);
+    a.card = r;
+    return a;
+}
+
 // the head: part 0 HC's down phase (sends X-HC), 1 its up phase (reads X-HC, sends X-HMIX in both forms), 2 logits
 // (reads X-HMIX), then the decision's parts (decision_parts: each send before its read), and last commit and finish.
 // fused (the graphs, HC4): parts 0 and 1 are one launch of hc::head_sub at part 0
@@ -232,32 +261,14 @@ bool head_part(pass_card & p, int32_t rows, int32_t part, const use_counters & u
     }
     const int32_t r = p.c.card;
     const fn::xchg::rings & rg = *p.c.rings;
-    const int32_t s = hc_slot_of(u, u.sub); // the head is HC sublayer u.sub (96 of a whole round in a graph)
+    const int32_t s = hc_slot_of(u, u.sub);
     const std::vector<decision_part> dp = decision_parts(o);
     bool ok = false;
     if (part == 0 || part == 1) {
         if (fused && part == 1) {
             return true;
         }
-        const layer_input in = layer_output(p.c); // layer 47's output boundary, only read (FC-HEAD3)
-        const bool first = !u.graph && u.sub == 0;
-        fn::hc::sub_args a = {};
-        a.w_down = p.head.w_down;
-        a.w_up = p.head.w_up;
-        a.hres = in.hres;
-        a.hx = in.hx;
-        a.hpost = in.hpost;
-        a.gamma = p.head.gamma;
-        a.x = p.carry;
-        a.hc_ring = rg.slot(r, fn::xchg::msg::hc, s);
-        a.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
-        a.hc_reset = first ? nullptr : rg.slot(r, fn::xchg::msg::hc, hc_slot_of(u, u.sub - 1));
-        a.hmix_reset = first ? nullptr : rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub - 1));
-        a.hmix_own = rg.slot(r, fn::xchg::msg::hmix, s);
-        a.hmix_peer = rg.slot(1 - r, fn::xchg::msg::hmix, s);
-        a.err = rg.err(r);
-        a.card = r;
-        ok = fn::hc::head_sub(rows, fused ? 3 : part + 1, a, p.c.stream);
+        ok = fn::hc::head_sub(rows, fused ? 3 : part + 1, head_sub_args(p, u), p.c.stream);
     } else if (part == 2) {
         const fn::head::logits_args la = {
             rg.slot(r, fn::xchg::msg::hmix, s), rg.err(r), r, p.out_w, fn::head::n_vocab_card, p.logits, nullptr};
@@ -272,6 +283,15 @@ bool head_part(pass_card & p, int32_t rows, int32_t part, const use_counters & u
         ok = fn::round::commit(ca, p.c.stream) && fn::round::finish(fa, p.c.stream);
     }
     return ok ? true : fail(err, "head part " + std::to_string(part));
+}
+
+// ME12: the head HC of both cards on one device and stream, one launch
+bool head_pair_part(pass_card * const p[2], int32_t rows, const use_counters u[2], std::string & err) {
+    if (!set_device(*p[0], err)) {
+        return false;
+    }
+    const fn::hc::pair_args a = {{head_sub_args(*p[0], u[0]), head_sub_args(*p[1], u[1])}, p[0]->c.ws.mom[1]};
+    return fn::hc::head_pair(rows, a, p[0]->c.stream) ? true : fail(err, "head hc pair");
 }
 
 bool check_options(const pass_options & o, int32_t rows, std::string & err) {
@@ -419,6 +439,7 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     // SR1: every versioned object (each GDN layer's state and convolution history, the PLE history; FC-ST1) reads and
     // writes its versions through the round state's one committed-slot word, which the commit node moves
     p.c.cur = &p.rstate->cur;
+    p.c.gsel = &p.rstate->gdn; // ME11: the GDN state's selector beside it, moved by the same commit
     // the error words: the card's exchange word, attend's and select's, EX1b's status
     const fn::qsa::attn::workspace aw = fn::qsa::attn::carve(p.c.attn_ws);
     const fn::qsa::workspace qw = fn::qsa::carve(p.c.qsa_ws);
@@ -431,6 +452,7 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     fn::round::state st = {};
     st.next_round = next_round;
     st.cur = 0;
+    st.gdn = 0;
     return cuda_ok(cudaSetDevice(m.device[card]), "cudaSetDevice", err) &&
            cuda_ok(cudaMemcpy(p.errs, errs, sizeof(errs), cudaMemcpyHostToDevice), "error list", err) &&
            cuda_ok(cudaMemcpy(p.rstate, &st, sizeof(st), cudaMemcpyHostToDevice), "round state", err) &&
@@ -533,7 +555,17 @@ step_status pass_pair_enqueue(pass_card * const p[2], int32_t rows, const pass_o
             }
         }
     }
+    // ME12: on one device and stream the head HC's four phase launches are one (hc::head_pair) at part 0; the scratch
+    // is card 0's ws.mom[1], which the target's BF16 layers leave unused (layer.cpp hc_pair_phase)
+    const bool hc_pair =
+        p[0]->c.device == p[1]->c.device && p[0]->c.stream != nullptr && p[0]->c.stream == p[1]->c.stream;
     for (int32_t part = 0; part < n_head_parts(o); ++part) {
+        if (hc_pair && part < 2) {
+            if (part == 0 && !head_pair_part(p, rows, u, err)) {
+                return step_status::failed;
+            }
+            continue;
+        }
         for (int32_t k = 0; k < 2; ++k) {
             if (!head_part(*p[k], rows, part, u[k], o, false, err)) {
                 return step_status::failed;
@@ -574,6 +606,299 @@ bool pass_bootstrap_enqueue(pass_card * const p[2], int32_t row, const pass_opti
         }
     }
     return true;
+}
+
+// ---- FMU2: the joint verify round ----
+
+bool pass_lane_init(const pass_card & slot, const fn::xchg::joint_rings & jr, int32_t u, const layer_ws & joint_ws,
+                    void * route, const uint32_t ** errs, pass_card & out, std::string & err) {
+    if (u < 0 || u >= fn::xchg::max_lanes || route == nullptr || errs == nullptr) {
+        return fail(err, "pass_lane_init: lane, routing or error list missing");
+    }
+    out = slot;
+    const int32_t card = slot.c.card;
+    const fn::xchg::rings & rg = jr.lane(u);
+    out.c.rings = &rg;
+    out.c.ws = lane_ws(joint_ws, u);
+    int32_t * ids = nullptr;
+    float * wts = nullptr;
+    joint_route_carve(route, ids, wts);
+    out.c.ex.ids = ids + int64_t(u) * layer_max_rows * fn::n_expert_used;
+    out.c.ex.wts = wts + int64_t(u) * layer_max_rows * fn::n_expert_used;
+    joint_lane_ex(route, u, out.c.ex); // FMU2 (build item 1): the lane's GLU slots and meta (the status word shared)
+    out.c.record_mixed[0] = out.c.record_mixed[1] = nullptr;
+    out.c.observe = nullptr;
+    fn::samp::card_view & sv = out.samp;
+    sv.err = rg.err(card);
+    for (int32_t q = 0; q < 2; ++q) {
+        sv.a_own[q] = rg.slot(card, fn::xchg::msg::samp_a, q);
+        sv.a_peer[q] = rg.slot(1 - card, fn::xchg::msg::samp_a, q);
+        sv.b_own[q] = rg.slot(card, fn::xchg::msg::samp_b, q);
+        sv.b_peer[q] = rg.slot(1 - card, fn::xchg::msg::samp_b, q);
+        sv.c_own[q] = rg.slot(card, fn::xchg::msg::samp_c, q);
+        sv.c_peer[q] = rg.slot(1 - card, fn::xchg::msg::samp_c, q);
+        sv.d_own[q] = rg.slot(card, fn::xchg::msg::samp_d, q);
+        sv.d_peer[q] = rg.slot(1 - card, fn::xchg::msg::samp_d, q);
+    }
+    sv.x_own = rg.slot(card, fn::xchg::msg::samp_x, 0);
+    sv.x_peer = rg.slot(1 - card, fn::xchg::msg::samp_x, 0);
+    const fn::qsa::attn::workspace aw = fn::qsa::attn::carve(out.c.attn_ws);
+    const fn::qsa::workspace qw = fn::qsa::carve(out.c.qsa_ws);
+    uint32_t * const words[] = {rg.err(card), aw.error, qw.error, out.c.ex.status, jr.err(card)};
+    const uint32_t * list[fn::round::max_err] = {};
+    out.n_err = 5;
+    for (int32_t i = 0; i < fn::round::max_err; ++i) {
+        out.err_words[i] = i < out.n_err ? words[i] : nullptr;
+        list[i] = out.err_words[i];
+    }
+    out.errs = errs;
+    return cuda_ok(cudaSetDevice(out.c.device), "cudaSetDevice", err) &&
+           cuda_ok(cudaMemcpy(errs, list, sizeof(list), cudaMemcpyHostToDevice), "lane error list", err);
+}
+
+namespace {
+
+// the joint pass's checks (lanes 2..4, each lane's options the whole model without records), j's lanes at the passes'
+bool joint_begin(joint_pass & jp, std::string & err) {
+    if (jp.lanes < 2 || jp.lanes > fn::xchg::max_lanes) {
+        return fail(err, "joint pass: lanes outside 2 .. 4");
+    }
+    jp.j.lanes = jp.lanes;
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        const pass_options & o = *jp.o[k];
+        if (!check_options(o, layer_max_rows, err) || o.layer_lo != 0 || o.layer_hi != fn::n_layer - 1 ||
+            o.n_records != 0) {
+            return fail(err, "joint pass: lane " + std::to_string(k) + ": the whole model without records only");
+        }
+        jp.j.lane[k] = &jp.lane[k]->c;
+    }
+    return true;
+}
+
+// PLE's part 0 of every lane in one joint launch on lane 0's stream (FMU2 build item 4: each weight loaded once; each
+// lane's key and value bitwise its own part 0), in the joint frame's PLE region
+bool joint_ple_products(joint_pass & jp, std::string & err) {
+    if (jp.j.dense_work == nullptr) {
+        return fail(err, "ple joint products: no joint work");
+    }
+    if (!set_device(*jp.lane[0], err)) {
+        return false;
+    }
+    fn::ple::step_args a[fn::xchg::max_lanes];
+    const fn::ple::step_args * ap[fn::xchg::max_lanes] = {};
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        a[k] = ple_args(*jp.lane[k]);
+        ap[k] = &a[k];
+    }
+    uint8_t * work = static_cast<uint8_t *>(jp.j.dense_work) + joint_ple_work_offset();
+    return fn::ple::products_joint(jp.lanes, ap, work, jp.lane[0]->c.stream) ? true : fail(err, "ple joint products");
+}
+
+// layer l's states and inputs of every lane
+void joint_layer_in(joint_pass & jp, int32_t l, const layer_state * st[], layer_input in[]) {
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        st[k] = &jp.lane[k]->s[l];
+        in[k] = layer_in(*jp.lane[k], l, *jp.o[k]);
+    }
+}
+
+// the head HC of every lane in one launch (hc::head_sub_joint; mode as sub's)
+bool joint_head_hc(joint_pass & jp, int32_t mode, const use_counters & u, std::string & err) {
+    fn::hc::sub_args ha[fn::xchg::max_lanes];
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        ha[k] = head_sub_args(*jp.lane[k], u);
+    }
+    if (!set_device(*jp.lane[0], err)) {
+        return false;
+    }
+    return fn::hc::head_sub_joint(jp.lanes, mode, ha, jp.lane[0]->c.stream) ? true : fail(err, "head hc sub_joint");
+}
+
+// every lane's logits in one launch into its own buffer (head::logits_joint)
+bool joint_logits(joint_pass & jp, const use_counters & u, std::string & err) {
+    fn::head::logits_args la[fn::xchg::max_lanes];
+    const int32_t s = hc_slot_of(u, u.sub);
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        pass_card & p = *jp.lane[k];
+        la[k] = {p.c.rings->slot(p.c.card, fn::xchg::msg::hmix, s),
+                 p.c.rings->err(p.c.card),
+                 p.c.card,
+                 p.out_w,
+                 fn::head::n_vocab_card,
+                 p.logits,
+                 nullptr};
+    }
+    pass_card & p0 = *jp.lane[0];
+    if (!set_device(p0, err)) {
+        return false;
+    }
+    if (!fn::head::logits_joint(jp.lanes, la, static_cast<int32_t>(fn::xchg::joint_rings::lane_floats()),
+                                jp.j.jr->err(p0.c.card), p0.c.stream)) {
+        return fail(err, "head logits_joint");
+    }
+    return true;
+}
+
+// lane k's head part (3: its SM1 stamp, then its decision, commit and finish onward)
+bool joint_head_part(joint_pass & jp, int32_t k, int32_t part, const use_counters & u, std::string & err) {
+    // SM1: the decision's start in context, as head_part's part 2 stamps it
+    if (part == 3 && jp.o[k]->sampling != nullptr &&
+        (!set_device(*jp.lane[k], err) || !fn::round::stamp_logits(jp.lane[k]->rstate, jp.lane[k]->c.stream))) {
+        return fail(err, "lane " + std::to_string(k) + ": stamp_logits");
+    }
+    if (part >= n_head_parts(*jp.o[k])) {
+        return true;
+    }
+    if (!head_part(*jp.lane[k], layer_max_rows, part, u, *jp.o[k], true, err)) {
+        err = "lane " + std::to_string(k) + ": " + err;
+        return false;
+    }
+    return true;
+}
+
+int32_t joint_head_parts(const joint_pass & jp) {
+    int32_t n = 0;
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        n = std::max(n, n_head_parts(*jp.o[k]));
+    }
+    return n;
+}
+
+} // namespace
+
+step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & err) {
+    const int32_t rows = layer_max_rows;
+    if (!joint_begin(jp, err)) {
+        return step_status::failed;
+    }
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        if (!round_begin(*jp.lane[k], err)) {
+            return step_status::failed;
+        }
+    }
+    for (int32_t k = 0; k < jp.lanes; ++k) {
+        if (!embed(*jp.lane[k], rows, err)) {
+            return step_status::failed;
+        }
+    }
+    for (int32_t l = 0; l < fn::n_layer; ++l) {
+        if (l == 1) {
+            // FMU2: PLE's products in one joint launch (build item 4), then its parts 1 and 2 part-outer, lane-inner
+            // (build item 3: each lane's kernels and buffers unchanged)
+            if (!joint_ple_products(jp, err)) {
+                return step_status::failed;
+            }
+            for (int32_t part = 1; part < 3; ++part) {
+                for (int32_t k = 0; k < jp.lanes; ++k) {
+                    if (!ple_part(*jp.lane[k], rows, part, err)) {
+                        return step_status::failed;
+                    }
+                }
+            }
+        }
+        const layer_state * st[fn::xchg::max_lanes] = {};
+        layer_input in[fn::xchg::max_lanes];
+        joint_layer_in(jp, l, st, in);
+        const step_status ss = layer_joint_step(jp.j, jp.lane[0]->w[l], st, in, u, err);
+        if (ss != step_status::ok) {
+            err = "layer " + std::to_string(l) + ": " + err;
+            return ss;
+        }
+    }
+    // the head HC of every lane in one launch, every lane's logits in one launch, then the lanes' decision, commit and
+    // finish parts, part-outer and lane-inner (FMU2 build item 3: a lane's cross-card part waits once for its peer,
+    // while the other lanes' parts of the same stage follow it; each lane's kernels and buffers are unchanged)
+    if (!joint_head_hc(jp, 3, u, err) || !joint_logits(jp, u, err)) {
+        return step_status::failed;
+    }
+    const int32_t parts = std::max(joint_head_parts(jp), 4);
+    for (int32_t part = 3; part < parts; ++part) {
+        for (int32_t k = 0; k < jp.lanes; ++k) {
+            if (!joint_head_part(jp, k, part, u, err)) {
+                return step_status::failed;
+            }
+        }
+    }
+    u.sub++;
+    return step_status::ok;
+}
+
+step_status pass_joint_pair_enqueue(joint_pass * const jp[2], use_counters u[2], std::string & err) {
+    const int32_t rows = layer_max_rows;
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!joint_begin(*jp[c], err)) {
+            return step_status::failed;
+        }
+    }
+    const int32_t lanes = jp[0]->lanes;
+    if (jp[1]->lanes != lanes) {
+        err = "joint pair pass: the same lanes on both cards";
+        return step_status::failed;
+    }
+    // pass_pair_enqueue's order: each card's begins and embeddings, then every phase on card 0 before card 1's
+    for (int32_t c = 0; c < 2; ++c) {
+        for (int32_t k = 0; k < lanes; ++k) {
+            if (!round_begin(*jp[c]->lane[k], err) || !embed(*jp[c]->lane[k], rows, err)) {
+                return step_status::failed;
+            }
+        }
+    }
+    for (int32_t l = 0; l < fn::n_layer; ++l) {
+        if (l == 1) {
+            for (int32_t c = 0; c < 2; ++c) {
+                if (!joint_ple_products(*jp[c], err)) {
+                    return step_status::failed;
+                }
+            }
+            for (int32_t part = 1; part < 3; ++part) {
+                for (int32_t c = 0; c < 2; ++c) {
+                    for (int32_t k = 0; k < lanes; ++k) {
+                        if (!ple_part(*jp[c]->lane[k], rows, part, err)) {
+                            return step_status::failed;
+                        }
+                    }
+                }
+            }
+        }
+        const layer_state * st[2][fn::xchg::max_lanes] = {};
+        layer_input in[2][fn::xchg::max_lanes];
+        joint_layer_in(*jp[0], l, st[0], in[0]);
+        joint_layer_in(*jp[1], l, st[1], in[1]);
+        joint_lanes * jj[2] = {&jp[0]->j, &jp[1]->j};
+        const layer_weights * w[2] = {&jp[0]->lane[0]->w[l], &jp[1]->lane[0]->w[l]};
+        const layer_state * const * sp[2] = {st[0], st[1]};
+        const layer_input * ip[2] = {in[0], in[1]};
+        const step_status ss = layer_joint_pair_step(jj, w, sp, ip, u, err);
+        if (ss != step_status::ok) {
+            err = "layer " + std::to_string(l) + ": " + err;
+            return ss;
+        }
+    }
+    for (int32_t mode = 1; mode <= 2; ++mode) {
+        for (int32_t c = 0; c < 2; ++c) {
+            if (!joint_head_hc(*jp[c], mode, u[c], err)) {
+                return step_status::failed;
+            }
+        }
+    }
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!joint_logits(*jp[c], u[c], err)) {
+            return step_status::failed;
+        }
+    }
+    const int32_t parts = std::max({joint_head_parts(*jp[0]), joint_head_parts(*jp[1]), 4});
+    for (int32_t part = 3; part < parts; ++part) {
+        for (int32_t c = 0; c < 2; ++c) {
+            for (int32_t k = 0; k < lanes; ++k) {
+                if (!joint_head_part(*jp[c], k, part, u[c], err)) {
+                    return step_status::failed;
+                }
+            }
+        }
+    }
+    u[0].sub++;
+    u[1].sub++;
+    return step_status::ok;
 }
 
 } // namespace fn::model

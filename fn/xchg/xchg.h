@@ -110,6 +110,7 @@
 // must outlive every queued kernel that uses a slot (callers synchronize both devices before destroying it).
 
 #include <cstdint>
+#include <memory>
 
 namespace fn::xchg {
 
@@ -207,6 +208,8 @@ constexpr uint32_t err_hash = 1u << 21;        // SM1: the cards' decision recor
 constexpr uint32_t err_samp_empty = 1u << 22;  // SM1: a row with no candidate (fn::samp)
 constexpr uint32_t err_samp_count = 1u << 23;  // SM1: a cut bin's members differ in number from its count (fn::samp)
 constexpr uint32_t err_draft_depth = 1u << 24; // DR1: a draft row's cell outside the draft cache (fn::draft)
+constexpr uint32_t err_kv_tier = 1u << 27;     // ME1: a selection the KV tier cannot remap (fn::qsa::tier)
+constexpr uint32_t err_gdn_sel = 1u << 28;     // ME11: the GDN selector outside the contract at commit (fn::round)
 
 struct error_bit {
     const char * name;
@@ -236,6 +239,8 @@ constexpr error_bit card_error_bits[] = {
     {"sampler empty row", err_samp_empty},
     {"sampler member count", err_samp_count},
     {"draft depth", err_draft_depth},
+    {"KV tier", err_kv_tier},
+    {"GDN selector", err_gdn_sel},
 };
 constexpr bool card_error_bits_are_unique() {
     constexpr int32_t n = sizeof(card_error_bits) / sizeof(card_error_bits[0]);
@@ -305,6 +310,9 @@ bool enable_peer_access(int32_t dev0, int32_t dev1);
 class rings {
   public:
     rings(int32_t dev0, int32_t dev1);
+    // FMU2: a view of rings another owner allocated (joint_rings' lanes): buf[c] card_words floats (rings_card_bytes
+    // less the error word) and err[c] one word on device dev[c]; not freed by the view, not prefilled by it
+    rings(int32_t dev0, int32_t dev1, float * const buf[2], uint32_t * const err[2]);
     ~rings();
     rings(const rings &) = delete;
     rings & operator=(const rings &) = delete;
@@ -327,10 +335,54 @@ class rings {
     float * buf_[2] = {nullptr, nullptr}; // n_msg x n_slot slots a card
     uint32_t * err_[2] = {nullptr, nullptr};
     bool ok_ = false;
+    bool owns_ = true;
 };
 
 // bytes rings allocates on each card: every slot of every message, and the error word
 int64_t rings_card_bytes();
+
+// ---- FMU2: the joint round's exchange memory ----
+//
+// A joint round (fn/model/layer.h joint_lanes) runs 2..4 slots' rounds of max_rows rows each as lanes on one stream a
+// card. Every per-lane piece (HC, the bodies' per-slot kernels, PLE, the head, the decision) uses its lane's ring, a
+// complete rings in the lone format with the lone protocol and slot rules, so lanes never share a slot; the joint dense
+// products read every lane's X-HMIX slot at a fixed stride (lane_floats). The destination-half exchanges after the
+// joint products (X-A, X-F) run once over all lanes' rows on the joint slots (n_slot each, joint_rows rows, the R2
+// protocol and slot rule unchanged). Error words: one a lane ring (its pieces') and the joint word (X-A, X-F); a joint
+// round's commit on every lane checks its lane's word and the joint word, so a joint error fails every lane's round.
+constexpr int32_t max_lanes = 4;
+constexpr int32_t joint_rows = max_lanes * max_rows;
+
+class joint_rings {
+  public:
+    joint_rings(int32_t dev0, int32_t dev1);
+    ~joint_rings();
+    joint_rings(const joint_rings &) = delete;
+    joint_rings & operator=(const joint_rings &) = delete;
+
+    bool ok() const { return ok_; }
+    // lane u's ring (0 .. max_lanes - 1)
+    const rings & lane(int32_t u) const { return *lane_[u]; }
+    // floats from lane u's ring to lane u + 1's (every slot at the same offset in each)
+    static int64_t lane_floats();
+    // card's joint receive slot s (0 .. n_slot - 1) of X-A or X-F: joint_rows rows of words_half words
+    float * slot(int32_t card, msg m, int32_t s) const;
+    uint32_t * err(int32_t card) const { return err_[card] == nullptr ? nullptr : err_[card] + max_lanes; }
+
+    // Synchronous (callers have drained both devices): every lane ring and joint slot refilled with the sentinels and
+    // every error word zeroed
+    bool reset_all() const;
+
+  private:
+    int32_t dev_[2] = {-1, -1};
+    float * buf_[2] = {nullptr, nullptr};    // max_lanes lane rings, then X-A's and X-F's joint slots
+    uint32_t * err_[2] = {nullptr, nullptr}; // max_lanes lane words, then the joint word
+    std::unique_ptr<rings> lane_[max_lanes];
+    bool ok_ = false;
+};
+
+// bytes joint_rings allocates on each card
+int64_t joint_rings_card_bytes();
 
 // bytes of one slot of message m
 constexpr int64_t slot_bytes(msg m) {
@@ -396,6 +448,11 @@ bool send_half(int32_t rows, int32_t peer_card, const float * partial, float * p
 // same on either card); the slot is polled and reset. code: err_poll_a or err_poll_f.
 bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
               uint32_t code, void * stream);
+// FMU2: send_half and recv_add over a joint round's rows (1 .. joint_rows) on a joint slot (joint_rings::slot); the
+// same kernels and layout ([B][1280] a slot)
+bool send_half_joint(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream);
+bool recv_add_joint(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+                    uint32_t code, void * stream);
 // X-ROUTE send (router owner): ids_full [B][ids_stride] (the first 10 of each row), wts [B][10], sg [B]; also writes
 // the compact ids_local [B][10] the experts read on this card
 bool send_route(int32_t rows, const int32_t * ids_full, int32_t ids_stride, const float * wts, const float * sg,

@@ -31,7 +31,9 @@ struct synth {
 // deployed (ep-test only, C1b Amendment 4): dir/<fmt>-fnfl-deployed.bin, each block's d from the format's deployed
 // range on ep-test's own seed stream (fn/quant/synth.h). down (DR1): Q8_0's down shape, dir/Q8_0-down-fnfl.bin (the
 // other formats' shape follows the format).
-bool load_synth(fmt f, const std::string & dir, synth & out, bool deployed = false, bool down = false);
+// ME7: gu, Q2_0 in the gate/up shape (the Q2 draft's routed gate/up), dir/Q2_0-gu-fnfl.bin with its own seeds
+bool load_synth(fmt f, const std::string & dir, synth & out, bool deployed = false, bool down = false,
+                bool gu = false);
 
 // One card's packed buffer of n_copies x 512 experts: expert e of copy c is synthetic expert map[e] (n_synth: poison).
 bool pack_card(const synth & s, int32_t card, const std::vector<int32_t> & map, int32_t n_copies,
@@ -51,9 +53,10 @@ int fnfl_ex_prep(const char * dir);
 // rotating between instantiations; both cards' halves on device against the FP64 reference (the routed experts and
 // the shared expert on DP2's synthetic rows); each launch run twice and compared bitwise; each row at B < 4 against the
 // same row at B = 4, bitwise (NC1 section 2); all-zero input and a bad expert ID. formats: "all", "san" (Compute
-// Sanitizer's covering set: each routed and each shared format once, every down pair) or a list of routed gate/up
-// formats (iq2_xxs, ...). XB2: the routing meta by write_meta against the host's, and routings that place the shared
-// expert's units across the snake's turn (Amendment 1). With base_dir (71b92a9's experts cubins), also the
+// Sanitizer's covering set: each routed and each shared format once, every down pair), "q4" (ME1: the Unsloth Q4
+// candidate's own gate/up and down lists, experts_inst.h) or a list of routed gate/up formats (iq2_xxs, ...). XB2: the
+// routing meta by write_meta against the host's, and routings that place the shared expert's units across the snake's
+// turn (Amendment 1). With base_dir (71b92a9's experts cubins), also the
 // xb3-bitwise arm: every launch's outputs byte-identical to 71b92a9's kernels' on the same inputs; and the
 // xb4-bitwise arm: every down instantiation against 71b92a9's at the cases and at U cases of each n_u mod 3. Prints
 // "ex-test: PASS" and returns 0 when every check passes.

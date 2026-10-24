@@ -16,18 +16,22 @@
 // card (layer / 4) % 2; the router and the shared-expert gate on both cards (XP1's V2, LP1), each computing all B rows'
 // routing, so there is no X-ROUTE; expert channels 320r..320r+319.
 //
-// State (R1's reserved buffers): GDN state [6][24][128 x 128] F32 a layer (logical version 0 the committed state,
-// version v = 1..B the state after row v - 1 of the last step, at slot fn::round::version_slot(*card_ctx::cur, v); SR1)
-// and convolution history [6][5,120][3] F32 alike (SP2: six versions); KV [cell][256] BF16 for K and V; the
-// indexer's raw keys [cell][128] BF16 and F32 summaries. A commit moves the one committed-slot word every versioned
-// object shares (fn::round::commit in the model pass, fn::round::advance in layer-test's runner).
+// State (R1's reserved buffers): convolution history [6][5,120][3] F32 a layer (logical version 0 the committed
+// history, version v = 1..B after row v - 1 of the last step, at slot fn::round::version_slot(*card_ctx::cur, v); SR1;
+// SP2: six versions); ME11: the GDN state as two banks [2][24][128 x 128] F32 and two record sets [2][5][16,512 bytes]
+// a layer, selected by the word *card_ctx::gsel (fn/kernels/round/version.h, fn/kernels/gdn/gdn.h); KV [cell][256] BF16
+// for K and V; the indexer's raw keys [cell][128] BF16 and F32 summaries. A commit moves the committed-slot word and
+// the GDN selector together (fn::round::commit in the model pass, fn::round::advance in layer-test's runner).
 
 #include "fn/kernels/dense/dense.h"
+#include "fn/kernels/experts/experts.h"
 #include "fn/model/model.h"
+#include "fn/xchg/xchg.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -130,6 +134,9 @@ struct draft_weights {
     const uint8_t * ex_gate_up = nullptr;
     const uint8_t * ex_down = nullptr;
     const uint8_t * ex_sh_down = nullptr; // fn::experts::pack_down's layout
+    // ME7: the routed gate/up and down format (fn::experts::fmt), as the loader resolved the draft file's: Q8_0, or the
+    // opt-in Q2_0 (the shared expert stays Q8_0)
+    int32_t ex_fmt = -1;
 };
 bool resolve_draft_weights(const model & m, int32_t card, draft_weights & out, std::string & err);
 // SP2 (sparse draft attention, temporary at SP2's disposition): blk.48.indexer's weights on card 0, GGUF rows (BF16
@@ -146,13 +153,19 @@ bool pack_draft(model & m, std::string & err);
 
 // R1's state of a layer on a card
 struct layer_state {
-    float * gdn = nullptr;        // [5][24][128 x 128]
+    float * gdn = nullptr;        // ME11: the banks [2][24][128 x 128]
+    float * rec = nullptr;        // ME11: the record sets [2][5][fn::gdn::rec_step_floats]
     float * conv = nullptr;       // [6][5120][3]
-    uint16_t * k_cache = nullptr; // [cells][256] BF16
+    uint16_t * k_cache = nullptr; // [cells][256] BF16 (KV8: int8 codes [cells][256])
     uint16_t * v_cache = nullptr;
+    // KV8 (q8 only, else null): the layer's FP16 scales in the class's scale parts, cell c's group g at
+    // [c * kv_q8_scale_stride + g] (the part's base + 4 x the layer's QSA ordinal; fn/kernels/qsa/kv_q8.cuh)
+    uint16_t * k_scale = nullptr;
+    uint16_t * v_scale = nullptr;
     uint16_t * idx_keys = nullptr;   // [cells][128] BF16 (index owner)
     float * idx_summaries = nullptr; // tiled F32 (index owner)
     int32_t n_cells = 0;
+    int32_t kv_attn = -1; // a QSA layer's attention index (layer / 4: kv_tier.h); -1 on a GDN layer
 };
 bool resolve_state(const model & m, int32_t layer, int32_t card, layer_state & out, std::string & err);
 
@@ -190,13 +203,14 @@ struct layer_ws {
     int32_t * sel_off;   // [B + 1] its byte offsets
     int32_t * pos;       // [4][B] positions, one plane a rope section (layer-test's runner writes it before a step)
     int32_t * depth; // [1] cells before the rows (layer-test's runner writes it; the model pass reads the descriptor)
-    uint32_t * cur;  // [1] the committed slot (layer-test's runner; the model pass uses fn::round::state::cur)
+    uint32_t * cur;  // [2] the committed slot, then (ME11) the GDN selector (layer-test's runner; the model pass uses
+                     // fn::round::state::cur and gdn)
     // FFN: the router launch's outputs (the IDs and weights go to the experts' workspace)
     float * logits;   // [B][512]
     float * sg_logit; // [B]
     float * sg;       // [B] sigmoid of the shared gate: the shared expert's weight in EX2's down
 };
-size_t layer_ws_bytes();
+size_t layer_ws_bytes(int32_t rows = layer_max_rows); // FMU2: a joint frame's at fn::xchg::joint_rows
 // DP2's work: one region a launch site, each serving launches of one layout (dense.h: a region zeroed once is reused
 // only by launches with the same layout). The QSA input has a site a role: the index owner's 5 matrices and the
 // peer's 3 split differently, and a card changes role every four QSA layers. The router's site serves both layer
@@ -236,7 +250,10 @@ size_t dense_work_bytes();                 // all of them
 // launches. A host compare; the bodies run it while a graph is captured, not each round.
 bool dense_site_launch(void * work, const dense_layouts & layouts, dense_site site, fn::dense::product_args a,
                        int32_t rows, void * stream, std::string & err);
-layer_ws carve_layer_ws(void * base);
+layer_ws carve_layer_ws(void * base, int32_t rows = layer_max_rows);
+// FMU2: lane u's five-row view of a layer_ws carved at fn::xchg::joint_rows rows: every per-row buffer from row 5u (the
+// selection offsets from entry 6u); the HC run counters, positions, depth and committed-slot words shared
+layer_ws lane_ws(const layer_ws & joint, int32_t u);
 
 // The experts' decode buffers on a card (fn::experts::workspace_offsets): the GLU slots (the routed pairs and the
 // shared expert's rows), the routing, the status word. (x_codes and x_scales are unused since HC3: the FFN input is
@@ -251,6 +268,184 @@ struct ex_bufs {
     uint8_t * meta = nullptr; // the routing meta of ids (fn::experts::meta_bytes), the router's (XB2)
     uint32_t * status = nullptr;
 };
+
+// ME8: a non-owning view of one logical card's routing (its router's top-10 IDs and weights, its shared gate), read by
+// the other logical card's experts when both cards run on one device and one compute stream: the router computed
+// once. The buffers stay the producing card's; the next writer is its next router, after every consumer in stream
+// order (fn::experts::use_route sets a launch pair's routing from it)
+using route_view = fn::experts::route_ptrs;
+
+struct card_ctx;
+struct layer_weights;
+class kv_tier;
+
+// ME3: a byte range on one device (a prompt buffer's part the prompt writes)
+struct byte_span {
+    const void * p = nullptr;
+    int64_t bytes = 0;
+};
+
+// ME4: one ring group of a prompt layer (expert_service::prompt_group): experts [e_lo, e_hi), their pairs (exact after
+// a route-first layer's routing, else a bound), and each logical card's address tables (gate/up, down; 512 entries,
+// only [e_lo, e_hi) meaningful) for ep_gate_up_args::wt and ep_down_args::wt
+struct prompt_group_view {
+    int32_t e_lo = 0, e_hi = 0;
+    int64_t pairs = 0;
+    const uint8_t * const * table[2][2] = {}; // [card][down]
+};
+
+// MX7: a logical card's ep_sum inputs the prompt CPU share's add-back writes (fn/runtime/prompt_share.h): its routing's
+// sorted positions, its partials (F16 [R x 10][2560]) and its error word and bit (ep_down's)
+struct prompt_share_card {
+    const int32_t * pos = nullptr;
+    uint16_t * part16 = nullptr;
+    uint32_t * err = nullptr;
+    uint32_t err_bit = 0;
+    const float * wts = nullptr; // the route weights (TEST: the shadow comparison's report, mx7_shadow.h)
+};
+
+// ME1: the target FFN's routed experts through the expert cache (fn/runtime/expert_cache.h). With a service on both
+// cards (one device holding both, or one each), layer_pair_step runs both FFN bodies as one: both routers, then
+// ffn_pair, which enqueues card k's gate_up and down on c[k]'s stream. ga[k] and da[k] are those launches as the
+// resident banks would run them; the service sets their weights (w, wt), passes (skip, run_if) and CPU slots
+// (ext_slots_d).
+// ME3, the graph executor: a call made while its stream is capturing enqueues only the window's GPU work (resolve, the
+// window's descriptor copies and stamp, the passes and their flag waits, down, the combine), with no host action; the
+// replay's host work is pass_begin (the round boundary, the zone's return, the previous replay's timings) and
+// pass_posted (one service job a layer, each waiting for its window's stamp), both before the launch: a launch can
+// block until the GPU has run part of the replay, which needs the service (ME3). pass_abandon after a launch that
+// failed: the posted jobs end failed. On one device a capture enqueues through ffn_pair (the pair order); on two, each
+// card's capture through ffn_card (layer_card_step's ffn_body), card c's own part of the window on its own device.
+class expert_service {
+  public:
+    virtual ~expert_service() = default;
+    virtual bool ffn_pair(card_ctx * const c[2], const layer_weights * const w[2], int32_t rows,
+                          fn::experts::gate_up_args ga[2], fn::experts::down_args da[2], std::string & err) = 0;
+    virtual bool ffn_card(card_ctx & c, const layer_weights & w, int32_t rows, fn::experts::gate_up_args & ga,
+                          fn::experts::down_args & da, std::string & err) = 0;
+    virtual bool pass_begin(void * const stream[2], std::string & err) = 0;
+    virtual bool pass_posted(int32_t rows, std::string & err) = 0;
+    virtual void pass_abandon(const std::string & why) = 0;
+    // the executor the passes run under (graph: pass_begin and pass_posted frame each replay); set between passes
+    virtual void set_executor(bool graph) = 0;
+    // the prompt path (prompt.cpp): at target layer `layer`'s first expert launch of a chunk, after card 0's routing
+    // (ids: its [rows][10] on card 0's device when the chunk is one half, else null), the layer's experts made readable
+    // (staged) for the launches on card c's stream[c]; then prompt_table gives card's address table (512 entries; down
+    // or gate/up) of that layer for ep_gate_up_args::wt and ep_down_args::wt, and prompt_bank a valid bank pointer on
+    // card's device for their w. ME4: more, another chunk of the run follows (only then may the last layer stage the
+    // next chunk's first ahead)
+    virtual bool prompt_layer(int32_t layer, int32_t rows, const int32_t * ids, bool more, void * const stream[2],
+                              std::string & err) = 0;
+    virtual const uint8_t * const * prompt_table(int32_t layer, int32_t card, bool down) const = 0;
+    virtual const uint8_t * prompt_bank(int32_t card) const = 0;
+    // ME4 (fn/runtime/prompt_plan.h): the next loan stages through the ring (a run of one-half chunks), else ME3's two
+    // layer buffers. After a ring layer's prompt_layer, prompt_groups gives its groups (0: not a ring layer: use
+    // prompt_table). For each group in order: prompt_group makes each card's stream[d] wait for the group's weights and
+    // tables (their copies after every earlier reader of those bytes) and returns them; the caller enqueues the
+    // group's gate/up and down on both logical cards, then prompt_group_done records the group's release after those
+    // readers. ep_sum follows the layer's last group. MX3: rows, the run's largest chunk (0: no ring), sizes the ring
+    virtual void set_prompt_ring(int32_t rows) { (void)rows; }
+    // ME4's comparison base arm (expires at ME4's disposition): ME3's prompt staging (no ring; the parity buffers
+    // at the zone's start; routed-rows)
+    virtual void set_me4_base(bool on) { (void)on; }
+    virtual int32_t prompt_groups(int32_t layer) const {
+        (void)layer;
+        return 0;
+    }
+    virtual bool prompt_group(int32_t layer, int32_t g, void * const stream[2], prompt_group_view & v,
+                              std::string & err) {
+        (void)layer;
+        (void)g;
+        (void)stream;
+        (void)v;
+        err = "prompt_group: no ring";
+        return false;
+    }
+    virtual bool prompt_group_done(int32_t layer, int32_t g, void * const stream[2], std::string & err) {
+        (void)layer;
+        (void)g;
+        (void)stream;
+        err = "prompt_group_done: no ring";
+        return false;
+    }
+    // MX7 (fn/runtime/prompt_share.h): on a ring layer, after prompt_layer, prompt_share_begin with the layer's F16
+    // input ([rows][2560] on card 0's device) posts the CPU's experts' work; prompt_share_skip gives the device mask
+    // (512) of the experts whose tasks es_drop removes after each card's ep_group (null: none); after the layer's last
+    // group, prompt_share_end adds the CPU's products into each card's partials before ep_sum
+    virtual bool prompt_share_begin(int32_t layer, const uint16_t * x16, void * const stream[2], std::string & err) {
+        (void)layer;
+        (void)x16;
+        (void)stream;
+        (void)err;
+        return true;
+    }
+    virtual const uint8_t * prompt_share_skip(int32_t layer) const {
+        (void)layer;
+        return nullptr;
+    }
+    virtual bool prompt_share_end(int32_t layer, const prompt_share_card card[2], void * const stream[2],
+                                  std::string & err) {
+        (void)layer;
+        (void)card;
+        (void)stream;
+        (void)err;
+        return true;
+    }
+    // MX7: on every exit of a layer that called prompt_share_begin (an error between begin and end included): the
+    // layer's CPU job, if any, joined and its plan dropped, so the decode service never finds the pool in the share's
+    // hands. Idempotent; after a prompt_share_end that succeeded, nothing remains
+    virtual void prompt_share_settle(int32_t layer) { (void)layer; }
+    // ME2b: the prompt buffers' region. On one card the expert pool lends PB1's arena and PF1's staging to its slots
+    // between prompts (prompt_lent). prompt_hold(true) before the first write into them (a prompt's staging upload or
+    // preparation, a test's poison): the region's residents retired from the tables, every reader of them and every
+    // copy into the region finished. prompt_hold(false) after their last reader: every stream of the device drained,
+    // the residents refilled as a pass at the next decode window (or drain). Both idempotent; with nothing lent they
+    // return true at once.
+    // ME3: need, the byte spans (on the region's device) the prompt writes. Only the region's slots they touch and the
+    // staging the prompt's layers need are borrowed, and only their residents refilled; null: the whole region and
+    // zone (ME2b's loan).
+    virtual bool prompt_lent() const { return false; }
+    virtual bool prompt_hold(bool on, void * const stream[2], const std::vector<byte_span> * need, std::string & err) {
+        (void)on;
+        (void)stream;
+        (void)need;
+        (void)err;
+        return true;
+    }
+    // ME3: the startup half of the loan's one calculation: refused (err) unless the largest prompt's spans (need) and
+    // its staging fit the loan cap and the kept slots
+    virtual bool prompt_loan_check(const std::vector<byte_span> & need, std::string & err) {
+        (void)need;
+        (void)err;
+        return true;
+    }
+    // ME3: the CPUs the prompt's host helpers run on (the cache's helper mask), null for no preference
+    virtual const std::vector<int32_t> * helper_cpus() const { return nullptr; }
+    // ME3: known-token short reads in progress (their windows counted apart); the base arm's legacy mechanisms (ME3's
+    // comparison switch, expiring at its disposition)
+    virtual void set_short_read(bool on) { (void)on; }
+    virtual void set_legacy(bool on) { (void)on; }
+    virtual bool legacy() const { return false; }
+    // ME3: a request's accounting: request_begin at its prefill's entry, request_json its one line at its end
+    virtual void request_begin() {}
+    virtual std::string request_json() { return std::string(); }
+    // ME3 (Fable's load G ruling, 2026-10-18; Strata #267 adapted): no GPU wait outlives an error. After a round's
+    // completion wait timed out, or at teardown with work still on the streams (only_if_busy): the service's waiting
+    // jobs ended, every word a window's or a replay's swap wait reads raised until the devices' streams drain or
+    // timeout_ms passes, and every later window refused (the engine is started again, not computed on). note: what
+    // happened, empty when only_if_busy found nothing running. True when the streams drained
+    virtual bool release_gpu_waits(int32_t timeout_ms, bool only_if_busy, std::string & note) {
+        (void)timeout_ms;
+        (void)only_if_busy;
+        note.clear();
+        return true;
+    }
+};
+
+// ME3: a call a service makes once during its init, after the buffers its windows' GPU work names exist and before its
+// pool takes the device's remaining memory (the graph executor's capture: the graphs come out of the device's account
+// ahead of the pool)
+using service_hook = std::function<bool(expert_service &, std::string &)>;
 
 // What one card needs to run steps: its workspaces from R1's reservation and the rings.
 struct card_ctx {
@@ -283,6 +478,9 @@ struct card_ctx {
     // SR1: the committed slot of every versioned object (fn/kernels/round/version.h) on this card's device: the round
     // state's cur in the model pass, ws.cur in layer-test's runner
     const uint32_t * cur = nullptr;
+    // ME11: the GDN state's selector (fn/kernels/round/version.h): the round state's gdn in the model pass, ws.cur + 1
+    // in layer-test's runner
+    const uint32_t * gsel = nullptr;
     // an optional observer, called after each piece is enqueued (layer-bench's per-piece events); null: none
     void (*observe)(void * user, int32_t card, const char * piece) = nullptr;
     void * observe_user = nullptr;
@@ -290,6 +488,14 @@ struct card_ctx {
     // (device or pinned host memory, in stream order) after its body, before the next HC sublayer resets its X-HMIX
     // slot (HC3); null: none
     float * record_mixed[2] = {nullptr, nullptr};
+    // ME10: set by the expert cache's window when its one-device finish wrote this card's ws.out[1] (combine and X-F's
+    // exchange in one launch); layer_pair_step clears it before the FFN body and skips X-F's send and receive after it
+    bool ffn_finished = false;
+    // ME1: the expert cache's service (null: the resident banks)
+    expert_service * ex_service = nullptr;
+    // ME1 (--kv-host): the host-backed KV tier (kv_tier.h): the decode attention's K/V pointers and remapped bodies,
+    // the prompt's staging (null: the resident KV classes)
+    kv_tier * kv = nullptr;
 };
 bool resolve_card(const model & m, int32_t card, void * stream, card_ctx & out, std::string & err);
 // Zeroes the workspaces whose counters every complete launch leaves at zero (QA1b's select scratch, DP2's work,
@@ -356,6 +562,10 @@ bool half_exchange(card_ctx & c, int32_t set, int32_t rows, int32_t slot, bool s
 // card_ctx::observe
 void note_piece(const card_ctx & c, const char * piece);
 
+// ME8: whether card 1's FFN reads card 0's routing (both cards on one device and one non-null compute stream): its own
+// router, IDs, weights, shared gate and logits are then not written, and a reader of card 1's routing reads card 0's
+bool one_router(const card_ctx & c0, const card_ctx & c1);
+
 // One layer of B rows at positions N_before .. N_before + B - 1 (c.n_before and c.pos, device memory; the caller
 // checks N_before + B against the state's cells before it enqueues).
 // layer_pair_step enqueues both cards' work in phases, every send before the receive that reads it (down2 and up2 of
@@ -369,5 +579,44 @@ step_status layer_pair_step(card_ctx * const c[2], const layer_weights * const w
 step_status layer_card_step(card_ctx & c, const layer_weights & w, const layer_state & st, const layer_input & in,
                             int32_t rows, use_counters & u, std::string & err);
 
+// ---- FMU2: the joint round on one card (fn/xchg/xchg.h joint_rings) ----
+//
+// 2..4 slots' rounds of layer_max_rows rows each, as lanes of one stream: lane u's rows are the joint rows
+// 5u .. 5u + 4. Each lane's frame (lane[u]) is its slot's card_ctx with the lane's ring (joint_rings::lane(u)), the
+// joint layer_ws's lane view (lane_ws; lane 0's is the joint frame's base) and the joint routing buffers' lane view
+// (ex.ids, ex.wts rows 5u ..); its state, descriptor depth and positions, committed slot and GDN selector stay its
+// slot's. A layer runs both HC sublayers as one launch for every lane, each lane on its own ring (fn::hc::sub_joint,
+// BF16 HC weights); the dense products once for every lane (fn::dense::product_joint: each weight tile decoded
+// once, each row's result bitwise the lone launch's); the slot pieces per lane (gdn_core, QSA's summary, select,
+// X-SELECT and attend, the experts); X-A and X-F once over every lane's rows on the joint slots. Every lane takes the
+// same pieces in the same order on both cards with the lone slot rules (one use_counters for all lanes), so each
+// lane's ring sees the lone sequence. Resident banks only (no expert service, no host-backed KV); for a graph capture
+// (one card's whole round on its stream), or eagerly in layer_pair_step's order (layer_joint_pair_step).
+struct joint_lanes {
+    int32_t lanes = 0;
+    card_ctx * lane[fn::xchg::max_lanes] = {};
+    const fn::xchg::joint_rings * jr = nullptr;
+    void * dense_work = nullptr; // joint_dense_work_bytes(), zeroed once, this card's
+    dense_layouts dense_sites{}; // joint_dense_layouts (the target's six sites)
+};
+bool joint_dense_layouts(dense_layouts & out, std::string & err);
+size_t joint_dense_work_bytes();
+size_t joint_ple_work_offset(); // FMU2 build item 4: PLE's joint products' region (fn::ple::products_joint)
+// the routing buffers' bytes on a card for joint rows: IDs [20][10] I32, then weights [20][10] F32 (joint_route_carve);
+// FMU2 (build item 1): then each lane's experts' GLU slots (codes [55][320], scales [55][10][2]) and routing meta
+// (fn::experts::meta_bytes), so the lanes' gate/up and down run in one launch (fn::experts::gate_up_lanes)
+size_t joint_route_bytes();
+void joint_route_carve(void * base, int32_t *& ids, float *& wts);
+// lane u's GLU slots and meta in the joint routing region (base: joint_route_bytes), into ex
+void joint_lane_ex(void * base, int32_t u, ex_bufs & ex);
+step_status layer_joint_step(joint_lanes & j, const layer_weights & w, const layer_state * const st[],
+                             const layer_input in[], use_counters & u, std::string & err);
+// Both cards' joint lanes (j[0] on card 0, j[1] on card 1, the same lanes) in layer_pair_step's phases, sends before
+// receives and the HC sublayers as modes 1 then 2, so the joint round also runs where kernels execute one at a time
+// (Compute Sanitizer); layer_joint_step's launches on each card, each HC sublayer's mode-3 launch split in two.
+// st[k], in[k]: card k's lanes'.
+step_status layer_joint_pair_step(joint_lanes * const j[2], const layer_weights * const w[2],
+                                  const layer_state * const * const st[2], const layer_input * const in[2],
+                                  use_counters u[2], std::string & err);
 
 } // namespace fn::model

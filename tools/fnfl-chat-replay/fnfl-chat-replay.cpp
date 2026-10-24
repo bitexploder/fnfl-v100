@@ -12,6 +12,9 @@
 // CPU only: it loads the model's vocabulary and chat template from the GGUF metadata, no weights.
 //
 // usage: fnfl-chat-replay -m <model.gguf> [--json <out.jsonl>] [--quiet] <cases.json|cases.jsonl>...
+// ME4 (--prompt-tokens <out.jsonl>): instead of replaying, write each case's request as the server tokenizes its
+// prompt (oaicompat_chat_params_parse, then tokenize_input_prompts with special tokens, as server-context.cpp does for
+// a chat completion): {"name", "n_tokens", "tokens"} a line. The ME4 fixture's token IDs; no weights are loaded
 // A case: {"name", "request" | "request_file", "text" | "tokens", "stop": "eos"|"limit", "expect": {...}}
 //   expect: {"content", "reasoning_content", "tool_calls": [{"name", "arguments": {...}}], "lenient": bool}
 // Exit status: 0 when every case passes.
@@ -225,6 +228,7 @@ struct log_tail {
 int main(int argc, char ** argv) {
     std::string              model_path;
     std::string              json_out;
+    std::string              prompt_out; // ME4: --prompt-tokens
     bool                     quiet = false;
     std::vector<std::string> case_files;
     for (int i = 1; i < argc; i++) {
@@ -235,6 +239,8 @@ int main(int argc, char ** argv) {
             json_out = argv[++i];
         } else if (a == "--quiet") {
             quiet = true;
+        } else if (a == "--prompt-tokens" && i + 1 < argc) {
+            prompt_out = argv[++i];
         } else {
             case_files.push_back(a);
         }
@@ -284,6 +290,11 @@ int main(int argc, char ** argv) {
     };
 
     FILE * jout = json_out.empty() ? nullptr : fopen(json_out.c_str(), "w");
+    FILE * pout = prompt_out.empty() ? nullptr : fopen(prompt_out.c_str(), "w");
+    if (!prompt_out.empty() && pout == nullptr) {
+        fprintf(stderr, "cannot write %s\n", prompt_out.c_str());
+        return 2;
+    }
     int    n_pass = 0, n_fail = 0;
 
     for (const auto & cf : case_files) {
@@ -320,6 +331,29 @@ int main(int argc, char ** argv) {
             json body = c.contains("request") ? c.at("request")
                                               : json::parse(read_file(dir_of(cf) + "/" + c.at("request_file").get<std::string>()));
             body["stream"] = true;
+
+            if (pout != nullptr) {
+                // ME4: the request's prompt as the server tokenizes it
+                try {
+                    const json                       data = oaicompat_chat_params_parse(body, chat_params);
+                    const std::vector<server_tokens> in =
+                        tokenize_input_prompts(vocab, data.at("prompt"), true, true);
+                    if (in.size() != 1) {
+                        throw std::runtime_error("not one prompt");
+                    }
+                    llama_tokens toks;
+                    for (size_t i = 0; i < in[0].size(); i++) {
+                        toks.push_back(in[0][i]);
+                    }
+                    const json out = { { "name", name }, { "n_tokens", toks.size() }, { "tokens", toks } };
+                    fprintf(pout, "%s\n", out.dump().c_str());
+                    n_pass++;
+                } catch (const std::exception & e) {
+                    fprintf(stderr, "%s: request rejected: %s\n", name.c_str(), e.what());
+                    n_fail++;
+                }
+                continue;
+            }
 
             // a recorded turn: the request's messages end with the assistant message the model wrote; the text is
             // that message re-rendered by the chat template, and the parse must give the message back
@@ -625,6 +659,9 @@ int main(int argc, char ** argv) {
                 fprintf(jout, "%s\n", rec.dump().c_str());
             }
         }
+    }
+    if (pout != nullptr) {
+        fclose(pout);
     }
     if (jout) {
         fclose(jout);

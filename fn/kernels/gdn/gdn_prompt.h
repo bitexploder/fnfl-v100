@@ -3,7 +3,10 @@
 // The GDN mixer's math over prompt rows (PB1; PK3's span, FC-PF3's FC-GDN1 row) on one card: between the input products
 // (qkv, z, alpha, beta: fn::dense prompt launches) and ssm_out. A run of R rows (1 .. 4,096, a half) at consecutive
 // positions reads logical version v_in of the recurrent state and the convolution history and leaves one version,
-// v_out, at the run's end; nothing is written per row (FC-PF3).
+// v_out, at the run's end; nothing is written per row (FC-PF3). ME11: the recurrent state's logical versions are banks
+// (fn::round::gdn_bank_of): v_in = 0 is the committed bank with the selector's k records replayed onto it, element by
+// element as gdn_core does (gdn.h), and v_out >= 1 the other bank; a second half (v_in = v_out's bank) works in place,
+// each scan thread loading and storing the same cells.
 //   gdn_prompt_conv:  the causal convolution with SiLU (gdn_conv.cuh's per-row arithmetic: one FMUL, three FMAs, x / (1
 //                     + expf(-x))) over the run, from version v_in's 3-tap history; the run's last 3 inputs to v_out.
 //                     PB3: the input F32 or the product's FP16 output (its values, as F32, are the history's too).
@@ -48,8 +51,10 @@ struct prompt_args {
     float *          conv_out = nullptr;   // [rows][5120] post-SiLU; q and k normalized in place by prep
     const float *    conv_w   = nullptr;   // [5120][4]
     float *          hist     = nullptr;   // [5][5120][3]
-    float *          state    = nullptr;   // [5][24][128][128]
-    const uint32_t * cur      = nullptr;   // device: the committed slot
+    float *          state    = nullptr;   // [2][24][128][128] the banks (ME11, gdn.h)
+    const float *    rec      = nullptr;   // [2][5][rec_step_floats] the record sets (ME11): read at v_in = 0
+    const uint32_t * gsel     = nullptr;   // device: the GDN selector (fn::round::gdn_word)
+    const uint32_t * cur      = nullptr;   // device: the committed slot (the history)
     int32_t          v_in = 0, v_out = 1;  // logical versions read and written
     const float *    alpha    = nullptr;   // [rows][24] raw
     const float *    beta_raw = nullptr;

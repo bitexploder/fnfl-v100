@@ -21,6 +21,8 @@
 // HC layouts and, for EX1, the pack permutation derived by index probes of pack_gate_up and pack_down), are hashed
 // with SHA-256 and compared with the hash of the GGUF slice read from the mapping.
 
+#include "fn/kernels/experts/experts.h"
+#include "fn/kernels/experts/experts_cpu.h"
 #include "fn/loader/sha256.h"
 #include "fn/model/model.h"
 #include "fn/runtime/ple_host.h"
@@ -40,6 +42,23 @@ struct load_params {
     int64_t piece_bytes = int64_t(64) << 20;
     // PN1: the PLE table's residency (load_for_run): full populates and pins it, lazy leaves the plain mapping
     runtime::ple_residency ple_table = runtime::ple_residency::lazy;
+    // ME1: the target's routed experts are left to the expert cache (fn/runtime/expert_cache.h, which packs them into
+    // host memory); their regions get no device bytes. With device[0] == device[1] both logical cards share the one
+    // device, and card 1's copies of the tensors replicated whole on both cards read card 0's (model::single)
+    bool expert_cache = false;
+    // MEKV (--kv-host, one or two devices): the host-backed KV tier (fn/model/kv_tier.h): the target and draft KV
+    // classes
+    // in mapped pinned host memory and the tier's device class (state_params::kv_window); ME3 (--kv-window): its window
+    bool kv_host = false;
+    int32_t kv_window = 32768;
+    // MU1 (--parallel 2..4, resident TP): the slots; above one, each slot's own classes (fn/model/state.h slot_class)
+    // and the shared KV pool (fn/model/kv_pool.h) at n_cells a slot, and the other-reader lane's classes. MXMU1: or 2
+    // on one card with the expert cache and the host-backed tier: each slot's classes of its own, no pool or lane
+    int32_t n_slots = 1;
+    // KV8 (--fnfl-kv-format q8, resident TP on two devices): the target KV in the 8-bit format (state_params::kv_q8);
+    // pool_cells (more than one slot): the KV pool's physical cells, at least a slot's (0: a slot's)
+    bool kv_q8 = false;
+    int32_t pool_cells = 0;
 };
 
 // Wall times are measured with steady_clock on the host; busy times are summed over threads (thread-seconds).
@@ -97,5 +116,36 @@ bool verify_device(const load_params & p, const model::model & m, const std::vec
 // The CPU dry run of the same check: each unit filled on the host by the loader's fill instead of read back (no GPU).
 bool verify_host(const load_params & p, const model::model & m, const std::vector<card_digests> & want,
                  verify_report & rep, std::string & err);
+
+// ME1: one target layer's routed experts as the expert cache holds them (fn/runtime/expert_cache.h). An entry is one
+// expert of the layer with both cards' halves: [gate/up card 0][down card 0][gate/up card 1][down card 1], each the
+// bytes the device region of that card would hold for the expert (pack_gate_up of its 320 gate and 320 up rows,
+// pack_down of its 2,560 rows' 320 columns). Every part is a multiple of 256 bytes.
+struct expert_layer {
+    int32_t layer = -1;
+    int32_t gu_region = -1, dn_region = -1; // placement regions (the gate region holds the up tensor too)
+    experts::fmt gu_fmt = experts::fmt::iq3_xxs, dn_fmt = experts::fmt::q2_0;
+    int64_t gu_bytes = 0, dn_bytes = 0; // one card's half of one expert
+    int64_t entry_bytes() const { return 2 * (gu_bytes + dn_bytes); }
+    int64_t gu_at(int32_t card) const { return card * (gu_bytes + dn_bytes); }
+    int64_t dn_at(int32_t card) const { return card * (gu_bytes + dn_bytes) + gu_bytes; }
+};
+// the layer's regions and formats from the opened model (open_model); false (err set) for a layer outside the target
+// or regions that are not EX1's
+bool expert_layer_of(const model::model & m, int32_t layer, expert_layer & out, std::string & err);
+// expert e's entry into dst (entry_bytes), packed from the mapping (CPU); false on a failed pack
+bool pack_expert_entry(const model::model & m, const expert_layer & l, int32_t e, uint8_t * dst);
+// ME4: the layer's routed experts as immutable native views into the model's GGUF mappings (the CPU miss path's
+// operands, experts_cpu.h native_layer): the gate, up and down tensors' data, their row and expert strides. Checked:
+// each tensor placed and mapped, the EX1 shapes ([512][640][2,560] gate and up, [512][2,560][640] down), gate and up
+// of the layer's gate/up format and down of its down format, the row bytes the CPU kernels read (gu_row_bytes,
+// dn_row_bytes), and every expert's bytes inside its file's mapping. The model owns the mappings; the views live as
+// long as it. False (err) on any difference
+// ME7: the startup account's line on the MTP draft's routed experts: the format resolved from the draft file (Q8_0, or
+// the opt-in Q2_0), their packed bytes on each card and the placement's Q8_0 bytes, and the cards' weight totals that
+// follow (open_model's; the target cache's pool is sized after them)
+std::string draft_expert_line(const model::model & m);
+bool native_expert_layer(const model::model & m, const expert_layer & l, experts::cpu::native_layer & out,
+                         std::string & err);
 
 } // namespace fn::loader

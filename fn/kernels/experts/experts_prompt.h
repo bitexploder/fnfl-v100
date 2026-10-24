@@ -22,7 +22,9 @@
 //            rejected (false, nothing enqueued). An expert ID outside [0, 512) sets status[0] = 1 (when
 //            status is not null); then no task runs and ep_sum writes nothing.
 //   formats: gate/up IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S; down Q2_0, IQ4_NL, in EX1's packed layout (experts.h:
-//            pack_gate_up, pack_down): one copy of the weights serves decode and prompt rows.
+//            pack_gate_up, pack_down): one copy of the weights serves decode and prompt rows. ME1 (the Q4 candidate's):
+//            gate/up Q4_K, Q5_K (weight code x d sc minus dmin min: q x s + c, s and c each rounded once to FP16 from
+//            the exact F32 product, then one FP16 rounding); down Q5_1 (q x d + m, one rounding) and Q8_0 (as IQ4_NL).
 //   math:    weights FP16 (FNFL's choice for Volta's tensor cores, which take FP16 only): code x scale rounded once
 //            to FP16, the scale itself rounded to FP16 first; activations FP16 as the producer wrote them (EP-5: no
 //            in-kernel conversion); FP32 accumulation (HMMA.884.F32); GLU
@@ -87,6 +89,10 @@ struct ep_route {
     int32_t * counters;
 };
 
+// ME4: task_off [513] (4-byte aligned): task_off[e] the first of ep_group's tasks (sorted by expert) whose expert is
+// at least e, task_off[512] the task count (0 after a bad ID). The ring's groups run [task_off[e_lo], task_off[e_hi])
+bool ep_task_offsets(const ep_route & r, int32_t * task_off, void * stream);
+
 // task_rows: ep_task_rows of the layer's gate/up format (any multiple of 8 in [8, 48] for ep_down alone)
 bool ep_group(int32_t rows, int32_t task_rows, const int32_t * ids, const ep_route & r, uint32_t * status,
               void * stream);
@@ -98,6 +104,13 @@ struct ep_gate_up_args {
     ep_route route;        // as ep_group wrote it
     uint16_t * glu;        // F16 [R x 10][320] out
     float * glu_f32;       // F32 [R x 10][320] out, test only; nullptr in production
+    // ME1 (the expert cache): non-null, expert e's packed gate/up is wt[e] (a device table of 512 pointers, 16-byte
+    // aligned entries; the streamed prompt's staged or cached experts) instead of w + e x gate_up_bytes(f)
+    const uint8_t * const * wt = nullptr;
+    // ME4 (a ring group; read only with wt): with task_off (ep_task_offsets' [513]), only the tasks of experts
+    // [e_lo, e_hi): [task_off[e_lo], task_off[e_hi]); grid, the blocks launched (0: ep_max_tasks), at least those tasks
+    const int32_t * task_off = nullptr;
+    int32_t e_lo = 0, e_hi = 512, grid = 0;
 };
 
 struct ep_down_args {
@@ -111,6 +124,11 @@ struct ep_down_args {
     uint16_t * part16 = nullptr;
     uint32_t * err = nullptr;
     uint32_t err_bit = 0;
+    // ME1: as ep_gate_up_args::wt, for down (down_bytes(f) an expert)
+    const uint8_t * const * wt = nullptr;
+    // ME4: as ep_gate_up_args' (read only with wt)
+    const int32_t * task_off = nullptr;
+    int32_t e_lo = 0, e_hi = 512, grid = 0;
 };
 
 struct ep_sum_args {

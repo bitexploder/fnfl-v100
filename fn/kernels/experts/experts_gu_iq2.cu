@@ -16,4 +16,10 @@ bool gate_up_iq2_s(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gat
     return gate_up_for<fmt::iq2_s>(fg, fu, rows, a, st);
 }
 
+// ME10: both shards of one cache pass in one launch (the IQ2 body's pair family), B = 4 and 5
+bool gate_up_pair_iq2(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
+                      cudaStream_t st) {
+    return gate_up_pair_u<gu_iq2>(f, fg, fu, rows, a, st);
+}
+
 } // namespace fn::experts::detail

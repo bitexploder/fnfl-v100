@@ -87,8 +87,13 @@ __device__ __forceinline__ float warp_sum(float v) {
 //                warp its 512-byte state row (logical version 0, one float4 a lane), the dominant stream.
 //             2. while the state streams: q, k, z, ssm_norm and v into shared memory and the gates; one barrier; the
 //                q and k norms, warp 2b + w (w = 0 for q, 1 for k) normalizing row b's 128 values; one barrier.
-//             3. the recurrence, the rows in order; each row step stores logical version b + 1. Every warp runs it
-//                (warp 21 of a 21-row split on a copy of row 20, storing nothing), so no branch encloses its shuffles.
+//             3. ME11: the committed matrix materialized in registers: each row warp replays the selector's k records
+//                onto its row (per step: the decay, the group's normalized k, the row's delta; m <- fmaf(k, delta, m *
+//                decay)) and stores the result, the pre-step state, into the other bank. Then the recurrence, the rows
+//                in order, in registers; each step records its operands into the other set (one writer an element:
+//                the normalized k by split 0 of head g < 8 (the group's first head), the decay by split 0 of each
+//                head, delta by lane 0 of each real row warp). Every warp runs it (warp 21 of a 21-row split on a
+//                copy of row 20, storing nothing), so no branch encloses its shuffles.
 //             4. warps 0..B-1 write the block's o to gated (F32); the head's last block (see hand-off) reads its rows
 //                of gated (all 6 blocks' o) in one round, sums o^2 over each row's 128, applies the norm, ssm_norm and
 //                sigmoid(z), and writes gated and its activation format.
@@ -115,12 +120,15 @@ __device__ __forceinline__ float warp_sum(float v) {
 //             version, and per row and head for gated <= 1e-4 max(1, 1e-3 / cond), cond = rms(o) / (max_j |M_j| /
 //             sqrt(128)) from the reference (GD1 Amendment 1: o = Mq can cancel, and the norm rescales it), with every
 //             output exactly 0 where cond is 0; the activation format bitwise.
-//   versions: (SR1) logical version v at slot fn::round::version_slot(cur, v), cur read once from its device word at
-//             the start (before the small loads); the state row's address waits for it.
-//   floor:    1.949 us + bytes / 1,021.6 GB/s; bytes a launch: reads 1,572,864 + B 45,248 + 704 (state; conv, z, alpha,
-//             beta, the finish's re-read; dt, a, ssm_norm), writes B 1,601,280 (versions; o, the finish's rewrite,
-//             codes and scales): 1.709 / 4.804 MB at B = 3, 8.32 us. Forecast T(B) with the measured write rate W =
-//             1,318.9 GB/s (Amendment 2b step 0): 8.665 us at B = 3, 6.349 at B = 1 [A, GD1 results.json a2b].
+//   versions: (ME11) the selector read once from its device word at the start (before the small loads); bank, set and
+//             k through fn::round::gdn_bank, gdn_set and gdn_steps (version.h). The round never writes the committed
+//             bank or set. The replay is the recurrence's own per-cell sequence on the stored operands (FMUL by the
+//             decay, then the FFMA with that product as the addend), so version k is reproduced bit for bit.
+//   floor:    (GD1, before ME11) 1.949 us + bytes / 1,021.6 GB/s; bytes a launch: reads 1,572,864 + B 45,248 + 704
+//             (state; conv, z, alpha, beta, the finish's re-read; dt, a, ssm_norm), writes B 1,601,280 (versions; o,
+//             the finish's rewrite, codes and scales). ME11 [counted]: the state reads 1,572,864 + k 16,512 (the
+//             bank and k records), writes 1,572,864 + B 16,512 (the pre-step bank and B records) in place of
+//             B 1,572,864 versions; unmeasured.
 //   evidence: GD1 (gd-test, gd-bench); simulator node gdn.recur (family gdn_recur).
 template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(const core_args a) {
     // the small values, one array (32-bit shared offsets): q [B][128], k [B][128], z [B][128], ssm_norm [128], v [B][22]
@@ -140,7 +148,7 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
     const int32_t n_rows = split_rows(s);
     const int32_t tid = static_cast<int32_t>(threadIdx.x);
     const int32_t warp = tid / 32, lane = tid % 32;
-    const uint32_t cur = *a.cur; // the committed slot (SR1)
+    const uint32_t gs = *a.gsel; // ME11: the committed bank, set and steps (version.h)
 
     // 1. the small loads, then the state row: threads 0..255 the group's q and k, 256..383 the head's z (and
     // ssm_norm), warp 12's lanes the block's v (B values each, into s_f), warp 13 the gates' inputs
@@ -177,10 +185,9 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
     const bool has_row = warp < n_rows;
     const int32_t row_off = (h * head_dim + row0 + (has_row ? warp : n_rows - 1)) * head_dim; // floats, in a version
     constexpr int32_t sv = static_cast<int32_t>(state_version_floats);
-    // the state and its versions are read next a pass later: evict-first (__ldcs, __stcs) keeps the round's code in L2
-    // (XB1, from CR3)
-    float4 m =
-        __ldcs(reinterpret_cast<const float4 *>(a.state + fn::round::version_slot(cur, 0) * sv + row_off) + lane);
+    // the state is read next a pass later: evict-first (__ldcs, __stcs) keeps the round's code in L2 (XB1, from CR3)
+    float4 m = __ldcs(
+        reinterpret_cast<const float4 *>(a.state + fn::round::gdn_bank_of(gs, 0) * sv + row_off) + lane);
 
     // 2. while the state streams: the small values into shared memory, the gates; then the q and k norms, one warp a
     // (q or k, row) vector
@@ -196,8 +203,12 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
         const float xg = ga + gdt;
         const float lp = logf(1.0f + expf(xg)); // computed for every x and selected (no branch; inf above about 88)
         const float sp = xg > 20.0f ? xg : lp;
-        s_decay[lane] = expf(sp * gaa);
+        const float dec = expf(sp * gaa);
+        s_decay[lane] = dec;
         s_beta[lane] = sigmoid_fast(gb);
+        if (s == 0) { // ME11: the head's decay, one writer (split 0)
+            a.rec[(1 - fn::round::gdn_set(gs)) * rec_set_floats + lane * rec_step_floats + rec_decay + h] = dec;
+        }
     }
     __syncthreads();
     const float4 * s_q = reinterpret_cast<const float4 *>(s_f + o_q); // [B][32]
@@ -218,7 +229,37 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
     }
     __syncthreads();
 
-    // 3. the recurrence: one warp a row, the step's rows in order (a rolled loop of B trips: code size, R17)
+    // 3. ME11: the group's normalized k into the round's record set (split 0 of the group's first head, h = g)
+    float * rec_out = a.rec + (1 - fn::round::gdn_set(gs)) * rec_set_floats;
+    if (h < n_group && s == 0 && tid < B * head_dim) {
+        rec_out[(tid / head_dim) * rec_step_floats + rec_k + h * head_dim + tid % head_dim] = s_f[o_k + tid];
+    }
+    // the committed matrix: the selector's k records replayed onto the bank's row, the recurrence's own operations
+    const int32_t j_row = row0 + (has_row ? warp : n_rows - 1);
+    {
+        const float * rec_in = a.rec + fn::round::gdn_set(gs) * rec_set_floats;
+        const int32_t steps = fn::round::gdn_steps(gs);
+#pragma unroll 1
+        for (int32_t t = 0; t < steps; ++t) {
+            const float * r = rec_in + t * rec_step_floats;
+            const float dec = __ldg(r + rec_decay + h);
+            const float4 kv = __ldg(reinterpret_cast<const float4 *>(r + rec_k + g * head_dim) + lane);
+            const float delta = __ldg(r + rec_delta + h * head_dim + j_row);
+            m.x *= dec;
+            m.y *= dec;
+            m.z *= dec;
+            m.w *= dec;
+            m.x = fmaf(kv.x, delta, m.x);
+            m.y = fmaf(kv.y, delta, m.y);
+            m.z = fmaf(kv.z, delta, m.z);
+            m.w = fmaf(kv.w, delta, m.w);
+        }
+    }
+    if (has_row) { // the pre-step state into the other bank (logical version 1's bank)
+        __stcs(reinterpret_cast<float4 *>(a.state + fn::round::gdn_bank_of(gs, 1) * sv + row_off) + lane, m);
+    }
+
+    // 4. the recurrence: one warp a row, the step's rows in order (a rolled loop of B trips: code size, R17)
     {
         const float scale = 1.0f / sqrtf(float(head_dim));
 #pragma unroll 1
@@ -245,9 +286,8 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
             o = fmaf(m.z, qv.z, o);
             o = fmaf(m.w, qv.w, o);
             o = warp_sum(o) * scale;
-            if (has_row) {
-                __stcs(reinterpret_cast<float4 *>(a.state + fn::round::version_slot(cur, b + 1) * sv + row_off) + lane,
-                       m);
+            if (has_row && lane == 0) { // ME11: the step's delta, the only per-step state write
+                rec_out[b * rec_step_floats + rec_delta + h * head_dim + j_row] = delta;
             }
             if (lane == 0) {
                 s_o[b][warp] = o;
@@ -256,7 +296,7 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
     }
     __syncthreads();
 
-    // 4. publish o, then the head's last block finishes the norm from its 128 values a row
+    // 5. publish o, then the head's last block finishes the norm from its 128 values a row
     uint32_t * counter = static_cast<uint32_t *>(a.ws) + h;
     if (warp < B && lane < n_rows) {
         a.gated[warp * n_value + h * head_dim + row0 + lane] = s_o[warp][lane];
@@ -350,7 +390,8 @@ size_t workspace_bytes() {
 bool core(const core_args & a, void * stream) {
     if (a.rows < 1 || a.rows > max_rows || !aligned16(a.conv) || !aligned16(a.z) || !aligned16(a.alpha) ||
         !aligned16(a.beta) || !aligned16(a.dt) || !aligned16(a.a) || !aligned16(a.norm_w) || !aligned16(a.state) ||
-        a.cur == nullptr ||
+        !aligned16(a.rec) || a.gsel == nullptr ||
+        (a.rec < a.state + n_bank * state_version_floats && a.state < a.rec + n_rec_set * rec_set_floats) ||
         !aligned16(a.gated) || !aligned16(a.gated_q.codes) || !aligned16(a.gated_q.scales) || !aligned16(a.ws) ||
         a.gated_q.rows != a.rows || a.gated_q.k != n_value || stream == nullptr) {
         return false;

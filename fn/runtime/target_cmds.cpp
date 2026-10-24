@@ -8,7 +8,9 @@
 #include "fn/loader/run_load.h"
 #include "fn/model/state.h"
 #include "fn/proto/xp1/timing.h"
+#include "fn/quant/kv_q8_ref.h"
 #include "fn/xchg/xchg.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/model.h"
 #include "fn/model/pass.h"
 #include "fn/model/shapes.h"
@@ -18,6 +20,7 @@
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <chrono>
@@ -163,6 +166,14 @@ bool load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char
     lp.model_path = a.model_path;
     lp.draft_path = a.draft_path;
     lp.ple_table = a.ple_table;
+    if (a.single_card >= 0) { // ME1: both logical cards on one device, the routed experts left to the expert cache
+        lp.device[0] = lp.device[1] = a.single_card;
+    }
+    lp.expert_cache = a.cached(); // ME1: one device or cached TP
+    lp.kv_host = a.kv_host;       // ME1: the host-backed KV tier (one device)
+    lp.kv_window = a.cache.kv_window; // ME3
+    lp.kv_q8 = a.kv_q8;               // KV8
+    lp.pool_cells = a.pool_cells;
     fn::loader::run_load_report lr;
     std::string err;
     if (!fn::loader::load_for_run(lp, n_cells, m, lr, err)) {
@@ -172,9 +183,11 @@ bool load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char
     printf("%s: model loaded in %.2f s (open %.2f, fill %.2f, reserve %.2f) at %d cells; free %.3f / %.3f GiB\n", tool,
            lr.total_s, lr.open_s, lr.fill_s, lr.reserve_s, n_cells, double(lr.free_after[0]) / 1073741824.0,
            double(lr.free_after[1]) / 1073741824.0);
+    printf("%s: KV format %s\n", tool, a.kv_q8 ? "q8 (KV8: int8 codes, an FP16 scale a group of 64)" : "bf16");
     for (const std::string & line : fn::loader::ple_table_lines(lr)) {
         printf("%s: %s\n", tool, line.c_str());
     }
+    printf("%s: %s\n", tool, fn::loader::draft_expert_line(m).c_str()); // ME7
     return true;
 }
 
@@ -187,6 +200,12 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
     fn::loader::load_params lp;
     lp.model_path = a.model_path;
     lp.draft_path = a.draft_path;
+    if (a.single_card >= 0) { // ME1, as load
+        lp.device[0] = lp.device[1] = a.single_card;
+    }
+    lp.expert_cache = a.cached();
+    lp.kv_host = a.kv_host;
+    lp.kv_window = a.cache.kv_window;
     fn::loader::load_times lt;
     std::string err;
     for (int32_t c = 0; c < 2; ++c) {
@@ -198,6 +217,7 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
         fprintf(stderr, "model-dry: %s\n", err.c_str());
         return false;
     }
+    printf("model-dry: %s\n", fn::loader::draft_expert_line(m).c_str()); // ME7
     for (int32_t c = 0; c < 2; ++c) {
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device") ||
             !cuda_ok(cudaMemset(m.weights[c].data(), 0, m.weights[c].size()), "zero weights")) {
@@ -208,21 +228,16 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
     sp.n_cells = n_cells;
     sp.ple_conv_kernel = m.ple_conv_kernel;
     sp.ple_ngram = m.ple_ngram;
-    for (const md::buffer_class & plan : md::state_classes(sp)) {
-        auto rc = std::make_unique<md::reserved_class>();
-        rc->plan = plan;
-        for (int32_t c = 0; c < 2; ++c) {
-            const int64_t bytes = plan.allocation(c);
-            if (!rc->buf[c].allocate(m.device[c], size_t(bytes), err) ||
-                (bytes > 0 && (!cuda_ok(cudaSetDevice(m.device[c]), "device") ||
-                               !cuda_ok(cudaMemset(rc->buf[c].data(), 0, size_t(bytes)), "zero state")))) {
-                fprintf(stderr, "model-dry: %s %s\n", plan.name.c_str(), err.c_str());
-                return false;
-            }
-        }
-        m.state.push_back(std::move(rc));
+    sp.kv_window = m.kv_host ? m.kv_window : 0;
+    sp.single = m.single;
+    sp.kv_q8 = a.kv_q8; // KV8
+    int64_t host_bytes = 0;
+    if (!fn::loader::reserve_state(m, sp, a.n_slots, host_bytes, err, a.pool_cells)) {
+        fprintf(stderr, "model-dry: %s\n", err.c_str());
+        return false;
     }
-    if (!fn::loader::fill_ex1_grids(m, err) || !fn::xchg::enable_peer_access(m.device[0], m.device[1])) {
+    if (!fn::loader::fill_ex1_grids(m, err) ||
+        (!m.single && !fn::xchg::enable_peer_access(m.device[0], m.device[1]))) {
         fprintf(stderr, "model-dry: grids or peer access %s\n", err.c_str());
         return false;
     }
@@ -292,13 +307,14 @@ struct pass_out {
     std::vector<uint64_t> hash;  // per position: both cards' logits
     std::vector<int32_t> argmax; // per position
     std::vector<double> kl;      // per p % 8 == 7 position (first pass only)
+    std::vector<int32_t> top1;   // ME2 (host_top1): per position, the host's argmax of the logits, the lower ID on a tie
     int64_t rounds = 0;
 };
 
 // one forced pass over n positions from empty state; B: rows of each round in turn
 bool run_pass(rt::target & t, const std::vector<int32_t> & ids, int32_t n, const std::vector<int32_t> & cycle,
               const std::vector<uint8_t> * ref_logits, card_records * rec, FILE * const * rec_files, pass_out & o,
-              float * h_logits) {
+              float * h_logits, bool host_top1 = false) {
     std::string err;
     if (!t.reset(err)) {
         fprintf(stderr, "model-test: reset: %s\n", err.c_str());
@@ -308,6 +324,7 @@ bool run_pass(rt::target & t, const std::vector<int32_t> & ids, int32_t n, const
     o.hash.assign(size_t(n), 0);
     o.argmax.assign(size_t(n), -1);
     o.kl.clear();
+    o.top1.assign(host_top1 ? size_t(n) : 0, -1);
     constexpr size_t R = size_t(fn::round::max_rows); // SP2: five rows (h_logits [2][R][VC])
     std::vector<float> hrec(R * 4 * F + R * 4 + R * F + 2 * R * D);
     std::vector<float> rows_out(R * 4 * D), mixed_out(R * D);
@@ -337,6 +354,15 @@ bool run_pass(rt::target & t, const std::vector<int32_t> & ids, int32_t n, const
             const float * l1 = h_logits + R * VC + size_t(b) * VC;
             o.hash[size_t(p)] = hash_bytes(l1, size_t(VC) * 4, hash_bytes(l0, size_t(VC) * 4, 0xcbf29ce484222325ull));
             o.argmax[size_t(p)] = r.argmax[0][b];
+            if (host_top1) {
+                int32_t best = 0;
+                for (int32_t i = 1; i < V; ++i) {
+                    if ((i < VC ? l0[i] : l1[i - VC]) > (best < VC ? l0[best] : l1[best - VC])) {
+                        best = i;
+                    }
+                }
+                o.top1[size_t(p)] = best;
+            }
             if (ref_logits != nullptr && p % 8 == 7) {
                 const float * ref = reinterpret_cast<const float *>(ref_logits->data()) + size_t(p / 8) * V;
                 o.kl.push_back(kl_div(ref, l0, l1));
@@ -456,13 +482,30 @@ bool fill_synthetic(md::model & m, rt::target & t, int32_t depth) {
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device")) {
             return false;
         }
-        for (const char * cls : {"target KV (K0)", "target index keys and summaries", "GDN state",
-                                 "convolution histories", "draft KV (F16)"}) {
+        for (const char * cls : {"target KV (K0)", "target index keys and summaries", "target index keys (ME6)",
+                                 "GDN state", "convolution histories", "draft KV (F16)"}) {
             const md::reserved_class * rc = m.state_class(cls);
             for (int32_t p = 0; rc != nullptr && p < (int32_t)rc->plan.parts.size(); ++p) {
                 const std::string & name = rc->plan.parts[p].name;
                 const int64_t n = rc->plan.parts[p].bytes[c];
                 if (n <= 0 || name.find("summaries") != std::string::npos) {
+                    continue;
+                }
+                if (std::string(cls) == "target KV (K0)" && m.kv_q8) {
+                    // KV8: the 8-bit format: codes in [-127, 127] (random bytes, -128 moved to -127) and every
+                    // group's scale 1 / 127, so the values stay in [-1, 1]
+                    const bool scales = name == "K scales" || name == "V scales";
+                    std::vector<uint8_t> b(static_cast<size_t>(n));
+                    const uint16_t s127 = fn::quant::f16_bits_rn(1.0f / 127.0f);
+                    for (size_t i = 0; i < b.size(); ++i) {
+                        const uint8_t r = static_cast<uint8_t>(h16[(at16 + i / 2) % h16.size()] >> (8 * (i % 2)));
+                        b[i] = scales ? static_cast<uint8_t>(s127 >> (8 * (i % 2))) : r == 0x80 ? 0x81 : r;
+                    }
+                    at16 = (at16 + b.size() / 2 + 977) % (h16.size() / 2);
+                    if (!cuda_ok(cudaMemcpy(rc->part_ptr(p, c), b.data(), b.size(), cudaMemcpyHostToDevice),
+                                 "fill q8")) {
+                        return false;
+                    }
                     continue;
                 }
                 // the draft's F16 cells take the same bits: BF16 values in [-1, 1] read as F16 are finite
@@ -589,6 +632,90 @@ bool warm(rt::target & t, int32_t depth, double seconds) {
 
 } // namespace
 
+namespace {
+
+// KV8 (load 4): pass 1's KL and top-1 in bf16 on the loaded model (the run-to-run reference beside the q8 passes),
+// written to model-test-bf16.json and kl-per-position-bf16.tsv; then the state released and reserved again in q8, the
+// weights kept
+bool bf16_then_q8(const fnfl_target_args & a, md::model & m, const std::vector<int32_t> & ids, int32_t N,
+                  const std::vector<uint8_t> & ref_logits, const std::vector<uint8_t> & ref_top, double y_p50,
+                  double y_p99, double y_max, double y_top1) {
+    float * h_logits = nullptr;
+    if (!cuda_ok(cudaMallocHost(&h_logits, size_t(2) * fn::round::max_rows * VC * 4), "pinned logits")) {
+        return false;
+    }
+    std::unique_ptr<float, decltype(&cudaFreeHost)> hold(h_logits, cudaFreeHost);
+    {
+        rt::target_options o;
+        o.model_path = a.model_path;
+        o.timeout_s = 60.0;
+        rt::target t;
+        std::string err;
+        if (!t.init(m, o, err)) {
+            fprintf(stderr, "model-test bf16: init: %s\n", err.c_str());
+            return false;
+        }
+        pass_out p;
+        if (!run_pass(t, ids, N, {1, 2, 3, 4}, &ref_logits, nullptr, nullptr, p, h_logits)) {
+            return false;
+        }
+        const double k50 = percentile(p.kl, 50), k99 = percentile(p.kl, 99),
+                     kmax = *std::max_element(p.kl.begin(), p.kl.end());
+        const uint32_t * top = reinterpret_cast<const uint32_t *>(ref_top.data());
+        int32_t n_diff = 0;
+        for (int32_t q = 0; q < N; ++q) {
+            n_diff += p.argmax[size_t(q)] != static_cast<int32_t>(top[size_t(4) * q]) ? 1 : 0;
+        }
+        printf("model-test bf16 (KV8's run-to-run reference, this load, %lld rounds): KL(reference || FNFL) p50 %.6g "
+               "p99 %.6g max %.6g; top-1 differs at %d positions (2x yardstick %.6g / %.6g / %.6g, %.0f)\n",
+               static_cast<long long>(p.rounds), k50, k99, kmax, n_diff, 2 * y_p50, 2 * y_p99, 2 * y_max, 2 * y_top1);
+        FILE * jf = fopen((a.out_dir + "/model-test-bf16.json").c_str(), "w");
+        FILE * tf = fopen((a.out_dir + "/kl-per-position-bf16.tsv").c_str(), "w");
+        if (jf == nullptr || tf == nullptr) {
+            fprintf(stderr, "model-test bf16: cannot write the outputs\n");
+            return false;
+        }
+        fprintf(jf,
+                "{\"format\": \"bf16\", \"positions\": %d, \"rounds\": %lld, \"kl\": {\"p50\": %.9g, \"p99\": %.9g, "
+                "\"max\": %.9g}, \"top1_differ\": %d}\n",
+                N, static_cast<long long>(p.rounds), k50, k99, kmax, n_diff);
+        fprintf(tf, "pos\tkl_ref_fnfl\n");
+        for (size_t i = 0; i < p.kl.size(); ++i) {
+            fprintf(tf, "%zu\t%.9g\n", i * 8 + 7, p.kl[i]);
+        }
+        fclose(jf);
+        fclose(tf);
+    }
+    std::string err;
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!cuda_ok(cudaSetDevice(m.device[c]), "device") || !cuda_ok(cudaDeviceSynchronize(), "drain")) {
+            return false;
+        }
+    }
+    fn::loader::release_state(m);
+    md::state_params sp;
+    sp.n_cells = a.n_cells;
+    sp.ple_conv_kernel = m.ple_conv_kernel;
+    sp.ple_ngram = m.ple_ngram;
+    sp.kv_q8 = true;
+    int64_t host_bytes = 0;
+    if (!fn::loader::reserve_state(m, sp, 1, host_bytes, err) || !fn::loader::fill_ex1_grids(m, err)) {
+        fprintf(stderr, "model-test: the q8 reservation: %s\n", err.c_str());
+        return false;
+    }
+    size_t f[2] = {0, 0}, tot = 0;
+    for (int32_t c = 0; c < 2; ++c) {
+        cudaSetDevice(m.device[c]);
+        cudaMemGetInfo(&f[c], &tot);
+    }
+    printf("model-test: the state reserved again in q8 (KV8) at %d cells, the weights kept (no load): free %.3f / %.3f "
+           "GiB\n",
+           a.n_cells, double(f[0]) / 1073741824.0, double(f[1]) / 1073741824.0);
+    return true;
+}
+
+} // namespace
+
 int fnfl_model_test(const fnfl_target_args & a) {
     const bool full = a.mode == "full";
     if (!full && a.mode != "san" && a.mode != "race") {
@@ -623,8 +750,16 @@ int fnfl_model_test(const fnfl_target_args & a) {
                "positions\n",
                y_p50, y_p99, y_max, y_top1);
     }
+    // KV8 (load 4): q8 in full mode loads the state in bf16 for the run-to-run reference's KL pass, then lays it out
+    // again in q8 for the q8 passes (and spec's checks with --spec-ids), all on this one loaded model
+    const bool both = full && a.kv_q8;
+    fnfl_target_args la = a;
+    la.kv_q8 = a.kv_q8 && !both;
     auto m = std::make_unique<md::model>();
-    if (!load(a, full ? a.n_cells : 8192, *m, "model-test")) {
+    if (!load(la, full ? a.n_cells : 8192, *m, "model-test")) {
+        return 1;
+    }
+    if (both && !bf16_then_q8(a, *m, ids, N, ref_logits, ref_top, y_p50, y_p99, y_max, y_top1)) {
         return 1;
     }
     rt::target_options o;
@@ -781,8 +916,26 @@ int fnfl_model_test(const fnfl_target_args & a) {
     printf("model-test: ledger: %lld checks, %lld failures (last pass); error words 0 in every round; graph captures "
            "%d\n",
            static_cast<long long>(L.checks), static_cast<long long>(L.failures), t.captures());
-    const bool pass = kl_ok && top_ok && det_bad == 0 && bi_bad == 0 && led_ok;
-    printf("model-test: %s\n", pass ? "PASS" : "FAIL");
+    bool pass = kl_ok && top_ok && det_bad == 0 && bi_bad == 0 && led_ok;
+    printf("model-test: %s (KV format %s; positions 0 .. %d, KL at every 8th from 7)\n", pass ? "PASS" : "FAIL",
+           m->kv_q8 ? "q8" : "bf16", N - 1);
+    if (both && !a.spec_ids.empty()) {
+        // KV8 (load 4): spec's C4a..C4f checks (NC1 section 7: T = 0 speculation against greedy, the rejection
+        // rollback against a clean replay) on this loaded model in q8
+        fnfl_target_args sa = a;
+        sa.ids = a.spec_ids;
+        sa.out_dir = a.out_dir + "/spec";
+        sa.mode = "real";
+        fnfl_target_args::run_setting cur;
+        cur.sampling.temp = 1.0f;
+        cur.sampling.penalty_last_n = 0;
+        sa.run_settings = {cur};
+        mkdir(sa.out_dir.c_str(), 0755);
+        mkdir((sa.out_dir + "/c4d").c_str(), 0755); // spec writes C4d's rows there
+        const int sr = fnfl_spec_on(sa, m.get());
+        printf("model-test: spec's checks on this load: %s\n", sr == 0 ? "PASS" : "FAIL");
+        pass = pass && sr == 0;
+    }
     return pass ? 0 : 1;
 }
 
@@ -870,6 +1023,182 @@ bool fnfl_load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
 
 bool fnfl_load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char * tool) {
     return load(a, n_cells, m, tool);
+}
+
+namespace {
+
+// ME1: each device's use before the expert pool, by owner: the weights, every device state class, and the rest
+// (the CUDA context, the engine's workspaces and lanes, small buffers) as used minus those
+std::string device_account(const md::model & m) {
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    std::string out;
+    int prev = 0;
+    cudaGetDevice(&prev);
+    for (int32_t c = 0; c < 2; ++c) {
+        const int32_t d = m.device[c];
+        if (c == 1 && d == m.device[0]) {
+            break;
+        }
+        size_t fr = 0, tot = 0;
+        if (cudaSetDevice(d) != cudaSuccess || cudaMemGetInfo(&fr, &tot) != cudaSuccess) {
+            out += "device " + std::to_string(d) + ": no memory information\n";
+            continue;
+        }
+        int64_t weights = 0, state = 0, small = 0;
+        std::string classes;
+        for (int32_t k = 0; k < 2; ++k) {
+            weights += m.device[k] == d && !m.weights[k].host() ? int64_t(m.weights[k].size()) : 0;
+        }
+        char b[320];
+        for (const auto & rc : m.state) {
+            int64_t n = 0;
+            for (int32_t k = 0; k < 2; ++k) {
+                n += m.device[k] == d && !rc->buf[k].host() ? int64_t(rc->buf[k].size()) : 0;
+            }
+            state += n;
+            if (n < (int64_t(1) << 24)) {
+                small += n;
+                continue;
+            }
+            std::snprintf(b, sizeof(b), "; %s %.3f", rc->plan.name.c_str(), double(n) / gib);
+            classes += b;
+        }
+        const int64_t used = int64_t(tot - fr);
+        std::snprintf(b, sizeof(b), "device %d before the pool: used %.3f of %.3f GiB: weights %.3f", d,
+                      double(used) / gib, double(tot) / gib, double(weights) / gib);
+        out += b + classes;
+        std::snprintf(b, sizeof(b), "; smaller state classes %.3f; context, workspaces and other buffers %.3f\n",
+                      double(small) / gib, double(used - weights - state) / gib);
+        out += b;
+        // ME11: the GDN state's banks and records, and the prefill checkpoints with their placement, in bytes (both
+        // logical cards that live on this device)
+        int64_t banks = 0, records = 0, ck = 0;
+        bool ck_host = false;
+        for (const auto & rc : m.state) {
+            for (int32_t k = 0; k < 2; ++k) {
+                if (m.device[k] != d) {
+                    continue;
+                }
+                if (rc->plan.name == "GDN state") {
+                    for (const md::part & pt : rc->plan.parts) {
+                        const bool rec = pt.name.size() > 8 && pt.name.compare(pt.name.size() - 8, 8, " records") == 0;
+                        (rec ? records : banks) += pt.bytes[k];
+                    }
+                } else if (rc->plan.name == "prefill checkpoints (PF1)") {
+                    ck += rc->plan.allocation(k);
+                    ck_host = rc->buf[k].host();
+                }
+            }
+        }
+        std::snprintf(b, sizeof(b),
+                      "device %d GDN state (ME11): banks %lld + records %lld = %lld bytes (2 banks + 2 x 5 records a "
+                      "layer and card); prefill checkpoints %lld bytes in %s memory\n",
+                      d, (long long)banks, (long long)records, (long long)(banks + records), (long long)ck,
+                      ck_host ? "pinned host" : "device");
+        out += b;
+    }
+    cudaSetDevice(prev);
+    return out;
+}
+
+} // namespace
+
+std::unique_ptr<fn::runtime::expert_cache> fnfl_expert_cache(const fnfl_target_args & a, md::model & m, bool dry,
+                                                             const char * tool, const md::service_hook & before_pool) {
+    fn::runtime::expert_cache_options o;
+    o.pool_bytes = a.ex_pool_mib >= 0 ? a.ex_pool_mib << 20 : -1;
+    o.reserve_bytes = a.ex_reserve_mib << 20;
+    o.device_cap_bytes = a.device_cap_mib >= 0 ? a.device_cap_mib << 20 : -1;
+    o.cpu_workers = a.ex_cpu;
+    o.zero_backing = dry;
+    o.native_hold = dry && a.ex_native_hold; // ME4's gate: the residency check
+    o.profile = a.ex_profile;
+    o.profile_save = a.ex_profile_save;
+    o.swap_overlap = a.ex_swap_overlap;
+    o.before_pool = before_pool;
+    // ME3: the settings table (fn/cache_settings.h), read back at startup (* given) and carried by each request's line
+    fn::runtime::apply_settings(a.cache, o);
+    if (dry && a.mx7_dry_maxt > 0) {
+        o.prompt_cpu_share_test_maxt = a.mx7_dry_maxt; // MX7: zero weights route few experts, each heavily
+    }
+    printf("%s: ME3 settings (cache): %s\n", tool, fn::settings::readback(a.cache, 1).c_str());
+    printf("%s: ME3 settings (executor): %s; (K/V): %s\n", tool, fn::settings::readback(a.cache, 0).c_str(),
+           fn::settings::readback(a.cache, 2).c_str());
+    printf("%s: %s", tool, device_account(m).c_str());
+    auto x = std::make_unique<fn::runtime::expert_cache>();
+    std::string err;
+    if (!x->init(m, o, err)) {
+        fprintf(stderr, "%s: %s\n", tool, err.c_str());
+        return nullptr;
+    }
+    x->set_settings_json(fn::settings::json(a.cache));
+    printf("%s: %s", tool, x->plan_text().c_str());
+    return x;
+}
+
+bool fnfl_kl_check(rt::target & t, const std::string & ids_path, const std::string & ref_dir,
+                   const std::string & spread_json, const std::string & out_dir, const std::string & label, bool & pass) {
+    constexpr int32_t N = 4096;
+    pass = false;
+    std::vector<int32_t> ids;
+    std::vector<uint8_t> ref_top, ref_logits;
+    double y_p50 = 0, y_p99 = 0, y_max = 0, y_top1 = 0;
+    std::string js;
+    {
+        std::ifstream f(spread_json);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        js = ss.str();
+    }
+    if (!read_ids(ids_path, ids) || int32_t(ids.size()) < N || !read_file(ref_dir + "/top.bin", ref_top, size_t(N) * 16) ||
+        !read_file(ref_dir + "/logits.bin", ref_logits, size_t(N / 8) * V * 4) || !json_number(js, "kl", "p50", y_p50) ||
+        !json_number(js, "kl", "p99", y_p99) || !json_number(js, "kl", "max", y_max) ||
+        !json_number(js, "top1", "differ", y_top1)) {
+        fprintf(stderr, "KL check: the IDs, the reference or the yardstick is missing\n");
+        return false;
+    }
+    float * h_logits = nullptr;
+    if (!cuda_ok(cudaMallocHost(&h_logits, size_t(2) * fn::round::max_rows * VC * 4), "pinned logits")) {
+        return false;
+    }
+    std::unique_ptr<float, decltype(&cudaFreeHost)> hold(h_logits, cudaFreeHost);
+    pass_out p;
+    const auto t0 = std::chrono::steady_clock::now();
+    // the top-1 from the logits on the host: with the sampler set (spec run's T = 1), a forced round's done record
+    // carries the sampler's draw (samp.cu), not the greedy token
+    if (!run_pass(t, ids, N, {1, 2, 3, 4}, &ref_logits, nullptr, nullptr, p, h_logits, true)) {
+        return false;
+    }
+    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    const double k50 = percentile(p.kl, 50), k99 = percentile(p.kl, 99), kmax = *std::max_element(p.kl.begin(), p.kl.end());
+    const uint32_t * top = reinterpret_cast<const uint32_t *>(ref_top.data());
+    int32_t diff = 0;
+    for (int32_t q = 0; q < N; ++q) {
+        diff += p.top1[size_t(q)] != static_cast<int32_t>(top[size_t(4) * q]) ? 1 : 0;
+    }
+    const bool kl_ok = k50 <= 2 * y_p50 && k99 <= 2 * y_p99 && kmax <= 2 * y_max;
+    const bool top_ok = double(diff) <= 2 * y_top1;
+    pass = kl_ok && top_ok;
+    if (FILE * tf = fopen((out_dir + "/top1-" + label + ".tsv").c_str(), "w")) {
+        fprintf(tf, "pos\tfnfl\tref\n");
+        for (int32_t q = 0; q < N; ++q) {
+            fprintf(tf, "%d\t%d\t%u\n", q, p.top1[size_t(q)], top[size_t(4) * q]);
+        }
+        fclose(tf);
+    }
+    if (FILE * tf = fopen((out_dir + "/kl-" + label + ".tsv").c_str(), "w")) {
+        fprintf(tf, "pos\tkl_ref_fnfl\n");
+        for (size_t i = 0; i < p.kl.size(); ++i) {
+            fprintf(tf, "%zu\t%.9g\n", i * 8 + 7, p.kl[i]);
+        }
+        fclose(tf);
+    }
+    printf("KL check (%s): %lld rounds over %d positions in %.1f s; KL(reference || FNFL) p50 %.6g p99 %.6g max %.6g "
+           "(2x yardstick %.6g / %.6g / %.6g) %s; top-1 differs at %d positions (2x yardstick %.0f) %s: %s\n",
+           label.c_str(), static_cast<long long>(p.rounds), N, s, k50, k99, kmax, 2 * y_p50, 2 * y_p99, 2 * y_max,
+           kl_ok ? "ok" : "FAIL", diff, 2 * y_top1, top_ok ? "ok" : "FAIL", pass ? "PASS" : "FAIL");
+    fflush(stdout);
+    return true;
 }
 
 bool fnfl_fill_synthetic(md::model & m, rt::target & t, int32_t depth) {
@@ -990,14 +1319,14 @@ int fnfl_model_dry(const fnfl_target_args & a) {
         }
         return fnfl_spec(b);
     }
-    const bool eager = a.mode == "eager";
+    const bool eager = a.mode == "eager" || a.ex_eager; // ME3: --ex-executor eager selects it too
     const bool sample = a.mode == "sample";
     std::vector<int32_t> ids;
     if (!read_ids(a.ids, ids)) {
         return 1;
     }
     // the deepest rows' ledger beyond the file repeats it from its start (synthetic positions)
-    for (size_t i = 0; ids.size() < size_t(198720) + 8; ++i) {
+    for (size_t i = 0; ids.size() < size_t(std::max(198720, a.n_cells)) + 8; ++i) {
         ids.push_back(ids[i]);
     }
     const int32_t cells = eager ? 8192 : a.n_cells;
@@ -1013,6 +1342,7 @@ int fnfl_model_dry(const fnfl_target_args & a) {
     o.eager = eager;
     o.timeout_s = eager ? 1800.0 : 30.0;
     o.graph_nodes = eager ? std::string() : a.out_dir; // SR1: each captured graph's node list
+    o.defer_capture = m->expert_cache && !eager;       // ME3: the graphs inside the cache's init, before its pool
     if (!fnfl_draft_settings(a, false, "model-dry", o.draft)) {
         return 1;
     }
@@ -1022,10 +1352,34 @@ int fnfl_model_dry(const fnfl_target_args & a) {
         fprintf(stderr, "model-dry: init: %s\n", err.c_str());
         return 1;
     }
-    printf("model-dry: zero weights, %d cells, %s, %d graph captures\n", cells, eager ? "eager" : "graphs",
-           t.captures());
+    // ME1: a cached load (one device, or cached TP) serves the routed experts through the expert cache (zero backing);
+    // ME3: the graph executor's graphs captured through it before its pool
+    std::unique_ptr<fn::runtime::expert_cache> xc;
+    if (m->expert_cache) {
+        const md::service_hook capture = [&t](md::expert_service & s, std::string & e) {
+            t.card(0).c.ex_service = &s;
+            t.card(1).c.ex_service = &s;
+            s.set_executor(true);
+            return t.capture(e);
+        };
+        xc = fnfl_expert_cache(a, *m, true, "model-dry", eager ? md::service_hook() : capture);
+        if (xc == nullptr) {
+            return 1;
+        }
+        t.card(0).c.ex_service = xc.get();
+        t.card(1).c.ex_service = xc.get();
+        if (!t.set_executor(!eager, err)) {
+            fprintf(stderr, "model-dry: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    printf("model-dry: zero weights, %d cells, %s executor (%s), %d graph captures, graphs %.1f / %.1f MiB on cards "
+           "0 / 1%s\n",
+           cells, t.graph_executor() ? "graph" : "eager", m->single ? "one device" : "two devices", t.captures(),
+           double(t.graph_bytes(0)) / 1048576.0, double(t.graph_bytes(1)) / 1048576.0,
+           m->expert_cache ? ", expert cache on" : "");
     double rtt_ns = 0.0;
-    if (!clock_offset(*m, g_offset_ns, rtt_ns)) {
+    if (!m->single && !clock_offset(*m, g_offset_ns, rtt_ns)) { // ME1: one device has no second clock
         fprintf(stderr, "model-dry: clock offset\n");
         return 1;
     }

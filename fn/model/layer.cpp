@@ -6,8 +6,10 @@
 #include "fn/kernels/experts/grids.h"
 #include "fn/kernels/gdn/gdn.h"
 #include "fn/kernels/hc/hc.h"
+#include "fn/kernels/ple/ple.h"
 #include "fn/kernels/qsa/attend.h"
 #include "fn/kernels/qsa/qsa.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/shapes.h"
 #include "fn/xchg/xchg.h"
 
@@ -265,10 +267,37 @@ int32_t use_slot(const use_counters & u, int64_t n, int64_t per_graph) {
     return static_cast<int32_t>((u.graph ? n % per_graph : n) % fn::xchg::n_slot);
 }
 
+// a BF16 HC sublayer's arguments on card c (hc::sub; ME12's hc::pair takes both cards')
+fn::hc::sub_args hc_sub_args(const card_ctx & c, const hc_module & h, int32_t set, const float * hres,
+                             const float * hpost, const float * hx, const use_counters & u) {
+    const int32_t r = c.card;
+    const int32_t s = hc_slot(u, u.sub);
+    const int32_t s_prev = hc_prev_slot(u, u.sub);
+    const fn::xchg::rings & rg = *c.rings;
+    fn::hc::sub_args a = {};
+    a.w_down = h.w_down;
+    a.w_up = h.w_up;
+    a.hres = hres;
+    a.hx = hx;
+    a.hpost = hpost;
+    a.gamma = h.gamma;
+    a.x = c.ws.x[set];
+    a.inject = c.ws.inject[set];
+    a.hc_ring = rg.slot(r, fn::xchg::msg::hc, s);
+    a.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
+    a.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
+    a.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
+    a.hmix_own = rg.slot(r, fn::xchg::msg::hmix, s);
+    a.hmix_peer = rg.slot(1 - r, fn::xchg::msg::hmix, s);
+    a.err = rg.err(r);
+    a.card = r;
+    return a;
+}
+
 // one HC sublayer's kernels, part 0 or 1: x = hres + hpost * hx, then the mixed input in both forms into the
 // sublayer's X-HMIX slot on both cards (HC3); the body's first launches acquire it (hmix_in). BF16 weights (HC4):
 // fused, one launch of hc::sub at part 0 (the graphs); otherwise its down phase at part 0 and its up phase at part 1
-// (the eager pair order, where every send precedes its read). Q8_0 weights (the draft, DR1): down2_q8, up2_q8.
+// (the pair order, eager or one device's graphs: every send precedes its read). Q8_0 weights (DR1): down2_q8, up2_q8.
 bool hc_phase(card_ctx & c, const hc_module & h, int32_t set, const float * hres, const float * hpost, const float * hx,
               int32_t rows, const use_counters & u, int32_t part, bool fused, std::string & err) {
     const int32_t r = c.card;
@@ -279,24 +308,7 @@ bool hc_phase(card_ctx & c, const hc_module & h, int32_t set, const float * hres
         if (fused && part == 1) {
             return true;
         }
-        const int32_t s_prev = hc_prev_slot(u, n);
-        fn::hc::sub_args a = {};
-        a.w_down = h.w_down;
-        a.w_up = h.w_up;
-        a.hres = hres;
-        a.hx = hx;
-        a.hpost = hpost;
-        a.gamma = h.gamma;
-        a.x = c.ws.x[set];
-        a.inject = c.ws.inject[set];
-        a.hc_ring = rg.slot(r, fn::xchg::msg::hc, s);
-        a.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
-        a.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
-        a.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
-        a.hmix_own = rg.slot(r, fn::xchg::msg::hmix, s);
-        a.hmix_peer = rg.slot(1 - r, fn::xchg::msg::hmix, s);
-        a.err = rg.err(r);
-        a.card = r;
+        const fn::hc::sub_args a = hc_sub_args(c, h, set, hres, hpost, hx, u);
         if (!fn::hc::sub(rows, fused ? 3 : part + 1, a, c.stream)) {
             return fail(err, "hc sub");
         }
@@ -333,6 +345,41 @@ bool hc_phase(card_ctx & c, const hc_module & h, int32_t set, const float * hres
         return fail(err, "hc up2");
     }
     note(c, "hc.up2");
+    return true;
+}
+
+// ME12: both logical cards' BF16 HC sublayer in one launch (hc::pair), when they share one device and one stream:
+// it replaces their down and up phases (the pair order's four launches). The common intermediate's scratch is card 0's
+// ws.mom[set], which the BF16 producer does not otherwise use (the Q8_0 down2 writes it); the launch forms and reads it
+// on the stream, so nothing before or after it on any stream sees it.
+static_assert(fn::hc::pair_scratch_bytes <= int64_t(layer_max_rows) * fn::hc::n_mom * 4, "ME12: the scratch fits mom");
+
+bool hc_paired(card_ctx * const c[2], const hc_module & h0, const hc_module & h1) {
+    return c[0]->device == c[1]->device && c[0]->stream != nullptr && c[0]->stream == c[1]->stream &&
+           h0.q8_down == nullptr && h1.q8_down == nullptr;
+}
+
+// sublayer set's HC input on card c: the layer's input (attention), or the attention sublayer's streams, injection and
+// output half (FFN)
+layer_input hc_input(const card_ctx & c, const layer_input & in, int32_t set) {
+    return set == 0 ? in : layer_input{c.ws.x[0], c.ws.inject[0], c.ws.out[0]};
+}
+
+bool hc_pair_phase(card_ctx * const c[2], const hc_module * const h[2], int32_t set, const layer_input in[2],
+                   int32_t rows, const use_counters u[2], std::string & err) {
+    fn::hc::pair_args a = {};
+    for (int32_t k = 0; k < 2; ++k) {
+        const layer_input hi = hc_input(*c[k], in[k], set);
+        a.s[k] = hc_sub_args(*c[k], *h[k], set, hi.hres, hi.hpost, hi.hx, u[k]);
+    }
+    a.scratch = c[0]->ws.mom[set];
+    if (!cuda_ok(cudaSetDevice(c[0]->device), "cudaSetDevice", err)) {
+        return false;
+    }
+    if (!fn::hc::pair(rows, a, c[0]->stream)) {
+        return fail(err, "hc pair");
+    }
+    note(*c[0], "hc.pair");
     return true;
 }
 
@@ -465,7 +512,8 @@ bool gdn_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
     g.a = w.a;
     g.norm_w = w.ssm_norm;
     g.state = st.gdn;
-    g.cur = c.cur;
+    g.rec = st.rec;
+    g.gsel = c.gsel;
     g.gated = ws.gated;
     g.gated_q = {ws.mid_codes, ws.mid_scales, rows, GV};
     g.ws = c.gdn_ws;
@@ -517,6 +565,10 @@ bool qsa_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
         ua.depth = c.n_before;
         ua.rows = rows;
         ua.max_cells = st.n_cells;
+        if (c.kv != nullptr) { // ME6: the host-backed tier's key window (kv_tier.h)
+            ua.keys = c.kv->keys(r, st.kv_attn);
+            ua.shift = c.kv->shift(r);
+        }
         if (!fn::qsa::summary_update(ua, c.stream)) {
             return fail(err, "summary_update");
         }
@@ -558,6 +610,18 @@ bool qsa_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
     aa.pos = c.pos;
     aa.k_cache = st.k_cache;
     aa.v_cache = st.v_cache;
+    aa.k_scale = st.k_scale; // KV8: set in q8
+    aa.v_scale = st.v_scale;
+    if (c.kv != nullptr) {
+        // ME1: the host-backed KV: the window's pointers and the body with the older blocks gathered (kv_tier.h)
+        if (!c.kv->select(r, st.kv_attn, rows, ws.sel_body, ws.sel_off, c.rings->err(r), c.stream, aa.body, err)) {
+            return false;
+        }
+        note(c, "kv.gather");
+        aa.k_cache = c.kv->k(r, st.kv_attn);
+        aa.v_cache = c.kv->v(r, st.kv_attn);
+        aa.shift = c.kv->shift(r); // ME3: the graphs' window start (null for eager)
+    }
     aa.depth = c.n_before;
     aa.max_cells = st.n_cells;
     aa.theta_scale = fn::qsa::attn::rope_theta_scale();
@@ -584,7 +648,7 @@ bool qsa_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
 // gate_up runs the routed experts and the shared expert's units, down their weighted sum with the shared term (sg)
 // added last into the X-F partial (R2's F7). The router (F32 row) and gate_up (codes and scales, the slot's last
 // reader) each acquire X-HMIX (HC3).
-bool ffn_body(card_ctx & c, const layer_weights & w, int32_t rows, const use_counters & u, std::string & err) {
+bool ffn_router(card_ctx & c, const layer_weights & w, int32_t rows, const use_counters & u, std::string & err) {
     layer_ws & ws = c.ws;
     fn::dense::product_args rt;
     rt.k = D;
@@ -597,13 +661,18 @@ bool ffn_body(card_ctx & c, const layer_weights & w, int32_t rows, const use_cou
     rt.route.ids = c.ex.ids;
     rt.route.wts = c.ex.wts;
     rt.route.sg = ws.sg;
-    if (!dense_launch(c, rt, rows, dense_site::router, "ffn.router", err)) {
-        return false;
-    }
+    return dense_launch(c, rt, rows, dense_site::router, "ffn.router", err);
+}
+
+// the experts' launches of the FFN as the resident banks run them (ME1's cache sets their tables)
+// ME8: rv, another logical card's routing on this device and stream (route_view), in place of c's own
+void expert_args(const card_ctx & c, const layer_weights & w, int32_t rows, const use_counters & u,
+                 fn::experts::gate_up_args & ga, fn::experts::down_args & da, const route_view * rv = nullptr) {
+
     const fn::act::out_view glu = {c.ex.glu_codes, c.ex.glu_scales, fn::experts::glu_slots, FFS};
     const fn::act::view glu_in = {c.ex.glu_codes, c.ex.glu_scales, fn::experts::glu_slots, FFS};
-    fn::experts::gate_up_args ga = {w.ex_gate_up, w.sh_gate.w, w.sh_up.w, c.grids, {nullptr, nullptr, rows, D},
-                                    c.ex.ids,     c.ex.meta,   glu,       nullptr, c.ex.status};
+    ga = {w.ex_gate_up, w.sh_gate.w, w.sh_up.w, c.grids, {nullptr, nullptr, rows, D},
+          c.ex.ids,     c.ex.meta,   glu,       nullptr, c.ex.status};
     ga.cw = fn::experts::class_weights(static_cast<fn::experts::fmt>(w.ex_gu_fmt),
                                        static_cast<fn::dense::fmt>(w.sh_gate.fmt),
                                        static_cast<fn::dense::fmt>(w.sh_up.fmt)); // XB3: the unit order's weights
@@ -611,19 +680,92 @@ bool ffn_body(card_ctx & c, const layer_weights & w, int32_t rows, const use_cou
     ga.hmix_peer_half = 1 - c.card;
     ga.err = c.rings->err(c.card);
     ga.map = c.ex_map; // SP4
+    da = {w.ex_down, w.ex_sh_down, c.grids, glu_in, c.ex.ids, c.ex.meta, c.ex.wts, c.ws.sg, c.ws.partial, c.ex.status};
+    if (rv != nullptr) {
+        fn::experts::use_route(*rv, ga, da);
+    }
+}
+
+// ME8: both logical cards on one device and one compute stream (the single-device executor's placement), so one
+// card's routing, written earlier in that stream, is readable by the other's experts
+bool same_stream(const card_ctx & a, const card_ctx & b) {
+    return a.device == b.device && a.stream == b.stream && a.stream != nullptr;
+}
+
+// the card's routing as a view (ME8)
+route_view route_of(const card_ctx & c) {
+    return {c.ex.ids, c.ex.wts, c.ws.sg};
+}
+
+// FFN on each card (XP1's V2): DP2's router with its top-10 epilogue and the shared gate's sigmoid, then EX2's experts:
+// gate_up runs the routed experts and the shared expert's units, down their weighted sum with the shared term (sg)
+// added last into the X-F partial (R2's F7). The router (F32 row) and gate_up (codes and scales, the slot's last
+// reader) each acquire X-HMIX (HC3).
+// ME8: the experts of the body alone, on rv's routing (null: c's own router's)
+bool ffn_experts(card_ctx & c, const layer_weights & w, int32_t rows, const use_counters & u, const route_view * rv,
+                 std::string & err) {
+    fn::experts::gate_up_args ga;
+    fn::experts::down_args da;
+    expert_args(c, w, rows, u, ga, da, rv);
+    if (c.ex_service != nullptr) { // ME3: a two-device graph capture, this card's part of the cache's window
+        return c.ex_service->ffn_card(c, w, rows, ga, da, err); // (it notes ffn.ex_gate_up and ffn.ex_down)
+    }
     if (!fn::experts::gate_up(static_cast<fn::experts::fmt>(w.ex_gu_fmt), static_cast<fn::dense::fmt>(w.sh_gate.fmt),
                               static_cast<fn::dense::fmt>(w.sh_up.fmt), rows, ga, c.stream)) {
         return fail(err, "experts gate_up");
     }
     note(c, "ffn.ex_gate_up");
-    const fn::experts::down_args da = {w.ex_down, w.ex_sh_down, c.grids, glu_in,     c.ex.ids,
-                                       c.ex.meta, c.ex.wts,     ws.sg,   ws.partial, c.ex.status};
     if (!fn::experts::down(static_cast<fn::experts::fmt>(w.ex_down_fmt),
                            static_cast<fn::experts::fmt>(w.ex_sh_down_fmt), rows, da, c.stream)) {
         return fail(err, "experts down");
     }
     note(c, "ffn.ex_down");
     return true;
+}
+
+bool ffn_body(card_ctx & c, const layer_weights & w, int32_t rows, const use_counters & u, std::string & err) {
+    return ffn_router(c, w, rows, u, err) && ffn_experts(c, w, rows, u, nullptr, err);
+}
+
+// ME1: both cards' FFN bodies through the expert cache: both routers, then the service's launches. ME8: on one device
+// and stream, card 0's router alone; card 1's experts read its routing (route_view)
+step_status ffn_pair(card_ctx * const c[2], const layer_weights * const w[2], int32_t rows, const use_counters u[2],
+                     std::string & err) {
+    fn::experts::gate_up_args ga[2];
+    fn::experts::down_args da[2];
+    const bool one = same_stream(*c[0], *c[1]);
+    const route_view r0 = route_of(*c[0]);
+    for (int32_t k = 0; k < 2; ++k) {
+        if (!cuda_ok(cudaSetDevice(c[k]->device), "cudaSetDevice", err) ||
+            ((k == 0 || !one) && !ffn_router(*c[k], *w[k], rows, u[k], err))) {
+            err = "card " + std::to_string(k) + ": " + err;
+            return step_status::failed;
+        }
+        expert_args(*c[k], *w[k], rows, u[k], ga[k], da[k], k == 1 && one ? &r0 : nullptr);
+    }
+    if (!c[0]->ex_service->ffn_pair(c, w, rows, ga, da, err) || !record_mixed(*c[0], 1, rows, u[0], err) ||
+        !record_mixed(*c[1], 1, rows, u[1], err)) {
+        return step_status::failed;
+    }
+    return step_status::ok;
+}
+
+// ME8: both cards' resident FFN bodies on one device and stream: card 0's router, then card 0's experts and card 1's
+// on its routing (route_view), each body's mixed record as run_body's
+step_status ffn_pair_resident(card_ctx * const c[2], const layer_weights * const w[2], int32_t rows,
+                              const use_counters u[2], std::string & err) {
+    const route_view r0 = route_of(*c[0]);
+    for (int32_t k = 0; k < 2; ++k) {
+        const bool ok = cuda_ok(cudaSetDevice(c[k]->device), "cudaSetDevice", err) &&
+                        (k == 1 || ffn_router(*c[0], *w[0], rows, u[0], err)) &&
+                        ffn_experts(*c[k], *w[k], rows, u[k], k == 1 ? &r0 : nullptr, err) &&
+                        record_mixed(*c[k], 1, rows, u[k], err);
+        if (!ok) {
+            err = "card " + std::to_string(k) + ": " + err;
+            return step_status::failed;
+        }
+    }
+    return step_status::ok;
 }
 
 // a sublayer's body; not_built while a piece is unbuilt
@@ -645,6 +787,10 @@ step_status run_body(body b, card_ctx & c, const layer_weights & w, const layer_
 }
 
 } // namespace
+
+bool one_router(const card_ctx & c0, const card_ctx & c1) {
+    return same_stream(c0, c1);
+}
 
 int32_t hc_slot_of(const use_counters & u, int64_t n) {
     return hc_slot(u, n);
@@ -755,7 +901,13 @@ bool resolve_weights(const model & m, int32_t layer, int32_t card, layer_weights
     int32_t gi = -1, di = -1;
     out.ex_gate_up = f.ptr("ffn_gate_exps.weight", gi);
     out.ex_down = f.ptr("ffn_down_exps.weight", di);
-    if (out.ex_gate_up == nullptr || out.ex_down == nullptr) {
+    // ME1: the expert cache holds the routed experts (null banks; its service supplies their addresses)
+    const auto cached = [&](int32_t t) {
+        return t >= 0 && m.region_of[size_t(t)] >= 0 && m.regions[card][m.region_of[size_t(t)]].cached;
+    };
+    if (m.expert_cache && cached(gi) && cached(di)) {
+        err.clear();
+    } else if (out.ex_gate_up == nullptr || out.ex_down == nullptr) {
         return false;
     }
     if (!expert_fmt(tensors[gi].format, out.ex_gu_fmt) || !expert_fmt(tensors[di].format, out.ex_down_fmt) ||
@@ -953,12 +1105,18 @@ bool resolve_draft_weights(const model & m, int32_t card, draft_weights & out, s
     }
     int64_t rows = 0, cols = 0;
     card_extent(si, card, rows, cols);
-    const bool q8 = std::strcmp(tensors[si].format, "Q8_0") == 0 && std::strcmp(tensors[gi].format, "Q8_0") == 0 &&
-                    std::strcmp(tensors[di].format, "Q8_0") == 0;
-    if (!q8 || rows != D || cols != FFS || si >= (int32_t)m.dense_packed.size() || m.dense_packed[size_t(si)] != 2 ||
+    // ME7: the routed experts as this load resolved them (model::tp: Q8_0, or the opt-in Q2_0), one format for gate/up
+    // and down; the shared expert Q8_0 either way
+    const char * rf = m.tp(gi).format;
+    const bool routed = (std::strcmp(rf, "Q8_0") == 0 || std::strcmp(rf, "Q2_0") == 0) &&
+                        std::strcmp(m.tp(di).format, rf) == 0;
+    if (!routed || std::strcmp(tensors[si].format, "Q8_0") != 0 || rows != D || cols != FFS ||
+        si >= (int32_t)m.dense_packed.size() || m.dense_packed[size_t(si)] != 2 ||
         tensors[gi].lay != layout::ex1_gate || tensors[di].lay != layout::ex1_down) {
-        return fail(err, tname(L, "ffn experts") + ": not Q8_0 in EX1's packed layouts (pack_draft)");
+        return fail(err, tname(L, "ffn experts") + ": not Q8_0 or Q2_0 routed (one format), Q8_0 shared, in EX1's "
+                                                    "packed layouts (pack_draft)");
     }
+    out.ex_fmt = int32_t(std::strcmp(rf, "Q2_0") == 0 ? fn::experts::fmt::q2_0 : fn::experts::fmt::q8_0);
     return true;
 }
 
@@ -987,19 +1145,37 @@ bool resolve_state(const model & m, int32_t layer, int32_t card, layer_state & o
     };
     const reserved_class * kv = m.state_class("target KV (K0)");
     const int32_t pk = find_part(kv, L + " K");
-    out.n_cells = pk < 0 ? 0 : static_cast<int32_t>(kv->plan.parts[pk].bytes[card] / (int64_t(HD) * 2));
+    // KV8: the class's scale parts mark the 8-bit format (a byte a value)
+    const bool q8 = find_part(kv, "K scales") >= 0;
+    out.n_cells = pk < 0 ? 0 : static_cast<int32_t>(kv->plan.parts[pk].bytes[card] / (int64_t(HD) * (q8 ? 1 : 2)));
     if (gdn) {
         out.gdn = reinterpret_cast<float *>(part("GDN state", L));
+        out.rec = reinterpret_cast<float *>(part("GDN state", L + " records"));
         out.conv = reinterpret_cast<float *>(part("convolution histories", L + " GDN"));
-        return out.gdn != nullptr && out.conv != nullptr;
+        return out.gdn != nullptr && out.rec != nullptr && out.conv != nullptr;
     }
-    out.k_cache = reinterpret_cast<uint16_t *>(part("target KV (K0)", L + " K")); // BF16 bits
+    out.kv_attn = layer / fn::full_attn_interval;
+    out.k_cache = reinterpret_cast<uint16_t *>(part("target KV (K0)", L + " K")); // BF16 bits (KV8: codes)
     out.v_cache = reinterpret_cast<uint16_t *>(part("target KV (K0)", L + " V"));
     if (out.k_cache == nullptr || out.v_cache == nullptr) {
         return false;
     }
+    if (q8) {
+        // KV8: this layer's 4 scales a cell inside the cell-major scale rows
+        const int32_t col = 4 * (layer / fn::full_attn_interval);
+        uint16_t * ks = reinterpret_cast<uint16_t *>(part("target KV (K0)", "K scales"));
+        uint16_t * vs = reinterpret_cast<uint16_t *>(part("target KV (K0)", "V scales"));
+        if (ks == nullptr || vs == nullptr) {
+            return false;
+        }
+        out.k_scale = ks + col;
+        out.v_scale = vs + col;
+    }
     if (card == (layer / fn::full_attn_interval) % 2) {
-        out.idx_keys = reinterpret_cast<uint16_t *>(part("target index keys and summaries", L + " keys"));
+        // ME6: with the host-backed tier the keys' class is their host history
+        const char * kcls = m.state_class("target index keys (ME6)") != nullptr ? "target index keys (ME6)"
+                                                                                : "target index keys and summaries";
+        out.idx_keys = reinterpret_cast<uint16_t *>(part(kcls, L + " keys"));
         out.idx_summaries = reinterpret_cast<float *>(part("target index keys and summaries", L + " summaries"));
         return out.idx_keys != nullptr && out.idx_summaries != nullptr;
     }
@@ -1008,9 +1184,16 @@ bool resolve_state(const model & m, int32_t layer, int32_t card, layer_state & o
 
 namespace {
 
-// the workspace's buffers in layer_ws's order, each 256-byte aligned
-template <typename Fn> void ws_items(layer_ws & w, Fn && f) {
-    const int64_t B = layer_max_rows;
+// FMU2: a lane's selection body and offsets in a joint layer_ws: its layer_max_rows rows' words and layer_max_rows + 1
+// offsets, each rounded up to 16 bytes, the alignment qsa::select and the attention require of each lane's view
+constexpr int64_t lane_sel_body_words = (int64_t(layer_max_rows) * fn::qsa::max_row_words + 3) / 4 * 4;
+constexpr int64_t lane_sel_off_words = (layer_max_rows + 1 + 3) / 4 * 4;
+
+// the workspace's buffers in layer_ws's order, each 256-byte aligned (FMU2: at rows rows; above layer_max_rows, the
+// selection body and offsets keep lane_sel_body_words and lane_sel_off_words for each five rows, so every lane view
+// has its own)
+template <typename Fn> void ws_items(layer_ws & w, int32_t rows, Fn && f) {
+    const int64_t B = rows;
     for (int32_t s = 0; s < 2; ++s) {
         f(reinterpret_cast<void **>(&w.x[s]), B * 4 * F * 4);
         f(reinterpret_cast<void **>(&w.mom[s]), B * fn::hc::n_mom * 4);
@@ -1033,11 +1216,13 @@ template <typename Fn> void ws_items(layer_ws & w, Fn && f) {
     f(reinterpret_cast<void **>(&w.attn), B * GV * 4);
     f(reinterpret_cast<void **>(&w.ik), B * fn::qsa::head_dim * 4);
     f(reinterpret_cast<void **>(&w.iq), B * IQ * 4);
-    f(reinterpret_cast<void **>(&w.sel_body), B * fn::qsa::max_row_words * 4);
-    f(reinterpret_cast<void **>(&w.sel_off), (B + 1) * 4);
+    const int64_t lanes = (B + layer_max_rows - 1) / layer_max_rows;
+    f(reinterpret_cast<void **>(&w.sel_body),
+      (B <= layer_max_rows ? B * fn::qsa::max_row_words : lanes * lane_sel_body_words) * 4);
+    f(reinterpret_cast<void **>(&w.sel_off), (B <= layer_max_rows ? B + 1 : lanes * lane_sel_off_words) * 4);
     f(reinterpret_cast<void **>(&w.pos), 4 * B * 4);
     f(reinterpret_cast<void **>(&w.depth), 4);
-    f(reinterpret_cast<void **>(&w.cur), 4);
+    f(reinterpret_cast<void **>(&w.cur), 8); // ME11: cur, then the GDN selector
     f(reinterpret_cast<void **>(&w.logits), B * NE * 4);
     f(reinterpret_cast<void **>(&w.sg_logit), B * 4);
     f(reinterpret_cast<void **>(&w.sg), B * 4);
@@ -1100,10 +1285,10 @@ int64_t align256w(size_t n) {
 
 } // namespace
 
-size_t layer_ws_bytes() {
+size_t layer_ws_bytes(int32_t rows) {
     layer_ws w;
     int64_t total = 0;
-    ws_items(w, [&](void **, int64_t bytes) { total += align256(bytes); });
+    ws_items(w, rows, [&](void **, int64_t bytes) { total += align256(bytes); });
     return static_cast<size_t>(total);
 }
 
@@ -1231,13 +1416,45 @@ size_t dense_work_bytes() {
     return dense_work_offset(dense_site::count);
 }
 
-layer_ws carve_layer_ws(void * base) {
+layer_ws carve_layer_ws(void * base, int32_t rows) {
     layer_ws w;
     uint8_t * p = static_cast<uint8_t *>(base);
-    ws_items(w, [&](void ** dst, int64_t bytes) {
+    ws_items(w, rows, [&](void ** dst, int64_t bytes) {
         *dst = p;
         p += align256(bytes);
     });
+    return w;
+}
+
+layer_ws lane_ws(const layer_ws & joint, int32_t u) {
+    const int64_t b = int64_t(u) * layer_max_rows; // the lane's first row
+    layer_ws w = joint;
+    for (int32_t s = 0; s < 2; ++s) {
+        w.x[s] += b * 4 * F;
+        w.mom[s] += b * fn::hc::n_mom;
+        w.inject[s] += b * 4;
+        w.out[s] += b * F;
+    }
+    w.zero += b * F;
+    w.partial += b * D;
+    w.mid_codes += fn::act::codes_bytes(static_cast<int32_t>(b), GV);
+    w.mid_scales += fn::act::scales_bytes(static_cast<int32_t>(b), GV) / sizeof(float);
+    w.conv += b * GC;
+    w.z += b * GV;
+    w.alpha += b * GH;
+    w.beta += b * GH;
+    w.gated += b * GV;
+    w.qfull += b * QF;
+    w.kv_k += b * HD;
+    w.kv_v += b * HD;
+    w.attn += b * GV;
+    w.ik += b * fn::qsa::head_dim;
+    w.iq += b * IQ;
+    w.sel_body += int64_t(u) * lane_sel_body_words;
+    w.sel_off += int64_t(u) * lane_sel_off_words;
+    w.logits += b * NE;
+    w.sg_logit += b;
+    w.sg += b;
     return w;
 }
 
@@ -1339,20 +1556,18 @@ step_status of(bool ok) {
 }
 
 // one phase of sublayer sub (0 attention, 1 FFN) on one card
-// fused: the graphs' single HC launch (layer_card_step); the eager pair order runs HC's two phases (HC4)
+// fused: the per-card graphs' single HC launch (layer_card_step); the pair order runs HC's two phases (HC4, ME3)
 step_status run_phase(card_ctx & c, const layer_weights & w, const layer_state & st, const layer_input & in,
                       int32_t sub, phase ph, int32_t rows, const use_counters & u, bool fused, std::string & err) {
     if (!cuda_ok(cudaSetDevice(c.device), "cudaSetDevice", err)) {
         return step_status::failed;
     }
     const hc_module & hm = sub == 0 ? w.hc_attn : w.hc_ffn;
-    const float * hres = sub == 0 ? in.hres : c.ws.x[0];
-    const float * hpost = sub == 0 ? in.hpost : c.ws.inject[0];
-    const float * hx = sub == 0 ? in.hx : c.ws.out[0];
+    const layer_input hi = hc_input(c, in, sub);
     switch (ph) {
         case phase::down:
         case phase::up:
-            return of(hc_phase(c, hm, sub, hres, hpost, hx, rows, u, static_cast<int32_t>(ph), fused, err));
+            return of(hc_phase(c, hm, sub, hi.hres, hi.hpost, hi.hx, rows, u, static_cast<int32_t>(ph), fused, err));
         case phase::body:
             return run_body(sub == 1 ? body::ffn : w.gdn ? body::gdn : body::qsa, c, w, st, rows, u, err);
         case phase::send:
@@ -1381,9 +1596,9 @@ void advance(use_counters & u, const layer_weights & w, int32_t sub) {
 }
 
 bool check_step(const card_ctx & c, const layer_weights & w, const layer_state & st, int32_t rows, std::string & err) {
-    if (rows < 1 || rows > layer_max_rows || c.n_before == nullptr || c.pos == nullptr || (w.gdn && c.cur == nullptr) ||
-        (!w.gdn && st.n_cells < rows)) {
-        return fail(err, "rows out of range, or no device depth, positions or committed slot");
+    if (rows < 1 || rows > layer_max_rows || c.n_before == nullptr || c.pos == nullptr ||
+        (w.gdn && (c.cur == nullptr || c.gsel == nullptr)) || (!w.gdn && st.n_cells < rows)) {
+        return fail(err, "rows out of range, or no device depth, positions, committed slot or GDN selector");
     }
     return true;
 }
@@ -1403,8 +1618,47 @@ step_status layer_pair_step(card_ctx * const c[2], const layer_weights * const w
         } order[] = {{phase::down, 0},     {phase::down, 1},         {phase::up, 0},   {phase::up, 1},
                      {phase::body, first}, {phase::body, 1 - first}, {phase::send, 0}, {phase::send, 1},
                      {phase::recv, 0},     {phase::recv, 1}};
+        // ME1: with the expert cache the FFN's two bodies run as one (ffn_pair); ME8: so do the resident ones on one
+        // device and stream (ffn_pair_resident), one router for both
+        const bool pair = sub == 1 && c[0]->ex_service != nullptr;
+        const bool shared = sub == 1 && !pair && same_stream(*c[0], *c[1]);
+        if (pair && c[1]->ex_service != c[0]->ex_service) {
+            err = "the expert cache's cards share one service";
+            return step_status::failed;
+        }
+        c[0]->ffn_finished = c[1]->ffn_finished = false;
+        // ME10: X-F's exchange is skipped only when the cached window's finish wrote both cards' outputs, which it
+        // does on one device and stream with both shards in the window; its slots stay at the sentinel
+        bool finished = false;
+        // ME12: on one device and stream both cards' HC phases are one launch, at {down, 0}
+        const hc_module * const hm[2] = {sub == 0 ? &w[0]->hc_attn : &w[0]->hc_ffn,
+                                         sub == 0 ? &w[1]->hc_attn : &w[1]->hc_ffn};
+        const bool hc_pair = hc_paired(c, *hm[0], *hm[1]);
         for (const auto & o : order) {
             const int32_t k = o.card;
+            if (hc_pair && (o.ph == phase::down || o.ph == phase::up)) {
+                if (o.ph == phase::down && k == 0 && !hc_pair_phase(c, hm, sub, in, rows, u, err)) {
+                    return step_status::failed;
+                }
+                continue;
+            }
+            if ((pair || shared) && o.ph == phase::body) {
+                if (k == first) {
+                    const step_status ps = pair ? ffn_pair(c, w, rows, u, err) : ffn_pair_resident(c, w, rows, u, err);
+                    if (ps != step_status::ok) {
+                        return ps;
+                    }
+                    finished = pair && c[0]->ffn_finished && c[1]->ffn_finished;
+                    if ((c[0]->ffn_finished || c[1]->ffn_finished) && (!finished || !same_stream(*c[0], *c[1]))) {
+                        err = "the FFN finish wrote one card's output, or ran across devices";
+                        return step_status::failed;
+                    }
+                }
+                continue;
+            }
+            if (finished && (o.ph == phase::send || o.ph == phase::recv)) {
+                continue;
+            }
             const step_status ps = run_phase(*c[k], *w[k], *st[k], in[k], sub, o.ph, rows, u[k], false, err);
             if (ps != step_status::ok) {
                 err = "card " + std::to_string(k) + ": " + err;
@@ -1430,6 +1684,488 @@ step_status layer_card_step(card_ctx & c, const layer_weights & w, const layer_s
             }
         }
         advance(u, w, sub);
+    }
+    return step_status::ok;
+}
+
+// ---- FMU2: the joint round ----
+
+namespace {
+
+constexpr int32_t joint_sites = static_cast<int32_t>(dense_site::router) + 1; // the target's six sites
+
+size_t joint_site_bytes(dense_site site) {
+    size_t n = 16;
+    for (auto & [s, a] : launch_shapes()) {
+        if (s == site) {
+            fn::dense::choose_splits(a);
+            n = std::max(n, fn::dense::joint_work_bytes(a));
+        }
+    }
+    return n;
+}
+
+size_t joint_work_offset(dense_site site) {
+    int64_t off = 0;
+    for (int32_t i = 0; i < static_cast<int32_t>(site); ++i) {
+        off += align256w(joint_site_bytes(static_cast<dense_site>(i)));
+    }
+    return static_cast<size_t>(off);
+}
+
+int32_t joint_rows_of(const joint_lanes & j) {
+    return j.lanes * layer_max_rows;
+}
+
+// a body's first joint launch acquires every lane's X-HMIX slot of sublayer u.sub (lane 0's, then lane_floats apart);
+// a failed acquire raises the joint error word
+void acquire_joint(fn::dense::product_args & a, fn::dense::joint_args & ja, const joint_lanes & j,
+                   const use_counters & u) {
+    const card_ctx & c0 = *j.lane[0];
+    a.hmix = hmix_in(c0, u);
+    a.hmix_peer_half = 1 - c0.card;
+    a.err = j.jr->err(c0.card);
+    ja.hmix_lane_floats = static_cast<int32_t>(fn::xchg::joint_rings::lane_floats());
+}
+
+// fn::dense::product_joint in site's joint region, its layout checked against the site's
+bool joint_launch(joint_lanes & j, fn::dense::product_args a, fn::dense::joint_args ja, dense_site site,
+                  const char * piece, std::string & err) {
+    card_ctx & c0 = *j.lane[0];
+    const int32_t i = static_cast<int32_t>(site);
+    if (j.dense_work == nullptr || i < 0 || i >= joint_sites) {
+        return fail(err, std::string(piece) + ": joint work or site missing");
+    }
+    a.grids = c0.dense_grids;
+    fn::dense::choose_splits(a);
+    fn::dense::work_layout l;
+    if (!fn::dense::joint_layout_of(a, l) || !fn::dense::same_layout(l, j.dense_sites[size_t(i)])) {
+        return fail(err, std::string(piece) + ": the joint work layout is not site " + dense_site_name(site) + "'s");
+    }
+    a.work = static_cast<uint8_t *>(j.dense_work) + joint_work_offset(site);
+    ja.lanes = j.lanes;
+    if (!fn::dense::product_joint(a, ja, c0.stream)) {
+        return fail(err, std::string(piece) + ": joint product");
+    }
+    note(c0, piece);
+    return true;
+}
+
+bool gdn_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
+               std::string & err) {
+    layer_ws & ws = j.lane[0]->ws; // the joint frame's base: every lane's rows
+    fn::dense::product_args in;
+    fn::dense::joint_args ja;
+    in.k = D;
+    in.n_mats = 4;
+    in.mats[0] = qmat(w.qkv, ws.conv);
+    in.mats[0].e = fn::dense::epi::conv_silu;
+    in.mats[1] = qmat(w.z, ws.z);
+    in.mats[2] = bmat(w.alpha, GH, ws.alpha);
+    in.mats[3] = bmat(w.beta, GH, ws.beta);
+    acquire_joint(in, ja, j, u);
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        ja.conv[k] = {w.conv1d, st[k]->conv, j.lane[k]->cur};
+    }
+    in.conv = ja.conv[0];
+    if (!joint_launch(j, in, ja, dense_site::gdn_input, "gdn.input", err)) {
+        return false;
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        card_ctx & c = *j.lane[k];
+        fn::gdn::core_args g;
+        g.conv = c.ws.conv;
+        g.z = c.ws.z;
+        g.alpha = c.ws.alpha;
+        g.beta = c.ws.beta;
+        g.dt = w.dt;
+        g.a = w.a;
+        g.norm_w = w.ssm_norm;
+        g.state = st[k]->gdn;
+        g.rec = st[k]->rec;
+        g.gsel = c.gsel;
+        g.gated = c.ws.gated;
+        g.gated_q = {c.ws.mid_codes, c.ws.mid_scales, layer_max_rows, GV};
+        g.ws = c.gdn_ws;
+        g.rows = layer_max_rows;
+        if (!fn::gdn::core(g, c.stream)) {
+            return fail(err, "gdn core");
+        }
+        note(c, "gdn.core");
+    }
+    fn::dense::product_args out;
+    out.k = GV;
+    out.n_mats = 1;
+    out.mats[0] = qmat(w.ssm_out, ws.partial);
+    out.x_codes = ws.mid_codes;
+    out.x_scales = ws.mid_scales;
+    return joint_launch(j, out, fn::dense::joint_args(), dense_site::gdn_out, "gdn.out", err);
+}
+
+bool qsa_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
+               std::string & err) {
+    layer_ws & ws = j.lane[0]->ws;
+    const int32_t r = j.lane[0]->card;
+    const bool owner = r == w.index_owner;
+    const int32_t sel_slot = use_slot(u, u.select, u.graph_select);
+    fn::dense::product_args in;
+    fn::dense::joint_args ja;
+    in.k = D;
+    in.n_mats = owner ? 5 : 3;
+    in.mats[0] = qmat(w.wq, ws.qfull);
+    in.mats[1] = qmat(w.wk, ws.kv_k);
+    in.mats[2] = qmat(w.wv, ws.kv_v);
+    if (owner) {
+        in.mats[3] = bmat(w.idx_q, IQ, ws.iq);
+        in.mats[4] = bmat(w.idx_k, fn::qsa::head_dim, ws.ik);
+    }
+    acquire_joint(in, ja, j, u);
+    if (!joint_launch(j, in, ja, owner ? dense_site::qsa_input_owner : dense_site::qsa_input_peer, "qsa.input", err)) {
+        return false;
+    }
+    // FMU2 (build item 3): every lane's selection before any lane's attend: the owner's summary, select and send of
+    // each lane, or the peer's receive of each, so the peer waits for the owner once a layer, not once a lane. Each
+    // lane's kernels, arguments and buffers (its own rows of the joint ws, its slot's state and workspaces, its lane
+    // ring) are unchanged, so every kernel's bits are
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        card_ctx & c = *j.lane[k];
+        const layer_state & sk = *st[k];
+        const fn::xchg::rings & rg = *c.rings;
+        if (owner) {
+            fn::qsa::round_update_args ua;
+            ua.keys = sk.idx_keys;
+            ua.k_norm = w.idx_k_norm;
+            ua.summaries = sk.idx_summaries;
+            ua.rope = fn::qsa::model_rope();
+            ua.ik = c.ws.ik;
+            ua.depth = c.n_before;
+            ua.rows = layer_max_rows;
+            ua.max_cells = sk.n_cells;
+            if (!fn::qsa::summary_update(ua, c.stream)) {
+                return fail(err, "summary_update");
+            }
+            note(c, "qsa.summary");
+            fn::qsa::select_args sa;
+            sa.summaries = sk.idx_summaries;
+            sa.q = c.ws.iq;
+            sa.q_norm = w.idx_q_norm;
+            sa.depth = c.n_before;
+            sa.max_cells = sk.n_cells;
+            sa.rope = fn::qsa::model_rope();
+            sa.ws = fn::qsa::carve(c.qsa_ws);
+            sa.body = c.ws.sel_body;
+            sa.offsets = c.ws.sel_off;
+            if (!fn::qsa::select(layer_max_rows, sa, c.stream)) {
+                return fail(err, "qsa select");
+            }
+            note(c, "qsa.select");
+            if (!fn::xchg::send_select(layer_max_rows, c.ws.sel_off, c.ws.sel_body,
+                                       rg.slot(1 - r, fn::xchg::msg::select, sel_slot), c.stream)) {
+                return fail(err, "send_select");
+            }
+            note(c, "x.select.send");
+        } else {
+            if (!fn::xchg::recv_select(layer_max_rows, rg.slot(r, fn::xchg::msg::select, sel_slot), c.ws.sel_off,
+                                       c.ws.sel_body, rg.err(r), c.stream)) {
+                return fail(err, "recv_select");
+            }
+            note(c, "x.select.recv");
+        }
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        card_ctx & c = *j.lane[k];
+        const layer_state & sk = *st[k];
+        fn::qsa::attn::args aa = {};
+        aa.qfull = c.ws.qfull;
+        aa.kv_k = c.ws.kv_k;
+        aa.kv_v = c.ws.kv_v;
+        aa.q_norm = w.q_norm;
+        aa.k_norm = w.k_norm;
+        aa.body = c.ws.sel_body;
+        aa.offsets = c.ws.sel_off;
+        aa.pos = c.pos;
+        aa.k_cache = sk.k_cache;
+        aa.v_cache = sk.v_cache;
+        aa.k_scale = sk.k_scale;
+        aa.v_scale = sk.v_scale;
+        aa.depth = c.n_before;
+        aa.max_cells = sk.n_cells;
+        aa.theta_scale = fn::qsa::attn::rope_theta_scale();
+        aa.out = c.ws.attn;
+        aa.codes = c.ws.mid_codes;
+        aa.scales = c.ws.mid_scales;
+        aa.k_f32 = nullptr;
+        aa.stamps = nullptr;
+        aa.ws = fn::qsa::attn::carve(c.attn_ws);
+        if (!fn::qsa::attn::attend(layer_max_rows, aa, c.stream)) {
+            return fail(err, "qsa attend");
+        }
+        note(c, "qsa.attend");
+    }
+    fn::dense::product_args out;
+    out.k = GV;
+    out.n_mats = 1;
+    out.mats[0] = qmat(w.wo, ws.partial);
+    out.x_codes = ws.mid_codes;
+    out.x_scales = ws.mid_scales;
+    return joint_launch(j, out, fn::dense::joint_args(), dense_site::qsa_out, "qsa.out", err);
+}
+
+bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u, std::string & err) {
+    card_ctx & c0 = *j.lane[0];
+    layer_ws & ws = c0.ws;
+    fn::dense::product_args rt;
+    fn::dense::joint_args ja;
+    rt.k = D;
+    rt.n_mats = 2;
+    rt.mats[0] = bmat(w.router, NE, ws.logits);
+    rt.mats[1] = bmat(w.sh_gate_w, 1, ws.sg_logit);
+    acquire_joint(rt, ja, j, u);
+    rt.route.logits = 0;
+    rt.route.gate = 1;
+    rt.route.ids = c0.ex.ids; // lane 0's view is the joint routing's base
+    rt.route.wts = c0.ex.wts;
+    rt.route.sg = ws.sg;
+    if (!joint_launch(j, rt, ja, dense_site::router, "ffn.router", err)) {
+        return false;
+    }
+    // FMU2 (build item 1): every lane's gate/up in one launch, then every lane's down in one, each lane's units its own
+    // (fn::experts::gate_up_lanes); a form the lanes launch does not take runs each lane's experts alone
+    const auto f = static_cast<fn::experts::fmt>(w.ex_gu_fmt);
+    const auto fg = static_cast<fn::dense::fmt>(w.sh_gate.fmt);
+    const auto fu = static_cast<fn::dense::fmt>(w.sh_up.fmt);
+    const auto fd = static_cast<fn::experts::fmt>(w.ex_down_fmt);
+    const auto fs = static_cast<fn::experts::fmt>(w.ex_sh_down_fmt);
+    fn::experts::gate_up_lanes_args ga;
+    fn::experts::down_lanes_args da;
+    bool lanes = true;
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        lanes = lanes && j.lane[k]->ex_service == nullptr;
+        expert_args(*j.lane[k], w, layer_max_rows, u, ga.s[k], da.s[k]);
+    }
+    if (lanes && fn::experts::gate_up_lanes_supported(f, fg, fu, j.lanes, ga) &&
+        fn::experts::down_lanes_supported(fd, fs, j.lanes, da)) {
+        if (!fn::experts::gate_up_lanes(f, fg, fu, j.lanes, ga, c0.stream)) {
+            return fail(err, "experts gate_up_lanes");
+        }
+        note(c0, "ffn.ex_gate_up");
+        if (!fn::experts::down_lanes(fd, fs, j.lanes, da, c0.stream)) {
+            return fail(err, "experts down_lanes");
+        }
+        note(c0, "ffn.ex_down");
+        return true;
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        if (!ffn_experts(*j.lane[k], w, layer_max_rows, u, nullptr, err)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the joint destination-half exchange of the joint partial (set 0: X-A, 1: X-F) on joint slot `slot`
+bool exchange_joint(joint_lanes & j, int32_t set, int32_t slot, bool send, std::string & err) {
+    card_ctx & c0 = *j.lane[0];
+    const int32_t r = c0.card;
+    const int32_t rows = joint_rows_of(j);
+    const fn::xchg::msg m = set == 0 ? fn::xchg::msg::a : fn::xchg::msg::f;
+    if (send) {
+        if (!fn::xchg::send_half_joint(rows, 1 - r, c0.ws.partial, j.jr->slot(1 - r, m, slot), c0.stream)) {
+            return fail(err, "send_half_joint");
+        }
+        note(c0, set == 0 ? "x.a.send" : "x.f.send");
+        return true;
+    }
+    if (!fn::xchg::recv_add_joint(rows, r, c0.ws.partial, j.jr->slot(r, m, slot), c0.ws.out[set], j.jr->err(r),
+                                  set == 0 ? fn::xchg::err_poll_a : fn::xchg::err_poll_f, c0.stream)) {
+        return fail(err, "recv_add_joint");
+    }
+    note(c0, set == 0 ? "x.a.recv" : "x.f.recv");
+    return true;
+}
+
+} // namespace
+
+bool joint_dense_layouts(dense_layouts & out, std::string & err) {
+    out = dense_layouts{};
+    std::array<bool, n_dense_sites> seen{};
+    for (auto & [s, a] : launch_shapes()) {
+        const int32_t i = static_cast<int32_t>(s);
+        if (i >= joint_sites) {
+            continue;
+        }
+        fn::dense::choose_splits(a);
+        fn::dense::work_layout l;
+        if (!fn::dense::joint_layout_of(a, l)) {
+            return fail(err, std::string("joint site ") + dense_site_name(s) + ": no layout");
+        }
+        if (seen[size_t(i)] && !fn::dense::same_layout(l, out[size_t(i)])) {
+            return fail(err, std::string("joint site ") + dense_site_name(s) + " serves two layouts");
+        }
+        seen[size_t(i)] = true;
+        out[size_t(i)] = l;
+    }
+    for (int32_t i = 0; i < joint_sites; ++i) {
+        if (!seen[size_t(i)]) {
+            return fail(err, std::string("joint site ") + dense_site_name(static_cast<dense_site>(i)) + ": no launch");
+        }
+    }
+    return true;
+}
+
+size_t joint_ple_work_offset() {
+    return joint_work_offset(dense_site::router) + align256w(joint_site_bytes(dense_site::router));
+}
+
+size_t joint_dense_work_bytes() {
+    return joint_ple_work_offset() + align256w(std::max<size_t>(fn::ple::joint_products_work_bytes(), 16));
+}
+
+namespace {
+
+// a lane's experts' buffers in the joint routing region: GLU codes, GLU scales ({d, s} a run), meta
+constexpr int64_t lane_ex_codes = int64_t(fn::experts::glu_slots) * FFS;
+constexpr int64_t lane_ex_scales = int64_t(fn::experts::glu_slots) * (FFS / 32) * 2 * 4;
+int64_t lane_ex_bytes() {
+    return align256(lane_ex_codes) + align256(lane_ex_scales) + align256(fn::experts::meta_bytes);
+}
+
+} // namespace
+
+size_t joint_route_bytes() {
+    return static_cast<size_t>(2 * align256(int64_t(fn::xchg::joint_rows) * NU * 4) +
+                               fn::xchg::max_lanes * lane_ex_bytes());
+}
+
+void joint_lane_ex(void * base, int32_t u, ex_bufs & ex) {
+    uint8_t * p = static_cast<uint8_t *>(base) + 2 * align256(int64_t(fn::xchg::joint_rows) * NU * 4) +
+                  int64_t(u) * lane_ex_bytes();
+    ex.glu_codes = reinterpret_cast<int8_t *>(p);
+    ex.glu_scales = reinterpret_cast<float *>(p + align256(lane_ex_codes));
+    ex.meta = p + align256(lane_ex_codes) + align256(lane_ex_scales);
+}
+
+void joint_route_carve(void * base, int32_t *& ids, float *& wts) {
+    uint8_t * p = static_cast<uint8_t *>(base);
+    ids = reinterpret_cast<int32_t *>(p);
+    wts = reinterpret_cast<float *>(p + align256(int64_t(fn::xchg::joint_rows) * NU * 4));
+}
+
+namespace {
+
+// the joint step's checks: lanes 2..4 on one card and stream, resident banks, every lane's step (check_step)
+bool joint_check(const joint_lanes & j, const layer_weights & w, const layer_state * const st[], std::string & err) {
+    if (j.lanes < 2 || j.lanes > fn::xchg::max_lanes || j.jr == nullptr || j.dense_work == nullptr) {
+        return fail(err, "joint step: lanes outside 2 .. 4, or no joint rings or work");
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        const card_ctx & c = *j.lane[k];
+        if (!check_step(c, w, *st[k], layer_max_rows, err)) {
+            return false;
+        }
+        if (c.ex_service != nullptr || c.kv != nullptr || c.card != j.lane[0]->card || c.stream != j.lane[0]->stream) {
+            return fail(err, "joint step: the expert cache, the host-backed KV, or lanes on different cards");
+        }
+    }
+    return true;
+}
+
+// every lane's HC sublayer sub in one launch (hc::sub_joint: each lane's the lone B = 5 code on its ring); mode as
+// sub's (3 both phases; 1 and 2 the pair order's)
+bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input in[], int32_t sub, int32_t mode,
+              const use_counters & u, std::string & err) {
+    const hc_module & hm = sub == 0 ? w.hc_attn : w.hc_ffn;
+    if (hm.q8_down != nullptr) {
+        return fail(err, "joint step: Q8_0 HC weights");
+    }
+    fn::hc::sub_args ha[fn::xchg::max_lanes];
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        const card_ctx & c = *j.lane[k];
+        const layer_input hi = hc_input(c, in[k], sub);
+        ha[k] = hc_sub_args(c, hm, sub, hi.hres, hi.hpost, hi.hx, u);
+    }
+    if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err) ||
+        !fn::hc::sub_joint(j.lanes, mode, ha, j.lane[0]->stream)) {
+        return err.empty() ? fail(err, "hc sub_joint") : false;
+    }
+    note(*j.lane[0], "hc.sub_joint");
+    return true;
+}
+
+// the sublayer's body for every lane
+bool body_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
+                int32_t sub, std::string & err) {
+    const std::vector<std::string> missing = body_unbuilt(sub == 1 ? body::ffn : w.gdn ? body::gdn : body::qsa);
+    if (!missing.empty()) {
+        return fail(err, "joint step: a body piece is not built");
+    }
+    if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err)) {
+        return false;
+    }
+    return sub == 1 ? ffn_joint(j, w, u, err) : w.gdn ? gdn_joint(j, w, st, u, err) : qsa_joint(j, w, st, u, err);
+}
+
+int32_t exchange_slot(const use_counters & u, int32_t sub) {
+    return sub == 0 ? use_slot(u, u.a, u.graph_a) : use_slot(u, u.f, u.graph_f);
+}
+
+} // namespace
+
+step_status layer_joint_step(joint_lanes & j, const layer_weights & w, const layer_state * const st[],
+                             const layer_input in[], use_counters & u, std::string & err) {
+    if (!joint_check(j, w, st, err)) {
+        return step_status::failed;
+    }
+    for (int32_t sub = 0; sub < 2; ++sub) {
+        if (!hc_joint(j, w, in, sub, 3, u, err) || !body_joint(j, w, st, u, sub, err)) {
+            return step_status::failed;
+        }
+        const int32_t slot = exchange_slot(u, sub);
+        if (!exchange_joint(j, sub, slot, true, err) || !exchange_joint(j, sub, slot, false, err)) {
+            return step_status::failed;
+        }
+        advance(u, w, sub);
+    }
+    return step_status::ok;
+}
+
+step_status layer_joint_pair_step(joint_lanes * const j[2], const layer_weights * const w[2],
+                                  const layer_state * const * const st[2], const layer_input * const in[2],
+                                  use_counters u[2], std::string & err) {
+    for (int32_t k = 0; k < 2; ++k) {
+        if (!joint_check(*j[k], *w[k], st[k], err)) {
+            err = "card " + std::to_string(k) + ": " + err;
+            return step_status::failed;
+        }
+    }
+    if (j[0]->lanes != j[1]->lanes || j[0]->lane[0]->card != 0 || j[1]->lane[0]->card != 1) {
+        return of(fail(err, "joint pair step: the same lanes on cards 0 and 1"));
+    }
+    for (int32_t sub = 0; sub < 2; ++sub) {
+        // layer_pair_step's order: both cards' down phases, both up phases, the bodies (the index owner's first),
+        // both sends, both receives
+        const int32_t first = body_first(*w[0], sub);
+        const int32_t slot[2] = {exchange_slot(u[0], sub), exchange_slot(u[1], sub)};
+        bool ok = true;
+        for (int32_t mode = 1; mode <= 2 && ok; ++mode) {
+            for (int32_t k = 0; k < 2 && ok; ++k) {
+                ok = hc_joint(*j[k], *w[k], in[k], sub, mode, u[k], err);
+            }
+        }
+        for (const int32_t k : {first, 1 - first}) {
+            ok = ok && body_joint(*j[k], *w[k], st[k], u[k], sub, err);
+        }
+        for (const bool send : {true, false}) {
+            for (int32_t k = 0; k < 2 && ok; ++k) {
+                ok = cuda_ok(cudaSetDevice(j[k]->lane[0]->device), "cudaSetDevice", err) &&
+                     exchange_joint(*j[k], sub, slot[k], send, err);
+            }
+        }
+        if (!ok) {
+            return step_status::failed;
+        }
+        advance(u[0], *w[0], sub);
+        advance(u[1], *w[1], sub);
     }
     return step_status::ok;
 }

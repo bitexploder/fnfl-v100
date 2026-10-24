@@ -195,8 +195,24 @@ size_t part_bytes();
 // False, with nothing enqueued, for positions outside 1..5 or a base the rule rejects.
 bool eh_proj(int32_t positions, const fn::dense::product_args & base, void * stream);
 
-bool datc_prepare(int32_t rows, const prepare_args & a, void * stream);
-bool datc_attend(const attend_args & a, void * stream);
+// ME3 (the host-backed KV's graphs, fn/model/kv_tier.h): shift, when set, is a device word w: the launch addresses
+// cell c at k_cache + (c - *w) * 256 (v_cache alike), *w read on the device (separate instantiations; the attend's for
+// the sparse form only); null: the resident launches
+bool datc_prepare(int32_t rows, const prepare_args & a, void * stream, const int64_t * shift = nullptr);
+bool datc_attend(const attend_args & a, void * stream, const int64_t * shift = nullptr);
+
+// FMU2 (build item 2, the joint draft step, fn/model/draft.h draft_joint_enqueue): up to max_copy_segs word copies
+// in one launch, block i segment i: dst[w] = src[w * src_stride] for w < words (the lanes' tokens and retained
+// carries gathered into the joint rows, the picks scattered back to each lane's descriptor). Bits copied unchanged.
+// False, with nothing enqueued, for n outside 1 .. max_copy_segs or a segment without pointers, words or stride.
+struct copy_seg {
+    const uint32_t * src = nullptr;
+    uint32_t * dst = nullptr;
+    int32_t words = 0;
+    int32_t src_stride = 1;
+};
+constexpr int32_t max_copy_segs = 8;
+bool lanes_copy(int32_t n, const copy_seg * segs, void * stream);
 
 // SP2 (sparse): *depth = *n_before - 1, the depth of the step's select (fn::qsa::select_args::q_ahead), one thread
 bool select_depth(const int32_t * n_before, int32_t * depth, void * stream);

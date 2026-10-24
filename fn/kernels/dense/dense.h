@@ -194,4 +194,40 @@ bool product(int32_t rows, const product_args & a, void * stream);
 
 const char * fmt_name(fmt f);
 
+// FMU2, the joint product: U lanes (2 .. max_lanes) of lane_rows rows in one launch that reads every weight once. Row
+// b = lane_rows u + i is lane u's row i. Each row's arithmetic is the lone launch's at B = 5 (the same per-lane dot
+// products, shuffle trees and part order; splits and tiles from the shape), so every output of lane u is bitwise equal
+// to product(lane_rows, ...) on lane u's rows alone (dense_joint_test). Matrices, formats, K and the epilogues as
+// product at B = 5 (K <= 3,072), except F32 weights (the draft's router), which the joint launch rejects. Every
+// per-row buffer of product_args (x codes, scales and F32 values, outputs, the GLU's codes, scales and F32 values,
+// the router's ids, weights and gate, a matrix's scale) holds the U lane_rows rows contiguously, lane u's at row
+// lane_rows u. Per lane: X-HMIX's slot (lane u's at a.hmix + u hmix_lane_floats, its rows 0 .. 4) and the convolution's
+// history and committed slot (conv[u]; the taps conv[0].w; a.conv is ignored). work: joint_work_bytes (its own
+// layout, joint_layout_of), zeroed once, private to joint launches of the same layout (any U). Dynamic shared memory:
+// U x 5 x 1.5 K bytes of staged activations (92,160 B at U = 4, K 3,072) plus the IQ3_S grid, or the router's 20 rows
+// (51,200 B) when larger, above the 48 KB default (the launch sets the kernel's opt-in attribute).
+constexpr int32_t lane_rows = max_rows;
+constexpr int32_t max_lanes = 4;
+constexpr int32_t max_joint_rows = lane_rows * max_lanes;
+constexpr int32_t max_lane_mats = 2; // matrices with lane outputs (joint_args::out)
+
+struct joint_args {
+    int32_t lanes = 0;
+    int32_t hmix_lane_floats = 0; // X-HMIX: from lane u's slot to lane u + 1's (a multiple of 4)
+    conv_args conv[max_lanes];
+    // lane outputs: F32-epilogue matrix i's lane u rows go to out[i][u] (lane_rows rows of m, 16-byte aligned;
+    // mats[i].out is ignored), for the head's vocabulary and PLE's two products; all null: each matrix's U lane_rows
+    // rows of mats[i].out
+    float * out[max_lane_mats][max_lanes] = {};
+    // per-lane F32 activations (PLE, FMU2 build item 4): lane u's lane_rows rows of K at x_f32[u] (16-byte aligned;
+    // BF16 matrices only, a.x_f32 ignored); all null: a.x_f32's (or X-HMIX's) rows
+    const float * x_f32[max_lanes] = {};
+};
+
+// The joint launch's work layout, the same at every U: lone layout_of's counters and router counter; a split or glu
+// matrix's partial sums [tile][part][8 rows][max_joint_rows] (no row-4 region)
+bool joint_layout_of(const product_args & a, work_layout & out);
+size_t joint_work_bytes(const product_args & a);
+bool product_joint(const product_args & a, const joint_args & j, void * stream);
+
 } // namespace fn::dense

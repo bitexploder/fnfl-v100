@@ -48,12 +48,17 @@ template <fmt F, dfmt FG, dfmt FU> __host__ __device__ constexpr int32_t gu_grid
 }
 // XB2 (d): a block's units in its rank order, routed then shared (U16 each, at most gu_max_ranks: 410 units over 72
 // blocks; SP2, capacity 5: 510 units, 8 ranks), then the routed count and the total (U16)
-template <int C> constexpr int32_t gu_max_ranks = (max_units_of(C) + n_sm - 1) / n_sm;
-template <int C> constexpr int32_t gu_list_bytes = C <= 4 ? 16 : 32;
-template <int C> constexpr bool gu_list_ok() {
-    return 2 * (gu_max_ranks<C> + 2) <= gu_list_bytes<C> && gu_max_ranks<C> <= 32;
+// ME10: NB, a launch's blocks a shard (72; 36 for gate_up_pair's two shards in one launch)
+template <int C, int NB = n_sm> constexpr int32_t gu_max_ranks = (max_units_of(C) + NB - 1) / NB;
+template <int C, int NB = n_sm> constexpr int32_t gu_list_bytes = (2 * (gu_max_ranks<C, NB> + 2) + 15) / 16 * 16;
+template <int C, int NB = n_sm> constexpr bool gu_list_ok() {
+    return 2 * (gu_max_ranks<C, NB> + 2) <= gu_list_bytes<C, NB> && gu_max_ranks<C, NB> <= 32;
 }
-static_assert(gu_list_ok<4>() && gu_list_ok<5>(), "a block's units: one warp's lanes");
+static_assert(gu_list_ok<4>() && gu_list_ok<5>() && gu_list_ok<4, n_sm / 2>() && gu_list_ok<5, n_sm / 2>(),
+              "a block's units: one warp's lanes");
+static_assert(gu_list_bytes<4> == 16 && gu_list_bytes<5> == 32 && gu_list_bytes<4, n_sm / 2> == 32 &&
+                  gu_list_bytes<5, n_sm / 2> == 48,
+              "the unit list's bytes (ME10: 15 ranks over 36 blocks at capacity 5)");
 // XB3: the struct alone (the order is not held)
 template <int C> constexpr int32_t gu_meta_bytes = static_cast<int32_t>(sizeof(meta_c<C>));
 static_assert(gu_meta_bytes<4> % 16 == 0 && gu_meta_bytes<5> % 16 == 0, "16-byte aligned list region");
@@ -69,18 +74,31 @@ template <fmt F, dfmt FG, dfmt FU, int B> __host__ __device__ constexpr int32_t 
 // list as XB2's last warp did (routed units, then shared, each in rank order; then the routed count and the total)
 // and, when order is set, each of the block's ranks' entries into the region's order (unit_order's form), so the
 // region holds what write_meta writes.
-template <int C>
+// ME3: X, the cache's instantiation (gate_up_args::skip and wt); the resident one (X false) is 412ecbd's text.
+// ME10: NB the launch's blocks a shard (the deal's stride; 36 when two shards share a launch)
+template <bool X, int C, int NB = n_sm>
 __device__ __forceinline__ void block_units(const meta_c<C> & m, const class_table & cw, int32_t first, uint16_t * list,
-                                            uint16_t * order) {
+                                            uint16_t * order, const uint8_t * const * wt, int32_t skip) {
     constexpr int32_t n_classes = C + 1;                 // SP2: the capacity's classes
     constexpr int32_t order_shared = order_shared_of(C); // and first shared unit
-    constexpr int32_t gu_ranks = gu_max_ranks<C>;
+    constexpr int32_t gu_ranks = gu_max_ranks<C, NB>;
     const uint32_t full = 0xffffffffu;
     const int32_t lane = static_cast<int32_t>(threadIdx.x & 31);
     const uint32_t lt = (1u << lane) - 1u;
     const int32_t n_u = m.n_u;
-    const int32_t c0 = lane < n_u ? __popc(m.mask[lane]) - 1 : -1;
-    const int32_t c1 = lane + 32 < n_u ? __popc(m.mask[lane + 32]) - 1 : -1;
+    int32_t c0, c1, n_run = 0;
+    if constexpr (X) {
+        // ME1 (gate_up_args::skip): an expert whose table entry is null takes no class, so no rank; skip 2 leaves out
+        // the shared class too
+        const bool run0 = lane < n_u && (skip == 0 || wt[m.e[lane]] != nullptr);
+        const bool run1 = lane + 32 < n_u && (skip == 0 || wt[m.e[lane + 32]] != nullptr);
+        c0 = run0 ? __popc(m.mask[lane]) - 1 : -1;
+        c1 = run1 ? __popc(m.mask[lane + 32]) - 1 : -1;
+        n_run = __popc(__ballot_sync(full, run0)) + __popc(__ballot_sync(full, run1));
+    } else {
+        c0 = lane < n_u ? __popc(m.mask[lane]) - 1 : -1;
+        c1 = lane + 32 < n_u ? __popc(m.mask[lane + 32]) - 1 : -1;
+    }
     int32_t size[n_classes]; // units of each class
     int32_t r0 = 0, r1 = 0;  // the experts' ranks in their classes
 #pragma unroll
@@ -91,7 +109,7 @@ __device__ __forceinline__ void block_units(const meta_c<C> & m, const class_tab
         r0 = c0 == c ? __popc(b0 & lt) : r0;
         r1 = c1 == c ? __popc(b0) + __popc(b1 & lt) : r1;
     }
-    size[n_classes - 1] = unit_groups;
+    size[n_classes - 1] = X && skip == 2 ? 0 : unit_groups;
     int32_t start[n_classes];
 #pragma unroll
     for (int32_t a = 0; a < n_classes; ++a) {
@@ -109,18 +127,19 @@ __device__ __forceinline__ void block_units(const meta_c<C> & m, const class_tab
     }
     const int32_t q0 = s0 + unit_groups * r0, q1 = s1 + unit_groups * r1; // the rank of each expert's unit g = 0
     const int32_t sh = start[n_classes - 1];
-    const int32_t n_ranks = unit_groups * (n_u + 1);
+    const int32_t n_ranks = X ? unit_groups * n_run + size[n_classes - 1] : unit_groups * (n_u + 1);
     uint32_t t = 0xffffu; // lane k: the unit at the block's rank k
 #pragma unroll
     for (int32_t k = 0; k < gu_ranks; ++k) {
-        const int32_t r = k * n_sm + ((k & 1) != 0 ? n_sm - 1 - first : first);
+        const int32_t r = k * NB + ((k & 1) != 0 ? NB - 1 - first : first);
         const uint32_t h0 = __ballot_sync(full, c0 >= 0 && r >= q0 && r < q0 + unit_groups);
         const uint32_t h1 = __ballot_sync(full, c1 >= 0 && r >= q1 && r < q1 + unit_groups);
         const int32_t src = h0 != 0 ? __ffs(h0) - 1 : __ffs(h1) - 1;
         const int32_t q = __shfl_sync(full, h0 != 0 ? q0 : q1, src < 0 ? 0 : src);
         const uint32_t u = static_cast<uint32_t>(src + (h0 != 0 ? 0 : 32));
         const uint32_t tk = r >= n_ranks                      ? 0xffffu
-                            : r >= sh && r < sh + unit_groups ? static_cast<uint32_t>(order_shared + r - sh)
+                            : r >= sh && r < sh + (X ? size[n_classes - 1] : unit_groups)
+                                ? static_cast<uint32_t>(order_shared + r - sh)
                                                               : unit_groups * u + static_cast<uint32_t>(r - q);
         t = lane == k ? tk : t;
     }
@@ -136,7 +155,7 @@ __device__ __forceinline__ void block_units(const meta_c<C> & m, const class_tab
         list[gu_ranks + 1] = static_cast<uint16_t>(__popc(routed) + __popc(shared));
     }
     if (order != nullptr && t != 0xffffu) {
-        order[lane * n_sm + ((lane & 1) != 0 ? n_sm - 1 - first : first)] = static_cast<uint16_t>(t);
+        order[lane * NB + ((lane & 1) != 0 ? NB - 1 - first : first)] = static_cast<uint16_t>(t);
     }
 }
 
@@ -292,6 +311,52 @@ __device__ __forceinline__ void row_out_q8(const int32_t (&is)[B], float dh, con
     }
 }
 
+// ME7, Q2_0: code byte k of word w (weights 4k .. 4k + 3, two bits each from bit 0) as four bytes 0..3, weight 4k + i in
+// byte i: the codes against one activation word in __dp4a. The byte broadcast to all four lanes, then lane i keeps its
+// bits 2i, 2i + 1
+__device__ __forceinline__ uint32_t q2_codes(uint32_t w, int32_t k) {
+    const uint32_t y = __byte_perm(w, 0u, 0x1111u * static_cast<uint32_t>(k));
+    return (y & 0x00000003u) | ((y >> 2) & 0x00000300u) | ((y >> 4) & 0x00030000u) | ((y >> 6) & 0x03000000u);
+}
+
+// ME1, the K-quants (Q4_K, Q5_K): row r's sub-block j as 32 weights 0..31 in the codes' order (word i: weights 4 i ..
+// 4 i + 3), its scale f = d sc and min mn = dmin m (each exact in F32: an FP16 times a 6-bit integer). Row b's partial
+// is (f da_b) is - mn s_b, is the exact integer sum against row b's codes and s_b the run's staged sum (the meta's y,
+// d_b times the codes' sum): one product, then one fused rounding. The warp reduction is row_out's.
+struct kq_row {
+    uint32_t q[8];
+    float f, mn;
+};
+__device__ __forceinline__ float kq_part(const kq_row & kr, const uint32_t (&act)[8], float da, float xs) {
+    int32_t is = 0;
+#pragma unroll
+    for (int32_t i = 0; i < 8; ++i) {
+        is = __dp4a(static_cast<int32_t>(kr.q[i]), static_cast<int32_t>(act[i]), is);
+    }
+    return __fmaf_rn(-kr.mn, xs, __fmul_rn(__fmul_rn(kr.f, da), static_cast<float>(is)));
+}
+__device__ __forceinline__ void kq_store(float part, float * at, int32_t lane) {
+    part += __shfl_xor_sync(0xffffffffu, part, 8);
+    part += __shfl_xor_sync(0xffffffffu, part, 16);
+    const uint32_t sa = static_cast<uint32_t>(__cvta_generic_to_shared(at));
+    asm volatile("{\n\t.reg .pred p;\n\tsetp.lt.s32 p, %0, 8;\n\t@p st.shared.f32 [%1], %2;\n\t}" ::"r"(lane), "r"(sa),
+                 "f"(part));
+}
+// a main chunk's row: byte t's low nibble is weight t, its high nibble weight t + 16; qh's bit t (Q5_K) is bit 4 of
+// weight t
+template <bool Q5> __device__ __forceinline__ void dec_kq(kq_row & kr, const uint4 & v, uint32_t qh) {
+#pragma unroll
+    for (int32_t k = 0; k < 4; ++k) {
+        const uint32_t x = word_of(v, k);
+        kr.q[k] = x & 0x0f0f0f0fu;
+        kr.q[4 + k] = (x >> 4) & 0x0f0f0f0fu;
+        if (Q5) {
+            kr.q[k] |= spread4(qh >> (4 * k)) << 4;
+            kr.q[4 + k] |= spread4(qh >> (16 + 4 * k)) << 4;
+        }
+    }
+}
+
 // Decoders, one row's sub-block each. dh: the row's FP16 d as F32.
 __device__ __forceinline__ void dec_iq3_xxs(row_dec & rd, uint2 q, uint32_t sg, float dh, const uint32_t * grid) {
 #pragma unroll
@@ -377,6 +442,12 @@ __device__ __forceinline__ uint32_t byte8(const bytes8 & b, int32_t m) {
     return ((k < 2 ? b.lo : b.hi) >> (8 * (2 * (k & 1) + (m >> 2)))) & 0xffu;
 }
 
+// ME1: expert e's packed gate/up: the cache's table entry when there is a table, else e's place in the resident bank
+// ME3: the cache's instantiation (X) only; the resident one keeps 412ecbd's address
+__device__ __forceinline__ const uint8_t * expert_base(const gate_up_args & a, int32_t e) {
+    return a.wt[e];
+}
+
 // One finished unit's row: warp row b sums the unit's NPART partials per channel in order (routed: the 20 warps;
 // shared: the 10 steps' 4 quarter lanes), STRIDE floats a channel, applies the GLU and writes FNFL's activation format
 // to slot (act.h's rule: lane i holds channel 32 g + i of the run).
@@ -389,6 +460,8 @@ __device__ __forceinline__ void glu_out(const gate_up_args & a, const float * rb
         gs += rb[lane * STRIDE + ww];
         us += rb[(32 + lane) * STRIDE + ww];
     }
+    // ME3: 412ecbd's text (glu_run, experts_dev.cuh, is the same arithmetic for glu_finish; through it ptxas's
+    // schedule of the resident kernels changed)
     const float v = gs / (1.0f + expf(-gs)) * us;
     float amax = fabsf(v);
 #pragma unroll
@@ -513,9 +586,10 @@ struct gu_iq3 {
     static constexpr bool iq3 = true;
     static constexpr int32_t table = gu_u3_table;
 };
-template <int B, typename FAM = gu_iq2> __host__ __device__ constexpr int32_t gu_u_smem_bytes() {
+// ME10: NB, the blocks a shard (72; 36 in gate_up_kernel_u_pair)
+template <int B, typename FAM = gu_iq2, int NB = n_sm> __host__ __device__ constexpr int32_t gu_u_smem_bytes() {
     return FAM::table + 2048 + B * (x_codes + x_meta) + 2 * B * 64 * red_stride * 4 + gu_meta_bytes<cap_of(B)> +
-           gu_list_bytes<cap_of(B)>;
+           gu_list_bytes<cap_of(B), NB>;
 }
 template <bool U, fmt F, dfmt FG, dfmt FU> __host__ __device__ constexpr int32_t gu_grid_region() {
     return U ? gu_u_table + 2048 : gu_grid_len<F, FG, FU>();
@@ -535,12 +609,18 @@ template <bool U, fmt F, dfmt FG, dfmt FU> __host__ __device__ constexpr int32_t
 // (k even) and 72 k + 71 - i (k odd), its routed units first, then each shared unit among them in rank order (one, or
 // two when the shared class straddles a snake turn).
 // Budget: __launch_bounds__(640, 1) caps registers at 96; shared memory gu_smem_bytes (dynamic).
-template <fmt F, dfmt FG, dfmt FU, int B, int DEPTH>
+template <bool X, fmt F, dfmt FG, dfmt FU, int B, int DEPTH>
 __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) {
+    if constexpr (X) { // ME1: a launch with nothing to run (gate_up_args::run_if)
+        if (a.run_if != nullptr && *a.run_if == 0u) {
+            return;
+        }
+    }
     constexpr int32_t C = cap_of(B); // SP2: the routing capacity (experts.h)
-    constexpr gu_layout L = gu_layout_of(F);
-    constexpr int32_t NA = (L.aux8 || L.sc8) ? 1 : 0; // the aux chunk: aux8 in x, y and sc8 in z, w
-    constexpr int32_t CC = 1 + NA + L.chunks;         // the d chunk, the aux chunk, then the main chunks
+    constexpr gu_layout L = gu_layout_k(F);
+    // the aux chunk: aux8 in x, y and sc8 in z, w; ME1, a K-quant's two: dmin, then the scale plane
+    constexpr int32_t NA = (L.aux8 || L.sc8) ? 1 : is_kq(F) ? 2 : 0;
+    constexpr int32_t CC = 1 + NA + L.chunks; // the d chunk, the aux chunk(s), then the main chunks
     constexpr int64_t T = tile_bytes(F);
     extern __shared__ uint4 smem_u4[];
     uint8_t * smem = reinterpret_cast<uint8_t *>(smem_u4);
@@ -595,8 +675,8 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
         build_meta_of<B>([&](int32_t i) { return __ldg(a.ids + i); }, *sv.m);
         __syncwarp();
         if (sv.m->bad == 0) {
-            block_units<C>(*sv.m, a.cw, static_cast<int32_t>(blockIdx.x), list,
-                        reinterpret_cast<uint16_t *>(a.meta + meta_order_of(C)));
+            block_units<X, C>(*sv.m, a.cw, static_cast<int32_t>(blockIdx.x), list,
+                        reinterpret_cast<uint16_t *>(a.meta + meta_order_of(C)), a.wt, a.skip);
         }
         if (blockIdx.x == 0) {
             const uint4 * src = reinterpret_cast<const uint4 *>(sv.m);
@@ -623,7 +703,14 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
     // byte offset of chunk q (0 = d, then aux when the format has one, then main) of this thread's record in a tile;
     // Q8_0's d chunk is the record's own (a d a sub-block), the others' their superblock's
     const auto chunk_off = [&](int32_t q) -> int64_t {
-        return q == 0 ? d_off(F) + (F == fmt::q8_0 ? tid : sb * 8 + rs) * 16
+        if constexpr (is_kq(F)) { // ME1: d and dmin of the superblock, then the record's scale plane entry
+            return q == 0   ? d_off(F) + (sb * 8 + rs) * 16
+                   : q == 1 ? dmin_off(F) + (sb * 8 + rs) * 16
+                   : q == 2 ? sm_off(F) + tid * 16
+                            : (int64_t(q - 3) * gu_threads + tid) * 16;
+        }
+        // ME7: Q2_0's d is its block's, a pair of sub-blocks: [j / 2][rs]
+        return q == 0 ? d_off(F) + (F == fmt::q8_0 ? tid : F == fmt::q2_0 ? (j >> 1) * 8 + rs : sb * 8 + rs) * 16
                       : (int64_t(q - 1 - NA) * gu_threads + tid) * 16;
     };
     // a chunk of the sequence: the aux chunk is one or two 8-byte loads, every other chunk one 16-byte load
@@ -646,6 +733,9 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
     };
     const auto tile_of = [&](int32_t t) -> const uint8_t * {
         const int32_t u = t / n_group;
+        if constexpr (X) {
+            return expert_base(a, m.e[u]) + int64_t(t - u * n_group) * T;
+        }
         return a.w + (int64_t(m.e[u]) * n_group + (t - u * n_group)) * T;
     };
 
@@ -690,10 +780,15 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
         // quarter-warps' 16-byte reads fall in distinct bank groups (R6)
         uint32_t act[B][8];
         float da[B];
+        [[maybe_unused]] int32_t sq[B]; // ME7, Q2_0: row b's codes summed over sub-block j (the staged halves' sums)
 #pragma unroll
         for (int32_t b = 0; b < B; ++b) {
             const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
             const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
+            if constexpr (F == fmt::q2_0) {
+                const float4 xm = sv.xm[b * n_sub + j];
+                sq[b] = __float_as_int(xm.z) + __float_as_int(xm.w);
+            }
             act[b][0] = c0.x;
             act[b][1] = c0.y;
             act[b][2] = c0.z;
@@ -731,7 +826,9 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
             [[maybe_unused]] bytes8 ax8 = {0, 0}, sc8 = {0, 0};
             [[maybe_unused]] uint4 held = {0, 0, 0, 0}; // IQ3: the sign words waiting
             [[maybe_unused]] int32_t is8[B];            // Q8_0: a row's integer sums, over its two chunks
-            // the unit's chunks in order; out(rd, r) finishes row r of a record (Q8_0 finishes its rows itself)
+            [[maybe_unused]] float mn8[8];              // ME1, the K-quants: rows 0..7's dmin, then their mins
+            // the unit's chunks in order; out(rd, r) finishes row r of a record (Q8_0 finishes its rows itself; the
+            // K-quants pass a kq_row)
             const auto chunks = [&](auto out) {
 #pragma unroll
                 for (int32_t q = 0; q < CC; ++q) {
@@ -748,12 +845,47 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                         }
                         continue;
                     }
+                    if constexpr (is_kq(F)) {
+                        // ME1: the dmin chunk as the d chunk; the scale plane's bytes 2m, 2m + 1 (row m's scale, min)
+                        // then scale both (exact products)
+                        if (q == 1) {
+#pragma unroll
+                            for (int32_t mr = 0; mr < 8; ++mr) {
+                                mn8[mr] = (mr & 1) ? half_hi(word_of(v, mr >> 1)) : half_lo(word_of(v, mr >> 1));
+                            }
+                            continue;
+                        }
+                        if (q == 2) {
+#pragma unroll
+                            for (int32_t mr = 0; mr < 8; ++mr) {
+                                const uint32_t sw = word_of(v, mr >> 1) >> (16 * (mr & 1));
+                                dh8[mr] *= static_cast<float>(sw & 0xffu);
+                                mn8[mr] *= static_cast<float>((sw >> 8) & 0xffu);
+                            }
+                            continue;
+                        }
+                    }
                     if (NA == 1 && q == 1) {
                         ax8 = take8(v.x, v.y);
                         sc8 = take8(v.z, v.w);
                         continue;
                     }
                     const int32_t c = q - 1 - NA;
+                    if constexpr (is_kq(F)) {
+                        // Q4_K: chunk c is row c; Q5_K: chunks 0 and 5 the high bits of rows 0..3 and 4..7 (held)
+                        constexpr bool Q5 = F == fmt::q5_k;
+                        if (Q5 && (c == 0 || c == 5)) {
+                            held = v;
+                            continue;
+                        }
+                        const int32_t mrow = Q5 ? c - 1 - (c > 5 ? 1 : 0) : c;
+                        kq_row kr;
+                        dec_kq<Q5>(kr, v, Q5 ? word_of(held, mrow & 3) : 0u);
+                        kr.f = dh8[mrow];
+                        kr.mn = mn8[mrow];
+                        out(kr, rs + 8 * mrow);
+                        continue;
+                    }
                     if constexpr (F == fmt::q8_0) {
                         // chunk c: half c & 1 of row c / 2's sub-block, against codes 16 (c & 1) .. of each routed row
                         const int32_t mrow = c >> 1, hh = c & 1;
@@ -775,7 +907,34 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                         }
                         continue;
                     }
-                    row_dec rd;
+                    if constexpr (F == fmt::q2_0) {
+                        // ME7: chunk c is rows 2c, 2c + 1: 8 code bytes each (weights 4k .. 4k + 3 in byte k, 2 bits
+                        // each). A row's weights are (code - 1) d, so its sub-block integer sum is sum(code x) - sum(x),
+                        // exact, finished as Q8_0's: (d da) is
+#pragma unroll
+                        for (int32_t h = 0; h < 2; ++h) {
+                            const int32_t mrow = 2 * c + h;
+                            const uint32_t w0 = h == 0 ? v.x : v.z, w1 = h == 0 ? v.y : v.w;
+#pragma unroll
+                            for (int32_t b = 0; b < B; ++b) {
+                                if (((mask >> b) & 1u) == 0) {
+                                    continue;
+                                }
+                                int32_t acc = -sq[b];
+#pragma unroll
+                                for (int32_t k = 0; k < 4; ++k) {
+                                    acc = __dp4a(static_cast<int32_t>(q2_codes(w0, k)),
+                                                 static_cast<int32_t>(act[b][k]), acc);
+                                    acc = __dp4a(static_cast<int32_t>(q2_codes(w1, k)),
+                                                 static_cast<int32_t>(act[b][4 + k]), acc);
+                                }
+                                is8[b] = acc;
+                            }
+                            row_out_q8<B>(is8, dh8[mrow], da, mask, red_buf, rs + 8 * mrow, w, lane);
+                        }
+                        continue;
+                    }
+                    [[maybe_unused]] row_dec rd;
                     if constexpr (F == fmt::iq2_xxs || F == fmt::iq2_xs) {
                         const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
 #pragma unroll
@@ -808,7 +967,7 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                             dec_iq2_s(rd, h == 0 ? v.x : v.z, h == 0 ? v.y : v.w, qh, sc, dh, grid);
                             out(rd, rs + 8 * mrow);
                         }
-                    } else {
+                    } else if constexpr (F == fmt::iq3_xxs || F == fmt::iq3_s) {
                         // IQ3: chunk k of row quad hq: k 0 [q r0][sg r0][sg r1], k 1 [q r1][sg r2][sg r3],
                         // k 2 [q r2][q r3]
                         const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
@@ -846,8 +1005,43 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
             // after b0 are read a unit too, into slots k = row - b0 - 1 (row_out over B - 1 slots, its partials from
             // row b0 + 1 on), instead of today's act held a block: act1 beside all four rows spilled at 96 registers
             // (IQ2_S, IQ3_S).
-            if constexpr (F == fmt::q8_0) {
+            if constexpr (F == fmt::q8_0 || F == fmt::q2_0) { // ME7: Q2_0 finishes its rows as Q8_0
                 chunks([](const row_dec &, int32_t) {});
+            } else if constexpr (is_kq(F)) {
+                // ME1: the unit's first routed row b0 from registers (its codes, d and staged sum read once a unit),
+                // the others' from shared memory at each row (row_out_s's form), in ascending row order
+                const int32_t b0 = __ffs(static_cast<int32_t>(mask)) - 1;
+                uint32_t act1[8];
+                {
+                    const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b0 * x_codes);
+                    const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
+                    act1[0] = c0.x;
+                    act1[1] = c0.y;
+                    act1[2] = c0.z;
+                    act1[3] = c0.w;
+                    act1[4] = c1.x;
+                    act1[5] = c1.y;
+                    act1[6] = c1.z;
+                    act1[7] = c1.w;
+                }
+                const float4 xm1 = sv.xm[b0 * n_sub + j];
+                chunks([&](const kq_row & kr, int32_t r) {
+                    const int32_t bb = opaque(b0);
+                    kq_store(kq_part(kr, act1, xm1.x, xm1.y), red_buf + (bb * 64 + r) * red_stride + w, lane);
+                    const uint32_t rest = mask >> (bb + 1); // bit k: row b0 + 1 + k
+#pragma unroll
+                    for (int32_t k = 0; k < B - 1; ++k) {
+                        if (((rest >> k) & 1u) == 0) {
+                            continue;
+                        }
+                        const int32_t b = bb + 1 + k;
+                        const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
+                        const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
+                        const uint32_t ab[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
+                        const float4 xmb = sv.xm[b * n_sub + j];
+                        kq_store(kq_part(kr, ab, xmb.x, xmb.y), red_buf + (b * 64 + r) * red_stride + w, lane);
+                    }
+                });
             } else {
                 constexpr bool SPLIT = F == fmt::iq2_xs || F == fmt::iq2_s;
                 const auto row_act = [&](int32_t b, uint32_t (&o)[8], float & d) {
@@ -969,523 +1163,35 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
 // 5, map 3), the family setting the formats with_f takes, the routed table region and the shared pairs of the direct
 // switch. A kernel, not a __device__ body under two kernels: through a forceinline body the IQ2 instances' SASS at
 // B = 1-3 changed (the body is optimized alone before it is inlined); this form keeps it instruction for instruction.
-template <typename FAM, int B, int DEPTH>
+template <bool X, typename FAM, int B, int DEPTH>
 __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel_u(gate_up_args a) {
-    constexpr int32_t C = cap_of(B); // SP2: the routing capacity (experts.h)
-    constexpr bool U = true; // the generic sections' run-time form; F, FG and FU are unused placeholders
-    constexpr fmt F = fmt::iq2_xxs;
-    constexpr dfmt FG = dfmt::q4_k, FU = dfmt::q4_k;
-    static_assert(!FAM::iq3 || B >= 4, "the IQ3 body: B = 4 and 5");
-    // the routed format's sections: body(gu_fc<f>{}) for this launch's f
-    const auto with_f = [&](auto && body) {
-        if constexpr (!U) {
-            body(gu_fc<F>{});
-        } else if constexpr (FAM::iq3) {
-            switch (static_cast<fmt>(a.u_f)) {
-                case fmt::iq3_xxs:
-                    body(gu_fc<fmt::iq3_xxs>{});
-                    break;
-                default:
-                    body(gu_fc<fmt::iq3_s>{});
-                    break;
-            }
-        } else {
-            switch (static_cast<fmt>(a.u_f)) {
-                case fmt::iq2_xxs:
-                    body(gu_fc<fmt::iq2_xxs>{});
-                    break;
-                case fmt::iq2_xs:
-                    body(gu_fc<fmt::iq2_xs>{});
-                    break;
-                default:
-                    body(gu_fc<fmt::iq2_s>{});
-                    break;
-            }
-        }
-    };
-    extern __shared__ uint4 smem_u4[];
-    uint8_t * smem = reinterpret_cast<uint8_t *>(smem_u4);
-    constexpr int32_t xs_off = U ? FAM::table + 2048 : gu_grid_len<F, FG, FU>();
-    constexpr int32_t xm_off = xs_off + B * x_codes;
-    constexpr int32_t red_off = xm_off + B * x_meta;
-    constexpr int32_t meta_off = red_off + 2 * B * 64 * red_stride * 4;
-    static_assert(xs_off % 16 == 0 && xm_off % 16 == 0 && red_off % 16 == 0 && meta_off % 16 == 0,
-                  "16-byte aligned shared regions");
-    const gu_smem_view<C> sv = {smem,
-                             reinterpret_cast<uint32_t *>(smem + (U                         ? FAM::table
-                                                                  : extra_iq3s<F, FG, FU>() ? gu_layout_of(F).grid_len
-                                                                                            : 0)),
-                             smem + xs_off,
-                             reinterpret_cast<float4 *>(smem + xm_off),
-                             reinterpret_cast<float *>(smem + red_off),
-                             reinterpret_cast<meta_c<C> *>(smem + meta_off)};
-    const int32_t tid = static_cast<int32_t>(threadIdx.x);
-    const int32_t lane = tid & 31;
-    const int32_t w = tid >> 5;
-    const int32_t j = tid >> 3;
-    const int32_t rs = tid & 7;
-    const uint32_t mz = gridDim.x == n_sm ? 0u : ~0u;
+    constexpr int32_t NB = n_sm;
+    const int32_t blk = static_cast<int32_t>(blockIdx.x);
+#include "fn/kernels/experts/experts_gu_u_body.inc"
+}
 
-    // The grid tables and the rows' activations first, neither depends on the routing: coalesced 16-byte loads through
-    // L1 (R3: written before this kernel and read by every SM; EX1's 4-byte L1-bypassing loads cost 7.7x the ideal L2
-    // sectors). Thread i < 80 B takes run (b, j) = (i / 80, i % 80) of the rows. They land in shared memory after the
-    // first weight chunks are issued.
-    // the routed table (run-time data in the IQ2 body): a signed table is copied after the ring is primed
-    const gu_layout gl = gu_layout_of(U ? static_cast<fmt>(a.u_f) : F);
-    const bool ex_iq3s = U ? a.u_fg == int32_t(dfmt::iq3_s) || a.u_fu == int32_t(dfmt::iq3_s) : extra_iq3s<F, FG, FU>();
-    const int32_t n_grid16 = gl.grid_len / 16;
-    const int32_t n_sgrid16 = ex_iq3s ? 2048 / 16 : 0;
-    static_assert(FAM::table / 16 + 2048 / 16 <= gu_threads, "one 16-byte load a thread");
-    uint4 grid_v = {0, 0, 0, 0};
-    if (tid < n_grid16) {
-        grid_v = __ldg(reinterpret_cast<const uint4 *>(a.grids + gl.grid_off) + tid);
-    } else if (tid < n_grid16 + n_sgrid16) {
-        grid_v = __ldg(reinterpret_cast<const uint4 *>(a.grids + iq3s_off) + (tid - n_grid16));
-    }
-    const bool stager = tid < B * n_sub;
-    // HC3: with X-HMIX, a stager whose run is in the peer's half polls it after the weight ring is primed (below)
-    const bool peer_run = stager && a.hmix != nullptr && (tid % n_sub) / (n_sub / 2) == a.hmix_peer_half;
-    uint4 xc0 = {0, 0, 0, 0}, xc1 = {0, 0, 0, 0};
-    float2 xsc = {0.0f, 0.0f};
-    if (stager && !peer_run) {
-        const uint4 * src = reinterpret_cast<const uint4 *>(a.x.codes) + 2 * tid; // codes [B][2560]: run tid
-        xc0 = __ldg(src);
-        xc1 = __ldg(src + 1);
-        xsc = __ldg(reinterpret_cast<const float2 *>(a.x.scales) + tid);
-    }
-    // XB3 part 1: warp 0 builds the routing meta (71b92a9's build_meta) and the block's units (block_units) while the
-    // other warps' loads are in flight; block 0 writes the struct for down (the kernel boundary orders it before down's
-    // read). The block's first unit comes from the order, so the ring's first loads follow the barrier.
-    uint16_t * list = reinterpret_cast<uint16_t *>(smem + meta_off + gu_meta_bytes<C>);
-    if (w == 0) {
-        build_meta_of<B>([&](int32_t i) { return __ldg(a.ids + i); }, *sv.m);
-        __syncwarp();
-        if (sv.m->bad == 0) {
-            block_units<C>(*sv.m, a.cw, static_cast<int32_t>(blockIdx.x), list,
-                        reinterpret_cast<uint16_t *>(a.meta + meta_order_of(C)));
-        }
-        if (blockIdx.x == 0) {
-            const uint4 * src = reinterpret_cast<const uint4 *>(sv.m);
-#pragma unroll 1
-            for (int32_t i = lane; i < meta_words_c<C>; i += 32) {
-                reinterpret_cast<uint4 *>(a.meta)[i] = src[i];
-            }
-        }
-    }
-    __syncthreads();
-    const meta_c<C> & m = *sv.m;
-    if (m.bad != 0) {
-        if (tid == 0 && blockIdx.x == 0 && a.status != nullptr) {
-            *a.status = 1u;
-        }
-        return;
-    }
-    if (list[gu_max_ranks<C> + 1] == 0) { // no rank of the launch's 10 U + 10 is this block's
-        return;
-    }
-    // the block's first routed unit (its tile primes the ring), or -1
-    const int32_t t_first = list[gu_max_ranks<C>] > 0 ? int32_t(list[0]) : -1;
-    const int32_t sb = j >> 3;
-    // byte offset of chunk q (0 = d, then aux when the format has one, then main) of this thread's record in format
-    // C::f's tile; Q8_0's d chunk is the record's own (a d a sub-block), the others' their superblock's
-    const auto chunk_off = [&](auto fc, int32_t q) -> int64_t {
-        using C = decltype(fc);
-        return q == 0 ? d_off(C::f) + (C::f == fmt::q8_0 ? tid : sb * 8 + rs) * 16
-                      : (int64_t(q - 1 - C::NA) * gu_threads + tid) * 16;
-    };
-    // a chunk of format C::f's sequence: the aux chunk is one or two 8-byte loads, every other chunk one 16-byte load
-    const auto load_chunk = [&](auto fc, const uint8_t * tl, int32_t q, uint32_t z) -> uint4 {
-        using C = decltype(fc);
-        if (C::NA == 1 && q == 1) {
-            uint4 v = {0, 0, 0, 0};
-            if (C::L.aux8) {
-                const uint2 x = __ldcs(reinterpret_cast<const uint2 *>(tl + aux8_off(C::f) + tid * 8 + z));
-                v.x = x.x;
-                v.y = x.y;
-            }
-            if (C::L.sc8) {
-                const uint2 x =
-                    __ldcs(reinterpret_cast<const uint2 *>(tl + sc8_off(C::f) + ((j >> 1) * 8 + rs) * 8 + z));
-                v.z = x.x;
-                v.w = x.y;
-            }
-            return v;
-        }
-        return __ldcs(reinterpret_cast<const uint4 *>(tl + chunk_off(fc, q) + z));
-    };
-    const auto tile_of = [&](auto fc, int32_t t) -> const uint8_t * {
-        const int32_t u = t / n_group;
-        return a.w + (int64_t(m.e[u]) * n_group + (t - u * n_group)) * decltype(fc)::T;
-    };
+// ME10: both shards of one device's cache pass in one 72-block launch (gate_up_pair): block i runs shard k = i / 36 as
+// its block i % 36 of 36 (the deal over 36 blocks), on that shard's arguments read in place from the parameter
+// (__grid_constant__: no copy); every other part is gate_up_kernel_u's body
+template <bool X, typename FAM, int B, int DEPTH>
+__global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel_u_pair(const __grid_constant__ gate_up_pair_args p) {
+    constexpr int32_t NB = n_sm / 2;
+    const int32_t shard = static_cast<int32_t>(blockIdx.x) / NB;
+    const gate_up_args & a = p.s[shard];
+    const int32_t blk = static_cast<int32_t>(blockIdx.x) - shard * NB;
+#include "fn/kernels/experts/experts_gu_u_body.inc"
+}
 
-    // prime the ring: the first DEPTH chunks of the sequence (units are at least CC >= DEPTH chunks long)
-    ring<DEPTH> rg;
-    const uint8_t * tile = a.w;
-    with_f([&](auto fc) {
-        static_assert(decltype(fc)::CC >= DEPTH, "a unit has at least DEPTH chunks");
-        if (t_first >= 0) {
-            tile = tile_of(fc, t_first);
-#pragma unroll
-            for (int32_t q = 0; q < DEPTH; ++q) {
-                rg.s[q] = load_chunk(fc, tile, q, 0u);
-            }
-        }
-    });
-    // X-HMIX's acquire (xchg.h): the peer half's runs, now that this block's first weight chunks are in flight
-    if (peer_run) {
-        fn::xchg::hmix_run(a.hmix, a.hmix_peer_half, tid / n_sub, tid % n_sub, xc0, xc1, xsc, a.err);
-    }
-    // the staged tables and activations into shared memory: the codes into DP2's swizzled chunks and each run's
-    // {d, s} with the exact sums of its halves' codes (fn::dense::act, which the shared units read)
-    if (tid < n_grid16) {
-        reinterpret_cast<uint4 *>(sv.grid)[tid] = grid_v;
-    } else if (tid < n_grid16 + n_sgrid16) {
-        reinterpret_cast<uint4 *>(sv.sgrid)[tid - n_grid16] = grid_v;
-    }
-    if (stager) {
-        const int32_t b = tid / n_sub, jj = tid - b * n_sub;
-        int32_t slo = 0, shi = 0;
-#pragma unroll
-        for (int32_t t = 0; t < 4; ++t) {
-            slo = fn::dense::dp4a(word_of(xc0, t), 0x01010101u, slo);
-            shi = fn::dense::dp4a(word_of(xc1, t), 0x01010101u, shi);
-        }
-        uint4 * xs = reinterpret_cast<uint4 *>(sv.xs + b * x_codes);
-        xs[fn::dense::swz(2 * jj)] = xc0;
-        xs[fn::dense::swz(2 * jj + 1)] = xc1;
-        sv.xm[tid] = make_float4(xsc.x, xsc.y, __int_as_float(slo), __int_as_float(shi)); // the sums' bits
-    }
-    __syncthreads();
-
-    if (t_first >= 0) {
-        // each thread's activations of sub-block j: the 8 lanes of a quarter-warp share j (a broadcast), and the four
-        // quarter-warps' 16-byte reads fall in distinct bank groups (R6). SP4 H2: at B = 4 and 5 no row's fragment is
-        // held a block (act's BA = 1, and neither array is read: row_out_c reads each row's at its turn; da keeps B for
-        // the Q8_0 section's row_out_q8 signature, which this body never runs)
-        constexpr int32_t BA = B <= 3 ? B : 1;
-        [[maybe_unused]] uint32_t act[BA][8];
-        [[maybe_unused]] float da[B];
-        if constexpr (B <= 3) {
-#pragma unroll
-            for (int32_t b = 0; b < B; ++b) {
-                const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
-                const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
-                act[b][0] = c0.x;
-                act[b][1] = c0.y;
-                act[b][2] = c0.z;
-                act[b][3] = c0.w;
-                act[b][4] = c1.x;
-                act[b][5] = c1.y;
-                act[b][6] = c1.z;
-                act[b][7] = c1.w;
-                da[b] = sv.xm[b * n_sub + j].x;
-            }
-        }
-
-        // the block's routed unit i (10 u + g), -1 past the last: a volatile load at each use, so no entry is held in
-        // a register across a unit (the loops hold the index alone, as they held the unit before XB2; IQ2_S at B = 4
-        // spilled at the 96-register cap otherwise)
-        const volatile uint16_t * lv = list;
-        const int32_t n_mine = list[gu_max_ranks<C>];
-        const auto unit_at = [&](int32_t i) -> int32_t { return i < n_mine ? int32_t(lv[i]) : -1; };
-
-        with_f([&](auto fc) {
-            using C = decltype(fc);
-            // The block's routed unit i, then its next one (none: -1). The ring slot of chunk q is (P + q) % DEPTH, a
-            // constant: data in flight is never moved between registers (a move waits for its load; EX1 v1 lost the
-            // stream depth that way). The refill of the last chunks targets the next routed unit (phase (P + C::CC) %
-            // DEPTH), or the current tile again after the block's last one, so no refill is predicated.
-            const auto run_unit = [&](auto phase, int32_t i, int32_t buf) {
-                constexpr int32_t P = decltype(phase)::value;
-                const uint32_t mask = m.mask[unit_at(i) / n_group];
-                const int32_t tn = unit_at(i + 1);
-                const uint8_t * tile_next = tn >= 0 ? tile_of(fc, tn) : tile;
-                float * red_buf = sv.red + buf * B * 64 * red_stride;
-
-                // the d chunk: rows 0..7's d, converted where the chunk is taken (XB2 (c): held as words, it compiled
-                // to a copy right after the next unit's load, a wait long before the data was used)
-                float dh8[8];
-                // the aux chunk's aux8 bytes (x, y) and sc8 bytes (z, w) of rows 0..7; IQ2_S: its qh (x, y) and scales
-                // (z, w) chunk, main chunk 0
-                [[maybe_unused]] bytes8 ax8 = {0, 0}, sc8 = {0, 0};
-                [[maybe_unused]] uint4 held = {0, 0, 0, 0}; // IQ3: the sign words waiting
-                [[maybe_unused]] int32_t is8[B];            // Q8_0: a row's integer sums, over its two chunks
-                // the unit's chunks in order; out(rd, r) finishes row r of a record (Q8_0 finishes its rows itself)
-                const auto chunks = [&](auto out) {
-#pragma unroll
-                    for (int32_t q = 0; q < C::CC; ++q) {
-                        const int32_t sl = (P + q) % DEPTH;
-                        const uint4 v = rg.s[sl];
-                        // refill the slot just taken: chunk q + DEPTH of the sequence, in this unit or the next
-                        const int32_t qn = q + DEPTH;
-                        const uint32_t z = order_after(v.x, mz);
-                        rg.s[sl] = qn < C::CC ? load_chunk(fc, tile, qn, z) : load_chunk(fc, tile_next, qn - C::CC, z);
-                        if (q == 0) {
-#pragma unroll
-                            for (int32_t mr = 0; mr < 8; ++mr) {
-                                dh8[mr] = (mr & 1) ? half_hi(word_of(v, mr >> 1)) : half_lo(word_of(v, mr >> 1));
-                            }
-                            continue;
-                        }
-                        if (C::NA == 1 && q == 1) {
-                            ax8 = take8(v.x, v.y);
-                            sc8 = take8(v.z, v.w);
-                            continue;
-                        }
-                        const int32_t c = q - 1 - C::NA;
-                        if constexpr (C::f == fmt::q8_0) {
-                            // chunk c: half c & 1 of row c / 2's sub-block, against codes 16 (c & 1) .. of each routed
-                            // row
-                            const int32_t mrow = c >> 1, hh = c & 1;
-#pragma unroll
-                            for (int32_t b = 0; b < B; ++b) {
-                                if (((mask >> b) & 1u) == 0) {
-                                    continue;
-                                }
-                                int32_t acc = hh == 0 ? 0 : is8[b];
-#pragma unroll
-                                for (int32_t i = 0; i < 4; ++i) {
-                                    acc = __dp4a(static_cast<int32_t>(word_of(v, i)),
-                                                 static_cast<int32_t>(act[b][4 * hh + i]), acc);
-                                }
-                                is8[b] = acc;
-                            }
-                            if (hh == 1) {
-                                row_out_q8<B>(is8, dh8[mrow], da, mask, red_buf, rs + 8 * mrow, w, lane);
-                            }
-                            continue;
-                        }
-                        row_dec rd;
-                        if constexpr (C::f == fmt::iq2_xxs || C::f == fmt::iq2_xs) {
-                            [[maybe_unused]] const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid); // IQ2_XS
-#pragma unroll
-                            for (int32_t h = 0; h < 2; ++h) {
-                                const int32_t mrow = 2 * c + h;
-                                const uint2 qq = h == 0 ? make_uint2(v.x, v.y) : make_uint2(v.z, v.w);
-                                const float dh = dh8[mrow];
-                                if constexpr (C::f == fmt::iq2_xxs) {
-                                    dec_iq2_xxs(rd, qq, dh, grid);
-                                    out(rd, rs + 8 * mrow);
-                                } else {
-                                    const uint32_t sc = byte8(ax8, mrow);
-                                    dec_iq2_xs(rd, qq, sc, dh, grid);
-                                    out(rd, rs + 8 * mrow);
-                                }
-                            }
-                        } else if constexpr (C::f == fmt::iq2_s) {
-                            if (c == 0) {
-                                ax8 = take8(v.x, v.y); // qh of rows 0..7
-                                sc8 = take8(v.z, v.w); // scales of rows 0..7
-                                continue;
-                            }
-                            const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
-#pragma unroll
-                            for (int32_t h = 0; h < 2; ++h) {
-                                const int32_t mrow = 2 * (c - 1) + h;
-                                const float dh = dh8[mrow];
-                                const uint32_t qh = byte8(ax8, mrow);
-                                const uint32_t sc = byte8(sc8, mrow);
-                                dec_iq2_s(rd, h == 0 ? v.x : v.z, h == 0 ? v.y : v.w, qh, sc, dh, grid);
-                                out(rd, rs + 8 * mrow);
-                            }
-                        } else {
-                            // IQ3: chunk k of row quad hq: k 0 [q r0][sg r0][sg r1], k 1 [q r1][sg r2][sg r3],
-                            // k 2 [q r2][q r3]
-                            const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
-                            const int32_t hq = c / 3;
-                            const int32_t k = c - 3 * hq;
-                            const auto row = [&](int32_t mrow, uint2 qq, uint32_t sg) {
-                                const float dh = dh8[mrow];
-                                if constexpr (C::f == fmt::iq3_xxs) {
-                                    dec_iq3_xxs(rd, qq, sg, dh, grid);
-                                } else {
-                                    const uint32_t qh = byte8(ax8, mrow);
-                                    const uint32_t scb = byte8(sc8, mrow);
-                                    dec_iq3_s(rd, qq, sg, qh, (j & 1) ? scb >> 4 : scb & 0xfu, dh, grid);
-                                }
-                                out(rd, rs + 8 * mrow);
-                            };
-                            if (k == 0) {
-                                held.x = v.w;
-                                row(4 * hq + 0, make_uint2(v.x, v.y), v.z);
-                            } else if (k == 1) {
-                                held.y = v.z;
-                                held.z = v.w;
-                                row(4 * hq + 1, make_uint2(v.x, v.y), held.x);
-                            } else {
-                                row(4 * hq + 2, make_uint2(v.x, v.y), held.y);
-                                row(4 * hq + 3, make_uint2(v.z, v.w), held.z);
-                            }
-                        }
-                    }
-                };
-                // XB3 K1b: one body. Every record's rows run the unit's first routed row b0 with no row test (row_out1
-                // on b0's codes and d, read once a unit from shared memory by b0's address, never act[b0]), then the
-                // other routed rows under one unit-uniform test, inside which today's per-row guard runs over the rest.
-                // Each row's partial is today's, in today's row order. Q8_0 (the draft's) keeps its own loop. At B = 4
-                // the rows after b0 are read a unit too, into slots k = row - b0 - 1 (row_out over B - 1 slots, its
-                // partials from row b0 + 1 on), instead of today's act held a block: act1 beside all four rows spilled
-                // at 96 registers (IQ2_S, IQ3_S).
-                if constexpr (C::f == fmt::q8_0) {
-                    chunks([](const row_dec &, int32_t) {});
-                } else {
-                    constexpr bool SPLIT = C::f == fmt::iq2_xs || C::f == fmt::iq2_s;
-                    const auto row_act = [&](int32_t b, uint32_t (&o)[8], float & d) {
-                        const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
-                        const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
-                        o[0] = c0.x;
-                        o[1] = c0.y;
-                        o[2] = c0.z;
-                        o[3] = c0.w;
-                        o[4] = c1.x;
-                        o[5] = c1.y;
-                        o[6] = c1.z;
-                        o[7] = c1.w;
-                        d = sv.xm[b * n_sub + j].x;
-                    };
-                    const int32_t b0 = __ffs(static_cast<int32_t>(mask)) - 1;
-                    uint32_t act1[8];
-                    float da1;
-                    row_act(b0, act1, da1);
-                    if constexpr (B >= 4) {
-                        // SP4 H2: b0 by row_out1, then the unit's other routed rows (the mask without b0, bit b: row
-                        // b) through row_out_c's one compact loop, at every decoded row
-                        float * red1 = red_buf + b0 * 64 * red_stride;
-                        const uint32_t rest = mask & (mask - 1u);
-                        chunks([&](const row_dec & rd, int32_t r) {
-                            row_out1<SPLIT>(rd, act1, da1, red1, r, w, lane);
-                            row_out_c<SPLIT>(rd, sv.xs, sv.xm, j, rest, red_buf, r, w, lane);
-                        });
-                    } else {
-                        float * red1 = red_buf + b0 * 64 * red_stride;
-                        const uint32_t rest = mask & (mask - 1u);
-                        chunks([&](const row_dec & rd, int32_t r) {
-                            row_out1<SPLIT>(rd, act1, da1, red1, r, w, lane);
-                            if (rest != 0u) {
-                                row_out<SPLIT, B>(rd, act, da, rest, red_buf, r, w, lane);
-                            }
-                        });
-                    }
-                }
-                tile = tile_next;
-                __syncthreads();
-                // epilogue of the unit: warp b (a routed row) sums its 20 warp partials per channel, GLU, FNFL's format
-                if (w < B && ((mask >> w) & 1u) != 0) {
-                    const int32_t t = unit_at(i);
-                    const int32_t u = t / n_group;
-                    glu_out<gu_warps, red_stride>(a, red_buf + w * 64 * red_stride, slot_of(m, u, w), t - u * n_group,
-                                                  lane);
-                }
-            };
-            // the ring's phase is a compile-time constant (R12): when a unit's chunks are a multiple of DEPTH every
-            // unit starts at phase 0, so one copy of the unit body serves them all (EX2 B3: the executed code a launch
-            // fetches cold, M9); an odd C::CC takes two units a trip, one copy a phase. IQ2_S at B = 4 keeps two
-            // copies: its single copy's runtime buffer index spilled 8 bytes at the 96-register cap (the per-triple
-            // kernel's B = 4; this body ran B = 1-3 only before SP4 H2, whose B = 4 and 5 keep one copy).
-            static_assert((2 * C::CC) % DEPTH == 0, "the phase repeats every two units");
-            if constexpr (C::CC % DEPTH == 0) {
-#pragma unroll 1
-                for (int32_t i = 0; i < n_mine; ++i) {
-                    run_unit(std::integral_constant<int32_t, 0>{}, i, i & 1);
-                }
-            } else {
-                for (int32_t i = 0; i < n_mine; i += 2) {
-                    run_unit(std::integral_constant<int32_t, 0>{}, i, 0);
-                    if (i + 1 < n_mine) {
-                        run_unit(std::integral_constant<int32_t, C::CC % DEPTH>{}, i + 1, 1);
-                    }
-                }
-            }
-        });
-    }
-    // the shared expert's pair: body(gate, up) as integral constants, this launch's (the IQ2 body: each pair's code
-    // behind one block-uniform switch, the ten pairs the IQ2 layers meet; the launcher admits only deployed triples)
-    const auto with_pair = [&](auto && body) {
-        using std::integral_constant;
-        if constexpr (!U) {
-            body(integral_constant<dfmt, FG>{}, integral_constant<dfmt, FU>{});
-        } else {
-#define FN_GU_PAIR(g, u)                                                                                               \
-    case int32_t(dfmt::g) * 16 + int32_t(dfmt::u):                                                                     \
-        body(integral_constant<dfmt, dfmt::g>{}, integral_constant<dfmt, dfmt::u>{});                                  \
-        break;
-            switch (a.u_fg * 16 + a.u_fu) {
-                FN_GU_PAIR(iq4_xs, iq3_s)
-                FN_GU_PAIR(q4_k, q4_k)
-                FN_GU_PAIR(iq4_xs, q6_k)
-                FN_GU_PAIR(iq3_s, iq4_xs)
-                FN_GU_PAIR(iq3_s, iq3_s)
-                FN_GU_PAIR(q4_k, iq3_s)
-                FN_GU_PAIR(q4_k, q5_k)
-                FN_GU_PAIR(q5_k, q4_k)
-                FN_GU_PAIR(iq4_xs, q4_k)
-                FN_GU_PAIR(iq4_xs, iq4_xs)
-                default:
-                    break;
-            }
-#undef FN_GU_PAIR
-        }
-    };
-    // the block's shared ranks after its routed units, in rank order: two when the shared class straddles a snake turn
-    // (XB2 Amendment 1). Each takes the whole partials region, so the unit before it must have finished its epilogue.
-#pragma unroll 1
-    for (int32_t i = list[gu_max_ranks<C>]; i < list[gu_max_ranks<C> + 1]; ++i) {
-        const int32_t sh_g = list[i] - order_shared_of(C);
-        if (i > 0) {
-            __syncthreads();
-        }
-        const fn::dense::act x = {sv.xs, sv.xm, D};
-        // the thread's warp and lane read again (opaque), not held across the routed units (K1b at B = 4: IQ3_XXS
-        // spilled one register here)
-        const int32_t tx = opaque(static_cast<int32_t>(threadIdx.x));
-        const int32_t sw = tx >> 5, sl = tx & 31;
-        if constexpr (B <= 3) {
-            with_pair([&](auto gc, auto uc) {
-                shared_unit<decltype(gc)::value, decltype(uc)::value, B>(a, sh_g, sw, sl, x, sv.sgrid, sv.red);
-            });
-        } else {
-            // SP4 H2: a direct switch (through with_pair ptxas outlined the pair at B = 4 and 5 in SP4's kernel)
-#define FN_GU_PAIR(g, u)                                                                                               \
-    case int32_t(dfmt::g) * 16 + int32_t(dfmt::u):                                                                     \
-        shared_unit<dfmt::g, dfmt::u, B>(a, sh_g, sw, sl, x, sv.sgrid, sv.red);                                        \
-        break;
-            if constexpr (FAM::iq3) {
-                // XB3 C1: the eight pairs the IQ3 layers meet (experts_inst.h)
-                switch (a.u_fg * 16 + a.u_fu) {
-                    FN_GU_PAIR(iq4_xs, q6_k)
-                    FN_GU_PAIR(iq3_s, iq3_s)
-                    FN_GU_PAIR(q4_k, iq3_s)
-                    FN_GU_PAIR(iq3_s, q4_k)
-                    FN_GU_PAIR(q6_k, iq3_s)
-                    FN_GU_PAIR(iq4_xs, iq4_xs)
-                    FN_GU_PAIR(iq4_xs, q4_k)
-                    FN_GU_PAIR(q4_k, iq4_xs)
-                    default:
-                        break;
-                }
-            } else {
-                switch (a.u_fg * 16 + a.u_fu) {
-                    FN_GU_PAIR(iq4_xs, iq3_s)
-                    FN_GU_PAIR(q4_k, q4_k)
-                    FN_GU_PAIR(iq4_xs, q6_k)
-                    FN_GU_PAIR(iq3_s, iq4_xs)
-                    FN_GU_PAIR(iq3_s, iq3_s)
-                    FN_GU_PAIR(q4_k, iq3_s)
-                    FN_GU_PAIR(q4_k, q5_k)
-                    FN_GU_PAIR(q5_k, q4_k)
-                    FN_GU_PAIR(iq4_xs, q4_k)
-                    FN_GU_PAIR(iq4_xs, iq4_xs)
-                    default:
-                        break;
-                }
-            }
-#undef FN_GU_PAIR
-        }
-        __syncthreads();
-        if (sw < B) {
-            glu_out<sh_parts, sh_stride>(a, sv.red + sw * 64 * sh_stride, m.n_slots + sw, sh_g, sl);
-        }
-    }
+// FMU2 (build item 1, experts.h gate_up_lanes): a joint round's lanes in one 72-block launch: block i runs lane
+// k = i / NB as its block i % NB of NB (the deal over NB blocks, NB = 72 / lanes), on that lane's arguments read in
+// place (__grid_constant__); every other part is gate_up_kernel_u's body. X false only (resident weights)
+template <typename FAM, int B, int DEPTH, int NB>
+__global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel_u_lanes(const __grid_constant__ gate_up_lanes_args p) {
+    constexpr bool X = false;
+    const int32_t ln = static_cast<int32_t>(blockIdx.x) / NB;
+    const gate_up_args & a = p.s[ln];
+    const int32_t blk = static_cast<int32_t>(blockIdx.x) - ln * NB;
+#include "fn/kernels/experts/experts_gu_u_body.inc"
 }
 
 // ---- SP4: the paired 320-thread mapping at B = 4 and 5 (gate_up_args::map 1) ---------------------------------------
@@ -1540,8 +1246,13 @@ __device__ __forceinline__ void rows_out_p(const row_dec & rd, const uint32_t (&
 // chunks (record 8 j + s, then 8 j + s + 4) through a ring of gp_depth slots refilled across records and units. The
 // staging covers B x 80 runs and the tables' 16-byte vectors with stride-320 loops; the shared unit's virtual warp v
 // runs on warp v % 10, v = w then w + 10. Budget: __launch_bounds__(320, 1); shared memory as the 640-thread kernels'.
-template <bool U, fmt F, dfmt FG, dfmt FU, int B>
+template <bool X, bool U, fmt F, dfmt FG, dfmt FU, int B>
 __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a) {
+    if constexpr (X) { // ME1: a launch with nothing to run (gate_up_args::run_if)
+        if (a.run_if != nullptr && *a.run_if == 0u) {
+            return;
+        }
+    }
     static_assert(B == 4 || B == 5, "SP4's widths");
     static_assert(U || (F == fmt::iq3_xxs || F == fmt::iq3_s), "the triples outside the IQ2 body: IQ3");
     constexpr int32_t C = cap_of(B);
@@ -1627,8 +1338,8 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
         build_meta_of<B>([&](int32_t i) { return __ldg(a.ids + i); }, *sv.m);
         __syncwarp();
         if (sv.m->bad == 0) {
-            block_units<C>(*sv.m, a.cw, static_cast<int32_t>(blockIdx.x), list,
-                           reinterpret_cast<uint16_t *>(a.meta + meta_order_of(C)));
+            block_units<X, C>(*sv.m, a.cw, static_cast<int32_t>(blockIdx.x), list,
+                           reinterpret_cast<uint16_t *>(a.meta + meta_order_of(C)), a.wt, a.skip);
         }
         if (blockIdx.x == 0) {
             const uint4 * src = reinterpret_cast<const uint4 *>(sv.m);
@@ -1677,6 +1388,9 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
     };
     const auto tile_of = [&](auto fc, int32_t t) -> const uint8_t * {
         const int32_t u = t / n_group;
+        if constexpr (X) {
+            return expert_base(a, m.e[u]) + (t - u * n_group) * decltype(fc)::T;
+        }
         return a.w + (int64_t(m.e[u]) * n_group + (t - u * n_group)) * decltype(fc)::T;
     };
 
@@ -1940,28 +1654,40 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
     }
 }
 
-template <bool U, fmt F, dfmt FG, dfmt FU, int B> bool launch_gate_up_p(const gate_up_args & a, cudaStream_t st) {
+template <bool X, bool U, fmt F, dfmt FG, dfmt FU, int B>
+bool launch_gate_up_px(const gate_up_args & a, cudaStream_t st) {
     constexpr int32_t smem = U ? gu_u_smem_bytes<B>() : gu_smem_bytes<F, FG, FU, B>();
     static_assert(smem <= 96 * 1024, "one block's shared memory");
     static std::atomic<uint32_t> attr_done{0u};
-    const void * k = reinterpret_cast<const void *>(gate_up_kernel_p<U, F, FG, FU, B>);
+    const void * k = reinterpret_cast<const void *>(gate_up_kernel_p<X, U, F, FG, FU, B>);
     if (!detail::smem_attr_once(attr_done, k, smem)) {
         return false;
     }
-    gate_up_kernel_p<U, F, FG, FU, B><<<n_sm, gp_threads, smem, st>>>(a);
+    gate_up_kernel_p<X, U, F, FG, FU, B><<<n_sm, gp_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-template <fmt F, dfmt FG, dfmt FU, int B> bool launch_gate_up(const gate_up_args & a, cudaStream_t st) {
+// ME3: the cache's instantiation when the arguments carry its table (gate_up_args::wt), else the resident one
+template <bool U, fmt F, dfmt FG, dfmt FU, int B> bool launch_gate_up_p(const gate_up_args & a, cudaStream_t st) {
+    return a.wt != nullptr ? launch_gate_up_px<true, U, F, FG, FU, B>(a, st)
+                           : launch_gate_up_px<false, U, F, FG, FU, B>(a, st);
+}
+
+template <bool X, fmt F, dfmt FG, dfmt FU, int B> bool launch_gate_up_x(const gate_up_args & a, cudaStream_t st) {
     constexpr int32_t smem = gu_smem_bytes<F, FG, FU, B>();
     static_assert(smem <= 96 * 1024, "one block's shared memory");
     static std::atomic<uint32_t> attr_done{0u};
-    if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(gate_up_kernel<F, FG, FU, B, gu_depth>),
+    if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(gate_up_kernel<X, F, FG, FU, B, gu_depth>),
                                 smem)) {
         return false;
     }
-    gate_up_kernel<F, FG, FU, B, gu_depth><<<n_sm, gu_threads, smem, st>>>(a);
+    gate_up_kernel<X, F, FG, FU, B, gu_depth><<<n_sm, gu_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// ME3: as launch_gate_up_p
+template <fmt F, dfmt FG, dfmt FU, int B> bool launch_gate_up(const gate_up_args & a, cudaStream_t st) {
+    return a.wt != nullptr ? launch_gate_up_x<true, F, FG, FU, B>(a, st) : launch_gate_up_x<false, F, FG, FU, B>(a, st);
 }
 
 template <fmt F, dfmt FG, dfmt FU> bool gate_up_rows(int32_t rows, const gate_up_args & a, cudaStream_t st) {
@@ -1974,8 +1700,9 @@ template <fmt F, dfmt FG, dfmt FU> bool gate_up_rows(int32_t rows, const gate_up
             return launch_gate_up<F, FG, FU, 3>(a, st);
         case 4:
             return launch_gate_up<F, FG, FU, 4>(a, st);
-        case 5: // SP2: the target's verification rows; the draft's Q8_0 layer runs B <= 4 (catch-up has no FFN)
-            if constexpr (F != fmt::q8_0) {
+        case 5: // SP2: the target's verification rows; the draft's Q8_0 layer runs B <= 4 (catch-up has no FFN); ME7:
+                // its Q2_0 too
+            if constexpr (F != fmt::q8_0 && F != fmt::q2_0) {
                 return launch_gate_up<F, FG, FU, 5>(a, st);
             }
             return false;
@@ -1985,19 +1712,85 @@ template <fmt F, dfmt FG, dfmt FU> bool gate_up_rows(int32_t rows, const gate_up
 }
 
 // XB3 part 6: the IQ2 body at B, its formats set in its arguments; XB3 C1: the IQ3 body (FAM gu_iq3) at B = 4 and 5
-template <int B, typename FAM = gu_iq2> bool launch_gate_up_u(const gate_up_args & a, cudaStream_t st) {
+template <bool X, int B, typename FAM> bool launch_gate_up_ux(const gate_up_args & a, cudaStream_t st) {
     constexpr int32_t smem = gu_u_smem_bytes<B, FAM>();
     static_assert(smem <= 96 * 1024, "one block's shared memory");
     static std::atomic<uint32_t> attr_done{0u};
-    if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(gate_up_kernel_u<FAM, B, gu_depth>), smem)) {
+    if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(gate_up_kernel_u<X, FAM, B, gu_depth>),
+                                smem)) {
         return false;
     }
-    gate_up_kernel_u<FAM, B, gu_depth><<<n_sm, gu_threads, smem, st>>>(a);
+    gate_up_kernel_u<X, FAM, B, gu_depth><<<n_sm, gu_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// ME3: as launch_gate_up_p
+template <int B, typename FAM = gu_iq2> bool launch_gate_up_u(const gate_up_args & a, cudaStream_t st) {
+    return a.wt != nullptr ? launch_gate_up_ux<true, B, FAM>(a, st) : launch_gate_up_ux<false, B, FAM>(a, st);
 }
 
 constexpr bool is_iq2(fmt f) {
     return f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s;
+}
+
+// ME10: both shards' gate/up of one cache pass in one launch (gate_up_pair): the IQ2 or IQ3 body's pair family at
+// B = 4 or 5, 72 blocks, 36 a shard. The caller (experts.cu gate_up_pair) has checked the shards and the triple
+template <int B, typename FAM> bool launch_gate_up_pair(const gate_up_pair_args & a, cudaStream_t st) {
+    constexpr int32_t smem = gu_u_smem_bytes<B, FAM, n_sm / 2>();
+    static_assert(smem <= 96 * 1024, "one block's shared memory");
+    static std::atomic<uint32_t> attr_done{0u};
+    const void * k = reinterpret_cast<const void *>(gate_up_kernel_u_pair<true, FAM, B, gu_depth>);
+    if (!detail::smem_attr_once(attr_done, k, smem)) {
+        return false;
+    }
+    gate_up_kernel_u_pair<true, FAM, B, gu_depth><<<n_sm, gu_threads, smem, st>>>(a);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+template <typename FAM>
+bool gate_up_pair_u(fmt f, dfmt fg, dfmt fu, int32_t rows, const gate_up_pair_args & a, cudaStream_t st) {
+    gate_up_pair_args u = a;
+    for (gate_up_args & x : u.s) {
+        x.u_f = int32_t(f);
+        x.u_fg = int32_t(fg);
+        x.u_fu = int32_t(fu);
+    }
+    return rows == 4 ? launch_gate_up_pair<4, FAM>(u, st) : rows == 5 && launch_gate_up_pair<5, FAM>(u, st);
+}
+
+// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B = 5, NB = 72 / lanes blocks a
+// lane; the caller (experts.cu gate_up_lanes) has checked the lanes and the triple
+static_assert(gu_list_ok<5, n_sm / 3>() && gu_list_ok<5, n_sm / 4>(), "a lane's units over 24 or 18 blocks: one warp");
+template <typename FAM, int NB> bool launch_gate_up_lanes(const gate_up_lanes_args & a, cudaStream_t st) {
+    constexpr int32_t smem = gu_u_smem_bytes<5, FAM, NB>();
+    static_assert(smem <= 96 * 1024, "one block's shared memory");
+    static std::atomic<uint32_t> attr_done{0u};
+    const void * k = reinterpret_cast<const void *>(gate_up_kernel_u_lanes<FAM, 5, gu_depth, NB>);
+    if (!detail::smem_attr_once(attr_done, k, smem)) {
+        return false;
+    }
+    gate_up_kernel_u_lanes<FAM, 5, gu_depth, NB><<<n_sm, gu_threads, smem, st>>>(a);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+template <typename FAM>
+bool gate_up_lanes_u(fmt f, dfmt fg, dfmt fu, int32_t lanes, const gate_up_lanes_args & a, cudaStream_t st) {
+    gate_up_lanes_args u = a;
+    for (int32_t k = 0; k < lanes; ++k) {
+        u.s[k].u_f = int32_t(f);
+        u.s[k].u_fg = int32_t(fg);
+        u.s[k].u_fu = int32_t(fu);
+    }
+    switch (lanes) {
+        case 2:
+            return launch_gate_up_lanes<FAM, n_sm / 2>(u, st);
+        case 3:
+            return launch_gate_up_lanes<FAM, n_sm / 3>(u, st);
+        case 4:
+            return launch_gate_up_lanes<FAM, n_sm / 4>(u, st);
+        default:
+            return false;
+    }
 }
 
 // routed format F's deployed triples (experts_inst.h); false for any other (fg, fu). The IQ2 formats launch the IQ2
@@ -2005,7 +1798,7 @@ constexpr bool is_iq2(fmt f) {
 // function at the 96-register cap) spilled 344 bytes, so B = 4 keeps the per-triple instantiations, and so does B = 5
 // (SP2). SP4 H2 (map 2): the IQ2 body at B = 4 and 5 with the compact optional-row loop; the IQ3 and Q8_0 formats keep
 // SP2's kernels under map 2. XB3 C1 (map 3): the IQ2 formats as map 2, the IQ3 formats' B = 4 and 5 on the IQ3 body.
-template <fmt F> bool gate_up_for(dfmt fg, dfmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st) {
+template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st) {
     // SP4 (map 1): B = 4 and 5 of the target formats on the paired 320-thread kernel, the IQ2 formats in its IQ2 body
     if constexpr (F != fmt::q8_0) {
         if (rows >= 4 && a.map == 1) {
@@ -2106,6 +1899,32 @@ template <fmt F> bool gate_up_for(dfmt fg, dfmt fu, int32_t rows, const gate_up_
         FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
         return false;
+    }
+}
+
+// ME1: the Q4 candidate's K-quant routed formats take gate_up_kernel at every B (no paired kernel, no body) with the
+// triples of their own list (experts_inst.h); the deployed formats as before
+template <fmt F> bool gate_up_for(dfmt fg, dfmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st) {
+    if constexpr (F == fmt::q2_0) { // ME7: the Q2 draft's routed gate/up, its own list (experts_inst.h)
+#define FN_EXPERTS_GU_CASE(rf, sgf, suf, layer)                                                                        \
+    if (fg == dfmt::sgf && fu == dfmt::suf) {                                                                          \
+        return gate_up_rows<fmt::rf, dfmt::sgf, dfmt::suf>(rows, a, st);                                               \
+    }
+        FN_EXPERTS_DRAFT_Q2_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+#undef FN_EXPERTS_GU_CASE
+        return false;
+    } else if constexpr (is_kq(F)) {
+#define FN_EXPERTS_GU_CASE(rf, sgf, suf, layer)                                                                        \
+    if constexpr (F == fmt::rf) {                                                                                      \
+        if (fg == dfmt::sgf && fu == dfmt::suf) {                                                                      \
+            return gate_up_rows<fmt::rf, dfmt::sgf, dfmt::suf>(rows, a, st);                                           \
+        }                                                                                                              \
+    }
+        FN_EXPERTS_Q4_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+#undef FN_EXPERTS_GU_CASE
+        return false;
+    } else {
+        return gate_up_deployed<F>(fg, fu, rows, a, st);
     }
 }
 

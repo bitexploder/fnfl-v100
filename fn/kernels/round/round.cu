@@ -87,14 +87,18 @@ __device__ __forceinline__ int32_t versions_of(const desc & d) {
 
 // One warp. Lane i < n_err reads error word i; nothing is committed when any is set (FC-RD2), or when k is 0 or out of
 // range. The test hook (desc::test_fail's bit for this card) sets err_test_commit in the card's exchange word first, so
-// a test sees exactly what a bounded poll failing on this card alone leaves. Otherwise lane 0 writes
-// cur <- version_slot(cur, k).
+// a test sees exactly what a bounded poll failing on this card alone leaves; ME11: a selector outside the contract sets
+// err_gdn_sel there the same way. Otherwise lane 0 writes cur <- version_slot(cur, k) and gdn <- gdn_after_round(gdn,
+// k).
 __global__ void __launch_bounds__(32) commit_kernel(const commit_args a) {
     const int32_t lane = threadIdx.x;
     const desc & d = *a.dev;
     if (lane == 0 && ((d.test_fail >> a.card) & 1) != 0) {
         // the list is read-only to the frame; only this test hook writes word 0 (the card's exchange word)
         atomicOr(const_cast<uint32_t *>(a.errs[0]), fn::xchg::err_test_commit);
+    }
+    if (lane == 0 && !gdn_valid(a.st->gdn)) {
+        atomicOr(const_cast<uint32_t *>(a.errs[0]), fn::xchg::err_gdn_sel);
     }
     __syncwarp();
     const uint32_t e = lane < a.n_err ? *reinterpret_cast<const volatile uint32_t *>(a.errs[lane]) : 0u;
@@ -104,11 +108,20 @@ __global__ void __launch_bounds__(32) commit_kernel(const commit_args a) {
     const int32_t k = versions_of(d);
     if (lane == 0 && k >= 1 && k <= max_rows) {
         a.st->cur = static_cast<uint32_t>(version_slot(a.st->cur, k));
+        a.st->gdn = gdn_after_round(a.st->gdn, k);
     }
 }
 
 __global__ void advance_kernel(uint32_t * cur, int32_t k) {
     *cur = static_cast<uint32_t>(version_slot(*cur, k));
+}
+
+__global__ void advance_gdn_kernel(uint32_t * cur, uint32_t * gdn, int32_t k, bool prompt) {
+    *cur = static_cast<uint32_t>(version_slot(*cur, k));
+    const uint32_t g = *gdn;
+    if (gdn_valid(g)) {
+        *gdn = prompt ? gdn_after_prompt(g) : gdn_after_round(g, k);
+    }
 }
 
 // one warp: the emitted tokens by kind, then the completion record; the round number last, after a system fence.
@@ -133,6 +146,7 @@ __global__ void __launch_bounds__(32) finish_kernel(const finish_args a) {
     if (lane == 0) {
         d.n_out = n_out;
         a.host->cur = a.st->cur;
+        a.host->gdn = a.st->gdn;
         const uint64_t t = globaltimer();
         a.st->t_end = t;
         a.host->n_out = n_out;
@@ -201,6 +215,17 @@ bool advance(uint32_t * cur, int32_t k, void * stream) {
         return true;
     }
     advance_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(cur, k);
+    return launched();
+}
+
+bool advance(uint32_t * cur, uint32_t * gdn, int32_t k, bool prompt, void * stream) {
+    if (cur == nullptr || gdn == nullptr || k < 0 || k > max_rows || stream == nullptr) {
+        return false;
+    }
+    if (k == 0) {
+        return true;
+    }
+    advance_gdn_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(cur, gdn, k, prompt);
     return launched();
 }
 

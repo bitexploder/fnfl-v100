@@ -57,7 +57,7 @@ struct slice_info {
 };
 
 slice_info info_of(const model::model & m, int32_t t, int32_t card) {
-    const model::tensor_place & tp = model::tensors[t];
+    const model::tensor_place & tp = m.tp(t);
     const model::card_place & cp = tp.card[card];
     slice_info s;
     s.blk = tp.block_elems;
@@ -123,7 +123,8 @@ bool ex1_fmt(const char * name, experts::fmt & f) {
     static const std::pair<const char *, experts::fmt> table[] = {
         {"IQ2_XXS", experts::fmt::iq2_xxs}, {"IQ2_XS", experts::fmt::iq2_xs}, {"IQ2_S", experts::fmt::iq2_s},
         {"IQ3_XXS", experts::fmt::iq3_xxs}, {"IQ3_S", experts::fmt::iq3_s},   {"Q2_0", experts::fmt::q2_0},
-        {"IQ4_NL", experts::fmt::iq4_nl},   {"Q8_0", experts::fmt::q8_0},
+        {"IQ4_NL", experts::fmt::iq4_nl},   {"Q8_0", experts::fmt::q8_0},     {"Q4_K", experts::fmt::q4_k},
+        {"Q5_K", experts::fmt::q5_k},       {"Q5_1", experts::fmt::q5_1}, // ME1: the Q4 candidate's routed formats
     };
     for (const auto & e : table) {
         if (std::strcmp(e.first, name) == 0) {
@@ -185,9 +186,9 @@ struct card_plan {
     std::vector<piece> pieces;
 };
 
-int64_t per_expert(const model::region_place & rg) {
+int64_t per_expert(const model::model & m, const model::region_place & rg) {
     experts::fmt f{};
-    ex1_fmt(model::tensors[rg.members[0]].format, f);
+    ex1_fmt(m.tp(rg.members[0]).format, f);
     return rg.lay == layout::ex1_gate ? experts::gate_up_bytes(f) : experts::down_bytes(f);
 }
 
@@ -195,7 +196,7 @@ card_plan plan_card(const model::model & m, int32_t card, int64_t piece_bytes) {
     card_plan cp;
     for (int32_t r = 0; r < (int32_t)m.regions[card].size(); ++r) {
         const model::region_place & rg = m.regions[card][r];
-        if (rg.bytes == 0) {
+        if (rg.bytes == 0 || rg.cached || rg.alias) {
             continue;
         }
         if (rg.lay == layout::gguf) {
@@ -206,7 +207,7 @@ card_plan plan_card(const model::model & m, int32_t card, int64_t piece_bytes) {
                 cp.units.push_back({r, q, e, rg.offset + q * s.row_out, (e - q) * s.row_out});
             }
         } else if (rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) {
-            const int64_t pe = per_expert(rg);
+            const int64_t pe = per_expert(m, rg);
             const int64_t step = std::max<int64_t>(1, piece_bytes / pe);
             for (int64_t e0 = 0; e0 < fn::n_expert; e0 += step) {
                 const int64_t e1 = std::min<int64_t>(fn::n_expert, e0 + step);
@@ -249,7 +250,7 @@ bool fill_unit(const model::model & m, int32_t card, const unit & u, uint8_t * h
             for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
                 const slice_info s = info_of(m, rg.members[mi], card);
                 const int64_t row0 = mi == 0 ? 0 : hc_low;
-                for (int64_t j = 0; j < model::tensors[rg.members[mi]].ne[1]; ++j) {
+                for (int64_t j = 0; j < m.tp(rg.members[mi]).ne[1]; ++j) {
                     for (int32_t c = 0; c < hc_streams; ++c) {
                         const int64_t row = c * R + row0 + j;
                         if (q8) {
@@ -284,7 +285,7 @@ bool fill_unit(const model::model & m, int32_t card, const unit & u, uint8_t * h
         }
         case layout::ex1_gate: {
             experts::fmt f{};
-            ex1_fmt(model::tensors[rg.members[0]].format, f);
+            ex1_fmt(m.tp(rg.members[0]).format, f);
             const slice_info g = info_of(m, rg.members[0], card), up = info_of(m, rg.members[1], card);
             const int64_t pe = experts::gate_up_bytes(f);
             repack = true;
@@ -299,7 +300,7 @@ bool fill_unit(const model::model & m, int32_t card, const unit & u, uint8_t * h
         }
         case layout::ex1_down: {
             experts::fmt f{};
-            ex1_fmt(model::tensors[rg.members[0]].format, f);
+            ex1_fmt(m.tp(rg.members[0]).format, f);
             const slice_info s = info_of(m, rg.members[0], card);
             const int64_t pe = experts::down_bytes(f);
             repack = true;
@@ -381,6 +382,34 @@ bool check_shapes(int32_t t, std::string & err) {
     return true;
 }
 
+// ME1: a region of one GGUF-layout tensor that both cards hold whole, the same rows and columns (the routers, the
+// shared-expert gates and the norms: never repacked in place, so one copy serves both logical cards)
+bool replicated(const model::region_place & rg) {
+    if (rg.lay != layout::gguf || rg.members[1] >= 0) {
+        return false;
+    }
+    const model::tensor_place & tp = model::tensors[rg.members[0]];
+    const model::card_place & a = tp.card[0];
+    const model::card_place & b = tp.card[1];
+    if (a.row_count == 0 || a.row_count != b.row_count || a.col_count != b.col_count || a.bytes != b.bytes) {
+        return false;
+    }
+    const auto same = [](const model::range & x, const model::range & y) {
+        return x.first == y.first && x.count == y.count;
+    };
+    for (int32_t i = 0; i < a.row_count; ++i) {
+        if (!same(model::ranges[a.row_first + i], model::ranges[b.row_first + i])) {
+            return false;
+        }
+    }
+    for (int32_t i = 0; i < a.col_count; ++i) {
+        if (!same(model::ranges[a.col_first + i], model::ranges[b.col_first + i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool plan_regions(model::model & m, std::string & err) {
     // region members from the table
     std::vector<std::array<int32_t, 2>> members(model::n_regions, {-1, -1});
@@ -413,32 +442,78 @@ bool plan_regions(model::model & m, std::string & err) {
                 err = "region " + std::to_string(r) + " has no first member";
                 return false;
             }
-            rg.bytes = model::tensors[rg.members[0]].card[card].bytes;
+            rg.bytes = m.tp(rg.members[0]).card[card].bytes;
             if (rg.members[1] >= 0) {
-                rg.bytes += model::tensors[rg.members[1]].card[card].bytes;
+                rg.bytes += m.tp(rg.members[1]).card[card].bytes;
             }
             if ((rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) && rg.bytes > 0 &&
-                rg.bytes != fn::n_expert * per_expert(rg)) {
-                err = std::string(model::tensors[rg.members[0]].name) + ": the EX1 region is not 512 packed experts";
+                rg.bytes != fn::n_expert * per_expert(m, rg)) {
+                err = std::string(m.tp(rg.members[0]).name) + ": the EX1 region is not 512 packed experts";
                 return false;
             }
             if (rg.lay == layout::ex1_gate &&
                 (rg.members[1] < 0 ||
-                 std::strcmp(model::tensors[rg.members[0]].format, model::tensors[rg.members[1]].format) != 0)) {
-                err = std::string(model::tensors[rg.members[0]].name) + ": gate and up formats differ";
+                 std::strcmp(m.tp(rg.members[0]).format, m.tp(rg.members[1]).format) != 0)) {
+                err = std::string(m.tp(rg.members[0]).name) + ": gate and up formats differ";
                 return false;
+            }
+            sum += rg.bytes;
+            // ME1: the cache's experts and card 1's replicated copies on one device take no device bytes
+            rg.cached = m.expert_cache && (rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) &&
+                        model::components[m.tp(rg.members[0]).component].layer < fn::n_layer;
+            rg.alias = m.single && card == 1 && replicated(rg);
+            if (rg.cached || rg.alias) {
+                rg.offset = rg.alias ? m.regions[0][r].offset : -1;
+                continue;
             }
             rg.offset = off;
             off += (rg.bytes + model::region_align - 1) / model::region_align * model::region_align;
-            sum += rg.bytes;
         }
         m.weight_bytes[card] = sum;
         m.weight_alloc[card] = off;
-        if (sum != model::weight_card_bytes[card]) {
+        if (sum != m.placed_card_bytes[card]) { // ME7: the placement's, with the draft's experts as resolved
             err = "card " + std::to_string(card) + ": regions hold " + std::to_string(sum) + " bytes, the placement " +
-                  std::to_string(model::weight_card_bytes[card]);
+                  std::to_string(m.placed_card_bytes[card]);
             return false;
         }
+    }
+    return true;
+}
+
+// ME7: the MTP draft's routed expert tensors (layer fn::n_layer), whose format the draft file decides
+bool draft_expert_tensor(const std::string & name) {
+    const std::string pre = "blk." + std::to_string(fn::n_layer) + ".";
+    return name == pre + "ffn_gate_exps.weight" || name == pre + "ffn_up_exps.weight" ||
+           name == pre + "ffn_down_exps.weight";
+}
+
+// ME7: a draft routed expert tensor's entry for this load. Q8_0: placement.h's, unchanged. Q2_0 (the opt-in Q2 draft:
+// work/ME7's splice): GGUF's Q2_0 geometry, and each card's packed bytes (512 experts of the card's half: gate and up
+// each half of gate_up_bytes, down down_bytes), with the cards' totals moved by the difference. Any other format is
+// refused by name.
+bool resolve_draft_expert(model::model & m, int32_t t, const fnfl_gguf_tensor & g, std::string & err) {
+    model::tensor_place & tp = m.place[size_t(t)];
+    if (strcasecmp(g.type_name.c_str(), "Q8_0") == 0) {
+        return true;
+    }
+    if (strcasecmp(g.type_name.c_str(), "Q2_0") != 0) {
+        err = "draft tensor '" + g.name + "' is " + g.type_name + ": the draft's routed experts are Q8_0 or Q2_0";
+        return false;
+    }
+    const experts::fmt f = experts::fmt::q2_0;
+    const int64_t per = tp.lay == layout::ex1_down ? experts::down_bytes(f) : experts::gate_up_bytes(f) / 2;
+    if (per <= 0 || (tp.lay != layout::ex1_down && tp.lay != layout::ex1_gate && tp.lay != layout::ex1_up)) {
+        err = "draft tensor '" + g.name + "': no Q2_0 packing for its layout";
+        return false;
+    }
+    tp.format = "Q2_0";
+    tp.block_elems = 64;
+    tp.block_bytes = 18;
+    tp.stored_bytes = tp.ne[0] / 64 * 18 * tp.ne[1] * tp.ne[2];
+    for (int32_t card = 0; card < 2; ++card) {
+        const int64_t bytes = fn::n_expert * per;
+        m.placed_card_bytes[card] += bytes - tp.card[card].bytes;
+        tp.card[card].bytes = bytes;
     }
     return true;
 }
@@ -449,6 +524,14 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
     const auto t0 = clock_type::now();
     m.device[0] = p.device[0];
     m.device[1] = p.device[1];
+    m.single = p.device[0] == p.device[1];
+    m.expert_cache = p.expert_cache;
+    m.kv_host = p.kv_host;
+    m.kv_window = p.kv_window;
+    if (m.kv_host && !m.single && !m.expert_cache) {
+        err = "two-device host KV needs the expert cache (--cached-tp)";
+        return false;
+    }
     std::vector<std::string> paths;
     if (!fnfl_gguf_shard_paths(p.model_path, paths, err)) {
         return false;
@@ -461,7 +544,13 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
     }
     m.sources.assign(model::n_tensors, model::tensor_source());
     std::vector<bool> seen(model::n_tensors, false);
+    // ME7: this load's entries, the draft's routed experts resolved from its file below
+    m.place.assign(model::tensors, model::tensors + model::n_tensors);
+    m.placed_card_bytes[0] = model::weight_card_bytes[0];
+    m.placed_card_bytes[1] = model::weight_card_bytes[1];
+    std::string draft_formats;
     for (const std::string & path : paths) {
+        const bool draft_file = &path == &paths.back();
         fnfl_gguf_dir dir;
         if (!fnfl_gguf_read_dir(path, dir, err)) {
             return false;
@@ -480,7 +569,13 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
                 err = "GGUF tensor '" + g.name + "' in '" + path + "' has no placement";
                 return false;
             }
-            const model::tensor_place & tp = model::tensors[it->second];
+            if (draft_file && draft_expert_tensor(g.name)) {
+                if (!resolve_draft_expert(m, it->second, g, err)) {
+                    return false;
+                }
+                draft_formats += draft_formats.empty() ? g.type_name : "," + g.type_name;
+            }
+            const model::tensor_place & tp = m.tp(it->second);
             if (seen[it->second] || strcasecmp(g.type_name.c_str(), tp.format) != 0 ||
                 g.block_elems != tp.block_elems || g.block_bytes != tp.block_bytes || g.ne[0] != tp.ne[0] ||
                 g.ne[1] != tp.ne[1] || g.ne[2] != tp.ne[2] || g.ne[3] != 1 || (int64_t)g.bytes != tp.stored_bytes) {
@@ -498,6 +593,22 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
             }
         }
         m.files.push_back(std::move(f));
+    }
+    // ME7: the draft's routed gate, up and down in one format: Q8_0 (placed) or Q2_0 (the opt-in); a mix is refused
+    {
+        int32_t n_q2 = 0, n_seen = 0;
+        for (int32_t t2 = 0; t2 < model::n_tensors; ++t2) {
+            if (draft_expert_tensor(model::tensors[t2].name) && seen[t2]) {
+                ++n_seen;
+                n_q2 += std::strcmp(m.tp(t2).format, "Q2_0") == 0 ? 1 : 0;
+            }
+        }
+        if (n_seen == 3 && n_q2 != 0 && n_q2 != 3) {
+            err = "the draft's routed experts mix formats (" + draft_formats + "): gate, up and down are all Q8_0 or "
+                  "all Q2_0";
+            return false;
+        }
+        m.draft_expert_format = n_q2 == 3 ? "Q2_0" : "Q8_0";
     }
     for (int32_t t2 = 0; t2 < model::n_tensors; ++t2) {
         if (!seen[t2]) {
@@ -521,6 +632,124 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
     }
     t.open_s = seconds_since(t0);
     return true;
+}
+
+bool expert_layer_of(const model::model & m, int32_t layer, expert_layer & out, std::string & err) {
+    if (layer < 0 || layer >= fn::n_layer || m.region_of.size() != size_t(model::n_tensors)) {
+        err = "expert layer " + std::to_string(layer) + ": not a target layer of an opened model";
+        return false;
+    }
+    const std::string pre = "blk." + std::to_string(layer) + ".";
+    const int32_t tg = model::model::find((pre + "ffn_gate_exps.weight").c_str());
+    const int32_t td = model::model::find((pre + "ffn_down_exps.weight").c_str());
+    if (tg < 0 || td < 0) {
+        err = pre + ": the routed expert tensors are not placed";
+        return false;
+    }
+    out.layer = layer;
+    out.gu_region = m.region_of[size_t(tg)];
+    out.dn_region = m.region_of[size_t(td)];
+    if (out.gu_region < 0 || out.dn_region < 0 || m.regions[0][out.gu_region].lay != layout::ex1_gate ||
+        m.regions[0][out.dn_region].lay != layout::ex1_down || !ex1_fmt(m.tp(tg).format, out.gu_fmt) ||
+        !ex1_fmt(m.tp(td).format, out.dn_fmt)) {
+        err = pre + ": the routed expert regions are not EX1's";
+        return false;
+    }
+    out.gu_bytes = experts::gate_up_bytes(out.gu_fmt);
+    out.dn_bytes = experts::down_bytes(out.dn_fmt);
+    if (out.gu_bytes <= 0 || out.dn_bytes <= 0 || out.gu_bytes % 256 != 0 || out.dn_bytes % 256 != 0) {
+        err = pre + ": an expert format the cache cannot hold";
+        return false;
+    }
+    return true;
+}
+
+bool pack_expert_entry(const model::model & m, const expert_layer & l, int32_t e, uint8_t * dst) {
+    for (int32_t card = 0; card < 2; ++card) {
+        bool repack = false;
+        const unit g{l.gu_region, e, e + 1, 0, l.gu_bytes};
+        const unit d{l.dn_region, e, e + 1, 0, l.dn_bytes};
+        if (!fill_unit(m, card, g, dst + l.gu_at(card), repack) ||
+            !fill_unit(m, card, d, dst + l.dn_at(card), repack)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool native_expert_layer(const model::model & m, const expert_layer & l, experts::cpu::native_layer & out,
+                         std::string & err) {
+    out = experts::cpu::native_layer();
+    const std::string pre = "blk." + std::to_string(l.layer) + ".";
+    const char * const names[3] = {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"};
+    const uint8_t * base[3] = {nullptr, nullptr, nullptr};
+    int64_t row[3] = {0, 0, 0}, mat[3] = {0, 0, 0};
+    for (int32_t i = 0; i < 3; ++i) {
+        const int32_t t = model::model::find((pre + names[i]).c_str());
+        if (t < 0 || size_t(t) >= m.sources.size() || m.sources[size_t(t)].file == nullptr) {
+            err = pre + names[i] + ": not placed or not mapped (native expert views)";
+            return false;
+        }
+        const model::tensor_place & tp = m.tp(t);
+        const model::tensor_source & src = m.sources[size_t(t)];
+        experts::fmt f{};
+        const bool down = i == 2;
+        const int64_t ne0 = down ? experts::cpu::n_ff : experts::cpu::d_model;
+        const int64_t ne1 = down ? experts::cpu::d_model : experts::cpu::n_ff;
+        if (!ex1_fmt(tp.format, f) || f != (down ? l.dn_fmt : l.gu_fmt) || tp.ne[0] != ne0 || tp.ne[1] != ne1 ||
+            tp.ne[2] != fn::n_expert || tp.block_elems <= 0) {
+            err = pre + names[i] + ": not the EX1 shape or the layer's format (native expert views)";
+            return false;
+        }
+        row[i] = tp.ne[0] / tp.block_elems * tp.block_bytes;
+        mat[i] = row[i] * tp.ne[1];
+        const int64_t want = down ? experts::cpu::dn_row_bytes(f) : experts::cpu::gu_row_bytes(f);
+        if (row[i] != want || row[i] <= 0 || (src.row_bytes > 0 && src.row_bytes != row[i])) {
+            err = pre + names[i] + ": a native row of " + std::to_string(row[i]) + " bytes, the CPU kernels read " +
+                  std::to_string(want);
+            return false;
+        }
+        // every expert's bytes inside the mapping
+        if (!experts::cpu::native_fits(uint64_t(src.offset), uint64_t(src.file->size()), mat[i], fn::n_expert)) {
+            err = pre + names[i] + ": its 512 experts run past the end of " + src.file->path();
+            return false;
+        }
+        base[i] = src.file->data() + src.offset;
+    }
+    if (row[0] != row[1] || mat[0] != mat[1]) {
+        err = pre + ": gate and up rows differ (native expert views)";
+        return false;
+    }
+    out.gate = base[0];
+    out.up = base[1];
+    out.down = base[2];
+    out.gu_row = row[0];
+    out.gu_expert = mat[0];
+    out.dn_row = row[2];
+    out.dn_expert = mat[2];
+    return true;
+}
+
+std::string draft_expert_line(const model::model & m) {
+    int64_t now[2] = {0, 0}, q8[2] = {0, 0};
+    for (int32_t t = 0; t < model::n_tensors; ++t) {
+        if (draft_expert_tensor(model::tensors[t].name)) {
+            for (int32_t c = 0; c < 2; ++c) {
+                now[c] += m.tp(t).card[c].bytes;
+                q8[c] += model::tensors[t].card[c].bytes;
+            }
+        }
+    }
+    const double mib = 1048576.0;
+    char b[512];
+    std::snprintf(b, sizeof(b),
+                  "MTP draft routed experts: %s (the draft file's%s); packed %.1f / %.1f MiB on cards 0 / 1 (Q8_0: "
+                  "%.1f / %.1f MiB, %+.1f MiB a card); weights %.3f / %.3f GiB a card",
+                  m.draft_expert_format, std::strcmp(m.draft_expert_format, "Q2_0") == 0 ? "; ME7's opt-in" : "",
+                  double(now[0]) / mib, double(now[1]) / mib, double(q8[0]) / mib, double(q8[1]) / mib,
+                  double(now[0] - q8[0]) / mib, double(m.weight_bytes[0]) / 1073741824.0,
+                  double(m.weight_bytes[1]) / 1073741824.0);
+    return b;
 }
 
 bool allocate_weights(model::model & m, std::string & err) {
@@ -687,13 +916,13 @@ bool hash_gguf_slices(const model::model & m, int32_t threads, std::vector<card_
     std::vector<std::pair<int32_t, int32_t>> jobs; // (tensor, card), largest first
     for (int32_t t = 0; t < model::n_tensors; ++t) {
         for (int32_t card = 0; card < 2; ++card) {
-            if (model::tensors[t].lay != layout::host && model::tensors[t].card[card].bytes > 0) {
+            if (m.tp(t).lay != layout::host && m.tp(t).card[card].bytes > 0) {
                 jobs.emplace_back(t, card);
             }
         }
     }
-    std::sort(jobs.begin(), jobs.end(), [](const auto & a, const auto & b) {
-        return model::tensors[a.first].card[a.second].bytes > model::tensors[b.first].card[b.second].bytes;
+    std::sort(jobs.begin(), jobs.end(), [&m](const auto & a, const auto & b) {
+        return m.tp(a.first).card[a.second].bytes > m.tp(b.first).card[b.second].bytes;
     });
     std::atomic<size_t> next{0};
     const auto worker = [&]() {
@@ -718,7 +947,7 @@ bool hash_gguf_slices(const model::model & m, int32_t threads, std::vector<card_
 std::string source_fingerprint(const model::model & m) {
     sha256 h;
     for (int32_t t = 0; t < model::n_tensors; ++t) {
-        const model::tensor_place & tp = model::tensors[t];
+        const model::tensor_place & tp = m.tp(t);
         h.update(tp.name, std::strlen(tp.name) + 1);
         h.update(tp.ne, sizeof(tp.ne));
         h.update(&tp.lay, sizeof(tp.lay));
@@ -845,7 +1074,7 @@ bool build_perms(const model::model & m, perm_map & perms, std::string & err) {
             continue;
         }
         experts::fmt f{};
-        ex1_fmt(model::tensors[rg.members[0]].format, f);
+        ex1_fmt(m.tp(rg.members[0]).format, f);
         const bool gu = rg.lay == layout::ex1_gate;
         const auto key = std::make_tuple((int32_t)f, gu, m.sources[rg.members[0]].row_bytes);
         if (perms.count(key) == 0 && !derive_perm(f, gu, std::get<2>(key), perms[key], err)) {
@@ -918,7 +1147,7 @@ bool check_all(const load_params & p, const model::model & m, const std::vector<
                 const ex1_perm * perm = nullptr;
                 if (rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) {
                     experts::fmt f{};
-                    ex1_fmt(model::tensors[rg.members[0]].format, f);
+                    ex1_fmt(m.tp(rg.members[0]).format, f);
                     perm = &perms.at(std::make_tuple((int32_t)f, rg.lay == layout::ex1_gate,
                                                      m.sources[rg.members[0]].row_bytes));
                     rec.resize(perm->slice_of.size());
@@ -944,7 +1173,7 @@ bool check_all(const load_params & p, const model::model & m, const std::vector<
                             uint8_t blk[hc_feat / q8_block * q8_block_bytes];
                             for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
                                 const int64_t row0 = mi == 0 ? 0 : hc_low;
-                                for (int64_t r = 0; r < model::tensors[rg.members[mi]].ne[1]; ++r) {
+                                for (int64_t r = 0; r < m.tp(rg.members[mi]).ne[1]; ++r) {
                                     for (int32_t c = 0; c < hc_streams; ++c) {
                                         const int64_t row = c * R + row0 + r;
                                         if (q8) {
@@ -997,7 +1226,7 @@ bool check_all(const load_params & p, const model::model & m, const std::vector<
                 }
                 for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
                     const int32_t t = rg.members[mi];
-                    if (model::tensors[t].card[card].bytes == 0) {
+                    if (m.tp(t).card[card].bytes == 0) {
                         continue;
                     }
                     const digest got = hs[mi].finish();
@@ -1006,7 +1235,7 @@ bool check_all(const load_params & p, const model::model & m, const std::vector<
                     if (got == want[t][card]) {
                         rep.equal[card]++;
                     } else {
-                        rep.failures.push_back(std::string(model::tensors[t].name) + " card " + std::to_string(card) +
+                        rep.failures.push_back(std::string(m.tp(t).name) + " card " + std::to_string(card) +
                                                ": read back " + hex(got) + ", GGUF slice " + hex(want[t][card]));
                     }
                 }

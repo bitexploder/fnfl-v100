@@ -37,12 +37,25 @@ constexpr double wide_lo = 1e-4, wide_hi = 1e-1;
 struct d_range {
     wfmt f;
     double lo, hi;
+    double lo2 = 0.0, hi2 = 0.0; // ME1: the second scale (dmin, Q5_1's m); 0: as d
 };
+// ME1: the Q4 candidate's formats, not measured (its GGUF is not downloaded): each range puts the largest |weight| and
+// the smallest scale's on IQ4_NL's deployed ones (its |d| range above x 127, its largest code): d divided by the
+// largest code product (Q4_K 63 x 15, Q5_K 63 x 31, Q5_1 31, Q8_0 127); the K-quants' dmin by 63 (the largest min);
+// Q5_1's m by 2
+constexpr double iq4_w_lo = 1.69157982e-05 * 127, iq4_w_hi = 2.52914429e-03 * 127;
 constexpr d_range deployed[] = {
-    {wfmt::iq2_xxs, 2.16007233e-05, 2.81715393e-03}, {wfmt::iq2_xs, 2.52485275e-05, 2.38037109e-03},
-    {wfmt::iq2_s, 2.27212906e-05, 1.54781342e-03},   {wfmt::iq3_xxs, 9.20891762e-06, 2.55393982e-03},
-    {wfmt::iq3_s, 8.68141651e-06, 2.86102295e-03},   {wfmt::q2_0, 1.37634277e-03, 9.38110352e-02},
+    {wfmt::iq2_xxs, 2.16007233e-05, 2.81715393e-03},
+    {wfmt::iq2_xs, 2.52485275e-05, 2.38037109e-03},
+    {wfmt::iq2_s, 2.27212906e-05, 1.54781342e-03},
+    {wfmt::iq3_xxs, 9.20891762e-06, 2.55393982e-03},
+    {wfmt::iq3_s, 8.68141651e-06, 2.86102295e-03},
+    {wfmt::q2_0, 1.37634277e-03, 9.38110352e-02},
     {wfmt::iq4_nl, 1.69157982e-05, 2.52914429e-03},
+    {wfmt::q4_k, iq4_w_lo / 945, iq4_w_hi / 945, iq4_w_lo / 63, iq4_w_hi / 63},
+    {wfmt::q5_k, iq4_w_lo / 1953, iq4_w_hi / 1953, iq4_w_lo / 63, iq4_w_hi / 63},
+    {wfmt::q5_1, iq4_w_lo / 31, iq4_w_hi / 31, iq4_w_lo / 2, iq4_w_hi / 2},
+    {wfmt::q8_0, iq4_w_lo / 127, iq4_w_hi / 127},
 };
 
 // an F16 scale: magnitude log-uniform in [lo_v, hi_v], rounded to F16 (Amendment 1's range is always a normal F16
@@ -76,7 +89,7 @@ void synth_value(wfmt f, rng & r, uint8_t * b) {
     }
 }
 
-bool fill_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst, double lo, double hi) {
+bool fill_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst, double lo, double hi, double lo2, double hi2) {
     if (n_blocks < 0 || dst == nullptr) {
         return false;
     }
@@ -106,7 +119,7 @@ bool fill_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst, double 
             case wfmt::q4_k:
             case wfmt::q5_k:
                 put_u16(b, scale_f16(r, true, lo, hi));
-                put_u16(b + 2, scale_f16(r, true, lo, hi));
+                put_u16(b + 2, scale_f16(r, true, lo2, hi2));
                 break;
             case wfmt::q6_k:
                 put_u16(b + 208, scale_f16(r, false, lo, hi));
@@ -116,6 +129,10 @@ bool fill_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst, double 
             case wfmt::iq4_nl:
             case wfmt::iq4_xs:
                 put_u16(b, scale_f16(r, false, lo, hi));
+                break;
+            case wfmt::q5_1: // ME1: d and m, each with a random sign
+                put_u16(b, scale_f16(r, false, lo, hi));
+                put_u16(b + 2, scale_f16(r, false, lo2, hi2));
                 break;
             case wfmt::bf16:
             case wfmt::f16:
@@ -129,7 +146,7 @@ bool fill_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst, double 
 } // namespace
 
 bool synth_blocks(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst) {
-    return fill_blocks(f, seed, n_blocks, dst, wide_lo, wide_hi);
+    return fill_blocks(f, seed, n_blocks, dst, wide_lo, wide_hi, wide_lo, wide_hi);
 }
 
 bool deployed_d_range(wfmt f, double & lo, double & hi) {
@@ -144,8 +161,13 @@ bool deployed_d_range(wfmt f, double & lo, double & hi) {
 }
 
 bool synth_blocks_deployed(wfmt f, uint64_t seed, int64_t n_blocks, uint8_t * dst) {
-    double lo = 0.0, hi = 0.0;
-    return deployed_d_range(f, lo, hi) && fill_blocks(f, seed, n_blocks, dst, lo, hi);
+    for (const d_range & d : deployed) {
+        if (d.f == f) {
+            const bool two = d.hi2 > 0.0;
+            return fill_blocks(f, seed, n_blocks, dst, d.lo, d.hi, two ? d.lo2 : d.lo, two ? d.hi2 : d.hi);
+        }
+    }
+    return false;
 }
 
 } // namespace fn::quant

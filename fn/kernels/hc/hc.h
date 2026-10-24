@@ -227,6 +227,44 @@ struct sub_args {
 bool sub(int32_t rows, int32_t mode, const sub_args & a, void * stream);
 bool head_sub(int32_t rows, int32_t mode, const sub_args & a, void * stream);
 
+// ---- FMU2: a joint round's sublayer, lanes of max_rows rows, one launch ----
+// One cooperative launch a card (sub's grid and block) for 2..4 lanes on one weight set, a[k] lane k's sub arguments
+// at max_rows (its own inputs, outputs, X-HC and X-HMIX slots and error word: each lane its own ring). Build order
+// item 1 (Fable review 2): one weight stream. Each warp holds its weight rows (down 5, up 8) widened to F32 for every
+// lane's rows; each row of each lane takes sub's B = max_rows arithmetic (dot8's fmaf chain, the lane sums in the
+// butterfly's xor order as a reduce-scatter, the finishes' orders), so every output of a lane (x, inject, both forms
+// of mixed in both cards' X-HMIX slots, its X-HC words, its resets, its error word) is bitwise its own sub launch's.
+// Dynamic shared memory up to 88,960 bytes (four lanes). Modes as sub's (1 the down phases, 2 the up phases, 3 both).
+// False, with nothing enqueued, for lanes outside 2..4, any lane sub would refuse at max_rows, lanes on different
+// cards or weights (w_down, w_up, gamma), two lanes sharing an X-HC or X-HMIX slot, or a lane's reset of a slot
+// another lane writes; false after a failed launch submission. head_sub_joint: head_sub's form (no inject).
+bool sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream);
+bool head_sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream);
+
+// ---- ME12: both logical shards of a sublayer on one device, one launch ----
+// One cooperative launch (as sub's: 72 blocks of 640 threads, one an SM) that does both cards' sub mode 3 on one device
+// and stream: block b runs card 0's down block b, then card 1's; a grid barrier; block 0 forms the low-rank activation
+// and the inverse RMS once (and, normal mode, the injection, written to both cards' inject) into scratch; a grid
+// barrier; then the 80 up blocks of both cards (block b: up tasks b and b + 72) read them from scratch instead of each
+// forming them. Every output (x, inject, both X-HC regions of both slots, both X-HMIX slots in both forms, the resets
+// and the error words) is bitwise the two cards' sub launches (modes 1, 1, 2, 2 in the pair order): the same operations
+// in the same order on the same canonical moment words. A moment poll that gives up sets err_poll_hc in both error
+// words. Head mode (head_pair): as head_sub, no injection.
+struct pair_args {
+    sub_args s[2];  // card k's sub arguments (s[k].card == k); s[k].hc_peer == s[1-k].hc_ring, likewise X-HMIX
+    float * scratch; // [B][320] low then [B][4] inverse RMS, F32, 16-byte aligned; read and written by this launch only
+};
+constexpr int64_t pair_scratch_bytes = int64_t(max_rows) * (n_down + 4) * 4; // 6,480
+// Per device, before a capture: false unless the device supports cooperative launches and every instance (B = 1..5,
+// both modes) is co-resident at 72 blocks of 640 threads (the occupancy API), with no local memory.
+bool pair_prepare();
+// Enqueue on stream; false, with nothing enqueued, for an unsupported row count, a shard argument hc::sub would refuse,
+// cards other than 0 then 1, slots that are not one pair's, a reset (by either shard) of either shard's current X-HC
+// or X-HMIX slot, or a null or misaligned scratch; false after a failed launch submission. Both cards' buffers must be
+// on the stream's device (the caller's placement check).
+bool pair(int32_t rows, const pair_args & a, void * stream);
+bool head_pair(int32_t rows, const pair_args & a, void * stream);
+
 // ---- V1: the HC head (FC-HEAD1), HC2 with injection off ----
 // The pinned engine's final mixer (qwen4exp.cpp 534-546 at 66e11c3): build_hc_mix with the output_hc_* weights and no
 // injection weight. It is down2, up2 (arm 0) and ready with the head-mode template argument, so HC2's layer

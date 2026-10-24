@@ -12,3 +12,10 @@ int fnfl_hc_test(int device, uint32_t rows_mask);
 // with power-of-two scales bitwise the BF16 kernels on the same weights, with general FP16 scales against FP64 (1e-6),
 // every sublayer bitwise sublayer 0, both cards equal, batch invariance and the rejects.
 int fnfl_hc2_test(int dev0, int dev1, uint32_t rows_mask);
+
+// FMU2: hc::sub_joint and head_sub_joint for 2..4 lanes of max_rows rows (each its own inputs, outputs and rings, all
+// on one set of weights) bitwise each lane's own sub or head_sub launches after every sublayer of a sequence (every
+// X-HC and X-HMIX slot, x and inject, the error words; both cards), a second joint run bitwise the first, and the
+// refusals.
+// Prints "hcj-test: PASS" and returns 0 when every case passes. DEV0 == DEV1: loopback, for Compute Sanitizer.
+int fnfl_hcj_test(int dev0, int dev1);

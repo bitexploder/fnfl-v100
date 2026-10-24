@@ -48,6 +48,18 @@
 //            disjoint), cold 39.3 / 34.4 us; latency-bound (issue active 36%), over the frozen forecast.
 //   evidence: QA2, qsa-requirements.md, HX12 (machine sheet), graph Q.
 //
+// KV8 (--fnfl-kv-format q8, an opt-in format; NC1 section 8 amended by the operator, 2026-10-22): with k_scale and
+// v_scale set, the caches hold int8 codes [cell][256] and FP16 scales [cell][kv8::scale_stride] (fn/kernels/qsa/
+// kv_q8.cuh; CPU reference fn/quant/kv_q8_ref.h). prepare quantizes the F32 k (after the norm and IMROPE) and v it would
+// round to BF16: per 64 values amax by a 3-step xor butterfly within each 8-lane quarter, scale = fp16_rn(amax / 127),
+// code = clamp(rint(x / s), -127, 127) (0 when s is 0); a lane stores its 8 codes (8 bytes) and lane 8 g the scale.
+// The attend loads a cell's codes (8 bytes a lane) and its group's scale in place and widens them to float(code) * s,
+// exact in F32, where the BF16 form widens exactly; every other operation and reduction order is unchanged. Bound
+// (qa2-test q8): the same 1e-5 against FP64 over the decoded cache; the new cells' codes and scales bitwise the CPU
+// quantizer of the launch's own F32 k (k_f32) and of v; bitwise reruns and B invariance. A separate instantiation
+// (attend_kernel<false, true>; the BF16 launch is unchanged); not with the host-backed KV (shift). Resources:
+// kernel_resources(r, true).
+//
 // Publication (one launch): the producer warps write the prepared q and the new cells' K and V; each writing lane
 // fences (__threadfence) and lane 0 of the warp adds 1 to the counter after a __syncwarp; every consumer CTA's thread 0
 // polls the counter with acquire loads (gpu scope) until it reaches 13 B (bounded; a timeout sets the error word), and
@@ -91,7 +103,7 @@ struct args {
     const uint32_t * body;   // the selection body (qsa.h layout) of the B rows
     const int32_t * offsets; // [B + 1] its byte offsets
     const int32_t * pos;     // [4][B] the rope planes t, h, w, e of each row
-    uint16_t * k_cache;      // BF16 [cells][256]; cells depth .. depth + B - 1 are written
+    uint16_t * k_cache;      // BF16 [cells][256] (KV8: int8 codes); cells depth .. depth + B - 1 are written
     uint16_t * v_cache;
     const int32_t * depth; // device: cells before the rows (FC-RD1's N_before), read by the launch (TG1)
     int32_t max_cells;     // host: the caches' cells; a depth with depth + B beyond them writes nothing and sets
@@ -104,6 +116,14 @@ struct args {
     uint64_t * stamps; // optional [grid][10], then [13 B]: globaltimer stamps of each CTA's first unit's phases and of
                        // each prepare task's publication (qa2-bench diag)
     workspace ws;
+    // ME3 (the host-backed KV's graphs, fn/model/kv_tier.h): optional device word w; when set, the launch reads and
+    // writes cell c at k_cache + (c - *w) * 256 (and v_cache alike), *w read on the device (a separate instantiation;
+    // null: the resident launch)
+    const int64_t * shift = nullptr;
+    // KV8: both set, the caches are q8: k_cache and v_cache hold int8 codes [cells][256] and these the layer's FP16
+    // scales, cell c's group g at [c * kv8::scale_stride + g] (cells depth .. depth + B - 1 written); both null: BF16
+    uint16_t * k_scale = nullptr;
+    uint16_t * v_scale = nullptr;
 };
 
 float rope_theta_scale();
@@ -127,6 +147,7 @@ struct resources {
     int32_t shared_bytes;
     int32_t ctas_per_sm;
 };
-bool kernel_resources(resources & r);
+// q8: the KV8 instantiation's (attend_kernel<false, true>)
+bool kernel_resources(resources & r, bool q8 = false);
 
 } // namespace fn::qsa::attn

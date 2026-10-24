@@ -127,4 +127,11 @@ bool logits(int32_t rows, const logits_args & a, void * stream);
 bool greedy_reduce(int32_t rows, const reduce_args & a, void * stream);
 bool greedy_decide(int32_t rows, const decide_args & a, void * stream);
 
+// FMU2: the logits of 2..4 lanes of max_rows rows in one launch that reads the card's vocabulary rows once
+// (dense::product_joint, lane outputs). a[k]: lane k's arguments, its X-HMIX slot lane 0's plus k hmix_lane_floats and
+// its own logits buffer; every lane's card, w and n the same, work null (the product unsplit). Lane k's logits are
+// bitwise logits(max_rows, a[k]); a failed X-HMIX acquire raises err (the joint round's word) instead of a lane's.
+// False, with nothing enqueued, on an input logits or the joint product rejects.
+bool logits_joint(int32_t lanes, const logits_args * a, int32_t hmix_lane_floats, uint32_t * err, void * stream);
+
 } // namespace fn::head

@@ -12,6 +12,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/round/round.h"
 #include "fn/kernels/samp/samp.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/layer.h"
 #include "fn/model/prompt.h"
 #include "fn/model/shapes.h"
@@ -93,15 +94,21 @@ int64_t pass_head_bytes() {
            align256(int64_t(round_rows) * 2560 * 4) + align256(int64_t(round_rows) * 2 * 4);
 }
 
+static_assert(gdn_record_step_bytes == int64_t(fn::gdn::rec_step_floats) * 4 &&
+                  gdn_record_bytes == fn::gdn::records_bytes && gdn_banks == fn::gdn::n_bank,
+              "ME11: state.h's GDN layout is gdn.h's");
+
 int64_t checkpoint_bytes(const state_params & p) {
-    const int64_t gdn = int64_t(gdn_heads_card) * gdn_head_dim * gdn_head_dim * 4;
+    const int64_t gdn = int64_t(gdn_heads_card) * gdn_head_dim * gdn_head_dim * 4 + gdn_record_bytes / 2;
     const int64_t conv = int64_t(gdn_conv_channels_card) * gdn_conv_history * 4;
     const int64_t ple = int64_t(ple_channels_card) * (p.ple_conv_kernel - 1) * p.ple_ngram * 4;
     return int64_t(n_gdn_layers) * (gdn + conv) + ple + int64_t(4) * 1280 * 4;
 }
 
-int64_t bytes_per_cell(int32_t card) {
-    const int64_t kv = int64_t(n_qsa_layers) * 2 * kv_head_dim * 2; // K0: BF16 K and V
+int64_t bytes_per_cell(int32_t card, bool kv_q8) {
+    // K0: BF16 K and V; KV8: int8 codes and the two scale rows
+    const int64_t kv = kv_q8 ? int64_t(n_qsa_layers) * 2 * kv_head_dim + int64_t(2) * kv_q8_scale_stride * 2
+                             : int64_t(n_qsa_layers) * 2 * kv_head_dim * 2;
     const int64_t draft_kv = int64_t{2} * kv_head_dim * 2;          // F16 K and V
     const int64_t index = int64_t(n_index_owned) * (fn::qsa::head_dim * 2 + fn::qsa::head_dim * 4 / fn::qsa::ratio);
     // SP2: the draft index on both cards (card 1's weight copies are fixed bytes, not per cell)
@@ -110,16 +117,32 @@ int64_t bytes_per_cell(int32_t card) {
     return kv + draft_kv + index + draft_index;
 }
 
+bool host_class(const std::string & name, bool single, bool kv_host) {
+    return (single && name == "prefill checkpoints (PF1)") ||
+           (kv_host && (name == "target KV (K0)" || name == "draft KV (F16)" ||
+                        name == "target index keys (ME6)" || name == "draft index keys (ME6)"));
+}
+
 std::vector<buffer_class> state_classes(const state_params & p) {
     const int64_t cells = p.n_cells;
     const int32_t blocks = fn::qsa::blocks_complete(p.n_cells);
     std::vector<buffer_class> out;
 
     buffer_class kv{
-        "target KV (K0)", "kv-cache-design.md K0: BF16 K and V, 512 + 512 bytes a cell, one head a layer", {}};
+        "target KV (K0)",
+        p.kv_q8 ? "KV8 (q8): int8 K and V codes, 256 + 256 bytes a cell, one head a layer; FP16 scales a group of 64, "
+                  "cell-major K and V scale rows of 64 (128 bytes each) for the 12 layers"
+                : "kv-cache-design.md K0: BF16 K and V, 512 + 512 bytes a cell, one head a layer",
+        {}};
+    const int64_t kv_elem = p.kv_q8 ? 1 : 2;
     for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
-        kv.parts.push_back(both("L" + std::to_string(l) + " K", cells * kv_head_dim * 2));
-        kv.parts.push_back(both("L" + std::to_string(l) + " V", cells * kv_head_dim * 2));
+        kv.parts.push_back(both("L" + std::to_string(l) + " K", cells * kv_head_dim * kv_elem));
+        kv.parts.push_back(both("L" + std::to_string(l) + " V", cells * kv_head_dim * kv_elem));
+    }
+    if (p.kv_q8) {
+        static_assert(kv_q8_scale_stride >= n_qsa_layers * 4, "KV8: a scale row holds every layer's 4 groups");
+        kv.parts.push_back(both("K scales", cells * kv_q8_scale_stride * 2));
+        kv.parts.push_back(both("V scales", cells * kv_q8_scale_stride * 2));
     }
     out.push_back(kv);
 
@@ -127,29 +150,63 @@ std::vector<buffer_class> state_classes(const state_params & p) {
                    "kv-cache-design.md: the draft block's F16 K and V, one head a card",
                    {both("L48 K", cells * kv_head_dim * 2), both("L48 V", cells * kv_head_dim * 2)}});
 
+    if (p.kv_window > 0) {
+        const int64_t arena = kv_tier::arena_cells(p.kv_window, cells) * kv_head_dim * 2;
+        out.push_back({"KV tier (ME1)",
+                       "kv_tier.h: per card a K and a V arena of the 13 attention layers' windows (W cells each) and "
+                       "the gather area (the whole slot while a prompt stages a layer), and the remap's tables",
+                       {both("K arena", arena), both("V arena", arena), both("tables", kv_tier::table_bytes())}});
+        // ME6: the raw index keys' device windows; their history is the two host classes below
+        out.push_back({"index key windows (ME6)",
+                       "kv_tier.h: per card a key arena of 7 windows (the 6 owned target layers, the draft) of W cells "
+                       "x 128 BF16, or one prompt chunk and its first block if larger",
+                       {both("key arena", kv_tier::key_arena_cells(p.kv_window) * fn::qsa::head_dim * 2)}});
+    }
+    // ME6: with the host-backed tier the raw index keys are their own (host) classes; the summaries stay here
+    const bool key_tier = p.kv_window > 0;
+
     buffer_class index{"target index keys and summaries",
-                       "qsa.h: raw keys BF16 [cell][128]; summaries summary_bytes(cells / 4), F32; on the owner",
+                       key_tier ? "qsa.h: summaries summary_bytes(cells / 4), F32; on the owner (ME6: the raw keys are "
+                                  "the target index keys (ME6) class)"
+                                : "qsa.h: raw keys BF16 [cell][128]; summaries summary_bytes(cells / 4), F32; on the "
+                                  "owner",
                        {}};
+    buffer_class target_keys{
+        "target index keys (ME6)", "qsa.h: raw keys BF16 [cell][128] on the owner (kv_tier.h)", {}};
     for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
         const int32_t c = index_owner(l);
-        index.parts.push_back(one("L" + std::to_string(l) + " keys", c, cells * fn::qsa::head_dim * 2));
+        (key_tier ? target_keys : index).parts.push_back(one("L" + std::to_string(l) + " keys", c,
+                                                             cells * fn::qsa::head_dim * 2));
         index.parts.push_back(one("L" + std::to_string(l) + " summaries", c, (int64_t)fn::qsa::summary_bytes(blocks)));
     }
     out.push_back(index);
+    if (key_tier) {
+        out.push_back(target_keys);
+    }
 
     // SP2 (sparse draft attention, temporary at SP2's disposition): each card computes the same index products and
     // makes the same selection, so the keys, summaries and the indexer's weights (GGUF on card 0) are on both cards
-    out.push_back({"draft index (SP2)",
-                   "qsa.h: raw keys BF16 [cell][128]; summaries summary_bytes(cells / 4), F32; blk.48.indexer's "
-                   "q_proj, k_proj (BF16) and norms (F32) copied to card 1; the step's select depth (I32); on both "
-                   "cards",
-                   {both("L48 keys", cells * fn::qsa::head_dim * 2),
-                    both("L48 summaries", (int64_t)fn::qsa::summary_bytes(blocks)),
-                    one("indexer q_proj copy", 1, int64_t(fn::qsa::n_idx_head) * fn::qsa::head_dim * fn::n_embd * 2),
-                    one("indexer k_proj copy", 1, int64_t(fn::qsa::head_dim) * fn::n_embd * 2),
-                    one("indexer q_norm copy", 1, int64_t(fn::qsa::head_dim) * 4),
-                    one("indexer k_norm copy", 1, int64_t(fn::qsa::head_dim) * 4),
-                    both("select depth", 4)}});
+    buffer_class draft_index{"draft index (SP2)",
+                             "qsa.h: raw keys BF16 [cell][128] (ME6: the draft index keys (ME6) class); summaries "
+                             "summary_bytes(cells / 4), F32; blk.48.indexer's q_proj, k_proj (BF16) and norms (F32) "
+                             "copied to card 1; the step's select depth (I32); on both cards",
+                             {}};
+    if (!key_tier) {
+        draft_index.parts.push_back(both("L48 keys", cells * fn::qsa::head_dim * 2));
+    }
+    draft_index.parts.push_back(both("L48 summaries", (int64_t)fn::qsa::summary_bytes(blocks)));
+    draft_index.parts.push_back(
+        one("indexer q_proj copy", 1, int64_t(fn::qsa::n_idx_head) * fn::qsa::head_dim * fn::n_embd * 2));
+    draft_index.parts.push_back(one("indexer k_proj copy", 1, int64_t(fn::qsa::head_dim) * fn::n_embd * 2));
+    draft_index.parts.push_back(one("indexer q_norm copy", 1, int64_t(fn::qsa::head_dim) * 4));
+    draft_index.parts.push_back(one("indexer k_norm copy", 1, int64_t(fn::qsa::head_dim) * 4));
+    draft_index.parts.push_back(both("select depth", 4));
+    out.push_back(draft_index);
+    if (key_tier) {
+        out.push_back({"draft index keys (ME6)",
+                       "qsa.h: the draft index's raw keys BF16 [cell][128] on both cards (kv_tier.h)",
+                       {both("L48 keys", cells * fn::qsa::head_dim * 2)}});
+    }
 
     // DR1 Stage A's re-shard (98.68% of the subset's IDs fall in card 0's vocabulary shard): each card's copy of half
     // the draft subset's output.weight rows, filled at load by head::pack_draft_head from head::draft_ids
@@ -159,12 +216,16 @@ std::vector<buffer_class> state_classes(const state_params & p) {
                    {both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card)),
                     both("draft head ID map", int64_t(fn::head::n_draft_card) * 4)}});
 
-    buffer_class gdn{
-        "GDN state", "WP2 section 4: 24 heads x 128 x 128 F32 a layer and card, base + 5 row versions (SP2)", {}};
+    // ME11: two banks and two five-step record sets a layer and card (fn/kernels/gdn/gdn.h), in place of six versions
+    buffer_class gdn{"GDN state",
+                     "WP2 section 4: 24 heads x 128 x 128 F32 a layer and card; ME11: two banks (Ln) and two record "
+                     "sets of 5 steps x 16,512 bytes (Ln records), selected by the round state's GDN word",
+                     {}};
     for (int32_t l = 0; l < fn::n_layer; ++l) {
         if (l % fn::full_attn_interval != fn::full_attn_interval - 1) {
             gdn.parts.push_back(both("L" + std::to_string(l),
-                                     int64_t(gdn_versions) * gdn_heads_card * gdn_head_dim * gdn_head_dim * 4));
+                                     int64_t(gdn_banks) * gdn_heads_card * gdn_head_dim * gdn_head_dim * 4));
+            gdn.parts.push_back(both("L" + std::to_string(l) + " records", gdn_record_bytes));
         }
     }
     out.push_back(gdn);
@@ -254,7 +315,8 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     // restored by their valid lengths, so they are not copied), and two device PLE staging slots of one chunk's rows
     // each (one being read by the chunk's rounds, the next chunk's uploading)
     buffer_class ck{"prefill checkpoints (PF1)",
-                    "FC-ST1: 36 GDN states 24 x 128 x 128 F32, 36 GDN histories 5,120 x 3 F32, the PLE history "
+                    "FC-ST1: 36 GDN states 24 x 128 x 128 F32 with up to 5 records (ME11), 36 GDN histories 5,120 x 3 "
+                    "F32, the PLE history "
                     "5,120 x (conv_kernel - 1) x ngram F32 and the draft's retained carry [4][1280] F32, a checkpoint "
                     "a card; 8 a slot",
                     {}};
@@ -262,21 +324,47 @@ std::vector<buffer_class> state_classes(const state_params & p) {
         ck.parts.push_back(both("checkpoint " + std::to_string(i), checkpoint_bytes(p)));
     }
     out.push_back(ck);
+    const int64_t pf_slot = int64_t(prefill_stage_rows) * 2560 * 4;
     out.push_back({"prefill staging (PF1)",
                    "FC-PLE1 at prompt rows: two slots of 8,192 rows x 2,560 F32 (one chunk's PLE input e)",
-                   {both("PLE staging slot 0", int64_t(prefill_stage_rows) * 2560 * 4),
-                    both("PLE staging slot 1", int64_t(prefill_stage_rows) * 2560 * 4)}});
+                   {p.single ? one("PLE staging slot 0", 0, pf_slot) : both("PLE staging slot 0", pf_slot),
+                    p.single ? one("PLE staging slot 1", 0, pf_slot) : both("PLE staging slot 1", pf_slot)}});
     // PB1: the bulk prompt path's arena (fn/model/prompt.h: the streams, the messages, the family scratch) and the
     // replicas of the peer's HC and PLE coefficients (FC-PF3's replicated HC) and the draft's full norms
     out.push_back({"prefill arena (PB1)",
                    "prompt.h prompt_arena_bytes: S [8192][4][2560], embeddings, mixed rows, the partial, the prompt "
                    "messages (P, EMB, SEL, MOM, DMIX), PLE's full history, the family scratch",
-                   {both("prompt arena", prompt_arena_bytes())}});
-    out.push_back({ "HC and PLE replicas (PB1)",
-                    "prompt.h prompt_replica_bytes: the peer's w_down, w_up and gamma of the 96 HC sublayers, its PLE "
-                    "key, value, norms and taps, the draft's full enorm and hnorm",
-                    { both("replicas", prompt_replica_bytes()) } });
+                   {part{"prompt arena",
+                         {prompt_arena_bytes(prompt_chunk_rows, prompt_half_rows, p.single, 0),
+                          prompt_arena_bytes(prompt_chunk_rows, prompt_half_rows, p.single, 1)}}}});
+    out.push_back({"HC and PLE replicas (PB1)",
+                   "prompt.h prompt_replica_bytes: the peer's w_down, w_up and gamma of the 96 HC sublayers, its PLE "
+                   "key, value, norms and taps, the draft's full enorm and hnorm",
+                   {both("replicas", prompt_replica_bytes(p.single))}});
     return out;
+}
+
+bool slot_class(const std::string & name) {
+    // MXMU1: with the host-backed tier each slot keeps its own history (the ME6 host keys) and device window
+    return pooled_class(name) || name == "GDN state" || name == "convolution histories" ||
+           name == "round and pass (TG1)" || name == "draft round (DR1)" || name == "sampler (SM1)" ||
+           name == "target index keys (ME6)" || name == "draft index keys (ME6)" || name == "KV tier (ME1)" ||
+           name == "index key windows (ME6)";
+}
+
+bool pooled_class(const std::string & name) {
+    return name == "target KV (K0)" || name == "draft KV (F16)" || name == "target index keys and summaries" ||
+           name == "draft index (SP2)";
+}
+
+std::vector<buffer_class> lane_classes() {
+    return {{"other-reader arena (MU1)",
+             "prompt.h prompt_arena_bytes(4096, 2048): the other-reader lane's streams, messages, PLE history and "
+             "family scratch",
+             {both("lane arena", prompt_arena_bytes(lane_rows, lane_half_rows))}},
+            {"other-reader staging (MU1)",
+             "FC-PLE1 at prompt rows: one slot of 4,096 rows x 2,560 F32 (the lane's chunk's PLE input e)",
+             {both("lane PLE staging", int64_t(lane_rows) * 2560 * 4)}}};
 }
 
 buffer_class chunk_class(int32_t chunk_rows) {

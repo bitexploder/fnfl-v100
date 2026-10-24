@@ -4,9 +4,11 @@
 #include "fn/model/shapes.h"
 #include "fn/xchg/xchg.cuh"
 
+#include <cooperative_groups.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 
 namespace fn::hc {
@@ -200,8 +202,10 @@ template <> struct w_lane<true> {
 // this card's moments go to the own region of its X-HC slot (own_mom) instead of a.mom; and the resets of the previous
 // sublayer's slots move before the block's second barrier, with warps 0..B-1 fencing after it, so every reset store is
 // performed before any moment of the block is published (xchg.h, HC4).
-template <int B, int D, bool X, bool H, bool Q, bool FUSED, int NT>
-__device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type & p, float * own_mom) {
+// ME12: vb is the block's (virtual) index, blockIdx.x except in the paired launch, which runs two down tasks a block.
+// U (the paired launch): act is in the dynamic region at every B, so the up phase's arrays reuse it (one arena).
+template <int B, int D, bool X, bool H, bool Q, bool FUSED, int NT, bool U = false>
+__device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type & p, float * own_mom, int32_t vb) {
     static_assert(D >= 1 && D <= rows_per_warp, "stream depth");
     static_assert(X || !H, "head mode is an HC2 mode");
     static_assert(X || !Q, "Q8_0 weights are an HC2 mode (DR1)");
@@ -218,7 +222,7 @@ __device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type
     // SP2: the fused launch at B = 5 takes act from the dynamic region (sub_dyn_bytes), which the up phase reuses:
     // both phases' static arrays would pass 48 KB. act's last read precedes the down phase's last barrier, and the up
     // phase writes its arrays only after its first barrier.
-    constexpr bool dyn = FUSED && B > 4;
+    constexpr bool dyn = FUSED && (B > 4 || U);
     __shared__ float4 act_st[dyn ? 1 : B][n_col][64];
     extern __shared__ float4 sub_dyn[];
     float4(*act)[n_col][64] = dyn ? reinterpret_cast<float4(*)[n_col][64]>(sub_dyn) : act_st;
@@ -227,8 +231,8 @@ __device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type
     // HC2's finish reads row b's sums with lane = row: red laid out [b][c][row] instead (same storage)
     float (*redx)[n_col][n_red] = reinterpret_cast<float (*)[n_col][n_red]>(&red[0][0][0]);
 
-    const int32_t s = blockIdx.x % n_stream; // the stream in the low bits keeps the index math to shifts
-    const int32_t g = blockIdx.x / n_stream;
+    const int32_t s = vb % n_stream; // the stream in the low bits keeps the index math to shifts
+    const int32_t g = vb / n_stream;
     const int32_t warp = threadIdx.x / 32;
     const int32_t lane = threadIdx.x % 32;
 
@@ -289,7 +293,7 @@ __device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type
     if constexpr (FUSED) {
         // release of the previous sublayer's slots on this card (xchg.h step 4, HC4): every thread of the grid takes
         // at most one 16-byte group of each, before the second barrier
-        const int32_t u = blockIdx.x * NT + threadIdx.x;
+        const int32_t u = vb * NT + threadIdx.x;
         if (x_args(p).hc_reset != nullptr && u < hc_slot_u4) {
             fn::xchg::reset4(reinterpret_cast<uint4 *>(x_args(p).hc_reset) + u);
         }
@@ -415,7 +419,7 @@ __device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type
             // release: this card's X-HC slot of the previous sublayer, whose readers (hc_up) have finished (xchg.h);
             // every row of it and both regions (R2, HC4): the previous sublayer may have had more rows than this one,
             // and a row left unreset would be read as landed by a later sublayer of that many rows
-            const int32_t u = blockIdx.x * NT + threadIdx.x;
+            const int32_t u = vb * NT + threadIdx.x;
             if (x_args(p).hc_reset != nullptr && u < hc_slot_u4) {
                 fn::xchg::reset4(reinterpret_cast<uint4 *>(x_args(p).hc_reset) + u);
             }
@@ -452,7 +456,7 @@ __device__ __forceinline__ void down_phase(const typename down_param<X, Q>::type
 
 template <int B, int D, bool X = false, bool H = false, bool Q = false>
 __global__ void __launch_bounds__(n_thread, 1) hc_down_kernel(const typename down_param<X, Q>::type p) {
-    down_phase<B, D, X, H, Q, false, n_thread>(p, nullptr);
+    down_phase<B, D, X, H, Q, false, n_thread>(p, nullptr, blockIdx.x);
 }
 
 // Block g: features c0 .. c0+n_f-1 in all four streams, so the mix needs no other block. Every block forms low from
@@ -1003,9 +1007,13 @@ template <int B> constexpr int32_t sub_dyn_bytes() {
 }
 static_assert(sub_dyn_bytes<5>() == 25600 && sizeof(up_dyn<5>) == 22240, "SP2: the B = 5 region [counted]");
 
-template <int B, bool H, bool FUSED>
+// ME12, COMMON (the paired launch, FUSED): low and the inverse RMS come formed from common ([B][80] float4 of low in
+// the stored [row][octet][float4] order, then [B][4] inverse RMS; pair_common wrote them before the grid barrier), so
+// the phase polls no moment and has no injector; the arrays are in the dynamic region at every B (down_phase's U).
+template <int B, bool H, bool FUSED, bool COMMON = false>
 __device__ __forceinline__ void up_phase(const up2_args & a, const float * hres, const float * hx, const float * hpost,
-                                         const float * own_ring, int32_t g, uint32_t mz) {
+                                         const float * own_ring, int32_t g, uint32_t mz,
+                                         const float * common = nullptr) {
     constexpr int32_t D = shipped_depth_up;
     constexpr int32_t n_low_warp = 3 * B;
     constexpr int32_t n_mix_warp = n_warp_up - n_low_warp;
@@ -1015,7 +1023,8 @@ __device__ __forceinline__ void up_phase(const up2_args & a, const float * hres,
     static_assert(up_rows >= D, "the stream depth fits a warp's rows");
 
     // SP2: the fused launch at B = 5 takes these from the dynamic region, over the down phase's act (down_phase)
-    constexpr bool dyn = FUSED && B > 4;
+    static_assert(FUSED || !COMMON, "the common intermediate is the paired launch's");
+    constexpr bool dyn = FUSED && (B > 4 || COMMON);
     constexpr int32_t bs = dyn ? 1 : B; // the static arrays' rows
     __shared__ float4 lows_st[bs][n_oct][16];
     // feature innermost, stride 33: the dot product's stores (lanes s, b) and the finish's reads are conflict-free
@@ -1054,7 +1063,7 @@ __device__ __forceinline__ void up_phase(const up2_args & a, const float * hres,
     const int32_t lb = warp / 3;
     const int32_t tt = 32 * (warp - 3 * lb) + lane;
     const bool lower = warp < n_low_warp && tt < 80;
-    const bool injector = !H && warp < n_low_warp && tt == 80 && g == n_up_block - 1;
+    const bool injector = !H && !COMMON && warp < n_low_warp && tt == 80 && g == n_up_block - 1;
     const int32_t j4 = 16 * (tt / 16) + 2 * (tt & 7) + ((tt >> 3) & 1);
     int32_t at4[n_stream]; // the float4 of each stream's u (or q) this lane forms low (or inject) from
 #pragma unroll
@@ -1093,7 +1102,17 @@ __device__ __forceinline__ void up_phase(const up2_args & a, const float * hres,
         }
     }
 
-    if (lower || injector) {
+    if constexpr (COMMON) {
+        if (lower) { // written by another block before the grid barrier: L2, not L1
+            lows[lb][tt / 16][tt % 16] = __ldcg(reinterpret_cast<const float4 *>(common) + lb * 80 + tt);
+            if (tt == 0) {
+#pragma unroll
+                for (int32_t si = 0; si < n_stream; ++si) {
+                    rinv_s[lb][si] = __ldcg(common + B * n_down + lb * n_stream + si);
+                }
+            }
+        }
+    } else if (lower || injector) {
         // acquire X-HC: poll this lane's five 16-byte words of the peer's moments (and, fused, of this card's own)
         const uint4 * mp4 = reinterpret_cast<const uint4 *>(a.hc_ring);
         uint4 pv[1 + n_stream];
@@ -1262,10 +1281,641 @@ struct sub_params {
 template <int B, bool H>
 __global__ void __launch_bounds__(n_thread_up, 1) hc_sub_kernel(const sub_params p, int32_t mode) {
     if ((mode & 1) != 0) {
-        down_phase<B, shipped_depth_down, true, H, false, true, n_thread_up>(p.d, p.own);
+        down_phase<B, shipped_depth_down, true, H, false, true, n_thread_up>(p.d, p.own, blockIdx.x);
     }
     if ((mode & 2) != 0 && blockIdx.x < n_up_block) {
         up_phase<B, H, true>(p.u, p.hres, p.hx, p.hpost, p.own, blockIdx.x, gridDim.x == n_block ? 0u : ~0u);
+    }
+}
+
+// FMU2 (hc.h sub_joint; build order item 1, Fable review 2 section 1): a joint round's sublayer, U lanes of max_rows
+// rows on the lanes' one weight set, one weight stream. Every lane's rows go through hc_sub_kernel<5>'s per-row
+// arithmetic, so a lane's outputs are bitwise its own sub launch's:
+// - down: warp (c, rg) holds its 5 weight rows (FUSED's rows, the clamp included) widened to F32 once; each activation
+//   row of each lane takes dot8's 8 fmaf from 0.0f with each held row (dot8f), then the 32-lane sum in the butterfly's
+//   xor order 16, 8, 4, 2, 1 as a reduce-scatter over the 5 held rows (rs5): every partial a lane forms is the
+//   butterfly's partial at that lane (a + b is b + a exactly, so a butterfly's lanes hold equal bits at each step), so
+//   each row's sum is the butterfly's. The finish sums the 5 columns in order, as down_phase's. Activations are staged
+//   two lanes (10 rows) a pass (102 KB for 20 would pass the 96 KB of shared memory); with two passes the packed
+//   weights are loaded again from L2 after the second staging, not held across it.
+// - up: every lane's lows, inverse RMS and gamma x (the moment polls) first, each lane up_phase's code on its own
+//   buffers (each card-ordered sum of two moments formed as peer + own: the same bits, as F32 addition commutes); then
+//   warp (o, rg) widens its 8 feature rows once and each lane's row takes dot8f with each, the 8-lane sum in the
+//   butterfly's order 1, 2, 4 as a reduce-scatter over the 8 features (rs8); then every lane's finish at once, warp
+//   5k + b finishing lane k's row b in up_phase's order.
+// Each lane writes its own X-HC and X-HMIX slots, x and inject; each lane's previous slots are reset before the
+// block's second barrier and the moment senders fence after it (down_phase FUSED's order). The lane count is a
+// template parameter, so no lane parameter is indexed at run time (the spill of the per-lane form).
+struct sub_joint_params {
+    sub_params p[fn::xchg::max_lanes];
+};
+
+// acc's 8 fmaf from 0.0f of dot8 with the row's widened weights w (bf16_lo(x), bf16_hi(x), .. of the 16 bytes)
+__device__ __forceinline__ float dot8f(const float (&w)[8], float4 a0, float4 a1) {
+    float acc = 0.0f;
+    acc = fmaf(w[0], a0.x, acc);
+    acc = fmaf(w[1], a0.y, acc);
+    acc = fmaf(w[2], a0.z, acc);
+    acc = fmaf(w[3], a0.w, acc);
+    acc = fmaf(w[4], a1.x, acc);
+    acc = fmaf(w[5], a1.y, acc);
+    acc = fmaf(w[6], a1.z, acc);
+    acc = fmaf(w[7], a1.w, acc);
+    return acc;
+}
+
+__device__ __forceinline__ void widen8(uint4 w, float (&f)[8]) {
+    f[0] = bf16_lo(w.x, 0u);
+    f[1] = bf16_hi(w.x, 0u);
+    f[2] = bf16_lo(w.y, 0u);
+    f[3] = bf16_hi(w.y, 0u);
+    f[4] = bf16_lo(w.z, 0u);
+    f[5] = bf16_hi(w.z, 0u);
+    f[6] = bf16_lo(w.w, 0u);
+    f[7] = bf16_hi(w.w, 0u);
+}
+
+// one step of a reduce-scatter: the lane keeps k and sends the partner its s; returns k + the partner's send
+template <int O> __device__ __forceinline__ float rs_step(float k, float s) {
+    return k + __shfl_xor_sync(0xffffffffu, s, O);
+}
+
+// the 32-lane sums of v[0..4] in the butterfly order 16, 8, 4, 2, 1 as a reduce-scatter: returns value r's sum, r by
+// the lane's bits 4, 3, 2: 0 (lanes 0-3), 1 (4-7), 2 (8-15), 3 (16-23), 4 (24-31)
+__device__ __forceinline__ float rs5(const float (&v)[5], int32_t lane, int32_t & r) {
+    const bool b4 = (lane & 16) != 0, b3 = (lane & 8) != 0, b2 = (lane & 4) != 0;
+    // offset 16: bit 4 clear keeps 0, 1, 2 (h0, h1, h2); set keeps 3, 4 (h0, h1)
+    const float h0 = rs_step<16>(b4 ? v[3] : v[0], b4 ? v[0] : v[3]);
+    const float h1 = rs_step<16>(b4 ? v[4] : v[1], b4 ? v[1] : v[4]);
+    const float h2 = rs_step<16>(v[2], v[2]);
+    // offset 8: of 0, 1, 2 bit 3 clear keeps 0, 1 (g0, g1), set keeps 2; of 3, 4 clear keeps 3, set 4 (g0)
+    const float other = b4 ? h1 : h2;
+    const float g0 = rs_step<8>(b3 ? other : h0, b3 ? h0 : other);
+    const float g1 = rs_step<8>(h1, h1);
+    // offset 4: of 0, 1 bit 2 clear keeps 0, set keeps 1; every other lane's one value goes on as a butterfly
+    const bool two = !b4 && !b3;
+    float f = rs_step<4>(two && b2 ? g1 : g0, two && !b2 ? g1 : g0);
+    f += __shfl_xor_sync(0xffffffffu, f, 2);
+    f += __shfl_xor_sync(0xffffffffu, f, 1);
+    r = !b4 ? (!b3 ? (!b2 ? 0 : 1) : 2) : (!b3 ? 3 : 4);
+    return f;
+}
+
+// the 8-lane sums (lane bits 0, 1, 2) of v[0..7] in the butterfly order 1, 2, 4 as a reduce-scatter: returns value q's
+// sum, q = 4 bit0 + 2 bit1 + bit2
+__device__ __forceinline__ float rs8(const float (&v)[8], int32_t lane, int32_t & q) {
+    const bool b0 = (lane & 1) != 0, b1 = (lane & 2) != 0, b2 = (lane & 4) != 0;
+    float h[4], g[2];
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) { // offset 1: bit 0 clear keeps 0..3, set keeps 4..7
+        h[i] = rs_step<1>(b0 ? v[4 + i] : v[i], b0 ? v[i] : v[4 + i]);
+    }
+#pragma unroll
+    for (int32_t i = 0; i < 2; ++i) { // offset 2: bit 1 clear keeps the first two of the four, set the last two
+        g[i] = rs_step<2>(b1 ? h[2 + i] : h[i], b1 ? h[i] : h[2 + i]);
+    }
+    q = (b0 ? 4 : 0) + (b1 ? 2 : 0) + (b2 ? 1 : 0);
+    return rs_step<4>(b2 ? g[1] : g[0], b2 ? g[0] : g[1]); // offset 4: bit 2 clear keeps the first, set the second
+}
+
+// the joint launch's dynamic region at U lanes: the down phase's act (two lanes' rows), sums and squares; the up
+// phase's per-lane lows, gamma x, inverse RMS and partials over it (the down phase ends with a barrier first)
+constexpr int32_t wide_pass = 2; // lanes staged a down pass
+template <int U> struct wide_down {
+    float4 act[wide_pass * max_rows][n_col][64];
+    float red[U][max_rows][n_col][20]; // [lane][row][column][the block's 20 row slots]: down_phase's redx a lane
+    float ssp[U][max_rows][n_stage_warp];
+};
+template <int U> struct wide_up {
+    float4 lows[U][max_rows][n_oct][16];
+    float gx[U][n_stream][max_rows][n_run_feat];
+    float rinv[U][max_rows][n_stream];
+    float red[U][n_oct][n_stream][max_rows][n_run_feat + 1];
+};
+template <int U> constexpr int32_t wide_dyn_bytes() {
+    constexpr int32_t d = static_cast<int32_t>(sizeof(wide_down<U>));
+    constexpr int32_t u = static_cast<int32_t>(sizeof(wide_up<U>));
+    return d > u ? d : u;
+}
+static_assert(wide_dyn_bytes<4>() <= 96 * 1024 && sizeof(wide_down<4>) == 60000 && sizeof(wide_up<4>) == 88960,
+              "the joint launch's region [counted]");
+
+// down: stager loads of lane q's rows (down_phase's), held until stage_store
+struct wide_stage {
+    float4 hr[max_rows], hv[max_rows];
+    float hp[max_rows];
+};
+
+__device__ __forceinline__ void stage_load(const sub_params & q, int32_t s, int32_t f4, wide_stage & st) {
+    const float4 * hres4 = reinterpret_cast<const float4 *>(q.d.d.hres) + s * (n_own / 4) + f4;
+    const float4 * hx4 = reinterpret_cast<const float4 *>(q.d.d.hx) + f4;
+#pragma unroll
+    for (int32_t b = 0; b < max_rows; ++b) {
+        st.hr[b] = __ldcg(hres4 + b * n_stream * (n_own / 4));
+        st.hv[b] = __ldcg(hx4 + b * (n_own / 4));
+        st.hp[b] = __ldcg(q.d.d.hpost + b * n_stream + s);
+    }
+}
+
+// down_phase's staging of one lane's rows into act rows a0 .., its x and (blocks g = 0) its squares' partials
+template <int U>
+__device__ __forceinline__ void stage_store(const sub_params & q, int32_t k, const wide_stage & st, float4 gm,
+                                            int32_t s, int32_t g, int32_t warp, int32_t lane, int32_t f4,
+                                            wide_down<U> & sd, int32_t a0) {
+    const int32_t slot = 16 * (warp & 1) + (lane & 15) + 32 * (lane >> 4);
+    float ss[max_rows];
+#pragma unroll
+    for (int32_t b = 0; b < max_rows; ++b) {
+        float4 x;
+        x.x = fmaf(st.hp[b], st.hv[b].x, st.hr[b].x);
+        x.y = fmaf(st.hp[b], st.hv[b].y, st.hr[b].y);
+        x.z = fmaf(st.hp[b], st.hv[b].z, st.hr[b].z);
+        x.w = fmaf(st.hp[b], st.hv[b].w, st.hr[b].w);
+        if (warp == g) {
+            reinterpret_cast<float4 *>(q.d.d.x)[(b * n_stream + s) * (n_own / 4) + f4] = x;
+        }
+        sd.act[a0 + b][warp / 2][slot] = make_float4(x.x * gm.x, x.y * gm.y, x.z * gm.z, x.w * gm.w);
+        ss[b] = x.x * x.x;
+        ss[b] = fmaf(x.y, x.y, ss[b]);
+        ss[b] = fmaf(x.z, x.z, ss[b]);
+        ss[b] = fmaf(x.w, x.w, ss[b]);
+    }
+    if (g == 0) {
+#pragma unroll
+        for (int32_t b = 0; b < max_rows; ++b) {
+#pragma unroll
+            for (int32_t o = 16; o > 0; o >>= 1) {
+                ss[b] += __shfl_xor_sync(0xffffffffu, ss[b], o);
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int32_t b = 0; b < max_rows; ++b) {
+                sd.ssp[k][b][warp] = ss[b];
+            }
+        }
+    }
+}
+
+template <int U, bool H> __device__ __forceinline__ void down_wide(const sub_joint_params & jp) {
+    constexpr int32_t B = max_rows;
+    constexpr int32_t rpw = 5;                             // FUSED: 4 row groups of 5 rows a warp
+    constexpr int32_t n_rows_w = H ? n_down : n_rows_down; // weight rows a stream
+    constexpr int32_t mom_w = H ? n_mom_head : n_mom;
+    constexpr int32_t n_pass = (U + wide_pass - 1) / wide_pass;
+    extern __shared__ float4 sub_dyn[];
+    wide_down<U> & sd = *reinterpret_cast<wide_down<U> *>(sub_dyn);
+    const int32_t vb = static_cast<int32_t>(blockIdx.x);
+    const int32_t s = vb % n_stream;
+    const int32_t g = vb / n_stream;
+    const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
+    const bool stager = warp < n_stage_warp;
+    const int32_t f4 = 32 * warp + 2 * (lane & 15) + (lane >> 4);
+    // every lane's release of its previous sublayer's slots (xchg.h step 4, HC4), before the second barrier: first,
+    // so the sentinels are not live with the staging and the weights
+    const int32_t u = vb * n_thread_up + static_cast<int32_t>(threadIdx.x);
+#pragma unroll
+    for (int32_t k = 0; k < U; ++k) {
+        if (jp.p[k].d.hc_reset != nullptr && u < hc_slot_u4) {
+            fn::xchg::reset4(reinterpret_cast<uint4 *>(jp.p[k].d.hc_reset) + u);
+        }
+        if (jp.p[k].d.hmix_reset != nullptr) {
+            fn::xchg::hmix_reset_slot(jp.p[k].d.hmix_reset, u);
+        }
+    }
+    wide_stage st;
+    float4 gm = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (stager) {
+        stage_load(jp.p[0], s, f4, st);
+        gm = __ldcg(reinterpret_cast<const float4 *>(jp.p[0].d.d.gamma) + s * (n_own / 4) + f4);
+    }
+    // every staging load before any weight load (down_phase)
+    __syncthreads();
+    const int32_t c = warp % n_col;
+    const int32_t rg = warp / n_col;
+    const int32_t row0 = s * n_rows_w + g * down_rows + rg * rpw;
+    const uint4 * wp = reinterpret_cast<const uint4 *>(jp.p[0].d.d.w_down) + (row0 * n_own + c * 256) / 8 + lane;
+    const int32_t qmax = min(n_rows_w - g * down_rows, down_rows) - 1 - rg * rpw;
+    // one pass: streamed (down_phase); two: kept in L2 and loaded again after the second pass's staging (held across
+    // it they spill)
+    uint4 w[rpw];
+#pragma unroll
+    for (int32_t q = 0; q < rpw; ++q) {
+        w[q] = n_pass > 1 ? __ldcg(wp + min(q, qmax) * (n_own / 8)) : __ldcs(wp + min(q, qmax) * (n_own / 8));
+    }
+#pragma unroll
+    for (int32_t pass = 0; pass < n_pass; ++pass) {
+        constexpr int32_t P = wide_pass;
+        const int32_t k0 = pass * P;
+        if (stager) {
+            if (pass > 0) {
+                stage_load(jp.p[k0], s, f4, st);
+            }
+            stage_store<U>(jp.p[k0], k0, st, gm, s, g, warp, lane, f4, sd, 0);
+            if (k0 + 1 < U) {
+                stage_load(jp.p[k0 + 1], s, f4, st);
+                stage_store<U>(jp.p[k0 + 1], k0 + 1, st, gm, s, g, warp, lane, f4, sd, B);
+            }
+        }
+        __syncthreads();
+        if (pass == 0 && warp < P * B) { // the moment senders: every reset above before any moment store
+            __threadfence();
+        }
+        if (pass > 0) {
+#pragma unroll
+            for (int32_t q = 0; q < rpw; ++q) {
+                w[q] = __ldcg(wp + min(q, qmax) * (n_own / 8));
+            }
+        }
+        float wf[rpw][8];
+#pragma unroll
+        for (int32_t q = 0; q < rpw; ++q) {
+            widen8(w[q], wf[q]);
+        }
+#pragma unroll
+        for (int32_t j = 0; j < P * B; ++j) {
+            if (k0 + j / B < U) {
+                const float4 a0 = sd.act[j][c][lane];
+                const float4 a1 = sd.act[j][c][lane + 32];
+                float v[rpw];
+#pragma unroll
+                for (int32_t q = 0; q < rpw; ++q) {
+                    v[q] = dot8f(wf[q], a0, a1);
+                }
+                int32_t r = 0;
+                const float sum = rs5(v, lane, r);
+                if ((lane & 3) == 0 && (lane < 8 || (lane & 7) == 0)) { // lanes 0, 4, 8, 16, 24: rows 0..4
+                    sd.red[k0 + j / B][j % B][c][rg * rpw + r] = sum;
+                }
+            }
+        }
+        __syncthreads();
+        // down_phase's finish of the pass's lanes, warp B (k - k0) + b sending lane k's row b
+        if (warp < P * B && k0 + warp / B < U) {
+            const int32_t k = k0 + warp / B;
+            const int32_t b = warp % B;
+            const int32_t r = lane < down_rows ? lane : 0;
+            float v = sd.red[k][b][0][r];
+#pragma unroll
+            for (int32_t cc = 1; cc < n_col; ++cc) {
+                v += sd.red[k][b][cc][r];
+            }
+            uint32_t * own = reinterpret_cast<uint32_t *>(jp.p[k].own) + b * mom_w;
+            uint32_t * peer = reinterpret_cast<uint32_t *>(jp.p[k].d.hc_peer) + b * mom_w;
+            const int32_t n = H ? min(down_rows, n_down - g * down_rows) : down_rows;
+            fn::xchg::put_hc_rows(own, peer, s, g * down_rows, n, fn::xchg::canonical(v));
+        }
+        if (g == 0 && static_cast<int32_t>(threadIdx.x) < P * B && k0 + static_cast<int32_t>(threadIdx.x) / B < U) {
+            const int32_t k = k0 + static_cast<int32_t>(threadIdx.x) / B;
+            const int32_t b = static_cast<int32_t>(threadIdx.x) % B;
+            float v = sd.ssp[k][b][0];
+#pragma unroll
+            for (int32_t i = 1; i < n_stage_warp; ++i) {
+                v += sd.ssp[k][b][i];
+            }
+            const uint32_t bits = fn::xchg::canonical(v);
+            reinterpret_cast<uint32_t *>(jp.p[k].own)[b * mom_w + s] = bits; // F32 moment as its bits
+            reinterpret_cast<uint32_t *>(jp.p[k].d.hc_peer)[b * mom_w + s] = bits;
+        }
+    }
+}
+
+// up_phase's moment polls and the lows, inverse RMS, injection and gamma x of lane k, into its buffers (FUSED)
+template <int U, bool H>
+__device__ __forceinline__ void up_prologue(const sub_params & q, int32_t k, wide_up<U> & su, int32_t g) {
+    constexpr int32_t B = max_rows;
+    constexpr int32_t n_low_warp = 3 * B;
+    constexpr int32_t n_grp = n_run_feat / 4;
+    constexpr int32_t mrow4 = (H ? n_mom_head : n_mom) / 4;
+    constexpr int32_t q4 = (4 + n_stream * n_down) / 4;
+    const up2_args & a = q.u;
+    const int32_t c0 = n_run_feat * g;
+    const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
+    const int32_t lb = warp / 3;
+    const int32_t tt = 32 * (warp - 3 * lb) + lane;
+    const bool lower = warp < n_low_warp && tt < 80;
+    const bool injector = !H && warp < n_low_warp && tt == 80 && g == n_up_block - 1;
+    const int32_t j4 = 16 * (tt / 16) + 2 * (tt & 7) + ((tt >> 3) & 1);
+    int32_t at4[n_stream];
+#pragma unroll
+    for (int32_t si = 0; si < n_stream; ++si) {
+        at4[si] = lb * mrow4 + (lower ? 1 + (n_down / 4) * si + j4 : q4 + si);
+    }
+    const int32_t ml = 32 * (warp - n_low_warp) + lane;
+    const int32_t mpair = ml / n_grp;
+    const int32_t gq = ml % n_grp;
+    const bool mixer = warp >= n_low_warp && mpair < n_stream * B;
+    // the lower and injector lanes (warps < 3 B) and the mixers (warps >= 3 B) are disjoint: in one branch each, the
+    // mixers' loads are not live across the polls (up_phase loads them first, in the same warps' order)
+    if (lower || injector) {
+        const uint4 * mp4 = reinterpret_cast<const uint4 *>(a.hc_ring);
+        const uint4 * op4 = reinterpret_cast<const uint4 *>(q.own);
+        const uint4 * pp[2 * (1 + n_stream)] = {mp4 + lb * mrow4, mp4 + at4[0],     mp4 + at4[1], mp4 + at4[2],
+                                                mp4 + at4[3],     op4 + lb * mrow4, op4 + at4[0], op4 + at4[1],
+                                                op4 + at4[2],     op4 + at4[3]};
+        uint4 v[2 * (1 + n_stream)];
+        fn::xchg::poll<2 * (1 + n_stream)>(pp, v, a.err, fn::xchg::err_poll_hc);
+        // up_phase adds card 0's moment to card 1's; an F32 addition is commutative bit for bit (a NaN result is the
+        // canonical NaN), so the sums are formed as peer + own without the card-order selects, which held both orders
+        // of all 20 words across the divisions (the spill)
+        float4 m[1 + n_stream];
+#pragma unroll
+        for (int32_t i = 0; i < 1 + n_stream; ++i) {
+            const float4 p4 = as_f4(v[i]), o4 = as_f4(v[1 + n_stream + i]);
+            m[i] = make_float4(p4.x + o4.x, p4.y + o4.y, p4.z + o4.z, p4.w + o4.w);
+        }
+        float ri[n_stream];
+        ri[0] = 1.0f / sqrtf(m[0].x / float(fn::n_embd) + fn::rms_eps);
+        ri[1] = 1.0f / sqrtf(m[0].y / float(fn::n_embd) + fn::rms_eps);
+        ri[2] = 1.0f / sqrtf(m[0].z / float(fn::n_embd) + fn::rms_eps);
+        ri[3] = 1.0f / sqrtf(m[0].w / float(fn::n_embd) + fn::rms_eps);
+        float4 z = make_float4(m[1].x * ri[0], m[1].y * ri[0], m[1].z * ri[0], m[1].w * ri[0]);
+#pragma unroll
+        for (int32_t si = 1; si < n_stream; ++si) {
+            z.x = fmaf(m[1 + si].x, ri[si], z.x);
+            z.y = fmaf(m[1 + si].y, ri[si], z.y);
+            z.z = fmaf(m[1 + si].z, ri[si], z.z);
+            z.w = fmaf(m[1 + si].w, ri[si], z.w);
+        }
+        z = make_float4(0.25f * z.x, 0.25f * z.y, 0.25f * z.z, 0.25f * z.w);
+        if (lower) {
+            su.lows[k][lb][tt / 16][tt % 16] =
+                make_float4(z.x * sigmoid(z.x), z.y * sigmoid(z.y), z.z * sigmoid(z.z), z.w * sigmoid(z.w));
+            if (tt == 0) {
+#pragma unroll
+                for (int32_t si = 0; si < n_stream; ++si) {
+                    su.rinv[k][lb][si] = ri[si];
+                }
+            }
+        } else {
+            reinterpret_cast<float4 *>(a.inject)[lb] =
+                make_float4(2.0f * sigmoid(z.x), 2.0f * sigmoid(z.y), 2.0f * sigmoid(z.z), 2.0f * sigmoid(z.w));
+        }
+    } else if (mixer) {
+        const int32_t w0 = c0 + 4 * gq;
+        const float4 gm4 = *reinterpret_cast<const float4 *>(a.gamma + (mpair % n_stream) * n_own + w0);
+        float4 xm4 = *reinterpret_cast<const float4 *>(q.hres + mpair * n_own + w0);
+        const float4 hv4 = *reinterpret_cast<const float4 *>(q.hx + (mpair / n_stream) * n_own + w0);
+        const float hp = q.hpost[mpair];
+        xm4 = make_float4(fmaf(hp, hv4.x, xm4.x), fmaf(hp, hv4.y, xm4.y), fmaf(hp, hv4.z, xm4.z),
+                          fmaf(hp, hv4.w, xm4.w));
+        const float xs[4] = {xm4.x, xm4.y, xm4.z, xm4.w};
+        const float gs[4] = {gm4.x, gm4.y, gm4.z, gm4.w};
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i) {
+            su.gx[k][mpair % n_stream][mpair / n_stream][4 * gq + i] = gs[i] * xs[i];
+        }
+    }
+}
+
+// up_phase's finish of lane k's row b (warp b's in up_phase)
+template <int U>
+__device__ __forceinline__ void up_finish(const sub_params & q, int32_t k, int32_t b, const wide_up<U> & su,
+                                          int32_t g) {
+    using hl = fn::xchg::hmix_layout;
+    const up2_args & a = q.u;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
+    const int32_t c0 = n_run_feat * g;
+    const int32_t f = lane;
+    float mixed = 0.0f;
+#pragma unroll
+    for (int32_t si = 0; si < n_stream; ++si) {
+        float zs = su.red[k][0][si][b][f];
+#pragma unroll
+        for (int32_t oo = 1; oo < n_oct; ++oo) {
+            zs += su.red[k][oo][si][b][f];
+        }
+        mixed = fmaf(su.gx[k][si][b][f] * su.rinv[k][b][si], sigmoid(zs), mixed);
+    }
+    const uint32_t bits = fn::xchg::canonical(0.25f * mixed);
+    const int32_t row0 = b * hl::width + a.card * n_own;
+    fn::xchg::put_run(reinterpret_cast<uint32_t *>(a.hmix_own) + row0, reinterpret_cast<uint32_t *>(a.hmix_peer) + row0,
+                      c0, n_run_feat, 0, bits);
+    float4 v;
+    v.x = __uint_as_float(__shfl_sync(0xffffffffu, bits, 4 * (lane & 7)));
+    v.y = __uint_as_float(__shfl_sync(0xffffffffu, bits, 4 * (lane & 7) + 1));
+    v.z = __uint_as_float(__shfl_sync(0xffffffffu, bits, 4 * (lane & 7) + 2));
+    v.w = __uint_as_float(__shfl_sync(0xffffffffu, bits, 4 * (lane & 7) + 3));
+    const bool real = lane < 8;
+    uint32_t packed = 0u;
+    float2 ds = make_float2(0.0f, 0.0f);
+    fn::act::quantize_run8(real ? v : make_float4(0.0f, 0.0f, 0.0f, 0.0f), packed, ds);
+    fn::xchg::hmix_put_run(a.hmix_own, a.hmix_peer, b, a.card * n_runs_card + g, packed, ds, real);
+}
+
+template <int U, bool H> __device__ __forceinline__ void up_wide(const sub_joint_params & jp) {
+    constexpr int32_t B = max_rows;
+    constexpr int32_t row_u4 = n_stream * (n_down / 8);
+    extern __shared__ float4 sub_dyn[];
+    wide_up<U> & su = *reinterpret_cast<wide_up<U> *>(sub_dyn);
+    const int32_t g = static_cast<int32_t>(blockIdx.x);
+    const int32_t c0 = n_run_feat * g;
+    const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32;
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) % 32;
+    const int32_t o = warp % n_oct;
+    const int32_t rg = warp / n_oct;
+    const int32_t s = lane / 8;
+    const int32_t k8 = lane % 8;
+    const uint4 * wrow =
+        reinterpret_cast<const uint4 *>(jp.p[0].u.w_up) + ((c0 + rg * up_rows) * n_stream + s) * (n_down / 8) + o * 8 +
+        k8;
+    // the weights to L2 while the moments are polled; loaded and widened after the polls (registers)
+#pragma unroll
+    for (int32_t q = 0; q < up_rows; ++q) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(wrow + q * row_u4));
+    }
+    __syncthreads(); // the down phase's last reads of the region (its finish) before the lows' stores
+#pragma unroll
+    for (int32_t k = 0; k < U; ++k) {
+        up_prologue<U, H>(jp.p[k], k, su, g);
+    }
+    __syncthreads();
+    float wf[up_rows][8];
+#pragma unroll
+    for (int32_t q = 0; q < up_rows; ++q) {
+        widen8(__ldcs(wrow + q * row_u4), wf[q]);
+    }
+#pragma unroll
+    for (int32_t k = 0; k < U; ++k) {
+#pragma unroll
+        for (int32_t b = 0; b < B; ++b) {
+            const float4 a0 = su.lows[k][b][o][k8];
+            const float4 a1 = su.lows[k][b][o][k8 + 8];
+            float v[up_rows];
+#pragma unroll
+            for (int32_t q = 0; q < up_rows; ++q) {
+                v[q] = dot8f(wf[q], a0, a1);
+            }
+            int32_t qq = 0;
+            const float sum = rs8(v, lane, qq);
+            su.red[k][o][s][b][rg * up_rows + qq] = sum;
+        }
+    }
+    __syncthreads();
+    if (warp < U * B) { // warp B k + b: lane k's row b
+        const int32_t k = warp / B;
+        const int32_t b = warp % B;
+#pragma unroll
+        for (int32_t kk = 0; kk < U; ++kk) {
+            if (kk == k) {
+                up_finish<U>(jp.p[kk], kk, b, su, g);
+            }
+        }
+    }
+}
+
+template <int U, bool H>
+__global__ void __launch_bounds__(n_thread_up, 1)
+    hc_sub_joint_kernel(const __grid_constant__ sub_joint_params p, int32_t mode) {
+    if ((mode & 1) != 0) {
+        down_wide<U, H>(p);
+    }
+    if ((mode & 2) != 0 && blockIdx.x < n_up_block) {
+        if ((mode & 1) != 0) {
+            __syncthreads(); // the down phase's finish reads of the region before the up phase's stores
+        }
+        up_wide<U, H>(p);
+    }
+}
+
+// ME12: both logical shards of one sublayer on one device, one cooperative grid (hc.h pair). p[k] is shard (card) k's
+// sub_params; common is the [B][320] low and [B][4] inverse RMS the up tasks read.
+struct pair_params {
+    sub_params p[2];
+    float * common;
+};
+
+// the dynamic region of the paired launch at every B: down's act, then the up phase's arrays (and the common stage's
+// inverse RMS) over it
+template <int B> constexpr int32_t pair_dyn_bytes() {
+    constexpr int32_t act = static_cast<int32_t>(sizeof(float4)) * B * n_col * 64;
+    constexpr int32_t up = static_cast<int32_t>(sizeof(up_dyn<B>));
+    return act > up ? act : up;
+}
+static_assert(pair_dyn_bytes<5>() == 25600 && pair_dyn_bytes<1>() == 5120, "ME12: the union arena [counted]");
+
+// Block 0 of the paired launch, after the first grid barrier (every moment of both shards landed): forms what the 80
+// up blocks of the four-launch order each formed again, once. Threads b < B: row b's four inverse RMS; then thread
+// 81 lb + tt < 81 B: low float4 tt of row lb from u float4 j4 (the up phase's permutation), or (tt = 80, normal mode)
+// row lb's injection, written to both shards. Every value takes up_phase's operations in its order on the same
+// canonical moment words, card 0's then card 1's (both read from shard 0's slot: card 0's own region, card 1's in the
+// peer region), so the bits are the four-launch order's. The words are polled as up_phase polls them; a poll that
+// gives up sets err_poll_hc in both shards' error words and the block still reaches the next grid barrier.
+template <int B, bool H> __device__ __forceinline__ void pair_common(const pair_params & pp) {
+    constexpr int32_t mrow4 = (H ? n_mom_head : n_mom) / 4;
+    constexpr int32_t q4 = (4 + n_stream * n_down) / 4;
+    extern __shared__ float4 sub_dyn[];
+    float(*rinv_s)[n_stream] = reinterpret_cast<float(*)[n_stream]>(sub_dyn); // [B][4], over the down arena
+    const uint4 * c0 = reinterpret_cast<const uint4 *>(pp.p[0].own);       // card 0's moments
+    const uint4 * c1 = reinterpret_cast<const uint4 *>(pp.p[0].u.hc_ring); // card 1's moments
+    uint32_t * const err0 = pp.p[0].u.err;
+    uint32_t * const err1 = pp.p[1].u.err;
+    const int32_t t = threadIdx.x;
+    if (t < B) {
+        const uint4 * pw[2] = {c0 + t * mrow4, c1 + t * mrow4};
+        uint4 w[2];
+        fn::xchg::poll<2>(pw, w, err0, fn::xchg::err_poll_hc);
+        if (!fn::xchg::landed(w[0]) || !fn::xchg::landed(w[1])) {
+            atomicOr(err1, fn::xchg::err_poll_hc);
+        }
+        const float4 v0 = as_f4(w[0]), v1 = as_f4(w[1]);
+        rinv_s[t][0] = 1.0f / sqrtf((v0.x + v1.x) / float(fn::n_embd) + fn::rms_eps);
+        rinv_s[t][1] = 1.0f / sqrtf((v0.y + v1.y) / float(fn::n_embd) + fn::rms_eps);
+        rinv_s[t][2] = 1.0f / sqrtf((v0.z + v1.z) / float(fn::n_embd) + fn::rms_eps);
+        rinv_s[t][3] = 1.0f / sqrtf((v0.w + v1.w) / float(fn::n_embd) + fn::rms_eps);
+#pragma unroll
+        for (int32_t si = 0; si < n_stream; ++si) {
+            pp.common[B * n_down + t * n_stream + si] = rinv_s[t][si];
+        }
+    }
+    __syncthreads();
+    const int32_t lb = t / 81;
+    const int32_t tt = t - 81 * lb;
+    const bool lower = lb < B && tt < 80;
+    const bool injector = !H && lb < B && tt == 80;
+    if (lower || injector) {
+        const int32_t j4 = 16 * (tt / 16) + 2 * (tt & 7) + ((tt >> 3) & 1);
+        int32_t at4[n_stream];
+#pragma unroll
+        for (int32_t si = 0; si < n_stream; ++si) {
+            at4[si] = lb * mrow4 + (lower ? 1 + (n_down / 4) * si + j4 : q4 + si);
+        }
+        const uint4 * pw[2 * n_stream] = {c0 + at4[0], c0 + at4[1], c0 + at4[2], c0 + at4[3],
+                                          c1 + at4[0], c1 + at4[1], c1 + at4[2], c1 + at4[3]};
+        uint4 w[2 * n_stream];
+        fn::xchg::poll<2 * n_stream>(pw, w, err0, fn::xchg::err_poll_hc);
+        bool all = true;
+#pragma unroll
+        for (int32_t i = 0; i < 2 * n_stream; ++i) {
+            all = all && fn::xchg::landed(w[i]);
+        }
+        if (!all) {
+            atomicOr(err1, fn::xchg::err_poll_hc);
+        }
+        float4 u0[n_stream], u1[n_stream];
+        float ri[n_stream];
+#pragma unroll
+        for (int32_t si = 0; si < n_stream; ++si) {
+            u0[si] = as_f4(w[si]);
+            u1[si] = as_f4(w[n_stream + si]);
+            ri[si] = rinv_s[lb][si];
+        }
+        float4 z = make_float4((u0[0].x + u1[0].x) * ri[0], (u0[0].y + u1[0].y) * ri[0], (u0[0].z + u1[0].z) * ri[0],
+                               (u0[0].w + u1[0].w) * ri[0]);
+#pragma unroll
+        for (int32_t si = 1; si < n_stream; ++si) {
+            z.x = fmaf(u0[si].x + u1[si].x, ri[si], z.x);
+            z.y = fmaf(u0[si].y + u1[si].y, ri[si], z.y);
+            z.z = fmaf(u0[si].z + u1[si].z, ri[si], z.z);
+            z.w = fmaf(u0[si].w + u1[si].w, ri[si], z.w);
+        }
+        z = make_float4(0.25f * z.x, 0.25f * z.y, 0.25f * z.z, 0.25f * z.w);
+        if (lower) {
+            reinterpret_cast<float4 *>(pp.common)[lb * 80 + tt] =
+                make_float4(z.x * sigmoid(z.x), z.y * sigmoid(z.y), z.z * sigmoid(z.z), z.w * sigmoid(z.w));
+        } else {
+            const float4 inj =
+                make_float4(2.0f * sigmoid(z.x), 2.0f * sigmoid(z.y), 2.0f * sigmoid(z.z), 2.0f * sigmoid(z.w));
+            reinterpret_cast<float4 *>(pp.p[0].u.inject)[lb] = inj;
+            reinterpret_cast<float4 *>(pp.p[1].u.inject)[lb] = inj;
+        }
+    }
+}
+
+// ME12 (hc.h pair): one cooperative grid of 72 blocks of 640 threads, one an SM. Block b runs down tasks b (shard 0's
+// block b) and b + 72 (shard 1's block b): every down block, moment send and reset index of both shards' sub launches
+// runs once. A grid barrier publishes both shards' moments; block 0 forms the common intermediate (pair_common); a
+// second grid barrier publishes it; then block b runs up tasks b and b + 72 (< 80): task v is shard v / 40's up block
+// v % 40, the four-launch order's up phase with low and the inverse RMS read instead of formed. The tasks are written
+// out in sequence, not looped (a task loop carries its index and the shard's pointers across the grid barriers and
+// spills at B = 5): one task's weights and shared arrays at a time, and a block barrier between a block's two tasks
+// covers the first's last shared reads. No block leaves before either grid barrier (every poll is bounded).
+template <int B, bool H>
+__global__ void __launch_bounds__(n_thread_up, 1) hc_pair_kernel(const __grid_constant__ pair_params pp) {
+    const int32_t b = blockIdx.x;
+    // each task with its shard's arguments as constant-bank operands (a runtime-indexed shard would hold its pointers
+    // in registers across the task and spill)
+    down_phase<B, shipped_depth_down, true, H, false, true, n_thread_up, true>(pp.p[0].d, pp.p[0].own, b);
+    __syncthreads();
+    down_phase<B, shipped_depth_down, true, H, false, true, n_thread_up, true>(pp.p[1].d, pp.p[1].own, b);
+    cooperative_groups::this_grid().sync();
+    if (b == 0) {
+        pair_common<B, H>(pp);
+    }
+    cooperative_groups::this_grid().sync();
+    const uint32_t mz = gridDim.x == n_block ? 0u : ~0u;
+    if (b < n_up_block) {
+        up_phase<B, H, true, true>(pp.p[0].u, pp.p[0].hres, pp.p[0].hx, pp.p[0].hpost, pp.p[0].own, b, mz, pp.common);
+    } else {
+        up_phase<B, H, true, true>(pp.p[1].u, pp.p[1].hres, pp.p[1].hx, pp.p[1].hpost, pp.p[1].own, b - n_up_block, mz,
+                                   pp.common);
+    }
+    if (b < 2 * n_up_block - n_block) {
+        __syncthreads();
+        up_phase<B, H, true, true>(pp.p[1].u, pp.p[1].hres, pp.p[1].hx, pp.p[1].hpost, pp.p[1].own,
+                                   b + n_block - n_up_block, mz, pp.common);
     }
 }
 
@@ -1473,6 +2123,72 @@ sub_params sub_of(const sub_args & a) {
     p.hpost = a.hpost;
     p.own = a.hc_ring + fn::xchg::hc_own_at;
     return p;
+}
+
+// ME12: the paired launch, through the same cooperative launch (and so the same captured node kind) as launch_sub
+template <int B, bool H> bool launch_pair(const pair_params & p, cudaStream_t stream) {
+    pair_params q = p;
+    void * args[] = {&q};
+    return cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(hc_pair_kernel<B, H>), dim3(n_block),
+                                       dim3(n_thread_up), args, pair_dyn_bytes<B>(), stream) == cudaSuccess;
+}
+
+// shard s's resets touch neither shard's current slot (the X-HC and X-HMIX slots the grid writes; null: no reset)
+bool resets_apart(const sub_args & s, const sub_args & s0, const sub_args & s1) {
+    return s.hc_reset != s0.hc_ring && s.hc_reset != s1.hc_ring && s.hmix_reset != s0.hmix_own &&
+           s.hmix_reset != s1.hmix_own;
+}
+
+// both shards' arguments valid as hc::sub's (mode 3), cards 0 and 1, and one pair: each shard's peer slots are the
+// other's own slots, no reset of either shard is a slot the grid writes (the resets and the sends are one grid's),
+// and the scratch is aligned
+bool pair_ok(int32_t rows, const pair_args & a, const void * stream, bool head) {
+    const sub_args & s0 = a.s[0];
+    const sub_args & s1 = a.s[1];
+    return sub_ok(rows, 3, s0, stream, head) && sub_ok(rows, 3, s1, stream, head) && s0.card == 0 && s1.card == 1 &&
+           s0.hc_peer == s1.hc_ring && s1.hc_peer == s0.hc_ring && s0.hmix_peer == s1.hmix_own &&
+           s1.hmix_peer == s0.hmix_own && s0.hc_ring != s1.hc_ring && s0.hmix_own != s1.hmix_own &&
+           resets_apart(s0, s0, s1) && resets_apart(s1, s0, s1) && aligned16(a.scratch);
+}
+
+pair_params pair_of(const pair_args & a, bool head) {
+    pair_params p = {};
+    for (int32_t k = 0; k < 2; ++k) {
+        p.p[k] = sub_of(a.s[k]);
+        if (head) {
+            p.p[k].u.inject = nullptr;
+        }
+    }
+    p.common = a.scratch;
+    return p;
+}
+
+template <bool H> bool launch_pair_rows(int32_t rows, const pair_params & p, cudaStream_t st) {
+    switch (rows) {
+        case 1:
+            return launch_pair<1, H>(p, st);
+        case 2:
+            return launch_pair<2, H>(p, st);
+        case 3:
+            return launch_pair<3, H>(p, st);
+        case 4:
+            return launch_pair<4, H>(p, st);
+        case 5:
+            return launch_pair<5, H>(p, st);
+        default:
+            return false;
+    }
+}
+
+// one instance co-resident at n_block blocks of n_thread_up on this device (the occupancy API with its dynamic
+// shared memory), and its resources within the launch's (no local memory)
+template <int B, bool H> bool pair_fits(int32_t sms) {
+    int32_t per_sm = 0;
+    cudaFuncAttributes fa = {};
+    return cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, hc_pair_kernel<B, H>, n_thread_up,
+                                                         pair_dyn_bytes<B>()) == cudaSuccess &&
+           cudaFuncGetAttributes(&fa, hc_pair_kernel<B, H>) == cudaSuccess && per_sm >= 1 &&
+           int64_t(per_sm) * sms >= n_block && fa.localSizeBytes == 0 && fa.maxThreadsPerBlock >= n_thread_up;
 }
 
 bool down2_ok(const down2_args & a, const void * stream, const void * w) {
@@ -1742,6 +2458,104 @@ bool head_sub(int32_t rows, int32_t mode, const sub_args & a, void * stream) {
         default:
             return false;
     }
+}
+
+// FMU2: every lane valid as sub's (head_sub's) at max_rows, one card, distinct X-HC and X-HMIX slots (each lane its own
+// ring), and no lane's reset a slot another lane writes
+bool sub_joint_ok(int32_t lanes, int32_t mode, const sub_args * a, const void * stream, bool head) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes) {
+        return false;
+    }
+    for (int32_t k = 0; k < lanes; ++k) {
+        if (!sub_ok(max_rows, mode, a[k], stream, head) || a[k].card != a[0].card || a[k].w_down != a[0].w_down ||
+            a[k].w_up != a[0].w_up || a[k].gamma != a[0].gamma) {
+            return false;
+        }
+        for (int32_t q = 0; q < lanes; ++q) {
+            if (q != k && (a[q].hc_ring == a[k].hc_ring || a[q].hmix_own == a[k].hmix_own ||
+                           a[q].hc_reset == a[k].hc_ring || a[q].hmix_reset == a[k].hmix_own)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+template <int U, bool H> bool launch_sub_joint_u(int32_t mode, const sub_args * a, cudaStream_t stream) {
+    sub_joint_params q = {};
+    for (int32_t k = 0; k < U; ++k) {
+        q.p[k] = sub_of(a[k]);
+        if (H) {
+            q.p[k].u.inject = nullptr;
+        }
+    }
+    int32_t m = mode;
+    void * args[] = {&q, &m};
+    const void * kern = reinterpret_cast<const void *>(hc_sub_joint_kernel<U, H>);
+    static std::atomic<uint32_t> attr_done{0u};
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 32) {
+        return false;
+    }
+    const uint32_t bit = 1u << dev;
+    if ((attr_done.load() & bit) == 0u) {
+        if (cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, wide_dyn_bytes<U>()) !=
+            cudaSuccess) {
+            return false;
+        }
+        attr_done.fetch_or(bit);
+    }
+    return cudaLaunchCooperativeKernel(kern, dim3(n_block), dim3(n_thread_up), args, wide_dyn_bytes<U>(), stream) ==
+           cudaSuccess;
+}
+
+template <bool H> bool launch_sub_joint(int32_t lanes, int32_t mode, const sub_args * a, cudaStream_t stream) {
+    switch (lanes) {
+        case 2:
+            return launch_sub_joint_u<2, H>(mode, a, stream);
+        case 3:
+            return launch_sub_joint_u<3, H>(mode, a, stream);
+        case 4:
+            return launch_sub_joint_u<4, H>(mode, a, stream);
+        default:
+            return false;
+    }
+}
+
+bool sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream) {
+    return sub_joint_ok(lanes, mode, a, stream, false) &&
+           launch_sub_joint<false>(lanes, mode, a, static_cast<cudaStream_t>(stream));
+}
+
+bool head_sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream) {
+    return sub_joint_ok(lanes, mode, a, stream, true) &&
+           launch_sub_joint<true>(lanes, mode, a, static_cast<cudaStream_t>(stream));
+}
+
+bool pair_prepare() {
+    int32_t dev = -1, coop = 0, sms = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&coop, cudaDevAttrCooperativeLaunch, dev) != cudaSuccess ||
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || coop == 0) {
+        return false;
+    }
+    return pair_fits<1, false>(sms) && pair_fits<2, false>(sms) && pair_fits<3, false>(sms) &&
+           pair_fits<4, false>(sms) && pair_fits<5, false>(sms) && pair_fits<1, true>(sms) && pair_fits<2, true>(sms) &&
+           pair_fits<3, true>(sms) && pair_fits<4, true>(sms) && pair_fits<5, true>(sms);
+}
+
+bool pair(int32_t rows, const pair_args & a, void * stream) {
+    if (!pair_ok(rows, a, stream, false)) {
+        return false;
+    }
+    return launch_pair_rows<false>(rows, pair_of(a, false), static_cast<cudaStream_t>(stream));
+}
+
+bool head_pair(int32_t rows, const pair_args & a, void * stream) {
+    if (!pair_ok(rows, a, stream, true)) {
+        return false;
+    }
+    return launch_pair_rows<true>(rows, pair_of(a, true), static_cast<cudaStream_t>(stream));
 }
 
 bool probe(int32_t depth, const uint16_t * w_down, uint32_t * out, void * stream) {

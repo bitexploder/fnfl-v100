@@ -96,6 +96,10 @@ class ple_pin {
 // /proc/vmstat's nr_foll_pin_acquired - nr_foll_pin_released (pages pinned with FOLL_PIN, system-wide); -1 unreadable
 int64_t ple_foll_pinned_pages();
 
+// ME4: the page range a ple_pin holds pinned now, [first, end); 0, 0 when none (another range registered beside it
+// must leave these pages out: a second registration of a page fails)
+void ple_pinned_range(uintptr_t & first, uintptr_t & end);
+
 // The 16 row indices of one row: token t0 and its predecessors t1 (one back) and t2 (two back), -1 for a missing one.
 void ple_row_indices(const ple_params & p, int32_t t0, int32_t t1, int32_t t2, int32_t (&idx)[ple_heads]);
 

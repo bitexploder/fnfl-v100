@@ -51,12 +51,21 @@ static_assert(n_ff_card == 320 && D == 2560 && n_expert == 512, "the shapes this
 //   IQ3_S   (C 6): as IQ3_XXS with sg = the 4 sign bytes; aux8 = qh byte; sc8 = scales byte j / 2 of rows 0..7
 //   Q8_0   (C 16, DR1): chunk c = row c / 2's int8 weights 16 (c & 1) .. 16 (c & 1) + 15 of sub-block j; each
 //                  32-weight block has its own d, so the d plane is [rec] of 16 B (the 8 rows' FP16 d of sub-block j)
+//   Q4_K   (C 8, ME1): chunk m = row m's 32 nibbles of sub-block j, byte t = weight t (low) and t + 16 (high); after
+//                  the main chunks the scale plane sm [rec] of 16 B (byte 2m: row m's 6-bit sub-block scale, 2m + 1:
+//                  its 6-bit min), then d and dmin, each [sb][rs] of 16 B (the 8 rows' FP16 d, dmin of superblock sb)
+//   Q2_0   (C 4, ME7, the Q2 draft's): chunk c = [row 2c: its 8 code bytes of sub-block j][row 2c + 1's]; a GGUF Q2_0
+//                  block (FP16 d, 16 code bytes, 64 weights) is sub-blocks 2i, 2i + 1, so the d plane is [j / 2][rs] of
+//                  16 B (the 8 rows' FP16 d of the pair): 72 bytes a 256 weights, GGUF's (Strata-V100 69713b61
+//                  mtp_pack.py q2_0 / ggml-quants.c: weight t's code at byte 2 + t / 4, bits 2 (t % 4); (code - 1) d)
+//   Q5_K   (C 10, ME1): Q4_K's with each row's high bits, 4 B a row (bit t: bit 4 of weight t): [qh of rows 0..3]
+//                  [r0][r1][r2][r3] [qh of rows 4..7][r4]..[r7]; the tile is 4 bytes a 256 weights over GGUF's
 constexpr int32_t gu_threads = 8 * n_sub; // 640: one thread a record
 constexpr int32_t gu_warps = gu_threads / 32;
 constexpr int32_t red_stride = gu_warps + 1; // floats per row of the reduction buffer (21: conflict-free columns)
 
 struct gu_layout {
-    int32_t block_bytes; // GGUF bytes per 256 weights
+    int32_t block_bytes; // packed bytes per 256 weights (GGUF's but for the K-quants, 4 more: the scales unpacked)
     int32_t chunks;      // main chunks per record
     bool aux8, sc8;
     int32_t grid_off, grid_len; // in the grid buffer
@@ -71,21 +80,41 @@ __host__ __device__ constexpr gu_layout gu_layout_of(fmt f) {
            : f == fmt::q8_0    ? gu_layout{8 * 34, 16, false, false, 0, 0}
                                : gu_layout{0, 0, false, false, 0, 0};
 }
+// ME1: the K-quants (the Q4 candidate's routed gate/up) take their layout from gu_layout_k, every format's at compile
+// time; gu_layout_of keeps the deployed formats' chain, whose run-time form the IQ bodies take (two more arms in it
+// changed their SASS)
+__host__ __device__ constexpr bool is_kq(fmt f) {
+    return f == fmt::q4_k || f == fmt::q5_k;
+}
+// ME7: Q2_0 (the Q2 draft's routed gate/up) is here too, out of gu_layout_of's run-time chain for the same reason
+__host__ __device__ constexpr gu_layout gu_layout_k(fmt f) {
+    return f == fmt::q4_k   ? gu_layout{148, 8, false, false, 0, 0}
+           : f == fmt::q5_k ? gu_layout{180, 10, false, false, 0, 0}
+           : f == fmt::q2_0 ? gu_layout{72, 4, false, false, 0, 0}
+                            : gu_layout_of(f);
+}
 
 constexpr int32_t kvalues_off = 17408;
 static_assert(kvalues_off + 16 == static_cast<int32_t>(grid_bytes), "grid buffer layout");
 
 __host__ __device__ constexpr int64_t tile_bytes(fmt f) {
-    return int64_t(gu_threads) * gu_layout_of(f).block_bytes;
+    return int64_t(gu_threads) * gu_layout_k(f).block_bytes;
 }
 __host__ __device__ constexpr int64_t aux8_off(fmt f) {
-    return int64_t(gu_layout_of(f).chunks) * gu_threads * 16;
+    return int64_t(gu_layout_k(f).chunks) * gu_threads * 16;
 }
 __host__ __device__ constexpr int64_t sc8_off(fmt f) {
     return aux8_off(f) + (gu_layout_of(f).aux8 ? gu_threads * 8 : 0);
 }
+// ME1: a K-quant's scale plane is where the aux8 plane would be
+__host__ __device__ constexpr int64_t sm_off(fmt f) {
+    return aux8_off(f);
+}
 __host__ __device__ constexpr int64_t d_off(fmt f) {
-    return sc8_off(f) + (gu_layout_of(f).sc8 ? (n_sub / 2) * 8 * 8 : 0);
+    return sc8_off(f) + (gu_layout_of(f).sc8 ? (n_sub / 2) * 8 * 8 : 0) + (is_kq(f) ? gu_threads * 16 : 0);
+}
+__host__ __device__ constexpr int64_t dmin_off(fmt f) {
+    return d_off(f) + 10 * 8 * 16;
 }
 
 static_assert(d_off(fmt::iq2_xxs) + 10 * 8 * 16 == tile_bytes(fmt::iq2_xxs), "IQ2_XXS tile bytes");
@@ -94,16 +123,26 @@ static_assert(d_off(fmt::iq2_s) + 10 * 8 * 16 == tile_bytes(fmt::iq2_s), "IQ2_S 
 static_assert(d_off(fmt::iq3_xxs) + 10 * 8 * 16 == tile_bytes(fmt::iq3_xxs), "IQ3_XXS tile bytes");
 static_assert(d_off(fmt::iq3_s) + 10 * 8 * 16 == tile_bytes(fmt::iq3_s), "IQ3_S tile bytes");
 static_assert(d_off(fmt::q8_0) + gu_threads * 16 == tile_bytes(fmt::q8_0), "Q8_0 tile bytes");
+static_assert(dmin_off(fmt::q4_k) + 10 * 8 * 16 == tile_bytes(fmt::q4_k), "Q4_K tile bytes");
+static_assert(d_off(fmt::q2_0) + (n_sub / 2) * 8 * 16 == tile_bytes(fmt::q2_0) && tile_bytes(fmt::q2_0) == 46080,
+              "Q2_0 tile bytes: 64 rows of 2,560 weights at GGUF's 18 bytes a 64");
+static_assert(dmin_off(fmt::q5_k) + 10 * 8 * 16 == tile_bytes(fmt::q5_k), "Q5_K tile bytes");
 
 // ---- down packed layout ------------------------------------------------------------------------------------------
 // Per expert: item j5 (0..4) covers input columns 64 j5 .. 64 j5 + 63 of every output row n.
 //   Q2_0:   chunks [j5][n] 16 B (the block's qs), then d [j5][n] FP16
 //   IQ4_NL: chunks [j10][n] 16 B (block j10's qs; item j5 = blocks 2 j5, 2 j5 + 1), then d [j5][n][2] FP16
 //   Q8_0 (DR1): chunks [j5][c][n] 16 B (c = 0..3: block 2 j5 + c / 2's int8 weights 16 (c & 1) ..), then d as IQ4_NL
+//   Q5_1 (ME1): chunks as IQ4_NL (block j10's qs: byte t = weight t (low) and t + 16 (high)), then [j5][n] of 16 B:
+//               the two blocks' qh words, then FP16 d0, m0, d1, m1
 constexpr int32_t n_item_k = 5;
 
 __host__ __device__ constexpr int32_t down_chunks(fmt f) {
     return f == fmt::q2_0 ? 1 : f == fmt::q8_0 ? 4 : 2;
+}
+// bytes of item j5's d entry of one output row
+__host__ __device__ constexpr int32_t down_d_bytes(fmt f) {
+    return f == fmt::q2_0 ? 2 : f == fmt::q5_1 ? 16 : 4;
 }
 
 // ---- the distinct experts of the launch (both kernels): experts_meta.cuh's meta, read at entry (XB2) ----------
@@ -155,6 +194,11 @@ __device__ __forceinline__ float half_hi(uint32_t h2) {
     return __half2float(__ushort_as_half(static_cast<unsigned short>(h2 >> 16)));
 }
 
+// ME1 (Q5_K, Q5_1): bits 0..3 of x to bit 0 of bytes 0..3 (the four shifted copies never overlap, so nothing carries)
+__device__ __forceinline__ uint32_t spread4(uint32_t x) {
+    return ((x & 0xfu) * 0x00204081u) & 0x01010101u;
+}
+
 __device__ __forceinline__ uint32_t word_of(const uint4 & v, int32_t i) {
     return i == 0 ? v.x : i == 1 ? v.y : i == 2 ? v.z : v.w;
 }
@@ -168,6 +212,28 @@ __device__ __forceinline__ uint32_t order_after(uint32_t v, uint32_t mz) {
 template <int D_> struct ring {
     uint4 s[D_];
 };
+
+// The GLU of one channel from its gate and up sums and FNFL's activation format of its 32-channel run (act.h's rule:
+// lane i holds channel i of the run; the warp's 32 lanes take part): code and v out, d and s of the run in every lane.
+// gate_up's glu_out and ME1's glu_finish both run it, so their GLU is one arithmetic.
+__device__ __forceinline__ int8_t glu_run(float gs, float us, float & v, float & d, float & sv) {
+    v = gs / (1.0f + expf(-gs)) * us;
+    float amax = fabsf(v);
+#pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    }
+    d = __fdiv_rn(amax, 127.0f);
+    const float id = amax > 0.0f ? __fdiv_rn(127.0f, amax) : 0.0f;
+    const int32_t qv = min(max(__float2int_rn(v * id), -127), 127);
+    int32_t sum = qv;
+#pragma unroll
+    for (int32_t off = 16; off > 0; off >>= 1) {
+        sum += __shfl_xor_sync(0xffffffffu, sum, off);
+    }
+    sv = d * static_cast<float>(sum);
+    return static_cast<int8_t>(qv);
+}
 
 } // namespace
 } // namespace fn::experts
@@ -183,5 +249,20 @@ bool gate_up_iq2_s(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gat
 bool gate_up_iq3_xxs(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
 bool gate_up_iq3_s(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
 bool gate_up_q8_0(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+bool gate_up_q2_0(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+bool gate_up_q4_k(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+bool gate_up_q5_k(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+// ME10: the pair launches (gate_up_pair) of the IQ2 and IQ3 bodies at B = 4 and 5; the caller checked the arguments
+bool gate_up_pair_iq2(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
+                      cudaStream_t st);
+bool gate_up_pair_iq3(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
+                      cudaStream_t st);
+
+// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B = 5, the IQ2 and IQ3 bodies
+// (experts_gu_lanes.cu); the caller checked the arguments
+bool gate_up_lanes_iq2(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
+                       cudaStream_t st);
+bool gate_up_lanes_iq3(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
+                       cudaStream_t st);
 
 } // namespace fn::experts::detail

@@ -2408,6 +2408,26 @@ bool pick(const card_view & v, const pick_io & io, void * stream) {
     return pick_stage(v, io, 0, stream) && pick_stage(v, io, 1, stream);
 }
 
+bool pick_lanes_stage(const card_view * const v[], const pick_io io[], int32_t lanes, int32_t stage, void * stream) {
+    if (v == nullptr || io == nullptr || lanes < 1 || lanes > max_rows) {
+        return false;
+    }
+    for (int32_t k = 0; k < lanes; ++k) {
+        if (v[k] == nullptr) {
+            return false;
+        }
+        card_view w = *v[k];
+        for (int32_t q = 0; q < 2; ++q) {
+            w.a_own[q] = v[k]->a_own[q] + int64_t(k) * a_row;
+            w.a_peer[q] = v[k]->a_peer[q] + int64_t(k) * a_row;
+        }
+        if (!pick_stage(w, io[k], stage, stream)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool read_list(const card_view & v, int32_t row, std::vector<uint32_t> & words, void * stream) {
     if (!view_ok(v) || stream == nullptr || row < 0 || row >= max_rows) {
         return false;

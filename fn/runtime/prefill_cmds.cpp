@@ -24,8 +24,11 @@
 //         by the bulk span on identical random draft inputs and hidden rows, against each other and FP64 references
 //         (vcheck_mode below).
 
+#include "fn/kernels/gdn/gdn.h"
+#include "fn/kernels/gdn/gdn_ref.h"
 #include "fn/kernels/qsa/attend.h"
 #include "fn/kernels/qsa/qsa.h"
+#include "fn/kernels/round/version.h"
 #include "fn/model/draft.h"
 #include "fn/model/model.h"
 #include "fn/model/placement.h"
@@ -119,7 +122,8 @@ uint64_t hash_bytes(uint64_t h, const void * p, size_t n) {
 
 template <typename T> bool get(std::vector<T> & v, const T * src, size_t n) {
     v.resize(n);
-    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDeviceToHost), "download");
+    // cudaMemcpyDefault: a source in device or (ME1: the host-backed KV, the PF1 checkpoints) pinned host memory
+    return n == 0 || cuda_ok(cudaMemcpy(v.data(), src, n * sizeof(T), cudaMemcpyDefault), "download");
 }
 
 bool sync_cards(rt::target & t, md::model & m) {
@@ -128,6 +132,12 @@ bool sync_cards(rt::target & t, md::model & m) {
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "sync")) {
             return false;
         }
+    }
+    // ME1: with the host-backed KV the KV classes are its host history, made whole for the reads that follow
+    std::string err;
+    if (!t.kv_flush(err)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return false;
     }
     return true;
 }
@@ -235,8 +245,9 @@ struct verdicts {
 
 // ---- plan: the chunk rules and the bookkeeping, no device ----
 
-std::string check_plan(int64_t from, int64_t to) {
-    const std::vector<rt::pf_chunk> p = rt::plan_chunks(from, to);
+// split: the one-half bound (pf_split_rows uncached, MX3's pf_cached_split_rows with the expert cache)
+std::string check_plan(int64_t from, int64_t to, int32_t split = rt::pf_split_rows) {
+    const std::vector<rt::pf_chunk> p = rt::plan_chunks(from, to, rt::pf_chunk_rows, split);
     if (p.empty() || p.front().start != from) {
         return "does not start at from";
     }
@@ -253,10 +264,10 @@ std::string check_plan(int64_t from, int64_t to) {
         if (c.start / rt::pf_span != (end - 1) / rt::pf_span) {
             return "crosses a multiple of 8,192 at " + std::to_string(c.start);
         }
-        const bool split = c.rows > rt::pf_split_rows;
-        if (c.half[0] + c.half[1] != c.rows || (!split && c.half[1] != 0) ||
-            (split && (c.half[0] % 64 != 0 || c.half[0] < c.half[1] || c.half[0] - c.half[1] > 128 ||
-                       c.half[0] > rt::pf_half_rows || c.half[1] < 1))) {
+        const bool two = c.rows > split;
+        if (c.half[0] + c.half[1] != c.rows || (!two && c.half[1] != 0) ||
+            (two && (c.half[0] % 64 != 0 || c.half[0] < c.half[1] || c.half[0] - c.half[1] > 128 ||
+                     c.half[0] > rt::pf_half_rows || c.half[1] < 1))) {
             return "halves " + std::to_string(c.half[0]) + " + " + std::to_string(c.half[1]);
         }
         // the tiling restarts only at from and at multiples of 8,192: a short chunk ends at one or at the end
@@ -270,7 +281,7 @@ std::string check_plan(int64_t from, int64_t to) {
     }
     // the plan from each multiple of 8,192 inside is this plan's suffix (a restore repeats the partition)
     for (int64_t k = (from / rt::pf_span + 1) * rt::pf_span; k < to; k += rt::pf_span) {
-        const std::vector<rt::pf_chunk> q = rt::plan_chunks(k, to);
+        const std::vector<rt::pf_chunk> q = rt::plan_chunks(k, to, rt::pf_chunk_rows, split);
         size_t j = 0;
         while (j < p.size() && p[j].start != k) {
             ++j;
@@ -293,30 +304,40 @@ int plan_mode(verdicts & v) {
                              7001, 8191, 8192, 8193, 12000, 16383, 16384, 20000, 196607};
     const int64_t lens[] = {1,    2,    3,    4,    5,    1535, 1536, 1537, 1538,  2048,  3071,  3072,
                             3073, 3391, 4096, 6144, 6145, 8191, 8192, 8193, 10000, 16385, 24577, 50000};
-    int32_t cases = 0;
-    std::string bad;
-    for (const int64_t f : froms) {
-        for (const int64_t n : lens) {
-            const std::string e = check_plan(f, f + n);
-            ++cases;
-            if (!e.empty() && bad.empty()) {
-                bad = std::to_string(f) + " .. " + std::to_string(f + n) + ": " + e;
+    // MX3: the uncached rule (one half up to 1,536 rows) and the expert cache's (one half up to 4,096 rows)
+    for (const int32_t split : {rt::pf_split_rows, rt::pf_cached_split_rows}) {
+        int32_t cases = 0;
+        std::string bad;
+        for (const int64_t f : froms) {
+            for (const int64_t n : lens) {
+                const std::string e = check_plan(f, f + n, split);
+                ++cases;
+                if (!e.empty() && bad.empty()) {
+                    bad = std::to_string(f) + " .. " + std::to_string(f + n) + ": " + e;
+                }
             }
         }
-    }
-    for (const int64_t to : {int64_t(8192), int64_t(131072), int64_t(198720)}) {
-        const std::string e = check_plan(0, to);
-        ++cases;
-        if (!e.empty() && bad.empty()) {
-            bad = "0 .. " + std::to_string(to) + ": " + e;
+        for (const int64_t to : {int64_t(8192), int64_t(131072), int64_t(198720)}) {
+            const std::string e = check_plan(0, to, split);
+            ++cases;
+            if (!e.empty() && bad.empty()) {
+                bad = "0 .. " + std::to_string(to) + ": " + e;
+            }
         }
+        const std::vector<rt::pf_chunk> c2049 = rt::plan_chunks(0, 2049, rt::pf_chunk_rows, split);
+        const bool one2049 = c2049.size() == 1 && (c2049[0].half[1] == 0) == (split == rt::pf_cached_split_rows);
+        const std::string rule = split == rt::pf_split_rows ? "uncached" : "cached (MX3)";
+        v.put("chunk rules " + rule, bad.empty() && one2049,
+              bad.empty() ? std::to_string(cases) +
+                                " (from, to) cases: contiguous, 1 .. 8,192 rows, none across a "
+                                "multiple of 8,192, one half up to " +
+                                std::to_string(split) +
+                                " rows, above it two halves within 128 rows (the first a multiple of 64, <= 4,096), "
+                                "short chunks only at a multiple or the end, every plan from a multiple its suffix; "
+                                "2,049 rows " +
+                                (one2049 ? (split == rt::pf_split_rows ? "two halves" : "one half") : "UNEXPECTED")
+                          : bad);
     }
-    v.put("chunk rules", bad.empty(),
-          bad.empty() ? std::to_string(cases) + " (from, to) cases: contiguous, 1 .. 8,192 rows, none across a "
-                                                "multiple of 8,192, one half up to 1,536 rows, above it two halves "
-                                                "within 128 rows (the first a multiple of 64, <= 4,096), short chunks "
-                                                "only at a multiple or the end, every plan from a multiple its suffix"
-                      : bad);
     // the chunk shapes of a full slot and of 131,072 (information)
     for (const int64_t to : {int64_t(131072), int64_t(198720)}) {
         std::map<int32_t, int32_t> hist;
@@ -456,7 +477,8 @@ int plan_mode(verdicts & v) {
 
 // ---- dry: zero weights ----
 
-// version cur's GDN states and histories, the PLE history and the draft's retained carry, both cards
+// version cur's GDN states (ME11: the matrix the slot's GDN selector names, its bank with the records replayed) and
+// histories, the PLE history and the draft's retained carry, both cards
 bool slot_bytes(rt::target & t, md::model & m, uint32_t cur, std::vector<uint8_t> & out) {
     out.clear();
     std::vector<uint8_t> b;
@@ -474,9 +496,17 @@ bool slot_bytes(rt::target & t, md::model & m, uint32_t cur, std::vector<uint8_t
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device")) {
             return false;
         }
+        std::vector<float> mat;
         for (const md::layer_state & st : p.s) {
-            if (st.gdn != nullptr && (!add(reinterpret_cast<const uint8_t *>(st.gdn) + cur * gdn, gdn) ||
-                                      !add(reinterpret_cast<const uint8_t *>(st.conv) + cur * conv, conv))) {
+            if (st.gdn == nullptr) {
+                continue;
+            }
+            if (!fn::gdn::ref::read_committed(st.gdn, st.rec, t.slot().gdn, mat)) {
+                return false;
+            }
+            const uint8_t * mb = reinterpret_cast<const uint8_t *>(mat.data());
+            out.insert(out.end(), mb, mb + gdn);
+            if (!add(reinterpret_cast<const uint8_t *>(st.conv) + cur * conv, conv)) {
                 return false;
             }
         }
@@ -506,8 +536,11 @@ bool slot_scribble(rt::target & t, md::model & m, uint32_t cur, uint64_t seed) {
         if (!cuda_ok(cudaSetDevice(m.device[c]), "device") || !sync_cards(t, m)) {
             return false;
         }
+        // ME11: the selector's bank and both record sets (the live records included)
+        const int64_t bank = fn::round::gdn_bank(t.slot().gdn);
         for (const md::layer_state & st : p.s) {
-            if (st.gdn != nullptr && (!put(reinterpret_cast<uint8_t *>(st.gdn) + cur * gdn, gdn) ||
+            if (st.gdn != nullptr && (!put(reinterpret_cast<uint8_t *>(st.gdn) + bank * gdn, gdn) ||
+                                      !put(st.rec, size_t(fn::gdn::records_bytes)) ||
                                       !put(reinterpret_cast<uint8_t *>(st.conv) + cur * conv, conv))) {
                 return false;
             }
@@ -578,6 +611,138 @@ bool chunks_are(const rt::pf_run_stats & s, const std::string & want) {
     return chunk_list(s) == want;
 }
 
+struct xc_release_guard {
+    rt::expert_cache * xc = nullptr;
+    ~xc_release_guard() {
+        if (xc != nullptr) {
+            std::string note;
+            xc->release_gpu_waits(5000, true, note);
+        }
+    }
+};
+
+bool init_target_and_prefiller(const fnfl_target_args & a, md::model & m, rt::target_options o, bool dry,
+                               std::unique_ptr<rt::expert_cache> & xc, rt::target & t, rt::prefiller & pf,
+                               std::string & err) {
+    o.defer_capture = m.expert_cache && !o.eager;
+    if (!t.init(m, o, err)) {
+        return false;
+    }
+    if (m.expert_cache) {
+        const md::service_hook capture = [&t](md::expert_service & s, std::string & e) {
+            t.card(0).c.ex_service = &s;
+            t.card(1).c.ex_service = &s;
+            s.set_executor(true);
+            return t.capture(e);
+        };
+        xc = fnfl_expert_cache(a, m, dry, "prefill-test", o.eager ? md::service_hook() : capture);
+        if (xc == nullptr) {
+            err = "the expert cache";
+            return false;
+        }
+        t.card(0).c.ex_service = xc.get();
+        t.card(1).c.ex_service = xc.get();
+        if (!t.set_executor(!o.eager, err) || !xc->reset_to_profile(err)) {
+            return false;
+        }
+    }
+    if (!pf.init(t, m, err)) {
+        return false;
+    }
+    if (xc != nullptr && (!pf.set_options(0, a.cache.prompt_chunk, err) || !pf.loan_check(err))) {
+        return false;
+    }
+    return true;
+}
+
+bool dump_post_prefill_state(rt::target & t, md::model & m, const state_hash & s, const std::string & dir) {
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+    const auto open_bin = [&](const char * name) -> FILE * { return fopen((dir + "/" + name).c_str(), "wb"); };
+    FILE * f_carry = open_bin("streams_carry_target.bin");
+    FILE * f_dcarry = open_bin("carry_prev_draft.bin");
+    FILE * f_logits = open_bin("head_logits.bin");
+    FILE * f_ple = open_bin("ple_history.bin");
+    FILE * f_gdn = open_bin("gdn_committed_state.bin");
+    FILE * f_conv = open_bin("gdn_conv_hist.bin");
+    FILE * f_qk = open_bin("qsa_k_cache.bin");
+    FILE * f_qv = open_bin("qsa_v_cache.bin");
+    FILE * f_ik = open_bin("qsa_index_keys.bin");
+    FILE * f_is = open_bin("qsa_index_summaries.bin");
+    FILE * f_dk = open_bin("draft_k_cache.bin");
+    FILE * f_dv = open_bin("draft_v_cache.bin");
+    FILE * f_tsv = fopen((dir + "/state_hashes.tsv").c_str(), "w");
+    bool ok = f_carry && f_dcarry && f_logits && f_ple && f_gdn && f_conv && f_qk && f_qv && f_ik && f_is && f_dk &&
+              f_dv && f_tsv;
+    const rt::ledger & l = t.slot();
+    const int64_t n = l.n;
+    const int32_t blocks = fn::qsa::blocks_complete(static_cast<int32_t>(n));
+    constexpr int64_t conv_floats = int64_t(md::gdn_conv_channels_card) * md::gdn_conv_history;
+    std::vector<float> vf;
+    std::vector<uint16_t> vu;
+    for (int32_t c = 0; c < 2 && ok; ++c) {
+        md::pass_card & p = t.card(c);
+        md::draft_card & d = t.draft(c);
+        if (!cuda_ok(cudaSetDevice(m.device[c]), "device")) {
+            ok = false;
+            break;
+        }
+        const int64_t s0 = fn::round::version_slot(l.cur, 0);
+        if (s.retained_row >= 0) {
+            ok = ok && get(vf, p.carry + size_t(s.retained_row) * 4 * 1280, size_t(4) * 1280) &&
+                 fwrite(vf.data(), 4, vf.size(), f_carry) == vf.size();
+            ok = ok && get(vf, p.logits + size_t(s.retained_row) * VC, size_t(VC)) &&
+                 fwrite(vf.data(), 4, vf.size(), f_logits) == vf.size();
+        }
+        if (t.draft_on()) {
+            ok =
+                ok && get(vf, d.carry_prev, size_t(4) * 1280) && fwrite(vf.data(), 4, vf.size(), f_dcarry) == vf.size();
+            ok =
+                ok && get(vu, d.k_cache, size_t(s.draft_n) * 256) && fwrite(vu.data(), 2, vu.size(), f_dk) == vu.size();
+            ok =
+                ok && get(vu, d.v_cache, size_t(s.draft_n) * 256) && fwrite(vu.data(), 2, vu.size(), f_dv) == vu.size();
+        }
+        ok = ok && get(vf, p.ple_hist + s0 * fn::ple::hist_version_floats, size_t(fn::ple::hist_version_floats)) &&
+             fwrite(vf.data(), 4, vf.size(), f_ple) == vf.size();
+        for (int32_t layer = 0; layer < 48 && ok; ++layer) {
+            const md::layer_state & st = p.s[layer];
+            if (p.w[layer].gdn) {
+                ok = ok && fn::gdn::ref::read_committed(st.gdn, st.rec, l.gdn, vf) &&
+                     fwrite(vf.data(), 4, vf.size(), f_gdn) == vf.size();
+                ok = ok && get(vf, st.conv + s0 * conv_floats, size_t(conv_floats)) &&
+                     fwrite(vf.data(), 4, vf.size(), f_conv) == vf.size();
+            } else {
+                ok = ok && get(vu, st.k_cache, size_t(n) * md::kv_head_dim) &&
+                     fwrite(vu.data(), 2, vu.size(), f_qk) == vu.size();
+                ok = ok && get(vu, st.v_cache, size_t(n) * md::kv_head_dim) &&
+                     fwrite(vu.data(), 2, vu.size(), f_qv) == vu.size();
+                if (st.idx_keys != nullptr) {
+                    ok = ok && get(vu, st.idx_keys, size_t(n) * fn::qsa::head_dim) &&
+                         fwrite(vu.data(), 2, vu.size(), f_ik) == vu.size();
+                    ok = ok && get(vf, st.idx_summaries, fn::qsa::summary_bytes(blocks) / 4) &&
+                         fwrite(vf.data(), 4, vf.size(), f_is) == vf.size();
+                }
+            }
+        }
+    }
+    if (ok) {
+        fprintf(f_tsv, "n\t%lld\ndraft_n\t%lld\nretained_row\t%d\n", static_cast<long long>(s.n),
+                static_cast<long long>(s.draft_n), s.retained_row);
+        for (int32_t i = 0; i < n_hash; ++i) {
+            fprintf(f_tsv, "%s\t%016llx\n", hash_names[i], static_cast<unsigned long long>(s.h[i]));
+        }
+    }
+    for (FILE * f : {f_carry, f_dcarry, f_logits, f_ple, f_gdn, f_conv, f_qk, f_qv, f_ik, f_is, f_dk, f_dv, f_tsv}) {
+        if (f != nullptr) {
+            fclose(f);
+        }
+    }
+    return ok;
+}
+
 int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verdicts & v) {
     const bool eager = a.mode == "dry-eager";
     const int32_t n = std::min<int32_t>(a.n_pos, 7000);
@@ -605,14 +770,17 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         o.sampling.temp = 0.0f;
         o.draft = dopt;
         o.timeout_s = 120.0;
+        std::unique_ptr<rt::expert_cache> xc;
         rt::target t;
         rt::prefiller pf;
-        if (!t.init(*m, o, err) || !pf.init(t, *m, err)) {
+        xc_release_guard rel;
+        if (!init_target_and_prefiller(a, *m, o, true, xc, t, pf, err)) {
             fprintf(stderr, "prefill-test: init: %s\n", err.c_str());
             return 1;
         }
+        rel.xc = xc.get();
         const std::vector<int32_t> P(pool.begin(), pool.begin() + n);
-        const int32_t              n_chunks = static_cast<int32_t>(rt::plan_chunks(0, n).size());
+        const int32_t n_chunks = static_cast<int32_t>(rt::plan_chunks(0, n).size());
         int64_t from = -1;
         rt::pf_run_stats st;
         state_hash                 hd, hp, hf;
@@ -656,22 +824,28 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         if (brief) {
             return v.all ? 0 : 1;
         }
-        // D3: a checkpoint's bytes restored exactly: random state, the checkpoint, other random state, the restore
+        // D3: a checkpoint's bytes restored exactly: random state, the checkpoint, other random state, the restore.
+        // ME11: the selector first takes the other bank and set with five live records (as after a short read's
+        // forced rounds), so the checkpoint holds a bank, five records and their count, restored to bank 0, set 0
         const uint32_t cur0 = t.slot().cur;
+        const uint32_t g5 = fn::round::gdn_word(1 - fn::round::gdn_bank(t.slot().gdn),
+                                                1 - fn::round::gdn_set(t.slot().gdn), 5);
         std::vector<uint8_t> want, got;
-        ok = ok && slot_scribble(t, *m, cur0, 0x1234) && pf.checkpoint_now(t, err) && slot_bytes(t, *m, cur0, want) &&
-             slot_scribble(t, *m, cur0, 0x5678) && slot_bytes(t, *m, cur0, got);
+        ok = ok && t.test_set_gdn(g5, err) && slot_scribble(t, *m, cur0, 0x1234) && pf.checkpoint_now(t, err) &&
+             slot_bytes(t, *m, cur0, want) && slot_scribble(t, *m, cur0, 0x5678) && slot_bytes(t, *m, cur0, got);
         const bool scribbled = ok && got != want;
         std::vector<int32_t> all(t.slot().tok.begin(), t.slot().tok.begin() + n + 8);
         all.push_back(pool[size_t(n) + 8]);
         all.push_back(pool[size_t(n) + 9]);
         ok = ok && pf.begin(t, all, n + 8, from, err) && sync_cards(t, *m) && slot_bytes(t, *m, t.slot().cur, got);
-        const bool exact = ok && got == want && t.slot().cur == 0;
+        const bool exact = ok && got == want && t.slot().cur == 0 && t.slot().gdn == fn::round::gdn_word(0, 0, 5);
         ok = ok && pf.run(t, &st, err);
         h = ok ? handoff(t, n + 10) : err;
         v.put("dry checkpoint bytes restored", ok && scribbled && exact && from == n + 8 && h.empty(),
-              ok ? std::to_string(want.size()) + " bytes (version " + std::to_string(cur0) +
-                       " saved, version 0 restored): " + (exact ? "equal" : "DIFFERENT") + "; restored at " +
+              ok ? std::to_string(want.size()) + " bytes (version " + std::to_string(cur0) + " and GDN selector " +
+                       std::to_string(g5) + " (5 records) saved, version 0 and selector " +
+                       std::to_string(t.slot().gdn) + " restored): " + (exact ? "equal" : "DIFFERENT") +
+                       "; restored at " +
                        std::to_string(from) + ", chunks " + chunk_list(st)
                  : err);
         // D4: a prompt keeping n + 2 tokens restores the prompt end n and drops the later checkpoints
@@ -792,12 +966,28 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
     }
     // the engine as the server drives it
     {
+        if (a.cached()) {
+            m = std::make_unique<md::model>();
+            if (!fnfl_load_dry(a, cells, *m)) {
+                return 1;
+            }
+        }
         rt::engine_config c;
         c.model_path = a.model_path;
         c.n_ctx_slot = cells;
-        c.draft      = dopt;
-        c.eog        = { eos_tokenizer };
-        c.timeout_s  = 30.0;
+        c.draft = dopt;
+        c.eog = {eos_tokenizer};
+        c.timeout_s = 30.0;
+        if (a.cached()) {
+            c.experts = [&a](md::model & mm, const md::service_hook & hook,
+                             std::string & e2) -> std::unique_ptr<md::expert_service> {
+                auto x = fnfl_expert_cache(a, mm, true, "prefill-test", hook);
+                if (x == nullptr) {
+                    e2 = "the expert cache";
+                }
+                return x;
+            };
+        }
         rt::engine e;
         if (!e.init(std::move(m), c, err)) {
             fprintf(stderr, "prefill-test: engine: %s\n", err.c_str());
@@ -920,8 +1110,18 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
             rt::engine_config c;
             c.model_path = a.model_path;
             c.n_ctx_slot = big;
-            c.draft      = dopt;
-            c.eog        = { eos_tokenizer };
+            c.draft = dopt;
+            c.eog = {eos_tokenizer};
+            if (a.cached()) {
+                c.experts = [&a](md::model & mm, const md::service_hook & hook,
+                                 std::string & e2) -> std::unique_ptr<md::expert_service> {
+                    auto x = fnfl_expert_cache(a, mm, true, "prefill-test", hook);
+                    if (x == nullptr) {
+                        e2 = "the expert cache";
+                    }
+                    return x;
+                };
+            }
             rt::engine e;
             fit = e.init(std::move(mb), c, err);
             for (int32_t card = 0; card < 2 && fit; ++card) {
@@ -1345,7 +1545,17 @@ bool deep_stage(std::unique_ptr<md::model> m,
     c.n_ctx_slot = a.n_cells;
     c.draft = dopt;
     c.eog = {eos_tokenizer};
-    c.timeout_s  = 60.0;
+    c.timeout_s = 60.0;
+    if (a.cached()) {
+        c.experts = [&a](md::model & mm, const md::service_hook & hook,
+                         std::string & e2) -> std::unique_ptr<md::expert_service> {
+            auto x = fnfl_expert_cache(a, mm, false, "prefill-test", hook);
+            if (x == nullptr) {
+                e2 = "the expert cache";
+            }
+            return x;
+        };
+    }
     rt::engine e;
     std::string err;
     if (!e.init(std::move(m), c, err)) {
@@ -1448,7 +1658,7 @@ int model_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, ve
     // the references first (no load if they do not match)
     pinned dec, pro;
     if (!load_pinned(a.ref_dir, a, dec, v) || !load_pinned(a.ref_prompt, a, pro, v) || dec.mode != "decode" ||
-        pro.mode != "prompt") {
+        (pro.mode != "prompt" && a.ref_prompt != a.ref_dir)) {
         fprintf(stderr, "prefill-test: the pinned references do not match this model, these IDs and their modes\n");
         return 1;
     }
@@ -1472,68 +1682,82 @@ int model_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, ve
         o.model_path    = a.model_path;
         o.sample        = true;
         o.sampling.temp = 0.0f;
-        o.draft         = dopt;
-        o.timeout_s     = 60.0;
-        rt::target    t;
+        o.draft = dopt;
+        o.timeout_s = 60.0;
+        std::unique_ptr<rt::expert_cache> xc;
+        rt::target t;
         rt::prefiller pf;
-        std::string   err;
-        if (!t.init(*m, o, err) || !pf.init(t, *m, err)) {
+        xc_release_guard rel;
+        std::string err;
+        if (!init_target_and_prefiller(a, *m, o, plumb, xc, t, pf, err)) {
             fprintf(stderr, "prefill-test: init: %s\n", err.c_str());
             return 1;
         }
-        const auto prefix = [&](int64_t n) {
-            return std::vector<int32_t>(pool.begin(), pool.begin() + n);
-        };
-        int64_t           from = -1;
-        rt::pf_run_stats  st, s0;
-        // NC1 section 6: three cases, each bulk-prefilled, then teacher-forced to 4,095
-        fnfl_cont         f2, f3, fa;
-        bool              ok = pf.begin(t, prefix(2048), 0, from, err) && pf.run(t, &st, err);
-        const std::string c2 = ok ? chunk_list(st) : "";
-        ok                   = ok && continue_forced(t, *m, pool, ref_n, f2, err);
-        printf("prefill-test: fresh at 2,048: chunks %s (halves %d + %d)\n", c2.c_str(),
-               st.chunks.empty() ? 0 : st.chunks[0].c.half[0], st.chunks.empty() ? 0 : st.chunks[0].c.half[1]);
-        nc                   = ok && nc1_case("fresh at 2,048", dec, pro, f2, tsv, vn) && nc;
-        ok                   = ok && pf.begin(t, prefix(3584), 0, from, err) && pf.run(t, &st, err);
-        const std::string c3 = ok ? chunk_list(st) : "";
-        ok                   = ok && continue_forced(t, *m, pool, ref_n, f3, err);
-        printf("prefill-test: fresh at 3,584: chunks %s (896 QSA blocks)\n", c3.c_str());
-        nc = ok && nc1_case("fresh at 3,584", dec, pro, f3, tsv, vn) && nc;
-        // append: 2,048, its prompt-end checkpoint restored, then to 3,584
-        ok = ok && pf.begin(t, prefix(2048), 0, from, err) && pf.run(t, &s0, err) &&
-             continue_forced(t, *m, pool, 2100, fa, err) && pf.begin(t, prefix(3584), 2048, from, err);
-        const int64_t from_a = from;
-        ok                   = ok && pf.run(t, &st, err);
-        const std::string ca =
-            ok ? chunk_list(s0) + " | restored at " + std::to_string(from_a) + ": " + chunk_list(st) : "";
-        ok = ok && from_a == 2048 && continue_forced(t, *m, pool, ref_n, fa, err);
-        printf("prefill-test: append: chunks %s\n", ca.c_str());
-        nc = ok && nc1_case("append 2,048 -> 3,584", dec, pro, fa, tsv, vn) && nc;
-        if (ok) {
-            const std::string mu = mutual(f3, fa);
-            printf("prefill-test: append against fresh at 3,584 (diagnostic): %s\n", mu.c_str());
+        rel.xc = xc.get();
+        const auto prefix = [&](int64_t n) { return std::vector<int32_t>(pool.begin(), pool.begin() + n); };
+        int64_t from = -1;
+        rt::pf_run_stats st, s0;
+        bool ok = true;
+        if (pro.mode != "prompt") {
+            if (tsv != nullptr) {
+                fclose(tsv);
+            }
+            printf("prefill-test: NC1 section 6 (diagnostic, PB3 Amendment 3): unavailable: no prompt-mode logits "
+                   "reference exists\n");
             if (v.log != nullptr) {
-                fprintf(v.log, "append against fresh at 3,584 (diagnostic): %s\n", mu.c_str());
+                fprintf(v.log, "NC1 section 6 (diagnostic, PB3 Amendment 3): unavailable: no prompt-mode logits "
+                               "reference exists\n");
             }
-        }
-        if (tsv != nullptr) {
-            fclose(tsv);
-        }
-        if (!ok || !nc) {
-            if (!err.empty()) {
-                printf("prefill-test: NC1: %s\n", err.c_str());
+        } else {
+            // NC1 section 6: three cases, each bulk-prefilled, then teacher-forced to 4,095
+            fnfl_cont f2, f3, fa;
+            ok = pf.begin(t, prefix(2048), 0, from, err) && pf.run(t, &st, err);
+            const std::string c2 = ok ? chunk_list(st) : "";
+            ok = ok && continue_forced(t, *m, pool, ref_n, f2, err);
+            printf("prefill-test: fresh at 2,048: chunks %s (halves %d + %d)\n", c2.c_str(),
+                   st.chunks.empty() ? 0 : st.chunks[0].c.half[0], st.chunks.empty() ? 0 : st.chunks[0].c.half[1]);
+            nc = ok && nc1_case("fresh at 2,048", dec, pro, f2, tsv, vn) && nc;
+            ok = ok && pf.begin(t, prefix(3584), 0, from, err) && pf.run(t, &st, err);
+            const std::string c3 = ok ? chunk_list(st) : "";
+            ok = ok && continue_forced(t, *m, pool, ref_n, f3, err);
+            printf("prefill-test: fresh at 3,584: chunks %s (896 QSA blocks)\n", c3.c_str());
+            nc = ok && nc1_case("fresh at 3,584", dec, pro, f3, tsv, vn) && nc;
+            // append: 2,048, its prompt-end checkpoint restored, then to 3,584
+            ok = ok && pf.begin(t, prefix(2048), 0, from, err) && pf.run(t, &s0, err) &&
+                 continue_forced(t, *m, pool, 2100, fa, err) && pf.begin(t, prefix(3584), 2048, from, err);
+            const int64_t from_a = from;
+            ok = ok && pf.run(t, &st, err);
+            const std::string ca =
+                ok ? chunk_list(s0) + " | restored at " + std::to_string(from_a) + ": " + chunk_list(st) : "";
+            ok = ok && from_a == 2048 && continue_forced(t, *m, pool, ref_n, fa, err);
+            printf("prefill-test: append: chunks %s\n", ca.c_str());
+            nc = ok && nc1_case("append 2,048 -> 3,584", dec, pro, fa, tsv, vn) && nc;
+            if (ok) {
+                const std::string mu = mutual(f3, fa);
+                printf("prefill-test: append against fresh at 3,584 (diagnostic): %s\n", mu.c_str());
+                if (v.log != nullptr) {
+                    fprintf(v.log, "append against fresh at 3,584 (diagnostic): %s\n", mu.c_str());
+                }
             }
-        }
-        printf("prefill-test: NC1 section 6 (diagnostic, PB3 Amendment 3): %s\n",
-               plumb ? "zero weights, not judged" :
-               nc    ? "every case within the old thresholds" :
-                       "a case outside the old thresholds (reported, not gating)");
-        if (v.log != nullptr) {
-            fprintf(v.log, "NC1 section 6 (diagnostic, PB3 Amendment 3): %s\n", nc ? "within" : "outside");
-        }
-        if (!ok) {
-            v.put("NC1 section 6 cases run", false, "a case did not run");
-            return 1;
+            if (tsv != nullptr) {
+                fclose(tsv);
+            }
+            if (!ok || !nc) {
+                if (!err.empty()) {
+                    printf("prefill-test: NC1: %s\n", err.c_str());
+                }
+            }
+            printf("prefill-test: NC1 section 6 (diagnostic, PB3 Amendment 3): %s\n",
+                   plumb ? "zero weights, not judged"
+                   : nc  ? "every case within the old thresholds"
+                         : "a case outside the old thresholds (reported, not gating)");
+            if (v.log != nullptr) {
+                fprintf(v.log, "NC1 section 6 (diagnostic, PB3 Amendment 3): %s\n", nc ? "within" : "outside");
+            }
+            if (!ok) {
+                v.put("NC1 section 6 cases run", false, "a case did not run");
+                return 1;
+            }
         }
         // the 20,000-token checks (FNFL-internal)
         const std::vector<int32_t> P20 = prefix(L20);
@@ -1557,9 +1781,15 @@ int model_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, ve
         pf.prompt()->clear_site_counts();
         ok                       = pf.begin(t, P20, 0, from, err) && pf.run(t, &st, err) && snapshot(t, *m, hb);
         const std::string c20    = ok ? chunk_list(st) : "";
-        bool              active = false;
-        const std::string sites  = site_line(pf, active);
+        bool active = false;
+        const std::string sites = site_line(pf, active);
         pf.prompt()->set_hc_dump(md::hc_dump_spec());
+        if (ok && !a.out_dir.empty()) {
+            ok = dump_post_prefill_state(t, *m, hb, a.out_dir + "/state-dump");
+            if (!ok) {
+                err = "cannot write post-prefill state dump to " + a.out_dir + "/state-dump";
+            }
+        }
         v.put("20,000: bulk prefill",
               ok && c20 == "0+8192* 8192+8192* 16384+3616*" && handoff(t, L20).empty() && active,
               ok ? "chunks " + c20 + "; call sites: " + sites : err);
@@ -2569,15 +2799,18 @@ int vcheck_mode(const fnfl_target_args & a, verdicts & v) {
         o.model_path    = a.model_path;
         o.sample        = true;
         o.sampling.temp = 0.0f;
-        o.draft         = dopt;
-        o.timeout_s     = 120.0;
-        rt::target    t;
+        o.draft = dopt;
+        o.timeout_s = 120.0;
+        std::unique_ptr<rt::expert_cache> xc;
+        rt::target t;
         rt::prefiller pf;
-        if (!t.init(*m, o, err) || !pf.init(t, *m, err)) {
+        xc_release_guard rel;
+        if (!init_target_and_prefiller(a, *m, o, true, xc, t, pf, err)) {
             fprintf(stderr, "prefill-test: init: %s\n", err.c_str());
             free_host();
             return 1;
         }
+        rel.xc = xc.get();
         // a zero retained carry and NaN draft cells
         const auto prepare = [&]() {
             for (int32_t c = 0; c < 2; ++c) {

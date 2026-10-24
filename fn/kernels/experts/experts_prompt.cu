@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <type_traits>
@@ -60,6 +61,27 @@ static_assert(d_off(fmt::iq3_xxs) + 10 * 128 == tile_bytes(fmt::iq3_xxs) &&
                   d_off(fmt::iq2_xs) + 10 * 128 == tile_bytes(fmt::iq2_xs) &&
                   d_off(fmt::iq2_s) + 10 * 128 == tile_bytes(fmt::iq2_s),
               "EX1 tile bytes");
+
+// ME1: the K-quants (the Q4 candidate's routed gate/up; experts_dev.cuh): C main chunks [c][rec] (Q4_K 8: chunk m =
+// row m's 32 nibbles, byte t = weight t low and t + 16 high; Q5_K 10: [qh rows 0..3][r0..r3][qh rows 4..7][r4..r7],
+// 4 qh bytes a row, bit t = bit 4 of weight t), then sm [rec] 16 B (byte 2 m: row m's 6-bit scale, 2 m + 1 its min),
+// then d and dmin, each [j / 8][rs] 16 B
+__host__ __device__ constexpr bool is_kq(fmt f) {
+    return f == fmt::q4_k || f == fmt::q5_k;
+}
+__host__ __device__ constexpr int32_t kq_sm_off(fmt f) {
+    return (f == fmt::q5_k ? 10 : 8) * nt_threads * 16;
+}
+__host__ __device__ constexpr int32_t kq_d_off(fmt f) {
+    return kq_sm_off(f) + nt_threads * 16;
+}
+constexpr int32_t kq_dmin = 10 * 128; // dmin's plane after d's
+// the bytes of one (expert, group) tile, every format
+__host__ __device__ constexpr int32_t ep_tile_bytes(fmt f) {
+    return is_kq(f) ? kq_d_off(f) + 2 * kq_dmin : tile_bytes(f);
+}
+static_assert(ep_tile_bytes(fmt::q4_k) == nt_threads * 148 && ep_tile_bytes(fmt::q5_k) == nt_threads * 180,
+              "ME1 K-quant tile bytes (experts_dev.cuh)");
 
 // the grid buffer (experts.h grid_table): iq2xxs, iq2xs, iq2s, iq3xxs, iq3s grids, kvalues_iq4nl
 constexpr int32_t grid_off_iq2xxs = 0, grid_off_iq2xs = 2048, grid_off_iq2s = 6144, grid_off_iq3xxs = 14336,
@@ -195,7 +217,14 @@ struct gu_col {
 template <fmt F> __device__ __forceinline__ gu_col gu_col_of(int32_t rs, int32_t m) {
     gu_col c = {rs, m, 0, 0, 0};
     const int32_t rec16 = rs * 16; // record rs of sub-block 0
-    if constexpr (F == fmt::iq3_xxs || F == fmt::iq3_s) {
+    if constexpr (is_kq(F)) {
+        // ME1: o_a row m's main chunk, o_b its qh word (Q5_K), o_c its scale and min bytes
+        const int32_t cm = F == fmt::q5_k ? (m < 4 ? 1 + m : 2 + m) : m;
+        c.o_a = cm * nt_threads * 16 + rec16;
+        c.o_b = (m < 4 ? 0 : 5) * nt_threads * 16 + rec16 + 4 * (m & 3);
+        c.o_c = kq_sm_off(F) + rec16 + 2 * m;
+        return c;
+    } else if constexpr (F == fmt::iq3_xxs || F == fmt::iq3_s) {
         const int32_t h = m >> 2, i4 = m & 3;
         const int32_t qc = 3 * h + (i4 == 0 ? 0 : i4 == 1 ? 1 : 2), qb = i4 == 3 ? 8 : 0;
         const int32_t sc = 3 * h + (i4 < 2 ? 0 : 1), sb = (i4 & 1) ? 12 : 8;
@@ -252,7 +281,54 @@ template <fmt F> __device__ __forceinline__ void gu_prefetch(const uint8_t * w, 
 
 // this column's offsets (gu_load) for tile offset to
 template <fmt F> __device__ __forceinline__ int4 gu_offsets(const gu_col & c, int32_t to) {
+    if constexpr (is_kq(F)) {
+        // ME1: x the main chunk, y the qh word, z d (dmin kq_dmin after it), w the scale and min bytes
+        return make_int4(to + c.o_a, to + c.o_b, to + kq_d_off(F) + c.rs * 16 + 2 * c.m, to + c.o_c);
+    }
     return make_int4(to + c.o_a, to + c.o_b, to + d_off(F) + c.rs * 16 + 2 * c.m, to + c.o_c);
+}
+
+// ME1: one K-quant sub-block of the column: its 32 nibbles, the qh word (Q5_K), the superblock's FP16 d | dmin << 16
+// and the sub-block's 6-bit scale | min << 8
+struct kq_raw {
+    uint4 q;
+    uint32_t h, d, s;
+};
+template <fmt F> __device__ __forceinline__ kq_raw kq_load(const uint8_t * w, const int4 & o, int32_t j) {
+    kq_raw r;
+    r.d = __ldg(reinterpret_cast<const unsigned short *>(w + (o.z + (j >> 3) * 128))) |
+          (static_cast<uint32_t>(__ldg(reinterpret_cast<const unsigned short *>(w + (o.z + kq_dmin + (j >> 3) * 128))))
+           << 16);
+    r.s = __ldg(reinterpret_cast<const unsigned short *>(w + (o.w + j * 128)));
+    r.q = __ldg(reinterpret_cast<const uint4 *>(w + (o.x + j * 128)));
+    r.h = F == fmt::q5_k ? __ldg(reinterpret_cast<const uint32_t *>(w + (o.y + j * 128))) : 0u;
+    return r;
+}
+template <fmt F> __device__ __forceinline__ void kq_prefetch(const uint8_t * w, const int4 & o, int32_t j) {
+    prefetch_l2(w + (o.x + j * 128));
+    prefetch_l2(w + (o.w + j * 128));
+    if constexpr (F == fmt::q5_k) {
+        prefetch_l2(w + (o.y + j * 128));
+    }
+}
+template <fmt F> using raw_of = std::conditional_t<is_kq(F), kq_raw, gu_raw>;
+template <fmt F> __device__ __forceinline__ raw_of<F> raw_load(const uint8_t * w, const int4 & o, int32_t j) {
+    if constexpr (is_kq(F)) {
+        return kq_load<F>(w, o, j);
+    } else {
+        return gu_load<F>(w, o, j);
+    }
+}
+template <fmt F> __device__ __forceinline__ void raw_prefetch(const uint8_t * w, const int4 & o, int32_t j) {
+    if constexpr (is_kq(F)) {
+        kq_prefetch<F>(w, o, j);
+    } else {
+        gu_prefetch<F>(w, o, j);
+    }
+}
+// bits 0..3 of x to bit 0 of bytes 0..3 (the four shifted copies never overlap, so nothing carries)
+__device__ __forceinline__ uint32_t spread4(uint32_t x) {
+    return ((x & 0xfu) * 0x00204081u) & 0x01010101u;
 }
 
 // The sign mask of half-word k (weights 2 k, 2 k + 1 of an 8-weight group with sign bits s8): s8 x K puts bit 2 k at
@@ -286,8 +362,17 @@ template <fmt F> __device__ __forceinline__ gu_scale gu_scale_of(const gu_raw & 
     }
     return {s, hmul2(s, 0xe400e400u)};
 }
+// ME1: a K-quant sub-block's scale s = d x sc and its min term c = -(dmin x min), each rounded once to FP16 from the
+// exact F32 product
+__device__ __forceinline__ gu_scale kq_scale(const kq_raw & r) {
+    const float d = half_lo(r.d), dm = half_lo(r.d >> 16);
+    return {h2_of(d * static_cast<float>(r.s & 0xffu)), h2_of(-(dm * static_cast<float>(r.s >> 8)))};
+}
 __host__ __device__ constexpr int32_t task_rows_of(fmt f) {
-    return f == fmt::iq3_xxs || f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s || f == fmt::iq3_s ? 40 : 0;
+    return f == fmt::iq3_xxs || f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s || f == fmt::iq3_s ||
+                   is_kq(f)
+               ? 40
+               : 0;
 }
 __host__ __device__ constexpr bool two_scales(fmt f) {
     return f == fmt::iq2_xs || f == fmt::iq2_s;
@@ -341,26 +426,68 @@ __device__ __forceinline__ uint4 gu_chunk(const gu_raw & r, const gu_scale & p, 
     }
 }
 
+// ME1: chunk l of a K-quant sub-block, weights 8 l .. 8 l + 7: code q (5 bits with qh) under 0x64 is 1024 + q exactly,
+// minus 1024 is q; q x s + c rounds once
+template <fmt F> __device__ __forceinline__ uint4 kq_chunk(const kq_raw & r, const gu_scale & p, int32_t l) {
+    const int32_t sh = l >= 2 ? 4 : 0;
+    uint32_t v0 = ((l & 1 ? r.q.z : r.q.x) >> sh) & 0x0f0f0f0fu;
+    uint32_t v1 = ((l & 1 ? r.q.w : r.q.y) >> sh) & 0x0f0f0f0fu;
+    if constexpr (F == fmt::q5_k) {
+        const uint32_t hb = r.h >> (8 * l);
+        v0 |= spread4(hb) << 4;
+        v1 |= spread4(hb >> 4) << 4;
+    }
+    constexpr uint32_t c64 = 0x64646464u, c1024 = 0x64006400u;
+    const auto hw = [&](uint32_t v, uint32_t sel) { return hfma2(hsub2(__byte_perm(v, c64, sel), c1024), p.s, p.c); };
+    return make_uint4(hw(v0, 0x4140), hw(v0, 0x4342), hw(v1, 0x4140), hw(v1, 0x4342));
+}
+
 // ---- down: one 32-weight step of one output row -------------------------------------------------------------------
 // EX1's packed down layout (experts.cu): Q2_0 chunks [j5][n] 16 B then d [j5][n] FP16; IQ4_NL chunks [j10][n] 16 B
 // then d [j5][n][2] FP16 (j5 = 64 inputs, j10 = 32).
 __host__ __device__ constexpr int32_t dn_bytes(fmt f) {
-    return f == fmt::q2_0 ? 5 * D * 18 : 10 * D * 18; // = down_bytes(f)
+    return f == fmt::q5_1 ? 10 * D * 24 : f == fmt::q8_0 ? 10 * D * 34 : f == fmt::q2_0 ? 5 * D * 18 : 10 * D * 18;
 }
 
 struct dn_raw {
     uint4 q; // IQ4_NL: the block's 16 qs bytes; Q2_0: x, y the step's 8 qs bytes
     uint32_t d;
 };
+// ME1: Q5_1 (q as IQ4_NL's, d the block's FP16 d | m << 16, h its qh word); Q8_0 (q, q1 the block's int8 weights
+// 0..15 and 16..31)
+struct dn_raw_q5 {
+    uint4 q;
+    uint32_t d, h;
+};
+struct dn_raw_q8 {
+    uint4 q, q1;
+    uint32_t d;
+};
+template <fmt F>
+using dn_raw_of = std::conditional_t<F == fmt::q5_1, dn_raw_q5, std::conditional_t<F == fmt::q8_0, dn_raw_q8, dn_raw>>;
 // a staging thread's GLU values of one down step: Q2_0 a and b (16 halves), IQ4_NL a (8 halves)
 struct glu_raw {
     uint4 a, b;
 };
 
 // eo: the expert's byte offset (below 2^31: 512 x 460,800 bytes); n16: 16 x the output row
-template <fmt F> __device__ __forceinline__ dn_raw dn_load(const uint8_t * w, int32_t eo, int32_t n16, int32_t j) {
-    dn_raw r;
-    if constexpr (F == fmt::iq4_nl) {
+template <fmt F>
+__device__ __forceinline__ dn_raw_of<F> dn_load(const uint8_t * w, int32_t eo, int32_t n16, int32_t j) {
+    dn_raw_of<F> r;
+    if constexpr (F == fmt::q5_1) {
+        // ME1: the qs as IQ4_NL's, then [j5][n] 16 B: qh0, qh1, d0 | m0 << 16, d1 | m1 << 16
+        const int32_t e = eo + 10 * D * 16 + (j >> 1) * (D * 16) + n16 + 4 * (j & 1);
+        r.q = __ldg(reinterpret_cast<const uint4 *>(w + (eo + n16 + j * (D * 16))));
+        r.h = __ldg(reinterpret_cast<const uint32_t *>(w + e));
+        r.d = __ldg(reinterpret_cast<const uint32_t *>(w + (e + 8)));
+    } else if constexpr (F == fmt::q8_0) {
+        // ME1: chunks [j5][c][n] (block 2 j5 + c / 2's weights 16 (c & 1) ..), then d [j5][n][2] FP16
+        const int32_t o = eo + ((j >> 1) * 4 + 2 * (j & 1)) * (D * 16) + n16;
+        r.q = __ldg(reinterpret_cast<const uint4 *>(w + o));
+        r.q1 = __ldg(reinterpret_cast<const uint4 *>(w + (o + D * 16)));
+        r.d = __ldg(reinterpret_cast<const unsigned short *>(
+            w + (eo + 20 * D * 16 + (n16 >> 2) + (j >> 1) * (D * 4) + ((j & 1) << 1))));
+    } else if constexpr (F == fmt::iq4_nl) {
         constexpr int32_t d_plane = 10 * D * 16;
         r.q = __ldg(reinterpret_cast<const uint4 *>(w + (eo + n16 + j * (D * 16))));
         r.d = __ldg(reinterpret_cast<const unsigned short *>(
@@ -388,8 +515,32 @@ __device__ __forceinline__ void table16(uint32_t q, const uint32_t (&t)[4], uint
 // Chunk c of one output row's 32-weight step, in a fixed K order per format (the activation tile is permuted alike):
 // IQ4_NL chunk c holds weights 4 c .. 4 c + 3 and 16 + 4 c .. 16 + 4 c + 3 (qs word c alone); Q2_0 chunk 2 h + p holds
 // weights 16 h + 2 p + (0, 4, 8, 12, 1, 5, 9, 13) of the step.
-template <fmt F> __device__ __forceinline__ uint4 dn_chunk(const dn_raw & r, const uint32_t (&kv)[4], int32_t c) {
-    if constexpr (F == fmt::iq4_nl) {
+template <fmt F>
+__device__ __forceinline__ uint4 dn_chunk(const dn_raw_of<F> & r, const uint32_t (&kv)[4], int32_t c) {
+    if constexpr (F == fmt::q5_1 || F == fmt::q8_0) {
+        // ME1, in IQ4_NL's K order. Q5_1: code q (5 bits with qh) under 0x64 is 1024 + q exactly, minus 1024 is q;
+        // q x d + m rounds once. Q8_0: q + 128 under 0x64 is 1152 + q, minus 1152 is q; times d rounds once
+        constexpr uint32_t c64 = 0x64646464u;
+        const uint32_t d2 = (r.d & 0xffffu) | (r.d << 16);
+        const uint32_t w = c == 0 ? r.q.x : c == 1 ? r.q.y : c == 2 ? r.q.z : r.q.w;
+        uint32_t lo, hi;
+        if constexpr (F == fmt::q5_1) {
+            const uint32_t m2 = (r.d >> 16) | (r.d & 0xffff0000u);
+            lo = (w & 0x0f0f0f0fu) | (spread4(r.h >> (4 * c)) << 4);
+            hi = ((w >> 4) & 0x0f0f0f0fu) | (spread4(r.h >> (16 + 4 * c)) << 4);
+            const auto h = [&](uint32_t v, uint32_t s) {
+                return hfma2(hsub2(__byte_perm(v, c64, s), 0x64006400u), d2, m2);
+            };
+            return make_uint4(h(lo, 0x4140), h(lo, 0x4342), h(hi, 0x4140), h(hi, 0x4342));
+        } else {
+            lo = w ^ 0x80808080u;
+            hi = (c == 0 ? r.q1.x : c == 1 ? r.q1.y : c == 2 ? r.q1.z : r.q1.w) ^ 0x80808080u;
+            const auto h = [&](uint32_t v, uint32_t s) {
+                return hmul2(hsub2(__byte_perm(v, c64, s), 0x64806480u), d2);
+            };
+            return make_uint4(h(lo, 0x4140), h(lo, 0x4342), h(hi, 0x4140), h(hi, 0x4342));
+        }
+    } else if constexpr (F == fmt::iq4_nl) {
         // 128 + code under 0x64 is 1152 + code exactly; minus 1152 is the code; times d rounds once
         const uint32_t d2 = (r.d & 0xffffu) | (r.d << 16);
         constexpr uint32_t c64 = 0x64646464u, c1152 = 0x64806480u;
@@ -489,6 +640,27 @@ __device__ __forceinline__ task_t task_of(const int32_t * tasks, int32_t i) {
     const int4 t = __ldg(reinterpret_cast<const int4 *>(tasks) + i);
     return {t.x, t.y, t.z};
 }
+// ME4: the block's task: a ring group's first task added (the cache instantiation with task_off), computed where it is
+// needed rather than held across the K loop (gate/up has no register to spare at 96)
+template <bool X, typename A> __device__ __forceinline__ int32_t block_task(const A & a) {
+    if constexpr (X) {
+        if (a.task_off != nullptr) {
+            return static_cast<int32_t>(blockIdx.x) + __ldg(a.task_off + a.e_lo);
+        }
+    }
+    return static_cast<int32_t>(blockIdx.x);
+}
+// ME4: block_task for gate/up's epilogue, the group's first task read volatile (as task_rows) rather than with
+// __ldg: at 96 registers ptxas then allocates the IQ2_XXS and IQ3_S cache K loops without spills (ME4 Carlos CUDA)
+template <bool X, typename A> __device__ __forceinline__ int32_t block_task_fresh(const A & a) {
+    if constexpr (X) {
+        if (a.task_off != nullptr) {
+            return static_cast<int32_t>(blockIdx.x) + *reinterpret_cast<const volatile int32_t *>(a.task_off + a.e_lo);
+        }
+    }
+    return static_cast<int32_t>(blockIdx.x);
+}
+
 // the epilogue's (first, n), re-read rather than held across the K loop
 __device__ __forceinline__ int2 task_rows(const int32_t * tasks, int32_t i) {
     const volatile int32_t * t = tasks + 4 * i;
@@ -511,7 +683,8 @@ __device__ __forceinline__ int32_t c_col(int32_t lane, int32_t i) {
 // weight passes through shared memory. Threads below 192 stage the activation tiles (PB3: a ring of four, step j's
 // tile staged during step j - 2, one barrier every second step):
 // row t / 4 of the task, 8 values (t % 4) of the step's 32 FP16 values, as the producer wrote them.
-template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_kernel(ep_gate_up_args a) {
+// ME3: X, the cache's instantiation (ep_gate_up_args::wt); the resident one (X false) reads the bank as 412ecbd's
+template <bool X, fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_kernel(ep_gate_up_args a) {
     extern __shared__ uint4 smem_u4[];
     uint8_t * smem = reinterpret_cast<uint8_t *>(smem_u4);
     uint8_t * at = smem;
@@ -527,21 +700,33 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
     const gu_col col = gu_col_of<F>(r, (up ? 4 : 0) + ((ch & 31) >> 3));
     constexpr grid_spec G = grid_of(F);
     constexpr int32_t RT = task_rows_of(F) / 8;
-    const uint32_t lo = static_cast<uint32_t>((lane % G.rep) * G.eb);
+    constexpr int32_t rep = G.rep > 0 ? G.rep : 1; // ME1: the K-quants have no table
+    const uint32_t lo = static_cast<uint32_t>((lane % rep) * G.eb);
     const int32_t srow = tid >> 2, sq = tid & 3; // staging
     const uint32_t srow_a = tile_row(at + srow * 64, asw(srow));
     constexpr int32_t n_steps = D / ks;
-    constexpr int32_t TB = tile_bytes(F);
-    const int32_t task = static_cast<int32_t>(blockIdx.x);
+    constexpr int32_t TB = ep_tile_bytes(F);
+    const int32_t task = block_task<X>(a);
+    if constexpr (X) {
+        // ME4: a ring group's tasks only
+        if (a.task_off != nullptr && task >= __ldg(a.task_off + a.e_hi)) {
+            return;
+        }
+    }
     if (task >= n_tasks_of(a.route)) {
         return;
     }
-    build_tables<F>(tb, a.grids);
+    if constexpr (G.entries > 0) { // ME1: the K-quants have no table
+        build_tables<F>(tb, a.grids);
+    }
     {
         const task_t tk = task_of(a.route.tasks, task);
         const int32_t nt = (tk.n + 7) >> 3;
+        // ME1: the task's expert from the cache's table (offsets from its first byte), else from the resident bank
+        const uint8_t * const wb = X ? a.wt[tk.e] : a.w;
+        const int32_t e_tiles = X ? 0 : tk.e * n_group;
         // this column's load offsets, kept in shared memory and re-read each step (registers are the limit here)
-        reinterpret_cast<int4 *>(ofs)[tid] = gu_offsets<F>(col, (tk.e * n_group + g) * TB);
+        reinterpret_cast<int4 *>(ofs)[tid] = gu_offsets<F>(col, (e_tiles + g) * TB);
         // the staged row's FP16 values (rows of 5,120 bytes, 16-byte aligned), as a 32-bit offset in halves
         const bool sreal = tid < n_stage && srow < tk.n;
         const int32_t xo = sreal ? (__ldg(a.route.sorted + tk.first + srow) / n_used) * D + 8 * sq : 0;
@@ -556,7 +741,7 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
         // a step's 64 bytes of a row: one line, one of its 4 threads (not for IQ2_S and IQ3_S: at 96 registers they
         // spill with it)
         const auto x_prefetch = [&](int32_t j) {
-            if (F != fmt::iq2_s && F != fmt::iq3_s && sreal && sq == 0) {
+            if (F != fmt::iq2_s && F != fmt::iq3_s && !is_kq(F) && sreal && sq == 0) {
                 prefetch_l1(a.x + xo + j * ks);
             }
         };
@@ -573,11 +758,11 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
             }
             // two raw slots with compile-time indices (R12): slot j & 1 holds sub-block j; sub-block j + 1 is loaded
             // during step j (a step ahead of its unpacking)
-            gu_raw raw[2];
+            raw_of<F> raw[2];
             {
                 const int4 o = ld_ofs(ofs + 16 * tid);
-                raw[0] = gu_load<F>(a.w, o, 0);
-                gu_prefetch<F>(a.w, o, 1);
+                raw[0] = raw_load<F>(wb, o, 0);
+                raw_prefetch<F>(wb, o, 1);
             }
             x_prefetch(2);
             x_stage(x_load(0), srow_a);
@@ -588,30 +773,55 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
             const auto step = [&](auto tile, int32_t j) {
                 constexpr int32_t T = decltype(tile)::value; // j & 3
                 constexpr int32_t P = T & 1;                 // the raw slot
-                if (j + 3 < n_steps) {
-                    x_prefetch(j + 3);
-                }
-                if (j + 1 < n_steps) {
-                    const int4 o = ld_ofs(ofs + 16 * tid);
-                    raw[P ^ 1] = gu_load<F>(a.w, o, j + 1);
+                if constexpr (is_kq(F)) {
+                    // ME1: the next sub-block is loaded once chunks 0 and 2 have consumed words x, y of this one (both
+                    // slots whole spill at 96 registers); chunks in the order 0, 2, 1, 3
                     if (j + 2 < n_steps) {
-                        gu_prefetch<F>(a.w, o, j + 2);
+                        x_stage(x_load(j + 2), srow_a + ((T + 2) & 3) * a_tile);
                     }
-                }
-                if (j + 2 < n_steps) {
-                    x_stage(x_load(j + 2), srow_a + ((T + 2) & 3) * a_tile); // rows hit L1 (prefetched): x is a few MB
-                }
-                const a_rows ar = {arow.even + T * a_tile, arow.odd + T * a_tile};
-                gu_scale sc = gu_scale_of<F>(raw[P], 0);
+                    const a_rows ar = {arow.even + T * a_tile, arow.odd + T * a_tile};
+                    const gu_scale sc = kq_scale(raw[P]);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 0), ar, 0);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 2), ar, 2);
+                    if (j + 1 < n_steps) {
+                        const int4 o = ld_ofs(ofs + 16 * tid);
+                        raw[P ^ 1] = raw_load<F>(wb, o, j + 1);
+                        if (j + 2 < n_steps) {
+                            raw_prefetch<F>(wb, o, j + 2);
+                        }
+                    }
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 1), ar, 1);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 3), ar, 3);
+                    if constexpr ((T & 1) != 0) {
+                        __syncthreads();
+                    }
+                } else {
+                    if (j + 3 < n_steps) {
+                        x_prefetch(j + 3);
+                    }
+                    if (j + 1 < n_steps) {
+                        const int4 o = ld_ofs(ofs + 16 * tid);
+                        raw[P ^ 1] = raw_load<F>(wb, o, j + 1);
+                        if (j + 2 < n_steps) {
+                            raw_prefetch<F>(wb, o, j + 2);
+                        }
+                    }
+                    if (j + 2 < n_steps) {
+                        // rows hit L1 (prefetched): x is a few MB
+                        x_stage(x_load(j + 2), srow_a + ((T + 2) & 3) * a_tile);
+                    }
+                    const a_rows ar = {arow.even + T * a_tile, arow.odd + T * a_tile};
+                    gu_scale sc = gu_scale_of<F>(raw[P], 0);
 #pragma unroll
-                for (int32_t l = 0; l < 4; ++l) {
-                    if (two_scales(F) && l == 2) {
-                        sc = gu_scale_of<F>(raw[P], 1);
+                    for (int32_t l = 0; l < 4; ++l) {
+                        if (two_scales(F) && l == 2) {
+                            sc = gu_scale_of<F>(raw[P], 1);
+                        }
+                        mma_chunk<NT>(acc, gu_chunk<F>(raw[P], sc, tb, lo, l), ar, l);
                     }
-                    mma_chunk<NT>(acc, gu_chunk<F>(raw[P], sc, tb, lo, l), ar, l);
-                }
-                if constexpr ((T & 1) != 0) {
-                    __syncthreads();
+                    if constexpr ((T & 1) != 0) {
+                        __syncthreads();
+                    }
                 }
             };
             static_assert(n_steps % gu_tiles == 0, "whole rings");
@@ -624,7 +834,7 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
 
             // GLU: lanes of quadpairs 0, 1 hold gate, their partners (lane ^ 8) up at the same places; each lane finishes
             // half of the elements (gate lanes 0..3, up lanes 4..7) and stores pairs of adjacent channels
-            const int2 fr = task_rows(a.route.tasks, static_cast<int32_t>(blockIdx.x));
+            const int2 fr = task_rows(a.route.tasks, block_task_fresh<X>(a));
             // the thread's place, re-read rather than held across the K loop (one register short at 96)
             const int32_t etid = tid_fresh(), elane = etid & 31, ew = etid >> 5, eqp = (elane >> 2) & 3;
             const bool eup = eqp >= 2;
@@ -669,7 +879,8 @@ template <fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gate_up_ker
 // 10 steps) are staged once, behind one barrier, so the K loops have none; the weight stream runs on across the groups
 // (step s = 10 g + j sits in slot j & 1 and is loaded during step s - 1), so each task pays its prologue once; group g's
 // partials are stored when its 10 steps end. Each partial is the same products in the same order as one launch a group.
-template <fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel(ep_down_args a) {
+// ME3: X as ep_gate_up_kernel's
+template <bool X, fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel(ep_down_args a) {
     extern __shared__ uint4 smem_u4[];
     uint8_t * at = reinterpret_cast<uint8_t *>(smem_u4); // [n_steps] activation tiles, step j at + j a_tile
     const int32_t tid = static_cast<int32_t>(threadIdx.x);
@@ -682,7 +893,13 @@ template <fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel
     const int32_t srow = tid >> 2, sq = tid & 3;
     constexpr int32_t n_steps = n_ff_card / ks;
     static_assert(n_steps % 2 == 0, "steps a pair: step 10 g + j sits in slot j & 1");
-    const int32_t task = static_cast<int32_t>(blockIdx.x);
+    const int32_t task = block_task<X>(a);
+    if constexpr (X) {
+        // ME4: a ring group's tasks only
+        if (a.task_off != nullptr && task >= __ldg(a.task_off + a.e_hi)) {
+            return;
+        }
+    }
     if (task >= n_tasks_of(a.route)) {
         return;
     }
@@ -697,10 +914,12 @@ template <fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel
     {
         const task_t tk = task_of(a.route.tasks, task);
         const int32_t nt = (tk.n + 7) >> 3;
-        const int32_t eo = tk.e * dn_bytes(F);
+        // ME1: the task's expert from the cache's table, else from the resident bank
+        const uint8_t * const wb = X ? a.wt[tk.e] : a.w;
+        const int32_t eo = X ? 0 : tk.e * dn_bytes(F);
         // two raw slots with compile-time indices (R12); step 0's weights load beside the staging
-        dn_raw raw[2];
-        raw[0] = dn_load<F>(a.w, eo, n16, 0);
+        dn_raw_of<F> raw[2];
+        raw[0] = dn_load<F>(wb, eo, n16, 0);
         // the GLU rows: IQ4_NL threads below 192 stage chunk t % 4 of row t / 4 (halves 4 c .. 4 c + 3 and 16 + 4 c ..
         // 16 + 4 c + 3 of the step); Q2_0 threads below 96 stage 16 halves (row t / 2, chunks 2 (t % 2) and
         // 2 (t % 2) + 1, permuted as the weights). Every step's tile, in two batches of loads then stores (the stores
@@ -758,9 +977,9 @@ template <fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel
             const auto step = [&](auto par, int32_t g, int32_t j) {
                 constexpr int32_t P = decltype(par)::value;
                 if (j + 1 < n_steps) {
-                    raw[P ^ 1] = dn_load<F>(a.w, eo, n16 + g * g16, j + 1);
+                    raw[P ^ 1] = dn_load<F>(wb, eo, n16 + g * g16, j + 1);
                 } else if (g + 1 < ep_n_col_groups) {
-                    raw[P ^ 1] = dn_load<F>(a.w, eo, n16 + (g + 1) * g16, 0);
+                    raw[P ^ 1] = dn_load<F>(wb, eo, n16 + (g + 1) * g16, 0);
                 }
                 const a_rows ar = {arow.even + j * a_tile, arow.odd + j * a_tile};
 #pragma unroll
@@ -783,7 +1002,7 @@ template <fmt F> __global__ void __launch_bounds__(dn_threads, 1) ep_down_kernel
                 }
                 // group g's partials, pairs of adjacent columns: F32, or FP16 rounded once (PB3: half the bytes the
                 // sum reads back)
-                const int2 fr = task_rows(a.route.tasks, static_cast<int32_t>(blockIdx.x));
+                const int2 fr = task_rows(a.route.tasks, block_task<X>(a));
                 bool big = false;
 #pragma unroll
                 for (int32_t t = 0; t < NT; ++t) {
@@ -1024,24 +1243,36 @@ bool smem_per_device(std::atomic<uint32_t> & done, const void * kernel, int32_t 
     return true;
 }
 
-template <fmt F> bool launch_gate_up(const ep_gate_up_args & a, cudaStream_t st) {
+template <bool X, fmt F> bool launch_gate_up_x(const ep_gate_up_args & a, cudaStream_t st) {
     constexpr int32_t smem = gu_smem(F);
     static std::atomic<uint32_t> done{ 0u };
-    if (!smem_per_device(done, reinterpret_cast<const void *>(ep_gate_up_kernel<F>), smem)) {
+    if (!smem_per_device(done, reinterpret_cast<const void *>(ep_gate_up_kernel<X, F>), smem)) {
         return false;
     }
-    ep_gate_up_kernel<F><<<ep_max_tasks, nt_threads, smem, st>>>(a);
+    const int32_t grid = X && a.task_off != nullptr && a.grid > 0 ? std::min(a.grid, ep_max_tasks) : ep_max_tasks;
+    ep_gate_up_kernel<X, F><<<grid, nt_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-template <fmt F> bool launch_down(const ep_down_args & a, cudaStream_t st) {
+// ME3: the cache's instantiation when the arguments carry its table, else the resident one
+template <fmt F> bool launch_gate_up(const ep_gate_up_args & a, cudaStream_t st) {
+    return a.wt != nullptr ? launch_gate_up_x<true, F>(a, st) : launch_gate_up_x<false, F>(a, st);
+}
+
+template <bool X, fmt F> bool launch_down_x(const ep_down_args & a, cudaStream_t st) {
     constexpr int32_t smem = (n_ff_card / ks) * a_tile; // every step's GLU tile
     static std::atomic<uint32_t> done{ 0u };  // PB1: per device, as above
-    if (!smem_per_device(done, reinterpret_cast<const void *>(ep_down_kernel<F>), smem)) {
+    if (!smem_per_device(done, reinterpret_cast<const void *>(ep_down_kernel<X, F>), smem)) {
         return false;
     }
-    ep_down_kernel<F><<<ep_max_tasks, dn_threads, smem, st>>>(a);
+    const int32_t grid = X && a.task_off != nullptr && a.grid > 0 ? std::min(a.grid, ep_max_tasks) : ep_max_tasks;
+    ep_down_kernel<X, F><<<grid, dn_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// ME3: as launch_gate_up
+template <fmt F> bool launch_down(const ep_down_args & a, cudaStream_t st) {
+    return a.wt != nullptr ? launch_down_x<true, F>(a, st) : launch_down_x<false, F>(a, st);
 }
 
 } // namespace
@@ -1067,6 +1298,33 @@ int32_t ep_task_rows(fmt gate_up) {
     return task_rows_of(gate_up);
 }
 
+// ME4: each expert's first task by a binary search of ep_group's tasks (sorted by expert); off[n_expert] the count
+__global__ void __launch_bounds__(544)
+    ep_task_off_kernel(const int32_t * tasks, const int32_t * counters, int32_t * off) {
+    const int32_t e = static_cast<int32_t>(threadIdx.x);
+    if (e > n_expert) {
+        return;
+    }
+    int32_t lo = 0, hi = *reinterpret_cast<const volatile int32_t *>(counters);
+    while (lo < hi) {
+        const int32_t mid = (lo + hi) >> 1;
+        if (tasks[4 * mid] < e) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    off[e] = lo;
+}
+
+bool ep_task_offsets(const ep_route & r, int32_t * task_off, void * stream) {
+    if (!route_ok(r) || !aligned4(task_off) || stream == nullptr) {
+        return false;
+    }
+    ep_task_off_kernel<<<1, 544, 0, static_cast<cudaStream_t>(stream)>>>(r.tasks, r.counters, task_off);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool ep_group(int32_t rows, int32_t task_rows, const int32_t * ids, const ep_route & r, uint32_t * status,
               void * stream) {
     if (rows < 1 || rows > ep_max_rows || task_rows < 8 || task_rows > ep_pass_rows || task_rows % 8 != 0 ||
@@ -1080,7 +1338,9 @@ bool ep_group(int32_t rows, int32_t task_rows, const int32_t * ids, const ep_rou
 bool ep_gate_up(fmt f, int32_t rows, const ep_gate_up_args & a, void * stream) {
     if (rows < 1 || rows > ep_max_rows || !aligned16(a.w) || !aligned16(a.grids) || !aligned16(a.x) ||
         !route_ok(a.route) || !aligned4(a.glu) || stream == nullptr ||
-        (a.glu_f32 != nullptr && !aligned16(a.glu_f32))) {
+        (a.glu_f32 != nullptr && !aligned16(a.glu_f32)) || (reinterpret_cast<uintptr_t>(a.wt) & 7u) != 0 ||
+        (a.task_off != nullptr && (a.wt == nullptr || !aligned4(a.task_off) || a.e_lo < 0 || a.e_lo > a.e_hi ||
+                                   a.e_hi > n_expert || a.grid < 0))) {
         return false;
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
@@ -1095,6 +1355,10 @@ bool ep_gate_up(fmt f, int32_t rows, const ep_gate_up_args & a, void * stream) {
             return launch_gate_up<fmt::iq3_xxs>(a, st);
         case fmt::iq3_s:
             return launch_gate_up<fmt::iq3_s>(a, st);
+        case fmt::q4_k:
+            return launch_gate_up<fmt::q4_k>(a, st);
+        case fmt::q5_k:
+            return launch_gate_up<fmt::q5_k>(a, st);
         default:
             return false;
     }
@@ -1103,7 +1367,9 @@ bool ep_gate_up(fmt f, int32_t rows, const ep_gate_up_args & a, void * stream) {
 bool ep_down(fmt f, int32_t rows, const ep_down_args & a, void * stream) {
     if (rows < 1 || rows > ep_max_rows || !aligned16(a.w) || !aligned16(a.grids) || !aligned16(a.glu) ||
         !route_ok(a.route) || (a.part16 != nullptr ? !aligned16(a.part16) || a.err == nullptr : !aligned16(a.part)) ||
-        stream == nullptr) {
+        stream == nullptr || (reinterpret_cast<uintptr_t>(a.wt) & 7u) != 0 ||
+        (a.task_off != nullptr && (a.wt == nullptr || !aligned4(a.task_off) || a.e_lo < 0 || a.e_lo > a.e_hi ||
+                                   a.e_hi > n_expert || a.grid < 0))) {
         return false;
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
@@ -1112,6 +1378,10 @@ bool ep_down(fmt f, int32_t rows, const ep_down_args & a, void * stream) {
             return launch_down<fmt::q2_0>(a, st);
         case fmt::iq4_nl:
             return launch_down<fmt::iq4_nl>(a, st);
+        case fmt::q5_1:
+            return launch_down<fmt::q5_1>(a, st);
+        case fmt::q8_0:
+            return launch_down<fmt::q8_0>(a, st);
         default:
             return false;
     }

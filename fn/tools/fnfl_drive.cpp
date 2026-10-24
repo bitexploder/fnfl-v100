@@ -9,8 +9,9 @@
 //
 // usage: fnfl-drive act-test [DEVICE]   (C2: the quantize kernel bitwise against the CPU reference)
 //        fnfl-drive act-bench [DEVICE] [all|acceptance]
-//        fnfl-drive gd-test [DEVICE] [all|short|chain|map|inv|san] [MODEL]   (GD1: DEVICE is the card; the weights
-//            of layers 10 and 40 are read from MODEL's file, no model load)
+//        fnfl-drive gd-test [DEVICE] [all|short|chain|map|inv|replay|san] [MODEL]   (GD1: DEVICE is the card; the
+//            weights of layers 10 and 40 are read from MODEL's file, no model load; ME11's replay: the compact state
+//            bitwise against the pre-ME11 kernel)
 //        fnfl-drive gd-bench [DEVICE] [all|ncu|probe|diag]
 //        fnfl-drive ple-test [all|san] [DEV0] [DEV1] [MODEL]   (E1: defaults all 0 1; DEV0 == DEV1: loopback on one
 //            device, for Compute Sanitizer; layer 1's PLE tensors, token_embd rows, PLE table rows and the ple.* keys
@@ -26,17 +27,20 @@
 //        fnfl-drive qa2-test [DEVICE] [all|san] [MODEL] [FIXTURE]   (QA2: attend against its FP64 reference; layer 11's
 //            norms and the rope and attention keys read from MODEL's file, no model load; FIXTURE: QA1's HX7 case)
 //        fnfl-drive qa2-bench [DEVICE] [all|ncu] [FIXTURE]   (QA2 steps 4-5)
+//        fnfl-drive kv-tier-test [DEVICE] [all|san]   (ME1: the host-backed KV tier against a resident cache, bitwise;
+//            synthetic, no model data; san: 32,768 cells for Compute Sanitizer)
 //        fnfl-drive draft-kernel-test [DEV0] [DEV1] [all|san]   (DR1 Stage C: the draft kernels against FP64)
 //        fnfl-drive draft-kernel-bench [DEV0] [DEV1]   (DR1 Stage C: DA-TC at the four depths, X-DRAFT-IN on both)
 //        fnfl-drive ex-calib [DEVICE]
 //        fnfl-drive ex-prep [CACHE]   (CPU only: the synthetic expert weights)
+//        fnfl-drive ex-cpu-test [CACHE]   (CPU only, ME2: the CPU miss path round trip, against FP64, a throughput line)
 //        fnfl-drive ex-test [DEVICE] [ROWS] [FORMATS] [CACHE] [BASE]   (EX2: ROWS like 1,2,3,4; FORMATS all, san or
 //            routed gate/up formats like iq2_xxs,iq3_s: every deployed instantiation with the shared expert; XB2:
 //            BASE, 71b92a9's experts cubins, adds the xb3-bitwise and xb4-bitwise arms)
 //        fnfl-drive ex-bench [DEVICE] [all|POINT] [CACHE] [HX7]   (EX2: every deployed launch warm and cold, HX7's
 //            captured routing; HX7: the capture directory; XB2: xb2prof:POINTS, each point once a decode for ncu;
 //            SP4 Amendment 1: sp4prof:POINTS:MAP, B = 5 on four decodes, cold, MAP 0 SP2 or 1 SP4, for ncu)
-//        fnfl-drive ep-prep [REFS] [CACHE] [ROUTES]   (CPU only: ep-test's FP64 references)
+//        fnfl-drive ep-prep [REFS] [CACHE] [ROUTES] [all|q4]   (CPU only: ep-test's FP64 references; q4: ME1's)
 //        fnfl-drive ep-test [DEVICE] [ROWS] [FORMATS] [full|san] [REFS] [CACHE] [ROUTES]   (ROWS like 128,1536)
 //        fnfl-drive ep-bench [DEVICE] [all|ncu] [CACHE] [ROUTES]   (ROUTES: FN4's routes.txt)
 //        fnfl-drive grid-test [HEADER]   (CPU only: the grid tables against ggml-common.h at 66e11c3; default the
@@ -46,6 +50,7 @@
 //        fnfl-drive xchg-test [DEV0] [DEV1] [ROUNDS] [ROWS]   (defaults 0 1 10000 1,3)
 //        fnfl-drive hc2-test [DEV0] [DEV1] [ROWS]   (default ROWS 1,2,3,4,5)
 //            (DEV0 == DEV1: loopback on one device and one stream, sends before reads: for Compute Sanitizer)
+//        fnfl-drive hcj-test [DEV0] [DEV1]   (FMU2: the joint sublayer against each lane's own; DEV0 == DEV1 loopback)
 //        fnfl-drive hc2-bench [DEV0] [DEV1] [all|ncu|ncu-up|ncu-fused|nsys|q8|cold]   (q8: DR1; cold, ncu-up, ncu-fused: HC4)
 //        fnfl-drive load-plan [OUT] [MODEL] [DRAFT]   (CPU only: the placement, the GGUF slice hashes, the dry run)
 //        fnfl-drive load-check [OUT] [CELLS] [MODEL] [DRAFT]   (devices 0 and 1; default CELLS 198,720)
@@ -54,6 +59,10 @@
 //            beside the read kernel and EP1's gate/up; default 0 1 all)
 //        fnfl-drive dp-test [DEVICE] [ROWS|all] [full|san|all]   (DP1, DP2; ROWS like 1,3, default all; san: the
 //            vocabulary at 8,192 rows, full: at 124,160, all: both; default full)
+//        fnfl-drive dpj-test [DEVICE] [full|san] [CASE]   (FMU2: the joint product at U = 2, 3, 4 lanes against each
+//            lane's B = 5 launch, bitwise, and FP64; FMU4: then "sampled pick", the joint draft step's sampled pick
+//            against each lane's lone pick on DEVICE and the other, san: loopback; san: fewer cases, U = 2 and 4; CASE:
+//            only the cases whose name contains one of its '|'-separated parts)
 //        fnfl-drive dp-bench [DEVICE] [all|seq|nsys|ncu:POINT|group:NAME]   (DP1 steps 6-8, DP2 steps 5-7)
 //        fnfl-drive pd-test|hcp-test|gdp-test|qsp-test|pe-test|dcp-test [DEVICE] [full|san]   (PB1: the prompt
 //            kernels against their FP64 or bitwise references: dense and router, HC and the exchange, GDN, QSA,
@@ -117,15 +126,18 @@
 //            lazy (default, PN1 Amendment 1): the plain mapping and PL1's hints; full: read into RAM and pinned at
 //            the load; generate --evict-ple needs lazy
 
+#include "fn/fnfl.h"
 #include "fn/kernels/act/act_test.h"
 #include "fn/kernels/dense/dense_bench.h"
 #include "fn/kernels/dense/dense_prompt_test.h"
+#include "fn/kernels/dense/dense_joint_test.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/draft/draft_bench.h"
 #include "fn/kernels/draft/draft_prompt_test.h"
 #include "fn/kernels/draft/draft_test.h"
 #include "fn/kernels/experts/experts_bench.h"
 #include "fn/kernels/experts/experts_calib.h"
+#include "fn/kernels/experts/experts_cpu_test.h"
 #include "fn/kernels/experts/experts_prompt_bench.h"
 #include "fn/kernels/experts/experts_prompt_test.h"
 #include "fn/kernels/experts/experts_test.h"
@@ -150,6 +162,7 @@
 #include "fn/kernels/samp/samp_ref.h"
 #include "fn/kernels/samp/samp_test.h"
 #include "fn/loader/load_check.h"
+#include "fn/model/kv_tier_test.h"
 #include "fn/proto/px1/px1_link.h"
 #include "fn/proto/xp1/xp1_bench.h"
 #include "fn/proto/xp1/xp1_test.h"
@@ -162,6 +175,7 @@
 #include "fn/xchg/xchg2_test.h"
 #include "fn/xchg/xchg_test.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -199,9 +213,18 @@ static bool parse_list(const char * s, std::vector<int32_t> & out) {
 }
 
 // a row-count list such as 1,3 as a mask (bit B-1); false on anything but digits 1..4 and commas
-// DR1: --draft-attention V and --draft-subset FILE from argv[from ..] into a; the other arguments in order into rest
+// DR1: --draft-attention V and --draft-subset FILE from argv[from ..] into a; the other arguments in order into rest.
+// ME7: --draft-model FILE, the MTP draft GGUF (default: the Q8_0 draft; the Q2 draft is work/ME7's splice)
 static bool draft_flags(int argc, char ** argv, int from, fnfl_target_args & a, std::vector<std::string> & rest) {
     for (int i = from; i < argc; ++i) {
+        if (strcmp(argv[i], "--draft-model") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s: no value\n", argv[i]);
+                return false;
+            }
+            a.draft_path = argv[++i];
+            continue;
+        }
         const bool att = strcmp(argv[i], "--draft-attention") == 0;
         if (att || strcmp(argv[i], "--draft-subset") == 0) {
             if (i + 1 >= argc) {
@@ -251,6 +274,158 @@ static bool parse_rows(const char * s, uint32_t & mask) {
     return mask != 0u;
 }
 
+// ME3 (fnfl-drive settings test; no model, no device): the server's settings path (fnfl_settings, the glue's) against
+// the driver's parse. Each table entry given once in its server spelling must read back as the driver's spelling
+// parses it (the same request JSON); a cache setting without the cache, a K/V one without --kv-host, a value out of
+// range and an unknown name are refused; then the read-back and the request JSON of a server start with every
+// setting at a value of its own
+// KV8 Amendment 1: fnfl_kv_format over every combination of the given value (none, bf16, q8, an invalid one) and the
+// configuration (Config A, one card, cached TP, one card with the host KV), against the table below; no model
+static int kv_format_test() {
+    struct cfg {
+        const char * name;
+        int32_t single_card;
+        bool cached_tp, kv_host;
+    };
+    const cfg cfgs[] = {{"Config A", -1, false, false},
+                        {"--fnfl-single-card 0", 0, false, false},
+                        {"--fnfl-cached-tp", -1, true, false},
+                        {"--fnfl-single-card 0 --fnfl-kv-host", 0, false, true}};
+    struct want {
+        bool ok, q8;
+        const char * line; // the startup text, or a fragment of the refusal
+    };
+    // [value][configuration]
+    const char * values[] = {"", "bf16", "q8", "q4"};
+    const want table[4][4] = {
+        {{true, true, "q8 (default)"},
+         {true, false, "bf16 (default: --fnfl-single-card has no q8)"},
+         {true, false, "bf16 (default: --fnfl-cached-tp has no q8)"},
+         {true, false, "bf16 (default: --fnfl-single-card with --fnfl-kv-host has no q8)"}},
+        {{true, false, "bf16"}, {true, false, "bf16"}, {true, false, "bf16"}, {true, false, "bf16"}},
+        {{true, true, "q8"},
+         {false, false, "serves resident TP on two cards (Config A) only"},
+         {false, false, "serves resident TP on two cards (Config A) only"},
+         {false, false, "serves resident TP on two cards (Config A) only"}},
+        {{false, false, "is bf16 or q8, not 'q4'"},
+         {false, false, "is bf16 or q8, not 'q4'"},
+         {false, false, "is bf16 or q8, not 'q4'"},
+         {false, false, "is bf16 or q8, not 'q4'"}}};
+    int32_t bad = 0, n = 0;
+    for (int32_t v = 0; v < 4; ++v) {
+        for (int32_t k = 0; k < 4; ++k) {
+            fnfl_config c;
+            c.kv_format = values[v];
+            c.single_card = cfgs[k].single_card;
+            c.cached_tp = cfgs[k].cached_tp;
+            c.kv_host = cfgs[k].kv_host;
+            fnfl_kv_choice out;
+            std::string err;
+            const bool ok = fnfl_kv_format(c, out, err);
+            const want & w = table[v][k];
+            const bool pass = ok == w.ok && (ok ? out.q8 == w.q8 && out.line == w.line
+                                                : err.find(w.line) != std::string::npos && !out.q8);
+            ++n;
+            bad += pass ? 0 : 1;
+            printf("kv-format-test: --fnfl-kv-format %-4s %-38s -> %s: %s\n", values[v][0] ? values[v] : "(none)",
+                   cfgs[k].name, ok ? out.line.c_str() : ("refused: " + err).c_str(), pass ? "PASS" : "FAIL");
+        }
+    }
+    printf("kv-format-test: %s (%d of %d combinations as the table)\n", bad == 0 ? "PASS" : "FAIL", n - bad, n);
+    return bad == 0 ? 0 : 1;
+}
+
+static int settings_test() {
+    // a legal value for each entry, "derived" ones given a CPU (checked against the allowed set at init, not here)
+    auto sample = [](const fn::settings::entry & e) -> std::string {
+        const std::string n = e.name;
+        if (n == "worker-cpus") {
+            return "2,3";
+        }
+        if (n == "helper-cpus") {
+            return "4,5";
+        }
+        if (n == "service-cpu") {
+            return "1";
+        }
+        if (n == "decode-cpu") {
+            return "0";
+        }
+        return e.def;
+    };
+    int32_t n_ok = 0, n_bad = 0;
+    for (int32_t i = 0; i < fn::settings::n_entries; ++i) {
+        const fn::settings::entry & e = fn::settings::table[i];
+        const std::string val = sample(e);
+        fn::settings::values vd, vs;
+        std::string err, text;
+        const bool dp = fn::settings::find(e.drive) == i && fn::settings::parse(i, val, vd, err);
+        fnfl_config c;
+        c.single_card = 0;
+        c.kv_host = true;
+        c.settings.emplace_back(e.serve, val);
+        const bool sp = fn::settings::find(e.serve) == i && fnfl_settings(c, vs, text, err);
+        const bool same = dp && sp && fn::settings::json(vd) == fn::settings::json(vs);
+        n_ok += same ? 1 : 0;
+        n_bad += same ? 0 : 1;
+        if (!same) {
+            printf("settings test: %s / %s %s: the driver %s, the server %s, %s (%s)\n", e.drive, e.serve,
+                   val.c_str(), dp ? "parses" : "refuses", sp ? "parses" : "refuses",
+                   dp && sp ? "different JSON" : "-", err.c_str());
+        }
+    }
+    printf("settings test: %d of %d entries parse alike in both spellings (driver %s, server fnfl_settings)%s\n",
+           n_ok, fn::settings::n_entries, "fn::settings::parse", n_bad == 0 ? "" : ": FAIL");
+    struct refusal {
+        const char * what;
+        const char * name;
+        const char * val;
+        bool cache, kv;
+    };
+    const refusal rs[] = {
+        {"a cache setting without the cache", "--fnfl-expert-short-read", "64", false, false},
+        {"a K/V setting without --fnfl-kv-host", "--fnfl-kv-window", "32768", true, false},
+        {"a value out of range", "--fnfl-expert-swap-decay", "1.5", true, true},
+        {"a chunk not a multiple of 256", "--fnfl-expert-prompt-chunk", "1000", true, true},
+        {"an unknown name", "--fnfl-expert-nothing", "1", true, true},
+    };
+    int32_t n_ref = 0;
+    for (const refusal & r : rs) {
+        fnfl_config c;
+        c.single_card = r.cache ? 0 : -1;
+        c.kv_host = r.kv;
+        c.settings.emplace_back(r.name, r.val);
+        fn::settings::values v;
+        std::string err, text;
+        const bool refused = !fnfl_settings(c, v, text, err);
+        n_ref += refused ? 1 : 0;
+        printf("settings test: %s (%s %s): %s%s%s\n", r.what, r.name, r.val, refused ? "refused: " : "ACCEPTED",
+               refused ? err.c_str() : "", refused ? "" : ": FAIL");
+    }
+    // the executor (scope 0) without the cache: accepted
+    fnfl_config c0;
+    c0.settings.emplace_back("--fnfl-expert-executor", "eager");
+    fn::settings::values v0;
+    std::string e0, t0;
+    const bool exec_ok = fnfl_settings(c0, v0, t0, e0) && v0.executor == "eager";
+    printf("settings test: the executor without the cache (--fnfl-expert-executor eager): %s\n",
+           exec_ok ? "accepted, eager" : "FAIL");
+    fnfl_config ca;
+    ca.single_card = 0;
+    ca.kv_host = true;
+    for (int32_t i = 0; i < fn::settings::n_entries; ++i) {
+        ca.settings.emplace_back(fn::settings::table[i].serve, sample(fn::settings::table[i]));
+    }
+    fn::settings::values va;
+    std::string ea, ta;
+    const bool all_ok = fnfl_settings(ca, va, ta, ea);
+    printf("settings test: a server start with every setting given (--fnfl-single-card 0 --fnfl-kv-host):\n%s",
+           all_ok ? ta.c_str() : (ea + "\n").c_str());
+    const bool pass = n_bad == 0 && n_ref == int32_t(sizeof(rs) / sizeof(rs[0])) && exec_ok && all_ok;
+    printf("settings test (driver/server parity, scope and range refusals, read-back): %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 int main(int argc, char ** argv) {
     // PN1: --ple-table lazy|full anywhere after the command sets the residency of every model load; it is taken out
     // of argv here so each command's own parsing is unchanged
@@ -268,6 +443,125 @@ int main(int argc, char ** argv) {
             --i;
         }
     }
+    // KV8: --kv-format bf16|q8 (or the server's --fnfl-kv-format) anywhere after the command, taken out of argv alike:
+    // the target KV's format for the target commands, qa2-test, qsp-test and state-test mu1 (bf16 unless given)
+    bool kv_q8 = false;
+    for (int i = 2; i < argc; ++i) {
+        if (strcmp(argv[i], "--kv-format") == 0 || strcmp(argv[i], "--fnfl-kv-format") == 0) {
+            if (i + 1 >= argc || (strcmp(argv[i + 1], "bf16") != 0 && strcmp(argv[i + 1], "q8") != 0)) {
+                fprintf(stderr, "%s: --kv-format is bf16 or q8\n", argv[0]);
+                return 2;
+            }
+            kv_q8 = strcmp(argv[i + 1], "q8") == 0;
+            for (int j = i; j + 2 <= argc; ++j) {
+                argv[j] = argv[j + 2];
+            }
+            argc -= 2;
+            --i;
+        }
+    }
+    // ME1: --single-card N, --cached-tp 1, --ex-pool-mib M, --ex-reserve-mib M, --ex-cpu N (-1: physical cores
+    // less one), --kv-host 1 (the host-backed KV tier, one or two devices) and --device-cap-mib M (a ceiling on the
+    // device's whole use) anywhere after the command (spec run, model-dry), taken out of argv alike
+    constexpr int32_t n_me1 = 7;
+    int64_t me1[n_me1] = {-1, -1, 768, -1, 0, 0, -1};
+    static const char * const me1_flag[n_me1] = {"--single-card", "--ex-pool-mib", "--ex-reserve-mib", "--ex-cpu",
+                                                 "--cached-tp",    "--kv-host",     "--device-cap-mib"};
+    for (int i = 2; i < argc; ++i) {
+        int32_t f = 0;
+        while (f < n_me1 && strcmp(argv[i], me1_flag[f]) != 0) {
+            ++f;
+        }
+        if (f == n_me1) {
+            continue;
+        }
+        if (i + 1 >= argc) {
+            fprintf(stderr, "%s: %s needs a value\n", argv[0], me1_flag[f]);
+            return 2;
+        }
+        me1[f] = strtoll(argv[i + 1], nullptr, 10);
+        for (int j = i; j + 2 <= argc; ++j) {
+            argv[j] = argv[j + 2];
+        }
+        argc -= 2;
+        --i;
+    }
+    // ME2 (expire at ME2's disposition): --ex-profile PATH (the cache's boot ranking, a STRP file), --ex-profile-save
+    // PATH (where the learned ranking is saved) and --ex-swap-overlap 0|1 (1 unless given) anywhere after the command,
+    // as ME1's
+    constexpr int32_t n_me2 = 3;
+    std::string me2[n_me2] = {"", "", "1"};
+    static const char * const me2_flag[n_me2] = {"--ex-profile", "--ex-profile-save", "--ex-swap-overlap"};
+    for (int i = 2; i < argc; ++i) {
+        int32_t f = 0;
+        while (f < n_me2 && strcmp(argv[i], me2_flag[f]) != 0) {
+            ++f;
+        }
+        if (f == n_me2) {
+            continue;
+        }
+        if (i + 1 >= argc) {
+            fprintf(stderr, "%s: %s needs a value\n", argv[0], me2_flag[f]);
+            return 2;
+        }
+        me2[f] = argv[i + 1];
+        for (int j = i; j + 2 <= argc; ++j) {
+            argv[j] = argv[j + 2];
+        }
+        argc -= 2;
+        --i;
+    }
+    if (me2[2] != "0" && me2[2] != "1") {
+        fprintf(stderr, "%s: --ex-swap-overlap is 0 or 1\n", argv[0]);
+        return 2;
+    }
+    // ME3: the cache's and the host K/V tier's settings (fn/cache_settings.h: --ex-<name>, --kv-<name>), anywhere
+    // after the command, taken out of argv alike; the server's spellings are accepted too
+    fn::settings::values cache_set;
+    for (int i = 2; i < argc; ++i) {
+        const int32_t f = fn::settings::find(argv[i]);
+        if (f < 0) {
+            continue;
+        }
+        std::string e;
+        if (i + 1 >= argc || !fn::settings::parse(f, argv[i + 1], cache_set, e)) {
+            fprintf(stderr, "%s: %s\n", argv[0], i + 1 >= argc ? (std::string(argv[i]) + " needs a value").c_str()
+                                                               : e.c_str());
+            return 2;
+        }
+        for (int j = i; j + 2 <= argc; ++j) {
+            argv[j] = argv[j + 2];
+        }
+        argc -= 2;
+        --i;
+    }
+    // ME1: the expert cache's streams wait on flags its service thread writes, and a kernel's first load under CUDA's
+    // lazy loading waits for the device, so the cache needs every module loaded at the context's creation (before any
+    // CUDA call here; the cache refuses a lazy context)
+    if (me1[0] >= 0 || me1[4] != 0) {
+        setenv("CUDA_MODULE_LOADING", "EAGER", 1);
+    }
+    if (kv_q8 && (me1[0] >= 0 || me1[4] != 0 || me1[5] != 0)) {
+        fprintf(stderr,
+                "%s: --kv-format q8 serves resident TP on two cards only: not with --single-card, --cached-tp or "
+                "--kv-host\n",
+                argv[0]);
+        return 2;
+    }
+    const auto me1_args = [&](fnfl_target_args & a) {
+        a.single_card = int32_t(me1[0]);
+        a.ex_pool_mib = me1[1];
+        a.ex_reserve_mib = me1[2];
+        a.ex_cpu = int32_t(me1[3]);
+        a.cached_tp = me1[4] != 0 && me1[0] < 0;
+        a.kv_host = me1[5] != 0;
+        a.device_cap_mib = me1[6];
+        a.ex_profile = me2[0];
+        a.ex_profile_save = me2[1];
+        a.ex_swap_overlap = me2[2] == "1";
+        a.cache = cache_set;
+        a.ex_eager = cache_set.executor == "eager";
+    };
     if (argc >= 2 && strcmp(argv[1], "act-test") == 0) {
         return fnfl_act_test(argc >= 3 ? atoi(argv[2]) : 0);
     }
@@ -339,7 +633,10 @@ int main(int argc, char ** argv) {
         static const char * model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
                                     "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
         return fnfl_qa2_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : model,
-                             argc >= 6 ? argv[5] : hx7_fixture);
+                             argc >= 6 ? argv[5] : hx7_fixture, kv_q8);
+    }
+    if (argc >= 2 && strcmp(argv[1], "kv-tier-test") == 0) {
+        return fnfl_kv_tier_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
     }
     if (argc >= 2 && strcmp(argv[1], "qa2-bench") == 0) {
         return fnfl_qa2_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all",
@@ -352,6 +649,20 @@ int main(int argc, char ** argv) {
         return fnfl_draft_kernel_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1,
                                       argc >= 5 ? argv[4] : "all");
     }
+    // ME3: the settings table (fn/cache_settings.h), both entry points' spellings, defaults, units and ranges
+    if (argc >= 2 && strcmp(argv[1], "kv-format-test") == 0) {
+        return kv_format_test();
+    }
+    if (argc >= 3 && strcmp(argv[1], "settings") == 0 && strcmp(argv[2], "test") == 0) {
+        return settings_test();
+    }
+    if (argc >= 2 && strcmp(argv[1], "settings") == 0) {
+        for (const fn::settings::entry & e : fn::settings::table) {
+            printf("%-26s %-34s %-8s %-12s default %-10s range %s: %s\n", e.drive, e.serve, e.metavar, e.unit, e.def,
+                   e.range, e.help);
+        }
+        return 0;
+    }
     if (argc >= 2 && strcmp(argv[1], "ex-calib") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_ex_calib(device);
@@ -359,6 +670,9 @@ int main(int argc, char ** argv) {
     static const char * ex_cache = "/home/jeremy/src/flashnext/work/C1b/cache"; // fn/quant's synthetic blocks (C1b)
     if (argc >= 2 && strcmp(argv[1], "ex-prep") == 0) {
         return fnfl_ex_prep(argc >= 3 ? argv[2] : ex_cache);
+    }
+    if (argc >= 2 && strcmp(argv[1], "ex-cpu-test") == 0) {
+        return fnfl_ex_cpu_test(argc >= 3 ? argv[2] : ex_cache);
     }
     if (argc >= 2 && strcmp(argv[1], "ex-test") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
@@ -384,7 +698,8 @@ int main(int argc, char ** argv) {
     // FP16 input (C2), fn/quant's deployed-range weights (C1b Amendment 4)
     static const char * ep_refs = "/home/jeremy/src/flashnext/work/C1b/ep-refs-a4";
     if (argc >= 2 && strcmp(argv[1], "ep-prep") == 0) {
-        return fnfl_ep_prep(argc >= 3 ? argv[2] : ep_refs, argc >= 4 ? argv[3] : ex_cache, argc >= 5 ? argv[4] : fn4);
+        return fnfl_ep_prep(argc >= 3 ? argv[2] : ep_refs, argc >= 4 ? argv[3] : ex_cache, argc >= 5 ? argv[4] : fn4,
+                            argc >= 6 ? argv[5] : "all");
     }
     if (argc >= 2 && strcmp(argv[1], "ep-test") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
@@ -411,10 +726,13 @@ int main(int argc, char ** argv) {
         return fnfl_grid_test(argc >= 3 ? argv[2]
                                         : "/home/jeremy/src/flashnext-opt/work/REL2/engine/ggml/src/ggml-common.h");
     }
-    if (argc >= 2 &&
-        (strcmp(argv[1], "xchg-test") == 0 || strcmp(argv[1], "hc2-test") == 0 || strcmp(argv[1], "hc2-bench") == 0)) {
+    if (argc >= 2 && (strcmp(argv[1], "xchg-test") == 0 || strcmp(argv[1], "hc2-test") == 0 ||
+                      strcmp(argv[1], "hc2-bench") == 0 || strcmp(argv[1], "hcj-test") == 0)) {
         const int dev0 = argc >= 3 ? atoi(argv[2]) : 0;
         const int dev1 = argc >= 4 ? atoi(argv[3]) : 1;
+        if (strcmp(argv[1], "hcj-test") == 0) {
+            return fnfl_hcj_test(dev0, dev1);
+        }
         if (strcmp(argv[1], "hc2-bench") == 0) {
             if (dev0 == dev1) {
                 fprintf(stderr, "hc2-bench: DEV0 and DEV1 must differ\n");
@@ -477,23 +795,27 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "pd-test") == 0) {
         return fnfl_pd_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "full");
     }
+    if (argc >= 2 && strcmp(argv[1], "qsp-test") == 0) {
+        return fnfl_qsp_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "full", kv_q8); // KV8: its format
+    }
     {
         const struct {
             const char * name;
             int (*fn)(int, const char *);
-        } pb1[] = {
-            { "hcp-test", fnfl_hcp_test },
-            { "gdp-test", fnfl_gdp_test },
-            { "qsp-test", fnfl_qsp_test },
-            { "pe-test",  fnfl_pe_test  },
-            { "dcp-test", fnfl_dcp_test }
-        };
+        } pb1[] = {{"hcp-test", fnfl_hcp_test},
+                   {"gdp-test", fnfl_gdp_test},
+                   {"pe-test", fnfl_pe_test},
+                   {"dcp-test", fnfl_dcp_test}};
 
         for (const auto & t : pb1) {
             if (argc >= 2 && strcmp(argv[1], t.name) == 0) {
                 return t.fn(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "full");
             }
         }
+    }
+    if (argc >= 2 && strcmp(argv[1], "dpj-test") == 0) { // FMU2: the joint product
+        return fnfl_dpj_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "full",
+                             argc >= 5 ? argv[4] : nullptr);
     }
     if (argc >= 2 && strcmp(argv[1], "dp-test") == 0) {
         uint32_t rows_mask = 0x1fu; // 1 .. 5 (SP2)
@@ -565,19 +887,39 @@ int main(int argc, char ** argv) {
         return strcmp(argv[1], "layer-test") == 0 ? fnfl_layer_test(a) : fnfl_layer_bench(a);
     }
     if (argc >= 2 && strcmp(argv[1], "model-test") == 0) {
-        if (argc < 6) {
-            fprintf(stderr, "model-test: REF_DIR SPREAD_JSON IDS OUT [full|san|race] [POSITIONS]\n");
+        fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
+        // KV8 (load 4, with --kv-format q8): --spec-ids IDS runs spec's checks on the same load after the q8 passes,
+        // with --draft-attention, --draft-subset and --decode-s S as spec's
+        std::vector<std::string> rest, pos;
+        if (!draft_flags(argc, argv, 2, a, rest)) {
             return 2;
         }
-        fnfl_target_args a;
+        bool bad = false;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            if (rest[i] == "--spec-ids" && i + 1 < rest.size()) {
+                a.spec_ids = rest[++i];
+            } else if (rest[i] == "--decode-s" && i + 1 < rest.size()) {
+                a.decode_s = atof(rest[++i].c_str());
+            } else if (rest[i].rfind("--", 0) == 0) {
+                bad = true;
+            } else {
+                pos.push_back(rest[i]);
+            }
+        }
+        if (bad || pos.size() < 4 || pos.size() > 6 || (!a.spec_ids.empty() && !kv_q8)) {
+            fprintf(stderr, "model-test: REF_DIR SPREAD_JSON IDS OUT [full|san|race] [POSITIONS] [--spec-ids IDS "
+                            "--draft-attention dense [--decode-s S]] (KV8: --spec-ids with --kv-format q8)\n");
+            return 2;
+        }
         a.ple_table = ple_table;
-        a.ref_dir = argv[2];
-        a.spread_json = argv[3];
-        a.ids = argv[4];
-        a.out_dir = argv[5];
-        a.mode = argc >= 7 ? argv[6] : "full";
-        if (argc >= 8) {
-            const long n = atol(argv[7]);
+        a.ref_dir = pos[0];
+        a.spread_json = pos[1];
+        a.ids = pos[2];
+        a.out_dir = pos[3];
+        a.mode = pos.size() >= 5 ? pos[4] : "full";
+        if (pos.size() >= 6) {
+            const long n = atol(pos[5].c_str());
             if (n < 16 || n > 4096 || n % 8 != 0) {
                 fprintf(stderr, "model-test: POSITIONS is 16..4096, a multiple of 8\n");
                 return 2;
@@ -588,6 +930,7 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "model-bench") == 0) {
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         if (argc < 4 || argc == 6 || argc > 8 || (argc >= 7 && strcmp(argv[4], "nsys") != 0) ||
             (argc == 8 && strcmp(argv[7], "real") != 0)) {
@@ -613,14 +956,15 @@ int main(int argc, char ** argv) {
         return fnfl_model_bench(a);
     }
     if (argc >= 2 && strcmp(argv[1], "state-test") == 0) {
-        return fnfl_state_test(argc, argv);
+        return fnfl_state_test(argc, argv, kv_q8);
     }
     if (argc >= 2 && strcmp(argv[1], "rollback-test") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "rollback-test: IDS OUT [real|dry|retain]\n");
+            fprintf(stderr, "rollback-test: IDS OUT [real|dry|retain|mu1|mu1-dry|mu1-joint|mu1-joint-eager]\n");
             return 2;
         }
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         a.ids = argv[2];
         a.out_dir = argv[3];
@@ -629,6 +973,7 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "prefill-test") == 0) {
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         std::vector<std::string> rest, pos;
         if (!draft_flags(argc, argv, 2, a, rest)) {
@@ -690,15 +1035,19 @@ int main(int argc, char ** argv) {
         if (pos.size() == 4) {
             a.n_pos = atoi(pos[3].c_str());
         }
+        me1_args(a);
         return fnfl_prefill_test(a);
     }
     if (argc >= 2 && strcmp(argv[1], "model-dry") == 0) {
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         std::vector<std::string> rest, pos;
         bool bad = !draft_flags(argc, argv, 2, a, rest);
         for (size_t i = 0; i < rest.size() && !bad; ++i) {
-            if (!sampling_flag(rest, i, a.sampling)) {
+            if (rest[i] == "--cells" && i + 1 < rest.size()) {
+                a.n_cells = atoi(rest[++i].c_str());
+            } else if (!sampling_flag(rest, i, a.sampling)) {
                 bad = rest[i].rfind("--", 0) == 0;
                 pos.push_back(rest[i]);
             }
@@ -711,11 +1060,18 @@ int main(int argc, char ** argv) {
         a.ids = pos[0];
         a.out_dir = pos[1];
         a.mode = pos.size() >= 3 ? pos[2] : "graph";
+        me1_args(a);
+        if ((!a.cached() && a.cache.any(1)) || (!a.kv_host && a.cache.any(2))) {
+            fprintf(stderr, "model-dry: an expert cache setting needs --single-card or --cached-tp, a K/V one "
+                            "--kv-host\n");
+            return 2;
+        }
         return fnfl_model_dry(a);
     }
     if (argc >= 2 && (strcmp(argv[1], "draft-test") == 0 || strcmp(argv[1], "draft-bench") == 0)) {
         const bool test = strcmp(argv[1], "draft-test") == 0;
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         std::vector<std::string> rest;
         if (!draft_flags(argc, argv, 2, a, rest) || rest.size() != (test ? 3u : 2u)) {
@@ -733,6 +1089,7 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "spec") == 0) {
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         std::vector<std::string> rest, pos;
         if (!draft_flags(argc, argv, 2, a, rest)) {
@@ -761,6 +1118,50 @@ int main(int argc, char ** argv) {
                 a.arms = rest[++i]; // SP2 Amendment 3: spec ab's arms
             } else if (rest[i] == "--max-tokens" && more) {
                 cur.max_tokens = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--ex-check" && more) {
+                a.ex_check = rest[++i]; // ME1: spec run's placement check
+            } else if (rest[i] == "--ex-ref" && more) {
+                a.ex_ref = rest[++i];
+            } else if (rest[i] == "--ex-kl" && more) {
+                a.ex_kl = rest[++i]; // ME2: spec run's KL check (NC1 section 5)
+            } else if (rest[i] == "--ex-kl-ref" && more) {
+                a.ex_kl_ref = rest[++i];
+            } else if (rest[i] == "--ex-kl-spread" && more) {
+                a.ex_kl_spread = rest[++i];
+            } else if (rest[i] == "--mx7-check" && more) {
+                a.mx7_check = rest[++i]; // MX7: the prompt CPU share's model checks (mx7_check.h)
+            } else if (rest[i] == "--mx7-shares" && more) {
+                a.mx7_shares = rest[++i];
+            } else if (rest[i] == "--mx7-dry-maxt" && more) {
+                a.mx7_dry_maxt = atoi(rest[++i].c_str()); // MX7: run-dry's share candidates' pair bound
+            } else if (rest[i] == "--next-ids" && more) {
+                a.next_ids.push_back(rest[++i]); // ME2: spec run's further prompts
+                a.next_append.push_back(false);
+                a.next_rows.push_back(-1);
+            } else if (rest[i] == "--next-append" && more) {
+                a.next_ids.push_back(rest[++i]); // ME3: an append to the previous request's state
+                a.next_append.push_back(true);
+                a.next_rows.push_back(-1);
+            } else if (rest[i] == "--next-append-rows" && i + 2 < rest.size()) {
+                a.next_rows.push_back(atoi(rest[++i].c_str())); // ME3's cleanup check: an append of N rows read
+                a.next_ids.push_back(rest[++i]);
+                a.next_append.push_back(true);
+            } else if (rest[i] == "--me3-cancel") {
+                a.me3_cancel = true; // TEST: the cancellation check (expires at ME4's disposition)
+            } else if (rest[i] == "--ex-native-hold") {
+                a.ex_native_hold = true; // TEST: ME4's host-memory residency check in a dry run
+            } else if (rest[i] == "--me9-check") {
+                a.me9_check = true; // TEST: ME9's admission check
+            } else if (rest[i] == "--me3-stall") {
+                a.me3_stall = true; // TEST: the stall check (expires at ME4's disposition)
+            } else if (rest[i] == "--me3-arms" && more) {
+                a.me3_arms = rest[++i]; // ME3's comparison switch (expires at ME3's disposition)
+            } else if (rest[i] == "--me4-arms" && more) {
+                a.me4_arms = rest[++i]; // ME4's comparison switch (expires at ME4's disposition)
+            } else if (rest[i] == "--append-close" && more) {
+                a.append_close = atoi(rest[++i].c_str()); // ME4: the fixture's length-stop rule
+            } else if (rest[i] == "--cells" && more) {
+                a.n_cells = atoi(rest[++i].c_str()); // ME1: the slot's cells (198,720 unless given)
             } else if (rest[i] == "--and") {
                 a.run_settings.push_back(cur);
                 cur = fnfl_target_args::run_setting();
@@ -792,8 +1193,17 @@ int main(int argc, char ** argv) {
                             "segments' settings)\n"
                             "spec: PROMPT_IDS OUT run|run-dry --draft-attention dense [--draft-subset FILE] [--runs N] "
                             "[--eog ID,ID..] SETTING [--and SETTING ..], SETTING: [--temp T] [--top-k K] [--top-p P] "
-                            "[--min-p P] [--seed S] [--max-tokens N]   (SV1: the runtime's engine as the server drives "
-                            "it)\n"
+                            "[--min-p P] [--seed S] [--max-tokens N] [--cells N]   (SV1: the runtime's engine as the "
+                            "server drives it; ME1: --single-card N [--ex-pool-mib M] [--ex-reserve-mib M] [--ex-cpu N] "
+                            "[--ex-check IDS [--ex-ref TOKENS]]; ME2: [--next-ids IDS ..], further prompts in the "
+                            "same process; [--ex-kl IDS --ex-kl-ref DIR --ex-kl-spread JSON], the KL check; anywhere: "
+                            "[--ex-profile STRP] [--ex-profile-save PATH] [--ex-swap-overlap 0|1]; ME3: "
+                            "[--next-append IDS ..], an append to the previous request's state; "
+                            "[--next-append-rows N IDS ..], an append whose read is N rows (checked); "
+                            "[--me3-arms base,final]; [--me4-arms base,final]; [--me3-stall], the stall check "
+                            "(a test); [--me3-cancel], the cancellation check (a test); "
+                            "anywhere: the settings of fn/cache_settings.h, --ex-<name> V and --kv-<name> V, "
+                            "fnfl-drive settings lists them)\n"
                             "spec: HISTORY_IDS OUT ab|ab-dry --draft-attention sparse [--draft-subset FILE] "
                             "[--arms D:FORM[:EX][,D:FORM[:EX]..]] SETTING   (SP2: the checks, then the arms, "
                             "2:dense,4:sparse unless given, from one decode-ready state; SP4: EX sp2, sp4, h2 or xb3, "
@@ -803,6 +1213,62 @@ int main(int argc, char ** argv) {
         a.ids = pos[0];
         a.out_dir = pos[1];
         a.mode = pos.size() == 3 ? pos[2] : "real";
+        me1_args(a);
+        if ((!a.cached() && a.cache.any(1)) || (!a.kv_host && a.cache.any(2))) {
+            fprintf(stderr, "spec: an expert cache setting needs --single-card or --cached-tp, a K/V one --kv-host\n");
+            return 2;
+        }
+        if (a.cached() && !run) {
+            fprintf(stderr, "spec: --single-card and --cached-tp serve spec run and run-dry only\n");
+            return 2;
+        }
+        if (!a.ex_kl.empty() && (!run || !a.cached() || a.ex_kl_ref.empty() || a.ex_kl_spread.empty())) {
+            fprintf(stderr, "spec: --ex-kl serves a cached spec run and needs --ex-kl-ref and --ex-kl-spread\n");
+            return 2;
+        }
+        if (!a.mx7_check.empty() && (!run || !a.cached() || a.mx7_shares.empty())) {
+            fprintf(stderr, "spec: --mx7-check serves a cached spec run and needs --mx7-shares\n");
+            return 2;
+        }
+        if (a.mx7_dry_maxt != 0 &&
+            (pos.size() != 3 || pos[2] != "run-dry" || !a.cached() || a.mx7_dry_maxt < 1 || a.mx7_dry_maxt > 4096)) {
+            fprintf(stderr, "spec: --mx7-dry-maxt N (1..4096) serves a cached run-dry\n");
+            return 2;
+        }
+        if (!a.next_ids.empty() && !run) {
+            fprintf(stderr, "spec: --next-ids and --next-append serve spec run and run-dry only\n");
+            return 2;
+        }
+        if (!a.me3_arms.empty() && (!run || !a.cached() ||
+                                    (a.me3_arms != "base,final" && a.me3_arms != "base" && a.me3_arms != "final"))) {
+            fprintf(stderr, "spec: --me3-arms base,final (or one of them) serves a cached spec run\n");
+            return 2;
+        }
+        if (!a.me4_arms.empty() && (!run || !a.cached() || !a.me3_arms.empty() ||
+                                    (a.me4_arms != "base,final" && a.me4_arms != "base" && a.me4_arms != "final"))) {
+            fprintf(stderr, "spec: --me4-arms base,final (or one of them) serves a cached spec run, not with "
+                            "--me3-arms\n");
+            return 2;
+        }
+        // ME4 (Carlos request 1, R1-08): a run of an append extends the previous run's state, so its tokens cannot
+        // equal run 0's; an append is read once
+        if (a.runs != 1 && std::find(a.next_append.begin(), a.next_append.end(), true) != a.next_append.end()) {
+            fprintf(stderr, "spec: --next-append and --next-append-rows take --runs 1 (each run would extend the "
+                            "previous run's state)\n");
+            return 2;
+        }
+        if (a.me9_check && (!run || a.single_card < 0)) {
+            fprintf(stderr, "spec: --me9-check serves a cached spec run on one device (--single-card)\n");
+            return 2;
+        }
+        if (a.me3_stall && (!run || !a.cached())) {
+            fprintf(stderr, "spec: --me3-stall serves a cached spec run\n");
+            return 2;
+        }
+        if (a.me3_cancel && (!run || !a.cached() || a.me3_stall)) {
+            fprintf(stderr, "spec: --me3-cancel serves a cached spec run, without --me3-stall\n");
+            return 2;
+        }
         return ab ? fnfl_spec_ab(a) : run ? fnfl_spec_run(a) : fnfl_spec(a);
     }
     if (argc >= 2 && strcmp(argv[1], "generate") == 0) {
@@ -816,6 +1282,7 @@ int main(int argc, char ** argv) {
             return 2;
         }
         fnfl_target_args a;
+        a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
         a.ids = argv[2];
         a.out_dir = argv[3];
@@ -972,11 +1439,11 @@ int main(int argc, char ** argv) {
     fprintf(
         stderr,
         "usage: %s "
-        "act-test|act-bench|gd-test|gd-bench|hc-test|hc-bench|qa-test|qa-bench|qa2-test|qa2-bench|ex-calib|ex-prep|ex-"
-        "test|ex-bench|"
-        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|xchg-test|hc2-test|hc2-bench|load-plan|load-check|"
-        "xchg2-test|px1-link|layer-test|layer-bench|xp1-test|xp1-bench|dp-test|dp-bench|pd-test|hcp-test|gdp-test|qsp-"
-        "test|pe-test|dcp-test|ple-test|ple-pin-test|ple-bench|state-test|"
+        "act-test|act-bench|gd-test|gd-bench|hc-test|hc-bench|qa-test|qa-bench|qa2-test|qa2-bench|kv-tier-test|"
+        "settings|kv-format-test|ex-calib|ex-prep|ex-cpu-test|ex-test|ex-bench|"
+        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|xchg-test|hc2-test|hcj-test|hc2-bench|load-plan|"
+        "load-check|xchg2-test|px1-link|layer-test|layer-bench|xp1-test|xp1-bench|dp-test|dpj-test|dp-bench|pd-test|"
+        "hcp-test|gdp-test|qsp-test|pe-test|dcp-test|ple-test|ple-pin-test|ple-bench|state-test|"
         "prefill-test|rollback-test|spec|draft-kernel-test|draft-kernel-bench|draft-test|draft-bench|sampler-ref|"
         "samp-test|samp-bench|v-test|v-bench [DEVICE] ...\n",
         argv[0]);

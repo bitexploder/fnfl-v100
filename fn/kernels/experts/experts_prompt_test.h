@@ -33,11 +33,13 @@ ep_sort ep_sort_pairs(const std::vector<int32_t> & ids);
 } // namespace fn::experts
 
 // ep-prep: the FP64 references of every ep-test case, written to dir (CPU only; reads the synthetic weights from
-// syn_dir). Returns 0 on success.
-int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes);
+// syn_dir), for formats "all" (the deployed ones) or "q4" (ME1: the Q4 candidate's gate/up Q4_K, Q5_K and down Q5_1,
+// Q8_0, synthetic scales from synth.h's chosen ranges). Returns 0 on success.
+int fnfl_ep_prep(const char * dir, const char * syn_dir, const char * routes, const char * formats);
 
-// ep-test: rows (128, 512 or 1536, as listed), formats as ex-test ("all" or a list of gate/up and down formats: every
-// listed gate/up format against every listed down format). mode "full": both runs bitwise, the zero and bad-ID cases;
-// "san": one run (Compute Sanitizer). Prints "ep-test: PASS" and returns 0 when every check passes.
+// ep-test: rows (128, 512 or 1536, as listed), formats "all" (the deployed ones), "q4" (ME1's, as ep-prep) or a list of
+// gate/up and down formats: every listed gate/up format against every listed down format. mode "full": both runs
+// bitwise, the zero and bad-ID cases; "san": one run (Compute Sanitizer). Prints "ep-test: PASS" and returns 0 when
+// every check passes.
 int fnfl_ep_test(int device, const char * rows, const char * formats, const char * dir, const char * syn_dir,
                  const char * routes, const char * mode);

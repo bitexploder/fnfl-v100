@@ -1,6 +1,7 @@
 #include "fn/kernels/qsa/attend.h"
 
 #include "fn/kernels/act/act_warp.cuh"
+#include "fn/kernels/qsa/kv_q8.cuh"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/shapes.h"
 
@@ -9,6 +10,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
+#include <utility>
 
 namespace fn::qsa::attn {
 namespace {
@@ -55,6 +58,11 @@ struct kargs {
     float * out;
     int8_t * codes;
     float * scales;
+    const int64_t * shift; // ME3: attend_kernel<true>'s device word (args::shift), after every field the resident reads
+    // KV8 (attend_kernel<false, true>): the layer's FP16 scales [cell][kv8::scale_stride] beside the int8 codes at
+    // k_cache and v_cache (kv_q8.cuh), after every field the BF16 launch reads
+    uint16_t * k_scale;
+    uint16_t * v_scale;
 };
 
 // the launch's work at the round's depth, formed by every thread at the start (FC-RD1: the depth is read on the device)
@@ -188,7 +196,25 @@ __device__ void norm_rope(float (&y)[8], const float * src, const float * w, con
     }
 }
 
-__device__ void prepare(const kargs & a, const plan & pl, int32_t task, int32_t lane) {
+// KV8: a row's int8 codes, cell c at byte c * 256 of the K or V array (kv_q8.cuh)
+__device__ __forceinline__ int8_t * codes_row(uint16_t * base, int64_t cell) {
+    // reason: in q8 the cache array holds int8 codes; its pointer is the class's untyped part
+    return reinterpret_cast<int8_t *>(base) + cell * head_dim;
+}
+
+// KV8: the lane's 8 values of the new cell's K or V row, quantized (kv8::quantize8: every lane takes part)
+__device__ __forceinline__ void put_q8(const float (&x)[8], uint16_t * cache, uint16_t * scale, int64_t cell,
+                                       int32_t lane) {
+    uint2 codes;
+    uint16_t sbits = 0;
+    fn::qsa::kv8::quantize8(x, codes, sbits);
+    reinterpret_cast<uint2 *>(codes_row(cache, cell))[lane] = codes;
+    if ((lane & 7) == 0) {
+        scale[cell * fn::qsa::kv8::scale_stride + lane / 8] = sbits;
+    }
+}
+
+template <bool Q8> __device__ void prepare(const kargs & a, const plan & pl, int32_t task, int32_t lane) {
     const int32_t t = task / n_task_row, r = task % n_task_row;
     const bool is_q = r < n_head;
     float y[8];
@@ -200,7 +226,11 @@ __device__ void prepare(const kargs & a, const plan & pl, int32_t task, int32_t 
         dst[1] = make_float4(y[4], y[5], y[6], y[7]);
     } else {
         const int64_t cell = static_cast<int64_t>(pl.depth) + t;
-        reinterpret_cast<uint4 *>(a.k_cache + cell * head_dim)[lane] = pack_bf16(y);
+        if constexpr (Q8) {
+            put_q8(y, a.k_cache, a.k_scale, cell, lane);
+        } else {
+            reinterpret_cast<uint4 *>(a.k_cache + cell * head_dim)[lane] = pack_bf16(y);
+        }
         if (a.k_f32 != nullptr) {
             float4 * dst = reinterpret_cast<float4 *>(a.k_f32 + t * head_dim) + 2 * lane;
             dst[0] = make_float4(y[0], y[1], y[2], y[3]);
@@ -209,7 +239,11 @@ __device__ void prepare(const kargs & a, const plan & pl, int32_t task, int32_t 
         const float4 va = __ldg(reinterpret_cast<const float4 *>(a.kv_v + t * head_dim) + 2 * lane);
         const float4 vb = __ldg(reinterpret_cast<const float4 *>(a.kv_v + t * head_dim) + 2 * lane + 1);
         const float v[8] = {va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w};
-        reinterpret_cast<uint4 *>(a.v_cache + cell * head_dim)[lane] = pack_bf16(v);
+        if constexpr (Q8) {
+            put_q8(v, a.v_cache, a.v_scale, cell, lane);
+        } else {
+            reinterpret_cast<uint4 *>(a.v_cache + cell * head_dim)[lane] = pack_bf16(v);
+        }
     }
     // publication: each writing lane fences its own stores, then one lane counts the task
     __threadfence();
@@ -274,6 +308,72 @@ __device__ __forceinline__ uint4 take(const uint4 r, uint32_t mz, uint32_t & dep
     return v;
 }
 
+// KV8: a lane's slot of one cell in q8: its 8 codes (two words) and its group's scale bits
+struct kv8w {
+    uint32_t c0, c1, s;
+};
+
+// KV8: the q8 form of cells: a lane loads its 8 codes (8 bytes) and its group's FP16 scale, evict-first as ld_kv
+struct cells8 {
+    const int8_t * codes;
+    const uint16_t * scale;
+    const int32_t * cell; // smem: the unit's cells
+    int32_t w, lane, n_w, depth;
+
+    __device__ __forceinline__ kv8w load(int32_t k, bool defer, bool & deferred, uint32_t dep = 0) const {
+        const int32_t c = k < n_w ? cell[w + n_cg * k] : -1;
+        deferred = defer && c >= depth;
+        if (c < 0 || deferred) {
+            return kv8w{0u, 0u, 0u};
+        }
+        const uint2 v =
+            __ldcs(reinterpret_cast<const uint2 *>(codes + static_cast<int64_t>(c) * head_dim + 8 * lane + dep));
+        const uint32_t s = __ldcs(scale + static_cast<int64_t>(c) * fn::qsa::kv8::scale_stride + lane / 8 + dep);
+        return kv8w{v.x, v.y, s};
+    }
+};
+
+// take (R4) in q8: the codes and the scale leave the slot through mz, and the zero dep made from all three words is
+// carried into both refill loads' addresses
+__device__ __forceinline__ kv8w take(const kv8w r, uint32_t mz, uint32_t & dep) {
+    const kv8w v = {r.c0 | mz, r.c1 | mz, r.s | mz};
+    dep = (v.c0 ^ v.c1 ^ v.s) & mz;
+    return v;
+}
+
+// q8 widened: float(code) * s, exact in F32 (kv_q8.cuh decode4)
+__device__ __forceinline__ void widen(const kv8w w, float (&x)[8]) {
+    const float s = fn::qsa::kv8::scale_value(w.s);
+    fn::qsa::kv8::decode4(w.c0, s, x);
+    fn::qsa::kv8::decode4(w.c1, s, x + 4);
+}
+
+// the K or V cell loads of a unit in the launch's format
+template <bool Q8> struct cells_of {
+    using type = cells;
+
+    __device__ __forceinline__ static cells make(const kargs & a, bool v, const int32_t * cell, int32_t w, int32_t lane,
+                                                 int32_t n_w, int32_t depth) {
+        return {v ? a.v_cache : a.k_cache, cell, w, lane, n_w, depth};
+    }
+};
+
+template <> struct cells_of<true> {
+    using type = cells8;
+
+    __device__ __forceinline__ static cells8 make(const kargs & a, bool v, const int32_t * cell, int32_t w,
+                                                  int32_t lane, int32_t n_w, int32_t depth) {
+        // reason: in q8 the cache array holds int8 codes
+        return {reinterpret_cast<const int8_t *>(v ? a.v_cache : a.k_cache),
+                v ? a.v_scale : a.k_scale,
+                cell,
+                w,
+                lane,
+                n_w,
+                depth};
+    }
+};
+
 // the 24 partial dots of 4 cells x 6 heads summed over the warp: a reduce-scatter (xor 16, 8, 4), then a butterfly
 // (xor 2, 1); lanes 4 o .. 4 o + 3 end with entries 3 o .. 3 o + 2 (entry = cell 6 + head), o = 4 b4 + 2 b3 + b2
 __device__ __forceinline__ void reduce24(const float (&p)[24], float (&q3)[3], int32_t lane) {
@@ -301,7 +401,7 @@ __device__ __forceinline__ void reduce24(const float (&p)[24], float (&q3)[3], i
     }
 }
 
-__device__ void run_unit(const kargs & a, const plan & pl, smem_t & sm, int32_t u, bool first) {
+template <bool Q8> __device__ void run_unit(const kargs & a, const plan & pl, smem_t & sm, int32_t u, bool first) {
     const int32_t tid = static_cast<int32_t>(threadIdx.x), w = tid / 32, lane = tid % 32;
     // unit u: row t, chunk j, head group G (units ordered by row, then chunk, then group)
     int32_t t = 0;
@@ -320,12 +420,14 @@ __device__ void run_unit(const kargs & a, const plan & pl, smem_t & sm, int32_t 
     __syncthreads();
     stamp(a, 1, first);
     const int32_t n_w = nc > w ? (nc - w + n_cg - 1) / n_cg : 0;
-    const cells ks = {a.k_cache, sm.cell, w, lane, n_w, pl.depth};
-    const cells vs = {a.v_cache, sm.cell, w, lane, n_w, pl.depth};
+    using cells_t = typename cells_of<Q8>::type;
+    const cells_t ks = cells_of<Q8>::make(a, false, sm.cell, w, lane, n_w, pl.depth);
+    const cells_t vs = cells_of<Q8>::make(a, true, sm.cell, w, lane, n_w, pl.depth);
+    using slot_t = decltype(ks.load(0, false, std::declval<bool &>()));
 
     // pass 1: scores. Cells k + 1 .. k + 4 in flight (slot k % 4, a compile-time index: R12); before the first
     // unit's acquire only cells below depth are loaded.
-    uint4 r[in_flight];
+    slot_t r[in_flight];
     bool deferred[in_flight];
 #pragma unroll
     for (int i = 0; i < in_flight; ++i) {
@@ -371,7 +473,7 @@ __device__ void run_unit(const kargs & a, const plan & pl, smem_t & sm, int32_t 
             const int32_t k = kb + cc;
             if (k < n_w) {
                 uint32_t dep = 0;
-                const uint4 v = take(r[cc], a.mz, dep);
+                const slot_t v = take(r[cc], a.mz, dep);
                 r[cc] = ks.load(k + in_flight, false, unused, dep);
                 float x[8];
                 widen(v, x);
@@ -451,7 +553,7 @@ __device__ void run_unit(const kargs & a, const plan & pl, smem_t & sm, int32_t 
             const int32_t k = kb + cc;
             if (k < n_w) {
                 uint32_t dep = 0;
-                const uint4 tv = take(r[cc], a.mz, dep);
+                const slot_t tv = take(r[cc], a.mz, dep);
                 r[cc] = vs.load(k + in_flight, false, unused, dep);
                 float v[8];
                 widen(tv, v);
@@ -551,7 +653,7 @@ __device__ void finish(const kargs & a, const plan & pl, int32_t fu, int32_t lan
                           a.scales + (t * (out_width / 32) + h * 8 + q) * 2);
 }
 
-__global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs a) {
+template <bool Q8> __device__ __forceinline__ void attend_body(const kargs & a) {
     __shared__ smem_t sm;
     const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32, lane = static_cast<int32_t>(threadIdx.x) % 32;
     const int32_t gw = static_cast<int32_t>(blockIdx.x) + static_cast<int32_t>(gridDim.x) * warp;
@@ -569,11 +671,11 @@ __global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs a) {
         return;
     }
     if (gw < n_task_row * a.rows) {
-        prepare(a, pl, gw, lane);
+        prepare<Q8>(a, pl, gw, lane);
     }
     bool first = true;
     for (int32_t u = static_cast<int32_t>(blockIdx.x); u < pl.n_units; u += static_cast<int32_t>(gridDim.x)) {
-        run_unit(a, pl, sm, u, first);
+        run_unit<Q8>(a, pl, sm, u, first);
         first = false;
     }
     // every unit's partials are written and every CTA has acquired (the grid barrier orders both); the counter is free
@@ -588,23 +690,46 @@ __global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs a) {
     stamp(a, 9, true);
 }
 
+// H false: the resident caches (QA2's launch, its body unchanged). ME3, H true: the host-backed KV's graphs: the K
+// and V pointers are the window's base and the device word the cells it starts at (kv_tier.h), read once a thread.
+// KV8, Q8 true: the resident caches in the 8-bit format (kv_q8.cuh; not with H)
+template <bool H, bool Q8> __global__ void __launch_bounds__(threads, 2) attend_kernel(const kargs ka) {
+    static_assert(!(H && Q8), "KV8: the host-backed KV stays BF16");
+    if constexpr (H) {
+        kargs a = ka;
+        const int64_t s = *ka.shift * head_dim;
+        a.k_cache -= s;
+        a.v_cache -= s;
+        attend_body<false>(a);
+    } else {
+        attend_body<Q8>(ka);
+    }
+}
+
+// the launch's instantiation: 0 resident BF16, 1 host-backed (ME3), 2 resident q8 (KV8)
+const void * kernel_of(int32_t variant) {
+    return variant == 1   ? reinterpret_cast<const void *>(attend_kernel<true, false>)
+           : variant == 2 ? reinterpret_cast<const void *>(attend_kernel<false, true>)
+                          : reinterpret_cast<const void *>(attend_kernel<false, false>);
+}
+
 bool aligned(const void * p, uintptr_t n) {
     return p != nullptr && reinterpret_cast<uintptr_t>(p) % n == 0;
 }
 
-int32_t ctas_per_sm(int32_t device) {
-    static int32_t cache[16] = {}; // per device (R14)
-    if (device < 0 || device >= 16) {
+int32_t ctas_per_sm(int32_t device, int32_t variant = 0) {
+    static int32_t cache[3][16] = {}; // per kernel per device (R14)
+    if (device < 0 || device >= 16 || variant < 0 || variant > 2) {
         return 0;
     }
-    if (cache[device] == 0) {
+    if (cache[variant][device] == 0) {
         int n = 0;
-        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, attend_kernel, threads, 0) != cudaSuccess) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel_of(variant), threads, 0) != cudaSuccess) {
             return 0;
         }
-        cache[device] = n;
+        cache[variant][device] = n;
     }
-    return cache[device];
+    return cache[variant][device];
 }
 
 } // namespace
@@ -650,14 +775,25 @@ int32_t grid(int32_t rows, int32_t device) {
     return n < cap ? n : cap;
 }
 
+namespace {
+
+// ME3, KV8: an instantiation's grid, from its own residency (a unit's result does not depend on its CTA)
+int32_t grid_of(int32_t rows, int32_t device, int32_t variant) {
+    const int32_t n = 2 * max_chunks * rows, cap = ctas_per_sm(device, variant) * n_sm;
+    return n < cap ? n : cap;
+}
+
+} // namespace
+
 bool attend(int32_t rows, const args & a, void * stream) {
     if (rows < 1 || rows > max_rows || stream == nullptr || a.depth == nullptr || a.max_cells < rows ||
-        a.max_cells > fn::qsa::max_cells ||
-        !aligned(a.qfull, 16) || !aligned(a.kv_k, 16) || !aligned(a.kv_v, 16) || a.q_norm == nullptr ||
-        a.k_norm == nullptr || a.body == nullptr || a.offsets == nullptr || a.pos == nullptr ||
+        a.max_cells > fn::qsa::max_cells || !aligned(a.qfull, 16) || !aligned(a.kv_k, 16) || !aligned(a.kv_v, 16) ||
+        a.q_norm == nullptr || a.k_norm == nullptr || a.body == nullptr || a.offsets == nullptr || a.pos == nullptr ||
         !aligned(a.k_cache, 16) || !aligned(a.v_cache, 16) || !aligned(a.out, 16) || !aligned(a.codes, 16) ||
         !aligned(a.scales, 8) || (a.k_f32 != nullptr && !aligned(a.k_f32, 16)) || !aligned(a.ws.q, 16) ||
-        !aligned(a.ws.acc, 16) || !aligned(a.ws.ml, 8) || a.ws.ready == nullptr || a.ws.error == nullptr) {
+        !aligned(a.ws.acc, 16) || !aligned(a.ws.ml, 8) || a.ws.ready == nullptr || a.ws.error == nullptr ||
+        (a.k_scale == nullptr) != (a.v_scale == nullptr) || (a.k_scale != nullptr && a.shift != nullptr) ||
+        (a.k_scale != nullptr && (!aligned(a.k_scale, 2) || !aligned(a.v_scale, 2)))) {
         return false;
     }
     int device = -1;
@@ -690,29 +826,32 @@ bool attend(int32_t rows, const args & a, void * stream) {
     k.out = a.out;
     k.codes = a.codes;
     k.scales = a.scales;
-    const int32_t g = grid(rows, device);
+    k.shift = a.shift;
+    k.k_scale = a.k_scale;
+    k.v_scale = a.v_scale;
+    const int32_t variant = a.shift != nullptr ? 1 : a.k_scale != nullptr ? 2 : 0;
+    const int32_t g = variant == 0 ? grid(rows, device) : grid_of(rows, device, variant);
     if (g < 1 || n_task_row * rows > n_warp * g) {
         return false;
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     void * params[] = {&k};
-    if (cudaLaunchCooperativeKernel(reinterpret_cast<const void *>(attend_kernel), dim3(g), dim3(threads), params, 0,
-                                    st) != cudaSuccess) {
+    if (cudaLaunchCooperativeKernel(kernel_of(variant), dim3(g), dim3(threads), params, 0, st) != cudaSuccess) {
         return false;
     }
     return true;
 }
 
-bool kernel_resources(resources & r) {
+bool kernel_resources(resources & r, bool q8) {
     cudaFuncAttributes fa = {};
     int device = -1;
-    if (cudaFuncGetAttributes(&fa, attend_kernel) != cudaSuccess || cudaGetDevice(&device) != cudaSuccess) {
+    if (cudaFuncGetAttributes(&fa, kernel_of(q8 ? 2 : 0)) != cudaSuccess || cudaGetDevice(&device) != cudaSuccess) {
         return false;
     }
     r.regs = fa.numRegs;
     r.local_bytes = static_cast<int32_t>(fa.localSizeBytes);
     r.shared_bytes = static_cast<int32_t>(fa.sharedSizeBytes);
-    r.ctas_per_sm = ctas_per_sm(device);
+    r.ctas_per_sm = ctas_per_sm(device, q8 ? 2 : 0);
     return true;
 }
 

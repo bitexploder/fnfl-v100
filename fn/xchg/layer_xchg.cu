@@ -221,10 +221,8 @@ bool launched() {
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-} // namespace
-
-bool send_half(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream) {
-    if (!rows_ok(rows) || peer_card < 0 || peer_card > 1 || !al16(partial) || !al16(peer_slot) || stream == nullptr) {
+bool send_half_rows(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream) {
+    if (peer_card < 0 || peer_card > 1 || !al16(partial) || !al16(peer_slot) || stream == nullptr) {
         return false;
     }
     const int32_t n4 = rows * half_words / 4;
@@ -233,9 +231,9 @@ bool send_half(int32_t rows, int32_t peer_card, const float * partial, float * p
     return launched();
 }
 
-bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
-              uint32_t code, void * stream) {
-    if (!rows_ok(rows) || card < 0 || card > 1 || !al16(partial) || !al16(slot) || !al16(out) || err == nullptr ||
+bool recv_add_rows(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+                   uint32_t code, void * stream) {
+    if (card < 0 || card > 1 || !al16(partial) || !al16(slot) || !al16(out) || err == nullptr ||
         stream == nullptr) {
         return false;
     }
@@ -243,6 +241,26 @@ bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, f
     recv_add_kernel<<<(n4 + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream)>>>(
         partial, card, reinterpret_cast<uint32_t *>(slot), out, err, code, n4); // F32 payload words handled as bits
     return launched();
+}
+
+} // namespace
+
+bool send_half(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream) {
+    return rows_ok(rows) && send_half_rows(rows, peer_card, partial, peer_slot, stream);
+}
+
+bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+              uint32_t code, void * stream) {
+    return rows_ok(rows) && recv_add_rows(rows, card, partial, slot, out, err, code, stream);
+}
+
+bool send_half_joint(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream) {
+    return rows >= 1 && rows <= joint_rows && send_half_rows(rows, peer_card, partial, peer_slot, stream);
+}
+
+bool recv_add_joint(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+                    uint32_t code, void * stream) {
+    return rows >= 1 && rows <= joint_rows && recv_add_rows(rows, card, partial, slot, out, err, code, stream);
 }
 
 bool send_route(int32_t rows, const int32_t * ids_full, int32_t ids_stride, const float * wts, const float * sg,

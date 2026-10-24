@@ -22,12 +22,15 @@
 
 #include "fn/kernels/round/round.h"
 #include "fn/model/draft.h"
+#include "fn/model/kv_tier.h"
 #include "fn/model/model.h"
 #include "fn/model/pass.h"
 #include "fn/runtime/ple_host.h"
 #include "fn/runtime/versions.h"
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -49,6 +52,9 @@ struct draft_options {
 struct target_options {
     std::string model_path; // the first target shard (read_ple_params)
     bool eager = false;     // both cards' passes enqueued in phases each round (no graphs)
+    // ME3: init captures no graphs; the caller captures them (target::capture) once the expert service's buffers
+    // exist (the cache's init, before its pool), so the graphs come out of the device's account before the pool
+    bool defer_capture = false;
     model::pass_options pass;
     // SM1: the request's sampler (FC-DEC2, FC-SAMP0); unset: V1's greedy as TG1 built it. Its options are refused
     // (init fails with the message) when samp::options::check does
@@ -60,6 +66,15 @@ struct target_options {
     // SV1: also capture the other decision variant (greedy at T <= 0, the top-k path at T > 0), so set_sampling
     // switches a request between T = 0 and T > 0 with no capture; needs the sampler
     bool both_paths = false;
+    // MU1: the slot this target is the frame of (its slot classes resolved under model::slot_scope); the engine's
+    // compute streams, one a card (null: the target creates its own), so every slot's rounds and the prompt path run
+    // in one order on each card; and the serialized counters of the shared exchange rings, which every slot's rounds
+    // advance in the order they run (X-PLE-STATS's use, xchg.h; the eager executor's message uses [2]); null: the
+    // target's own
+    int32_t slot = 0;
+    void * streams[2] = {nullptr, nullptr};
+    uint64_t * ple_use = nullptr;
+    model::use_counters * eager_uses = nullptr;
 };
 
 // false with the reason unless the draft settings are buildable (draft_options::attention)
@@ -82,6 +97,7 @@ struct round_result {
     float upload_ms[2] = {0, 0}; // the e copy's GPU time per card (events), when timed
     float span_ms[2] = {0, 0};   // each card's event span from before its graph launch to after it, when timed
     uint32_t cur[2] = {0, 0};    // each card's committed slot in its completion record (SR1)
+    uint32_t gdn[2] = {0, 0};    // ME11: each card's GDN selector in its completion record
     bool recovered = false;      // FC-RD2: an error word was set; both cards were put back at the pre-step slot
 };
 
@@ -105,6 +121,8 @@ class target {
   public:
     target() = default;
     ~target();
+    // MU1: the slot this target is the frame of
+    int32_t slot_index() const { return o_.slot; }
     target(const target &) = delete;
     target & operator=(const target &) = delete;
 
@@ -151,6 +169,38 @@ class target {
     // out[a] is the new pending token
     bool verify(int32_t d, const int32_t * prop, int32_t budget, round_result & r, std::string & err,
                 bool timed = false);
+    // FMU2: a verify round as a lane of a joint round (fn/runtime/joint.h). joint_verify_begin: verify's checks, the
+    // proposals into the ledger and the round staged (descriptor, PLE rows uploaded on the streams, the versions' step
+    // begun) with the lane ring's PLE use; the caller then launches the joint graphs and calls joint_release (the
+    // start flag), or joint_abandon when the launch failed; joint_verify_end: the completion wait and verify's checks,
+    // FC-RD2's recovery and the ledger, as verify. Graph executor only.
+    struct staged_round {
+        uint64_t rd = 0;
+        int64_t n_before = 0;
+        std::chrono::steady_clock::time_point t0, t1, t2, t3;
+    };
+    bool joint_verify_begin(int32_t d, const int32_t * prop, int32_t budget, uint64_t ple_use, staged_round & sr,
+                            std::string & err);
+    void joint_release(const staged_round & sr);
+    void joint_abandon();
+    bool joint_verify_end(int32_t d, const int32_t * prop, staged_round & sr, round_result & r, std::string & err);
+    // FMU2 (build item 2): a draft step as a lane of a joint draft step (joint_frame::draft). joint_draft_begin:
+    // draft_step's checks and its descriptor staged (eagerly the start flag too); the caller launches the joint draft
+    // and calls joint_release; nothing to undo when the launch fails. joint_draft_end: the completion wait and
+    // draft_step's checks (r.argmax[0][0 .. d - 1] the proposals). draft_pick_sampled: the draft's pick is SM1's.
+    bool joint_draft_begin(int32_t d, staged_round & sr, std::string & err);
+    bool joint_draft_end(int32_t d, const staged_round & sr, round_result & r, std::string & err);
+    bool draft_pick_sampled() const { return dc_[0].sampled; }
+    // the eager executor's message use counters (the shared rings' when the engine shares them)
+    model::use_counters * eager_counters() { return u_; }
+    // FMU2: the joint graph's inputs from this slot: its pass options (the sampler's path) and decision variant
+    const model::pass_options & pass_options() const { return o_.pass; }
+    int32_t variant() const { return var_; }
+    // FMU2 (the memory account): the nodes of card's captured verify graph at rows in the slot's variant; -1 without it
+    int64_t graph_node_count(int32_t rows, int32_t card) const;
+    // TEST (R9-12's repair, the dry spec run's verify-recovery check): the next verify round's commit sees an
+    // injected error on the cards of mask (bit r: card r; FC-RD2's recoverable error, as forced_k's test_fail)
+    void test_fail_next_verify(int32_t mask) { test_fail_verify_ = mask; }
     // the primitive (versions.h): truncate within the last step to j kept rows and the ledger to n_keep tokens
     bool cut(int32_t j, int64_t n_keep, std::string & err);
     // the slot's tokens grow by these, as prompt tokens (unprocessed; rollback-test's continuation after a cut)
@@ -161,6 +211,9 @@ class target {
     bool close_check(bool & checked, std::string & err);
     // a decision-hash mismatch (err_hash) invalidated the slot: no round runs until reset (FC-RD2)
     bool invalid() const { return invalid_; }
+    // TEST ONLY (ME11, prefill-test): the GDN selector on both cards, no step recorded (no round in flight); refused
+    // outside the contract
+    bool test_set_gdn(uint32_t gdn, std::string & err) { return v_.set_gdn(l_, gdn, err); }
     // TEST ONLY (SM1): flip card r's decision record (its hash), so the next comparison fails
     bool test_flip_record(int32_t r, std::string & err);
     // the bootstrap round: token zero from the retained logits (FC-PF2). test_fail (TEST ONLY, rollback-test retain):
@@ -185,7 +238,9 @@ class target {
     bool prompt_begin(std::string & err);
     bool prompt_commit(int32_t rows, int32_t k, std::string & err);
     bool prompt_head(std::string & err);
-    bool restored(int64_t n, const std::vector<int32_t> & tokens, std::string & err);
+    // ME11: gdn_steps, the checkpoint's live GDN records, which the load put into bank 0 and set 0: the selector
+    // becomes (0, 0, gdn_steps) on both cards
+    bool restored(int64_t n, const std::vector<int32_t> & tokens, int32_t gdn_steps, std::string & err);
     bool draft_on() const { return o_.draft.on; }
 
     // model-bench: set N (and L, U) to depth with the ledger's tokens, without running rounds (a synthetic history)
@@ -227,16 +282,46 @@ class target {
     // SP2: in the sparse form the draft index's cells too, holding what the memory holds, as the K and V do)
     bool draft_set_depth(int64_t depth, std::string & err);
     model::draft_card & draft(int32_t r) { return dc_[r]; }
+    // ME1: the host-backed KV tier (null without --kv-host); kv_flush makes its host history whole (state checks read
+    // the KV classes there), synchronous
+    model::kv_tier * tier() const { return tier_.get(); }
+    bool kv_flush(std::string & err) { return tier_ == nullptr || tier_->flush(st_[0], err); }
 
     // card r's pass (buffers for checks and synthetic fills)
     model::pass_card & card(int32_t r) { return p_[r]; }
     void * stream(int32_t r) const { return st_[r]; }
     int32_t captures() const { return captures_; }
+
+    // ME3: the graphs init deferred (target_options::defer_capture): every variant's target graphs, the draft's step
+    // and catch-up graphs, with the cards' current expert service. On one device (model::single) a graph holds both
+    // logical cards' passes in the pair order on the one stream (pass_pair_enqueue, draft_pair_enqueue: the
+    // producer-before-consumer schedule; a card's peer waits are always on work enqueued before them); on two, one
+    // graph a card. graph_bytes: the device memory the capture took (per card; one device: card 0's)
+    bool capture(std::string & err);
+    int64_t graph_bytes(int32_t card) const { return graph_bytes_[card]; }
+    // ME3: the executor of the next rounds, between requests: graph (the captured graphs, the serving default) or
+    // eager (the phased enqueue: Compute Sanitizer's, and ME3's base arm); the expert service and the KV tier follow
+    // it, and the slot is reset (the exchange rings' slot rules differ between the executors)
+    bool set_executor(bool graph, std::string & err);
+    bool graph_executor() const { return !eager_; }
+    // ME3: the submissions since init: graph launches (target, draft step, catch-up) and eager rounds
+    struct submissions {
+        int64_t target_graphs = 0, draft_graphs = 0, catchup_graphs = 0, eager_rounds = 0, eager_draft_rounds = 0;
+        int64_t joint_rounds = 0; // FMU2: verify rounds run as a joint round's lane
+        int64_t joint_drafts = 0; // FMU2: draft steps run as a joint draft step's lane
+    };
+    const submissions & submitted() const { return sub_; }
     const ple_params & ple() const { return ple_; }
 
   private:
     bool round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_result & r, std::string & err,
                int32_t test_k = 0, int32_t test_fail = 0, int32_t budget = 0, const float * const * staged = nullptr);
+    bool round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k, int32_t test_fail,
+                     int32_t budget, const float * const * staged, uint64_t ple_use, staged_round & sr,
+                     std::string & err);
+    bool round_collect(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k, const staged_round & sr,
+                       round_result & r, std::string & err);
+    bool verify_accept(const int32_t * prop, const round_result & r, std::string & err);
     bool forced_round(int32_t rows, round_result & r, std::string & err, bool upload_e, bool timed,
                       const float * const * staged);
     bool clear_slot(bool zero_state, std::string & err); // reset's body; rewind keeps the state objects
@@ -246,21 +331,30 @@ class target {
     bool check_ledger(std::string & err);
     bool clear_errors(std::string & err);
     bool write_nodes(int32_t v, int32_t rows, int32_t card, std::string & err) const;
+    bool write_graph_nodes(void * graph, const std::string & path, std::string & err) const;
     bool capture_draft(int32_t card, int32_t kind, int32_t rows, std::string & err, int32_t v = 0, int32_t mode = 0);
     bool capture_draft_kind(int32_t kind, int32_t max_rows, int32_t v, std::string & err); // every captured form
     void index_written(int64_t first, int64_t rows); // SP2: index_n_ after a draft K/V write in the current form
-    // SP2 (HC8's): card c's regions of the decode-ready state (ready_state): a device range, and whether it is a
-    // versioned object (fn/kernels/round/version.h: n_version slices, of which the committed one is copied)
+    // SP2 (HC8's): card c's regions of the decode-ready state (ready_state): a device range, and its kind: plain, a
+    // versioned object (fn/kernels/round/version.h: n_version slices, of which the committed one is copied), or (ME11)
+    // a GDN layer's two banks or two record sets, of which the selector's bank or set is copied
+    enum class region_kind : int32_t { plain, versioned, gdn_banks, gdn_records };
     struct ready_region {
         uint8_t * p;
         int64_t bytes;
-        bool versioned;
+        region_kind kind;
     };
     bool ready_regions(int32_t c, std::vector<ready_region> & out, std::string & err) const;
+    // the bytes of a region a ready state copies: one version, one bank, one record set (ME11) or the whole region
+    static int64_t ready_bytes(const ready_region & r);
     bool capture_variant(int32_t v, std::string & err);
     bool capture_target(int32_t v, int32_t b, int32_t c, std::string & err); // one of capture_variant's graphs
     void set_pick(int32_t v); // the draft's pick for variant v (draft_card::sampled)
     bool draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, round_result & r, std::string & err);
+    // draft_round's halves: the checks and the descriptor (eagerly the flag), and the wait and the checks
+    bool draft_stage(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, staged_round & sr, std::string & err);
+    bool draft_collect(int32_t kind, int32_t rows, const staged_round & sr, round_result & r, std::string & err);
+    bool draft_step_check(int32_t d, std::string & err) const;
 
     model::model * m_ = nullptr;
     target_options o_;
@@ -281,12 +375,19 @@ class target {
     int64_t var_bytes_[2] = {0, 0};
     void * ev_[2][4] = {}; // per card: upload start/end, launch start/end
     int32_t captures_ = 0;
+    bool eager_ = false;    // ME3: the executor the rounds run (set_executor)
+    bool captured_ = false; // ME3: the graphs exist (capture)
+    int64_t graph_bytes_[2] = {0, 0};
+    submissions sub_;
     uint64_t next_round_ = 1;
-    uint64_t ple_use_ = 0;
+    uint64_t own_ple_use_ = 0;
+    uint64_t * ple_use_ = &own_ple_use_; // MU1: the engine's when shared (target_options::ple_use)
+    bool own_streams_ = true;            // MU1: false when the engine's streams are used
     ple_params ple_;
     ledger l_;
     slot_versions v_;
-    model::use_counters u_[2]; // eager mode's exchange counters
+    model::use_counters own_u_[2];     // eager mode's exchange counters
+    model::use_counters * u_ = own_u_; // MU1: the engine's when shared (target_options::eager_uses)
     model::draft_card dc_[2];
     // [form: 0 dense, 1 sparse (SP2)][variant][0: step, 1: catch-up][d or B_c][card]; the catch-up has no pick, so
     // only variant 0 holds it
@@ -301,9 +402,15 @@ class target {
     // after a failed catch-up (FC-RD2's restore covers the draft's caches by their valid length)
     float * carry_save_[2] = {nullptr, nullptr};
     int64_t carry_save_n_ = -1; // draft_n() when the copy was taken; -1: no copy for the last target round
+    // R9-12: a verify round's proposals on the token vector, for the round's inputs only (verify); FC-RD2's recovery
+    // takes them off before it checks the ledger
+    int32_t verify_extra_ = 0;
+    int32_t test_fail_verify_ = 0; // TEST: test_fail_next_verify
     int64_t batch_start_ = 0; // N before the last target round
     bool invalid_ = false;    // SM1: a decision-hash mismatch invalidated the slot
+    bool released_ = false;   // ME3 (load G ruling): a completion timeout released the cache's GPU waits
     bool after_error(round_result & r, std::string & err); // FC-RD2's restore, the record discarded
+    std::unique_ptr<model::kv_tier> tier_; // ME1 (--kv-host)
 };
 
 } // namespace fn::runtime

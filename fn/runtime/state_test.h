@@ -22,5 +22,8 @@
 // committed slot at all five positions, and both cards back at cur_pre after each injected error.
 //
 // usage: fnfl-drive state-test [all|san] [graph|eager] [DEV0] [DEV1]   (san: a short script, for the sanitizers)
+//        fnfl-drive state-test mu1 [graph|eager] [DEV0] [DEV1]      (MU1: the multi-slot pool and frames,
+//                                                                    slots_gpu_test.cpp)
 
-int fnfl_state_test(int argc, char ** argv);
+// KV8: kv_q8 (the driver's --kv-format q8) runs mu1 at the q8 geometry; the rig's own modes keep no KV
+int fnfl_state_test(int argc, char ** argv, bool kv_q8 = false);

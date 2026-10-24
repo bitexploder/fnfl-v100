@@ -8,12 +8,13 @@ namespace {
 
 // Block geometry from ggml/src/ggml-common.h at 66e11c3 (the block_* structs: q2_0 lines 195-198, q8_0 259-262,
 // q4_K 334-344, q5_K 351-362, q6_K 369-374, iq2_xxs 388-391, iq2_xs 395-399, iq2_s 403-408, iq3_xxs 414-417, iq3_s
-// 422-428, iq4_nl 493-496, iq4_xs 499-504), and the type numbers from ggml/include/ggml.h lines 390-432
+// 422-428, iq4_nl 493-496, iq4_xs 499-504; ME1: q5_1 244-255), and the type numbers from ggml/include/ggml.h lines
+// 390-432
 constexpr wfmt_info table[n_wfmt] = {
     {"iq2_xxs", 16, 256, 66}, {"iq2_xs", 17, 256, 74}, {"iq2_s", 22, 256, 82},   {"iq3_xxs", 18, 256, 98},
     {"iq3_s", 21, 256, 110},  {"iq4_nl", 20, 32, 18},  {"iq4_xs", 23, 256, 136}, {"q2_0", 42, 64, 18},
     {"q4_k", 12, 256, 144},   {"q5_k", 13, 256, 176},  {"q6_k", 14, 256, 210},   {"q8_0", 8, 32, 34},
-    {"bf16", 30, 1, 2},       {"f16", 1, 1, 2},        {"f32", 0, 1, 4},
+    {"bf16", 30, 1, 2},       {"f16", 1, 1, 2},        {"f32", 0, 1, 4},    {"q5_1", 7, 32, 24},
 };
 
 uint32_t bits_of(float f) {
