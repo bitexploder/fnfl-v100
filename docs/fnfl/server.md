@@ -21,7 +21,7 @@ The server uses CUDA devices 0 and 1 and needs both. To run it on two other card
 Loading takes about 8 s when the model files are already in the page cache, and longer when they have to come off disk. During the load, `/health` answers 503. When it finishes, the log prints these lines:
 
 ```
-FNFL: model loaded in 7.75 s (open 0.38, fill 7.35, reserve 0.02) at 262144 cells; free 1.465 / 1.467 GiB
+FNFL: model loaded in 7.66 s (open 0.40, fill 7.24, reserve 0.02) at 262144 cells; free 3.086 / 3.088 GiB
 FNFL: --fnfl-ple-table lazy (default)
 FNFL: PLE table: lazy, not pinned (the plain mapping; PL1's hints before each gather)
 FNFL settings: slots 1; cells 262144; draft on, attention sparse (SP2's switch), d 4, subset ...; end-of-generation IDs [248044,248046,248063,248064,248065]; launch sampler T 1.00 top-k 20 top-p 0.95 min-p 0.05 ...
@@ -240,7 +240,7 @@ Each slot keeps the conversation it last processed and reuses as much of it as t
 
 ### Long prompts
 
-The engine reads prompts in chunks of 8,192 tokens at about 3,500 tokens/s on a fresh prompt. A 130,000-token prompt therefore takes about 37 s before the first token.
+The engine reads prompts in chunks of 8,192 tokens at about 3,600 tokens/s on a fresh prompt. A 131,072-token prompt therefore takes about 36 s before the first token.
 
 - A streaming request gets its HTTP headers at once.
 - With `"return_progress": true`, it also gets a progress event at the end of each chunk.

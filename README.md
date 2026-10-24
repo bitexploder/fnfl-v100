@@ -15,8 +15,9 @@ Oh, and, FNFL stands for "Flash Next For Life".
 These are PCIe cards:  
 
 - Engine ran at 218 t/s **average** at depth across nine hours of DeepSWE
+- 0.2 ran a whole DeepSWE task (sql-formatter, resolved) at 211 t/s average decode and 2,300 t/s prefill
 - ENGINE IS NOT AFRAID OF DEEP CONTEXT, Ran at 262K
-- Reads prompts at about 3,500 t/s, a 131k token prompt took 36.8 seconds to load
+- Reads prompts at about 3,600 t/s, a 131k token prompt took 36.2 seconds to load
 - Barely moved at depth, 3,391 tokens added to ~196k context took 1.28 seconds
 - Stable enough to run DeepSWE 1.1 all night without leaking or crashing
 - This quant solves DeepSWE at the same rate as the full quant in my single full bench
@@ -30,8 +31,8 @@ Who doesn't love some benchmaxx metrics that make their engine look good?
 
 **Synthetic t/s decode**
 
-314 t/s copying a source file word for word with almost 5 tokens per round.   
-295 t/s writing new code with greedy sampling jotting down a red-black tree and unit test with 4.57 t/s. Opus said it wrote something resembling code, good enough for a benchmaxx.  
+312 t/s copying a source file word for word with almost 5 tokens per round.   
+298 t/s writing new code with greedy sampling jotting down a red-black tree and unit test with 4.53 t/s. Opus said it wrote something resembling code, good enough for a benchmaxx.  
 
 **HumanEval:**
 
@@ -47,12 +48,12 @@ A lone user is not slowed by having four slots open, and every user gets the sam
 
 Startup costs not really factored out at all.  
 
-- 512 tokens: 1,360 tok/s
-- 2K: 2,343 tok/s
-- 8K: 2,988 tok/s
-- 32K: 3,519 tok/s
-- 128K: 3,572 tok/s, in 36.7 s
-- 255K (a full context): 3,493 tok/s, in 74.8 s
+- 512 tokens: 1,381 tok/s
+- 2K: 2,396 tok/s
+- 8K: 3,053 tok/s
+- 32K: 3,577 tok/s
+- 128K: 3,623 tok/s, in 36.2 s
+- 255K (a full context): 3,545 tok/s, in 73.7 s
 
 ## Caveat Emptor
 
@@ -191,7 +192,7 @@ The two-card engine above keeps every weight on the cards. With less GPU memory,
 
 What we measured on the test machine (Ryzen 5 5600, 6 cores; PCIe 3.0 x8 per card; 128 GB RAM), on development builds just before 0.2. "Poetry" is a long generated reply at shallow depth; "DeepSWE" is a whole coding-agent task run to completion, averaged over its depth.
 
-- **Two 32 GB cards (the main engine):** 218 t/s poetry; DeepSWE 208 t/s decode, 1,573 t/s prefill. With four users, about 240 to 272 t/s together.
+- **Two 32 GB cards (the main engine):** 218 t/s poetry; DeepSWE 211 t/s decode, 2,305 t/s prefill (0.2, one agent, the whole task). With four users, about 240 to 272 t/s together.
 - **Two 16 GB cards:** `--fnfl-cached-tp`, KV on the cards: 107 t/s poetry, 2,176 t/s prefill on a 36K prompt. With the KV in host memory (`--fnfl-kv-host`), DeepSWE ran at 101 t/s decode and 483 t/s prefill.
 - **One 32 GB card:** `--fnfl-single-card 0`, KV on the card: 106 t/s poetry, the fastest one-card setup. With `--fnfl-kv-host` instead: 102.5 t/s poetry; DeepSWE 79 t/s decode, 346 t/s prefill. Use `--fnfl-kv-host` only for two users on the card (`-np 2`) or when the KV does not fit.
 - **One 16 GB card:** `--fnfl-single-card 0 --fnfl-kv-host`: about 59 t/s poetry; DeepSWE 48.5 t/s decode, 173 t/s prefill.
