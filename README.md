@@ -4,11 +4,18 @@
 
 # FNFL: Qwen3.8-Flash-Next on two Tesla V100s
 
-This is a from scratch inference engine that runs on 2x32GB Tesla V100 GPU. It supports exactly one model and has been tested on exactly one quant. Qwen Flash Next 3.8 with the ISTA-DASLab IQ3_XXS 3-bit quant. This is a preview release, meaning I have barely tested it. If this interests you, you are in luck! I have written what I think is the fastest runtime for this model on these cards I know about. Every single decision and design choice was built around the V100 from the ground up. Why should you care? It is really, really fast at decoding and making tokens :)  
+This is a from scratch inference engine that runs on 1 or 2 Tesla V100 GPU. It supports exactly one model and has been tested on exactly one quant. Qwen Flash Next 3.8 with the ISTA-DASLab IQ3_XXS 3-bit quant. If this interests you, you are in luck! I have written what I think is the fastest runtime for this model on these cards I know about. Every single decision and design choice was built around the V100 from the ground up. Why should you care? It is really, really fast at decoding and making tokens :)  
 
 I did not trade quality for speed in our implementation.  I used llama.cp as the reference, and FNFL matches it as closely as llama.cpp matches itself. Output distribution good. 
 
-Oh, and, FNFL stands for "Flash Next For Life".  
+Oh, and, FNFL stands for "Flash Next For Life". 
+
+# Current Features
+
+- MoE Cacheing with strong performance matching Strata-V100
+  - Supports 16GB or 32GB cards
+- Multiple concurrent users
+- Fast decode and prompt reading at full context dept
 
 ## Why should you care?
 
@@ -22,6 +29,7 @@ These are PCIe cards:
 - Stable enough to run DeepSWE 1.1 all night without leaking or crashing
 - This quant solves DeepSWE at the same rate as the full quant in my single full bench
 - New in 0.2: up to four users at once. Four DeepSWE agents on one server decoded at about 60 t/s each, about 240 t/s together, with no stalls or errors
+- MoE cache on ONE card solved the same DeepSWE task: 79 t/s on a 32GB card, 48 t/s on a 16GB card
 
 I care about agentic coding, so that is what I had time to bench so far. It's still fast on other stuff. It may not be as smart, but this quant has proven strong. 
 
@@ -43,6 +51,12 @@ Who doesn't love some benchmaxx metrics that make their engine look good?
 272 t/s together, about 70 t/s each, with four users writing at once with greedy sampling (short prompts).  
 258 t/s together at temperature 1.0.  
 A lone user is not slowed by having four slots open, and every user gets the same tokens it would get alone.
+
+**MoE cache, one card, a whole DeepSWE task (sql-formatter, solved):**
+
+32GB card: 79 t/s decode, 346 t/s prefill  
+16GB card: 48 t/s decode, 173 t/s prefill  
+KV in host RAM, dev builds right before 0.2. On a 32GB card KV on the card is a bit faster (106 t/s vs 102 on poetry).
 
 **Synthetic prefill:**
 
