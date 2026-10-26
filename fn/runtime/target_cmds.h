@@ -52,6 +52,7 @@ struct fnfl_target_args {
     std::string append_ids;    // prefill-test model (PB3 closure): after the deep stage, the append point's prompt
     int32_t append_restore = 0; // its untimed prefix: a request of this many tokens, then the prompt restoring it
     std::string ids;         // the token IDs (model-test, model-bench: HX7's deep.ids; generate: the prompt)
+    std::string joint_kl;    // FMS2 item 7 (joint-kl, rollback-test mu1 --joint-kl): the lanes' IDs (HX7's deep.ids)
     std::string out_dir;
     std::string mode; // model-test: full | san | race; model-bench: all | nsys
     // model-bench nsys (SF1): the traced point's depth and B (TG1's 131,072 and 3 when not given)
@@ -92,7 +93,21 @@ struct fnfl_target_args {
     struct run_setting {
         fn::samp::options sampling;
         int32_t max_tokens = 256;
+        int32_t           spec_d     = 0;  // TTTS1 (--spec-d inside a setting): the setting's d; 0: the process's
     };
+
+    // TTTS1 (--split, anywhere after the command): the split's stage of this process: 0 one box, 1 the leader (the
+    // front, layers 0 .. split_k - 1, connecting to split_addr), 2 the follower (fnfl-drive stage: the back, listening
+    // on split_addr); X-HELLO's identities split_commit and split_digest (the launch script's git rev-parse and
+    // cuobjdump md5); record_hash: each step's decision hash (spec run's rounds.csv); split_groups (joint-kl on the
+    // split): the joint pass as 1 U4 group, as 2 pipelined U2 groups, or 0 both
+    int32_t                  split_role = 0;
+    int32_t                  split_k    = 27;
+    std::string              split_addr = "10.25.0.2";
+    int32_t                  split_port = 13371;
+    std::string              split_commit, split_digest;
+    bool                     record_hash  = false;
+    int32_t                  split_groups = 0;
     std::vector<run_setting> run_settings;
     int32_t runs = 3;
     std::vector<int32_t> eog; // empty: the tokenizer's EOS (248046) alone
@@ -190,6 +205,14 @@ int fnfl_rollback_test(const fnfl_target_args & a);
 // short read out of turn, cancellation before, during and while suspended, and the resumed reads
 int fnfl_rollback_mu1(const fnfl_target_args & a);
 
+// TTTS1: rollback-test mu1's slot state hash of slot (the engine's own window's parts), as bytes: the split
+// follower's answer to the leader's probe
+namespace fn::runtime {
+class engine;
+}
+
+bool fnfl_mu1_slot_hash(fn::runtime::engine & e, int32_t slot, std::vector<uint8_t> & out);
+
 namespace fn::model {
 class model;
 }
@@ -197,6 +220,21 @@ namespace fn::runtime {
 class target;
 struct draft_options;
 } // namespace fn::runtime
+// FMS2 item 7 (fn/runtime/joint_kl.cpp): the 16-bit joint X-A / X-F judged by KL on one loaded model: four lanes of
+// a.joint_kl alone and jointly (q8 KV, the switch on), and the lone pass in BF16 KV as the yardstick; PASS (exit 0)
+// when the joint's KL p50, p99, max and top-1 differences are each at most the yardstick's and no error word is set.
+// fnfl_joint_kl_on takes a model loaded with four slots of cells (rollback-test mu1's, after its PASS); fnfl_joint_kl
+// loads one (a.mode dry: model-dry's zero weights)
+// TTTS1: sp, the split's session (rollback-test mu1 --split's): the passes on the split, the follower rebuilt alike
+struct fnfl_split;
+int  fnfl_joint_kl_on(const fnfl_target_args &          a,
+                      std::unique_ptr<fn::model::model> m,
+                      int32_t                           cells,
+                      fnfl_split *                      sp = nullptr);
+// TTTS1: the model's state laid out again for slots slots of cells cells in q8 or BF16 KV (release, reserve, the EX1
+// grids), the weights kept; true when the model's KV format is now kv_q8's
+bool fnfl_lay_out(fn::model::model & m, int32_t cells, int32_t slots, bool kv_q8);
+int fnfl_joint_kl(const fnfl_target_args & a);
 // rollback-test's state hashes (SR1), for spec's replay check: on both cards every GDN layer's state and convolution
 // history (logical version 0), the PLE history, K and V of cells < N, the index keys of cells < N and the summaries of
 // blocks < N / 4, in that order; false on a failed read or a committed slot that is not the ledger's
@@ -238,11 +276,17 @@ struct fnfl_request_out {
     int32_t              n_processed = 0; // ME3: the prefill's processed tokens
 };
 
+namespace fn::runtime::stage {
+class leader;
+}
+
+// TTTS1: L (the split's leader, its front engine e) carries out the request's calls; null: e alone
 bool fnfl_spec_request(fn::runtime::engine &                e,
                        const std::vector<int32_t> &         prompt,
                        int32_t                              n_reuse,
                        const fn::runtime::request_options & o,
-                       fnfl_request_out &                   out);
+                       fnfl_request_out &                   out,
+                       fn::runtime::stage::leader *         L = nullptr);
 // PF1, prefill-test (fn/runtime/prefill_cmds.cpp): bulk prefill's driver; PB1: the bulk path against the forced
 // reference and the pinned engine. Mode plan: the chunk rules and the checkpoint bookkeeping, no device; dry and
 // dry-eager: zero weights, 16,384 cells, the driver's paths on the target and (dry) the engine's prefill, truncate,

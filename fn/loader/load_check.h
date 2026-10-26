@@ -25,3 +25,21 @@ struct fnfl_load_check_args {
 
 int fnfl_load_plan(const fnfl_load_check_args & a);
 int fnfl_load_check(const fnfl_load_check_args & a);
+
+// TTTS1 (fnfl-drive split-plan, CPU only, no GPU): a split's per-box plan. For each stage (the front: layers
+// 0 .. k - 1 with the embeddings; the back: k .. 47 with the head and the draft) the model is opened with the stage's
+// window (the placement, no fill), and each card's weight bytes and its state at slots slots are printed: the slot
+// classes x slots, the KV pool (the capacity classes at pool_cells, fn/model/state.h bytes_per_cell), the engine's
+// classes and the other-reader lane, in BF16 and q8 KV. The headroom: a measured free figure (free_*: GiB a card after
+// a split engine came up, its config cal_*) less the planned growth from that config to this one (the CUDA context,
+// graphs, frames and rings, not in the plan, taken as the measured config's)
+struct fnfl_split_plan_args {
+    std::string model_path, draft_path;
+    int32_t     k = 26, slots = 8, slot_cells = 262144, pool_cells = 819200;
+    std::string cal_model, cal_draft;
+    int32_t     cal_k = 27, cal_slots = 8, cal_slot_cells = 16384, cal_pool_cells = 131072;
+    bool        cal_q8        = true;
+    double      free_front[2] = { -1, -1 }, free_back[2] = { -1, -1 };
+};
+
+int fnfl_split_plan(const fnfl_split_plan_args & a);

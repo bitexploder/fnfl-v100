@@ -3,22 +3,37 @@
 #   start [--temp T] [--top-k K] [--top-p P] [--min-p P]   (TK1: the server's sampling; defaults T 1.0, top-k 20,
 #           top-p 0.95, min-p 0.05, the model's own; a request's fields override them)
 #           [--spec-d N] [--draft-attention dense|sparse]   (SP2: the drafts a step proposes, 1..4, and the draft's
-#           attention; defaults d 4 and sparse, the fnfl-stable server's settings; always passed as --fnfl-spec-d and
+#           attention; defaults d 2 (operator 2026-10-26, DeepSWE) and sparse; always passed as --fnfl-spec-d and
 #           --fnfl-draft-attention)
 #           refuses if a compute process is on either card or a canonical lock is held; takes the three canonical locks
 #           (flock -n) and starts llama-server with them, so the server process itself holds the locks for its
 #           lifetime (this script closes its own copies; no other process gets them); waits for /health (600 s).
+#           [--split [--split-layer K] [--slots N]]   (TTTS1: Flash-Next across Carlos and Carlin, resident TP on each:
+#           this server the leader, the front, layers 0 .. K - 1 (default 27); the follower, `fnfl-drive stage` (the
+#           back: layers K .. 47, the head and the draft), started first on Carlin over ssh, holding Carlin's three
+#           canonical locks for its lifetime; N slots (default 8) in two pipelined groups; CTX the KV pool (default
+#           819200: 102,400 cells a slot at N 8). The UCX variables (UCX_TLS, default tcp,self: Ubuntu's UCX 1.20 has
+#           no rc_mlx5; UCX_NET_DEVICES enp3s0np0 here, enp5s0np0 there; UCX_IB_GID_INDEX 3) and X-HELLO's commit and
+#           device-code digest (the md5 of cuobjdump -sass of the build's fnfl-drive, on each box) are printed with
+#           the effective settings)
 #   stop    SIGTERM to the pidfile's process only, up to 60 s for it to exit, then checks both cards at 0 MiB and the
-#           locks free.
-#   status  the PID, /health and the lock state.
+#           locks free. With a split: the follower ends at the leader's X-BYE; if it has not, SIGTERM to its pidfile's
+#           process on Carlin, then Carlin's cards and locks checked too.
+#   status  the PID, /health and the lock state (with a split, the follower's too).
 # Environment: BIN (default engine/build-fnfl/bin/llama-server), SERVE_DIR (default work/SV1/serve: server.log and
-# server.pid), PORT (default 8190), CTX (default 262144: full 256K context; explicit overrides are supported).
+# server.pid), PORT (default 8190), CTX (default 262144: full 256K context; explicit overrides are supported),
+# EXTRA_ARGS (more server flags, appended; TTTS1: a measurement's recipe flags such as --metrics).
+# TTTS1: FOLLOWER (ssh name, default carlin), FOLLOWER_ADDR (default 10.25.0.2), SPLIT_PORT (default 13371),
+# FOLLOWER_BIN (default fnfl-drive beside BIN, the same path on Carlin), FOLLOWER_DIR (default SERVE_DIR, on Carlin:
+# follower.log and follower.pid), EOG (the follower's end-of-generation IDs, the vocabulary's: default
+# 248044,248046,248063,248064,248065; X-HELLO refuses a set the server's differs from).
 set -u
 ROOT=/home/jeremy/src/flashnext
 LK=/home/jeremy/src/flashnext-opt/artifacts
 BIN=${BIN:-$ROOT/engine/build-fnfl/bin/llama-server}
 SERVE_DIR=${SERVE_DIR:-$ROOT/work/SV1/serve}
 PORT=${PORT:-8190}
+CTX_SET=${CTX:+1} # an explicit CTX (TTTS1: else the split's pool is 102,400 cells a slot)
 CTX=${CTX:-262144}
 MODEL=/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf
 DRAFT=/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf
@@ -36,15 +51,69 @@ TEMP=1.0
 TOP_K=20
 TOP_P=0.95
 MIN_P=0.05
-SPEC_D=4
+SPEC_D=2
 DRAFT_ATTN=sparse
+SPLIT=0
+SPLIT_K=27
+SLOTS=8
+FOLLOWER=${FOLLOWER:-carlin}
+FOLLOWER_ADDR=${FOLLOWER_ADDR:-10.25.0.2}
+SPLIT_PORT=${SPLIT_PORT:-13371}
+FOLLOWER_BIN=${FOLLOWER_BIN:-$(dirname "$BIN")/fnfl-drive}
+FOLLOWER_DIR=${FOLLOWER_DIR:-$SERVE_DIR}
+EOG=${EOG:-248044,248046,248063,248064,248065}
+SPLITF=$SERVE_DIR/split # TTTS1: while a split serves: the follower's ssh name and directory (its follower.pid there)
+# X-HELLO's identities, each box its own: the source commit of a binary's build tree (git describe --dirty of its
+# CMakeCache's source directory) and the device-code digest (the md5 of cuobjdump -sass of the build's fnfl-drive)
+ID_FNS='commit_of() { local b s; b=$(dirname "$(dirname "$1")"); s=$(sed -n "s/^CMAKE_HOME_DIRECTORY:INTERNAL=//p" "$b/CMakeCache.txt"); { git -C "$s" rev-parse HEAD && git -C "$s" diff --quiet HEAD || echo -dirty; } 2> /dev/null | tr -d "\n"; }; sass_md5() { local o; o=$(/usr/local/cuda/bin/cuobjdump -sass "$1" 2> /dev/null); [ -n "$o" ] && md5sum <<< "$o" | cut -d" " -f1 || echo none; }'
+eval "$ID_FNS"
+remote() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$FOLLOWER" "$@"; }
+follower_alive() { remote "[ -f $FOLLOWER_DIR/follower.pid ] && kill -0 \$(cat $FOLLOWER_DIR/follower.pid) 2> /dev/null"; }
+# the follower's end: it leaves at the leader's X-BYE (or when the link is lost); else SIGTERM to its pidfile's
+# process only, up to 60 s; then Carlin's cards and locks
+follower_stop() {
+    for _ in $(seq 30); do
+        follower_alive || break
+        sleep 1
+    done
+    if follower_alive; then
+        remote "kill -TERM \$(cat $FOLLOWER_DIR/follower.pid)"
+        for _ in $(seq 60); do
+            follower_alive || break
+            sleep 1
+        done
+    fi
+    if follower_alive; then
+        echo "fnfl-serve: the follower on $FOLLOWER did not exit in 60 s"
+        return 1
+    fi
+    rm -f "$SPLITF"
+    echo "fnfl-serve: the follower on $FOLLOWER stopped; there: $(remote 'nvidia-smi --query-gpu=index,memory.used --format=csv,noheader | tr "\n" " "; a=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader); echo "compute processes: ${a:-none}"')"
+}
+[ -f "$SPLITF" ] && read -r FOLLOWER FOLLOWER_DIR < "$SPLITF"
 
 case "${1:-}" in
     start)
         shift
         while [ $# -gt 0 ]; do
+            if [ "$1" = --split ]; then
+                SPLIT=1
+                shift
+                continue
+            fi
             [ $# -ge 2 ] || { echo "fnfl-serve: $1: no value"; exit 2; }
             case "$1" in
+                --split-layer)
+                    [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -ge 2 ] && [ "$2" -le 47 ] || {
+                        echo "fnfl-serve: --split-layer is 2..47"
+                        exit 2
+                    }
+                    SPLIT_K=$2
+                    ;;
+                --slots)
+                    [[ "$2" =~ ^[1-8]$ ]] || { echo "fnfl-serve: --slots is 1..8"; exit 2; }
+                    SLOTS=$2
+                    ;;
                 --temp) TEMP=$2 ;;
                 --top-k) TOP_K=$2 ;;
                 --top-p) TOP_P=$2 ;;
@@ -62,7 +131,7 @@ case "${1:-}" in
                     ;;
                 *)
                     echo "fnfl-serve: unknown option $1 (start [--temp T] [--top-k K] [--top-p P] [--min-p P]" \
-                        "[--spec-d N] [--draft-attention dense|sparse])"
+                        "[--spec-d N] [--draft-attention dense|sparse] [--split [--split-layer K] [--slots N]])"
                     exit 2
                     ;;
             esac
@@ -84,16 +153,51 @@ case "${1:-}" in
             echo "fnfl-serve: refused: a canonical lock is held"
             exit 3
         fi
+        NP=1
+        SPLIT_ARGS=()
+        if [ "$SPLIT" = 1 ]; then
+            # TTTS1: the follower first, on Carlin, under its three canonical locks (held by the follower itself)
+            NP=$SLOTS
+            [ -z "$CTX_SET" ] && CTX=$((102400 * SLOTS))
+            CELLS=$((CTX < 262144 ? CTX : 262144))
+            [ -x "$FOLLOWER_BIN" ] || { echo "fnfl-serve: no follower binary $FOLLOWER_BIN here (its build is the leader's)"; exit 2; }
+            COMMIT=$(commit_of "$BIN")
+            DIGEST=$(sass_md5 "$FOLLOWER_BIN")
+            UCX_TLS=${UCX_TLS:-tcp,self}
+            export UCX_TLS UCX_NET_DEVICES=${UCX_NET_DEVICES:-enp3s0np0} UCX_IB_GID_INDEX=${UCX_IB_GID_INDEX:-3}
+            FENV="UCX_TLS=$UCX_TLS UCX_NET_DEVICES=${FOLLOWER_NET:-enp5s0np0} UCX_IB_GID_INDEX=$UCX_IB_GID_INDEX"
+            FARGS="stage --kv-format q8 --split-layer $SPLIT_K --draft-attention $DRAFT_ATTN --draft-subset $SUBSET --slots $SLOTS --cells $CELLS --pool-cells $CTX --spec-d $SPEC_D --eog $EOG --split-addr $FOLLOWER_ADDR --split-port $SPLIT_PORT"
+            # the follower's own commit and digest (X-HELLO compares them with the leader's)
+            fstart="$ID_FNS; mkdir -p $FOLLOWER_DIR; FC=\$(commit_of $FOLLOWER_BIN); FD=\$(sass_md5 $FOLLOWER_BIN); apps=\$(nvidia-smi --query-compute-apps=pid --format=csv,noheader); [ -z \"\$apps\" ] || { echo \"BUSY \$apps\"; exit 4; }; exec 7> $LK/gpu.lock 8> $LK/gpu0.lock 9> $LK/gpu1.lock; { flock -n 7 && flock -n 8 && flock -n 9; } || { echo LOCKED; exit 3; }; env $FENV nohup setsid $FOLLOWER_BIN $FARGS --split-commit \$FC --split-digest \$FD >> $FOLLOWER_DIR/follower.log 2>&1 < /dev/null & echo \$! > $FOLLOWER_DIR/follower.pid; echo STARTED \$! \$FC \$FD"
+            fout=$(remote "$fstart")
+            case "$fout" in
+                STARTED*) ;;
+                *)
+                    echo "fnfl-serve: refused: the follower on $FOLLOWER did not start: ${fout:-no answer}"
+                    exit 3
+                    ;;
+            esac
+            SPLIT_ARGS=(--fnfl-split-layer "$SPLIT_K" --fnfl-split-addr "$FOLLOWER_ADDR" --fnfl-split-port "$SPLIT_PORT"
+                --fnfl-split-commit "$COMMIT" --fnfl-split-digest "$DIGEST" --fnfl-kv-format q8)
+            echo "$FOLLOWER $FOLLOWER_DIR" > "$SPLITF"
+            read -r _ FPID FCOMMIT FDIGEST <<< "$fout"
+            echo "fnfl-serve: split at k $SPLIT_K: the follower on $FOLLOWER ($FOLLOWER_ADDR:$SPLIT_PORT), pid $FPID, log $FOLLOWER_DIR/follower.log"
+            echo "fnfl-serve: X-HELLO: here commit $COMMIT, device code $DIGEST; there commit $FCOMMIT, device code $FDIGEST"
+            echo "fnfl-serve: UCX_TLS=$UCX_TLS UCX_NET_DEVICES=$UCX_NET_DEVICES (follower ${FOLLOWER_NET:-enp5s0np0}) UCX_IB_GID_INDEX=$UCX_IB_GID_INDEX"
+            echo "fnfl-serve: $SLOTS slots, KV pool $CTX cells (each slot's context $CELLS), --fnfl-spec-d $SPEC_D, eog $EOG"
+        fi
         {
             echo "start=$(date -u +%FT%T) bin=$BIN sha256=$(sha256sum "$BIN" | cut -d' ' -f1)"
             echo "context: $CTX tokens (-c); port: $PORT"
             echo "sampling: temp $TEMP top-k $TOP_K top-p $TOP_P min-p $MIN_P"
             echo "spec: --fnfl-spec-d $SPEC_D --fnfl-draft-attention $DRAFT_ATTN"
+            [ "$SPLIT" = 1 ] && echo "split: k $SPLIT_K, $SLOTS slots, follower $FOLLOWER ($FOLLOWER_ADDR:$SPLIT_PORT) $FOLLOWER_BIN, commit $COMMIT, device code $DIGEST, UCX_TLS=$UCX_TLS"
+            [ -n "${EXTRA_ARGS:-}" ] && echo "extra: $EXTRA_ARGS"
         } > "$SERVE_DIR/start.txt"
         # the server inherits descriptors 7-9 and so holds the three locks; setsid detaches it from this shell
-        nohup setsid "$BIN" --host 0.0.0.0 --port "$PORT" -m "$MODEL" -md "$DRAFT" -c "$CTX" -np 1 --jinja \
+        nohup setsid "$BIN" --host 0.0.0.0 --port "$PORT" -m "$MODEL" -md "$DRAFT" -c "$CTX" -np "$NP" --jinja \
             --temp "$TEMP" --top-k "$TOP_K" --top-p "$TOP_P" --min-p "$MIN_P" --fnfl-draft-subset "$SUBSET" \
-            --fnfl-spec-d "$SPEC_D" --fnfl-draft-attention "$DRAFT_ATTN" \
+            --fnfl-spec-d "$SPEC_D" --fnfl-draft-attention "$DRAFT_ATTN" "${SPLIT_ARGS[@]}" ${EXTRA_ARGS:-} \
             >> "$LOG" 2>&1 < /dev/null &
         echo $! > "$PIDF"
         exec 7>&- 8>&- 9>&-
@@ -103,7 +207,12 @@ case "${1:-}" in
                 echo "fnfl-serve: pid $(cat "$PIDF") serving on port $PORT after $(($(date +%s) - t0)) s; log $LOG"
                 exit 0
             fi
-            alive || { echo "fnfl-serve: the server exited during load:"; tail -5 "$LOG"; exit 1; }
+            if ! alive; then
+                echo "fnfl-serve: the server exited during load:"
+                tail -5 "$LOG"
+                [ "$SPLIT" = 1 ] && follower_stop
+                exit 1
+            fi
             sleep 1
         done
         echo "fnfl-serve: no /health in 600 s (pid $(cat "$PIDF") still loading?)"
@@ -125,6 +234,9 @@ case "${1:-}" in
             fi
             echo "fnfl-serve: pid $pid stopped"
         fi
+        if [ -f "$SPLITF" ]; then
+            follower_stop || exit 1
+        fi
         sleep 1
         apps=$(nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory --format=csv,noheader)
         echo "fnfl-serve: cards: $(cards); compute processes: ${apps:-none}; locks: $(locks_free && echo free || echo HELD)"
@@ -143,9 +255,17 @@ case "${1:-}" in
             echo "fnfl-serve: locks: held by $(lslocks -n -o PID,PATH 2> /dev/null | grep -E 'gpu[01]?\.lock' | awk '{print $1}' | sort -u | tr '\n' ' ')"
         fi
         echo "fnfl-serve: cards: $(cards)"
+        if [ -f "$SPLITF" ]; then
+            if follower_alive; then
+                echo "fnfl-serve: the follower on $FOLLOWER: pid $(remote "cat $FOLLOWER_DIR/follower.pid") running"
+            else
+                echo "fnfl-serve: the follower on $FOLLOWER: not running"
+            fi
+        fi
         ;;
     *)
-        echo "usage: fnfl-serve.sh start [--temp T] [--top-k K] [--top-p P] [--min-p P]|stop|status"
+        echo "usage: fnfl-serve.sh start [--temp T] [--top-k K] [--top-p P] [--min-p P] [--spec-d N]" \
+            "[--draft-attention dense|sparse] [--split [--split-layer K] [--slots N]]|stop|status"
         echo "       (BIN, SERVE_DIR, PORT from the environment)"
         exit 2
         ;;

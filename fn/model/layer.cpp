@@ -250,6 +250,12 @@ int32_t hc_slot(const use_counters & u, int64_t n) {
         }
         case hc_rule::catchup:
             return 2;
+        case hc_rule::stage:
+            if ((u.graph_subs - 2) % fn::xchg::n_slot == 1) {
+                static constexpr int32_t from_end[3] = { 1, 2, 0 };
+                return from_end[(u.graph_subs - 1 - k) % fn::xchg::n_slot];
+            }
+            break;
     }
     return k == u.graph_subs - 1 ? 1 : static_cast<int32_t>(k % fn::xchg::n_slot);
 }
@@ -819,6 +825,78 @@ bool dense_run(card_ctx & c, fn::dense::product_args a, int32_t rows, dense_site
         acquire_input(a, c, u);
     }
     return dense_launch(c, a, rows, site, piece, err);
+}
+
+bool hc_sublayer_lanes(card_ctx * const c[], int32_t lanes, const hc_module & h, int32_t set, const layer_input in[],
+                       const use_counters & u, int32_t part, uint32_t * runs, std::string & err) {
+    if (lanes < 2 || lanes > fn::xchg::max_lanes || h.q8_down == nullptr || runs == nullptr) {
+        return fail(err, "hc lanes: 2 .. 4 lanes of a Q8_0 sublayer with run counters");
+    }
+    const int64_t n = u.sub;
+    const int32_t s = hc_slot(u, n);
+    const int32_t s_prev = hc_prev_slot(u, n);
+    fn::hc::down2_q8_args d[fn::xchg::max_lanes] = {};
+    fn::hc::up2_q8_args up[fn::xchg::max_lanes] = {};
+    for (int32_t k = 0; k < lanes; ++k) {
+        const card_ctx & ck = *c[k];
+        const int32_t r = ck.card;
+        const fn::xchg::rings & rg = *ck.rings;
+        if (r != c[0]->card || ck.stream != c[0]->stream) {
+            return fail(err, "hc lanes: the lanes on one card and stream");
+        }
+        fn::hc::down2_args d2;
+        d2.d = {h.w_down, in[k].hres, in[k].hx, in[k].hpost, h.gamma, ck.ws.x[set], ck.ws.mom[set]};
+        d2.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
+        d2.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
+        d2.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
+        d[k] = {d2, h.q8_down};
+        const fn::hc::up2_args u2 = {h.w_up,
+                                     ck.ws.mom[set],
+                                     rg.slot(r, fn::xchg::msg::hc, s),
+                                     ck.ws.x[set],
+                                     h.gamma,
+                                     ck.ws.inject[set],
+                                     rg.slot(r, fn::xchg::msg::hmix, s),
+                                     rg.slot(1 - r, fn::xchg::msg::hmix, s),
+                                     runs + int64_t(k) * fn::hc::n_runs_card,
+                                     rg.err(r),
+                                     r};
+        up[k] = {u2, h.q8_up};
+    }
+    const bool ok =
+        part == 0 ? fn::hc::down2_q8_lanes(lanes, d, c[0]->stream) : fn::hc::up2_q8_lanes(lanes, up, c[0]->stream);
+    if (!ok) {
+        return fail(err, part == 0 ? "hc down2 lanes" : "hc up2 lanes");
+    }
+    note(*c[0], part == 0 ? "hc.down2.lanes" : "hc.up2.lanes");
+    return true;
+}
+
+bool dense_joint_run(card_ctx * const c[], int32_t lanes, fn::dense::product_args a, const fn::xchg::joint_rings & jr,
+                     void * work, const use_counters & u, const char * piece, std::string & err) {
+    if (lanes < 2 || lanes > fn::xchg::max_lanes || work == nullptr) {
+        return fail(err, std::string(piece) + ": 2 .. 4 lanes with the joint work");
+    }
+    const card_ctx & c0 = *c[0];
+    fn::dense::joint_args ja;
+    ja.lanes = lanes;
+    ja.hmix_lane_floats = static_cast<int32_t>(fn::xchg::joint_rings::lane_floats());
+    a.hmix = hmix_in(c0, u);
+    a.hmix_peer_half = 1 - c0.card;
+    a.err = jr.err(c0.card);
+    for (int32_t k = 1; k < lanes; ++k) {
+        if (hmix_in(*c[k], u) != a.hmix + int64_t(k) * ja.hmix_lane_floats || c[k]->card != c0.card) {
+            return fail(err, std::string(piece) + ": the lanes' X-HMIX slots are not the joint rings' lane slots");
+        }
+    }
+    a.grids = c0.dense_grids;
+    fn::dense::choose_splits(a);
+    a.work = work;
+    if (!fn::dense::product_joint(a, ja, c0.stream)) {
+        return fail(err, std::string(piece) + ": joint product");
+    }
+    note(c0, piece);
+    return true;
 }
 
 bool half_exchange(card_ctx & c, int32_t set, int32_t rows, int32_t slot, bool send, std::string & err) {
@@ -1713,6 +1791,7 @@ size_t joint_work_offset(dense_site site) {
     return static_cast<size_t>(off);
 }
 
+// the x16 exchange's rows: every lane's five (joint_x16 runs at R = 5 only: joint.cpp refuses it at R < 5)
 int32_t joint_rows_of(const joint_lanes & j) {
     return j.lanes * layer_max_rows;
 }
@@ -1729,8 +1808,19 @@ void acquire_joint(fn::dense::product_args & a, fn::dense::joint_args & ja, cons
 }
 
 // fn::dense::product_joint in site's joint region, its layout checked against the site's
+int32_t exchange_slot(const use_counters & u, int32_t sub) {
+    return sub == 0 ? use_slot(u, u.a, u.graph_a) : use_slot(u, u.f, u.graph_f);
+}
+
+// FMS2 item 6 (XC-1): the peer's joint X-A (set 0) or X-F (1) slot of this use, which the producer stores its half to
+uint32_t * peer_slot_joint(const joint_lanes & j, int32_t set, const use_counters & u) {
+    const fn::xchg::msg m = set == 0 ? fn::xchg::msg::a : fn::xchg::msg::f;
+    return reinterpret_cast<uint32_t *>(j.jr->slot(1 - j.lane[0]->card, m, exchange_slot(u, set)));
+}
+
+// sent (non-null): whether the product sent X-A itself (ja.peer kept: a split product)
 bool joint_launch(joint_lanes & j, fn::dense::product_args a, fn::dense::joint_args ja, dense_site site,
-                  const char * piece, std::string & err) {
+                  const char * piece, std::string & err, bool * sent = nullptr) {
     card_ctx & c0 = *j.lane[0];
     const int32_t i = static_cast<int32_t>(site);
     if (j.dense_work == nullptr || i < 0 || i >= joint_sites) {
@@ -1744,15 +1834,33 @@ bool joint_launch(joint_lanes & j, fn::dense::product_args a, fn::dense::joint_a
     }
     a.work = static_cast<uint8_t *>(j.dense_work) + joint_work_offset(site);
     ja.lanes = j.lanes;
+    ja.rows      = j.rows;      // FMS13
+    ja.dense_f16 = j.dense_f16; // FMS6
+    if (ja.peer != nullptr && a.mats[0].split < 2) {
+        ja.peer = nullptr; // an unsplit product leaves X-A to send_half_joint (or send_half_joint16)
+        ja.x16_err = nullptr;
+    }
     if (!fn::dense::product_joint(a, ja, c0.stream)) {
         return fail(err, std::string(piece) + ": joint product");
+    }
+    if (sent != nullptr) {
+        *sent = ja.peer != nullptr;
     }
     note(c0, piece);
     return true;
 }
 
+// FMS2 item 6: the X-A producer's arguments (matrix 0's peer half to the peer's slot of this use)
+fn::dense::joint_args xa_joint_args(const joint_lanes & j, const use_counters & u) {
+    fn::dense::joint_args ja;
+    ja.peer = peer_slot_joint(j, 0, u);
+    ja.peer_half = 1 - j.lane[0]->card;
+    ja.x16_err = j.x16 ? j.jr->err(j.lane[0]->card) : nullptr; // FMS2 item 7
+    return ja;
+}
+
 bool gdn_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
-               std::string & err) {
+               bool & sent, std::string & err) {
     layer_ws & ws = j.lane[0]->ws; // the joint frame's base: every lane's rows
     fn::dense::product_args in;
     fn::dense::joint_args ja;
@@ -1771,9 +1879,12 @@ bool gdn_joint(joint_lanes & j, const layer_weights & w, const layer_state * con
     if (!joint_launch(j, in, ja, dense_site::gdn_input, "gdn.input", err)) {
         return false;
     }
+    // FMS2 (build item 3, W3): every lane's gdn_core in one launch, grid.y = U, each lane on its own arguments and
+    // workspace (joint_lane_kernel_ws)
+    fn::gdn::core_args ga[fn::xchg::max_lanes];
     for (int32_t k = 0; k < j.lanes; ++k) {
         card_ctx & c = *j.lane[k];
-        fn::gdn::core_args g;
+        fn::gdn::core_args & g = ga[k];
         g.conv = c.ws.conv;
         g.z = c.ws.z;
         g.alpha = c.ws.alpha;
@@ -1785,25 +1896,25 @@ bool gdn_joint(joint_lanes & j, const layer_weights & w, const layer_state * con
         g.rec = st[k]->rec;
         g.gsel = c.gsel;
         g.gated = c.ws.gated;
-        g.gated_q = {c.ws.mid_codes, c.ws.mid_scales, layer_max_rows, GV};
+        g.gated_q              = { c.ws.mid_codes, c.ws.mid_scales, j.rows, GV };
         g.ws = c.gdn_ws;
-        g.rows = layer_max_rows;
-        if (!fn::gdn::core(g, c.stream)) {
-            return fail(err, "gdn core");
-        }
-        note(c, "gdn.core");
+        g.rows                 = j.rows;
     }
+    if (!fn::gdn::core_lanes(j.lanes, ga, j.lane[0]->stream)) {
+        return fail(err, "gdn core (lanes)");
+    }
+    note(*j.lane[0], "gdn.core");
     fn::dense::product_args out;
     out.k = GV;
     out.n_mats = 1;
     out.mats[0] = qmat(w.ssm_out, ws.partial);
     out.x_codes = ws.mid_codes;
     out.x_scales = ws.mid_scales;
-    return joint_launch(j, out, fn::dense::joint_args(), dense_site::gdn_out, "gdn.out", err);
+    return joint_launch(j, out, xa_joint_args(j, u), dense_site::gdn_out, "gdn.out", err, &sent);
 }
 
 bool qsa_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
-               std::string & err) {
+               bool & sent, std::string & err) {
     layer_ws & ws = j.lane[0]->ws;
     const int32_t r = j.lane[0]->card;
     const bool owner = r == w.index_owner;
@@ -1823,95 +1934,112 @@ bool qsa_joint(joint_lanes & j, const layer_weights & w, const layer_state * con
     if (!joint_launch(j, in, ja, owner ? dense_site::qsa_input_owner : dense_site::qsa_input_peer, "qsa.input", err)) {
         return false;
     }
-    // FMU2 (build item 3): every lane's selection before any lane's attend: the owner's summary, select and send of
-    // each lane, or the peer's receive of each, so the peer waits for the owner once a layer, not once a lane. Each
-    // lane's kernels, arguments and buffers (its own rows of the joint ws, its slot's state and workspaces, its lane
-    // ring) are unchanged, so every kernel's bits are
-    for (int32_t k = 0; k < j.lanes; ++k) {
+    // FMS2 (build item 3, W3): every lane's selection in one launch a piece: the owner's summary, score, select and
+    // send of all lanes (one X-SELECT send a layer), or the peer's one receive; then every lane's attend in one
+    // cooperative launch. Each lane's arguments and buffers are FMU2's (its own rows of the joint ws, its slot's state,
+    // its lane ring) with its own kernel workspaces (joint_lane_kernel_ws), so every lane's bits are its own launches'
+    card_ctx & c0 = *j.lane[0];
+    const int32_t L = j.lanes;
+    if (owner) {
+        fn::qsa::round_update_args ua[fn::xchg::max_lanes];
+        fn::qsa::select_args sa[fn::xchg::max_lanes];
+        const int32_t * off[fn::xchg::max_lanes] = {};
+        const uint32_t * body[fn::xchg::max_lanes] = {};
+        float * peer[fn::xchg::max_lanes] = {};
+        for (int32_t k = 0; k < L; ++k) {
+            card_ctx & c = *j.lane[k];
+            const layer_state & sk = *st[k];
+            ua[k].keys = sk.idx_keys;
+            ua[k].k_norm = w.idx_k_norm;
+            ua[k].summaries = sk.idx_summaries;
+            ua[k].rope = fn::qsa::model_rope();
+            ua[k].ik = c.ws.ik;
+            ua[k].depth = c.n_before;
+            ua[k].rows             = j.rows;
+            ua[k].max_cells = sk.n_cells;
+            sa[k].summaries = sk.idx_summaries;
+            sa[k].q = c.ws.iq;
+            sa[k].q_norm = w.idx_q_norm;
+            sa[k].depth = c.n_before;
+            sa[k].max_cells = sk.n_cells;
+            sa[k].rope = fn::qsa::model_rope();
+            sa[k].ws = fn::qsa::carve(c.qsa_ws);
+            sa[k].body = c.ws.sel_body;
+            sa[k].offsets = c.ws.sel_off;
+            off[k] = c.ws.sel_off;
+            body[k] = c.ws.sel_body;
+            peer[k] = c.rings->slot(1 - r, fn::xchg::msg::select, sel_slot);
+        }
+        if (!fn::qsa::summary_update_lanes(L, ua, nullptr, c0.stream)) {
+            return fail(err, "summary_update (lanes)");
+        }
+        note(c0, "qsa.summary");
+        if (!fn::qsa::select_lanes(L, j.rows, sa, c0.stream)) {
+            return fail(err, "qsa select (lanes)");
+        }
+        note(c0, "qsa.select");
+        if (!fn::xchg::send_select_lanes(L, j.rows, off, body, peer, c0.stream)) {
+            return fail(err, "send_select (lanes)");
+        }
+        note(c0, "x.select.send");
+    } else {
+        float * slot[fn::xchg::max_lanes] = {};
+        int32_t * off[fn::xchg::max_lanes] = {};
+        uint32_t * body[fn::xchg::max_lanes] = {};
+        uint32_t * werr[fn::xchg::max_lanes] = {};
+        for (int32_t k = 0; k < L; ++k) {
+            card_ctx & c = *j.lane[k];
+            slot[k] = c.rings->slot(r, fn::xchg::msg::select, sel_slot);
+            off[k] = c.ws.sel_off;
+            body[k] = c.ws.sel_body;
+            werr[k] = c.rings->err(r);
+        }
+        if (!fn::xchg::recv_select_lanes(L, j.rows, slot, off, body, werr, c0.stream)) {
+            return fail(err, "recv_select (lanes)");
+        }
+        note(c0, "x.select.recv");
+    }
+    fn::qsa::attn::args aa[fn::xchg::max_lanes] = {};
+    for (int32_t k = 0; k < L; ++k) {
         card_ctx & c = *j.lane[k];
         const layer_state & sk = *st[k];
-        const fn::xchg::rings & rg = *c.rings;
-        if (owner) {
-            fn::qsa::round_update_args ua;
-            ua.keys = sk.idx_keys;
-            ua.k_norm = w.idx_k_norm;
-            ua.summaries = sk.idx_summaries;
-            ua.rope = fn::qsa::model_rope();
-            ua.ik = c.ws.ik;
-            ua.depth = c.n_before;
-            ua.rows = layer_max_rows;
-            ua.max_cells = sk.n_cells;
-            if (!fn::qsa::summary_update(ua, c.stream)) {
-                return fail(err, "summary_update");
-            }
-            note(c, "qsa.summary");
-            fn::qsa::select_args sa;
-            sa.summaries = sk.idx_summaries;
-            sa.q = c.ws.iq;
-            sa.q_norm = w.idx_q_norm;
-            sa.depth = c.n_before;
-            sa.max_cells = sk.n_cells;
-            sa.rope = fn::qsa::model_rope();
-            sa.ws = fn::qsa::carve(c.qsa_ws);
-            sa.body = c.ws.sel_body;
-            sa.offsets = c.ws.sel_off;
-            if (!fn::qsa::select(layer_max_rows, sa, c.stream)) {
-                return fail(err, "qsa select");
-            }
-            note(c, "qsa.select");
-            if (!fn::xchg::send_select(layer_max_rows, c.ws.sel_off, c.ws.sel_body,
-                                       rg.slot(1 - r, fn::xchg::msg::select, sel_slot), c.stream)) {
-                return fail(err, "send_select");
-            }
-            note(c, "x.select.send");
-        } else {
-            if (!fn::xchg::recv_select(layer_max_rows, rg.slot(r, fn::xchg::msg::select, sel_slot), c.ws.sel_off,
-                                       c.ws.sel_body, rg.err(r), c.stream)) {
-                return fail(err, "recv_select");
-            }
-            note(c, "x.select.recv");
-        }
+        fn::qsa::attn::args & a = aa[k];
+        a.qfull = c.ws.qfull;
+        a.kv_k = c.ws.kv_k;
+        a.kv_v = c.ws.kv_v;
+        a.q_norm = w.q_norm;
+        a.k_norm = w.k_norm;
+        a.body = c.ws.sel_body;
+        a.offsets = c.ws.sel_off;
+        a.pos = c.pos;
+        a.k_cache = sk.k_cache;
+        a.v_cache = sk.v_cache;
+        a.k_scale = sk.k_scale;
+        a.v_scale = sk.v_scale;
+        a.depth = c.n_before;
+        a.max_cells = sk.n_cells;
+        a.theta_scale = fn::qsa::attn::rope_theta_scale();
+        a.out = c.ws.attn;
+        a.codes = c.ws.mid_codes;
+        a.scales = c.ws.mid_scales;
+        a.k_f32 = nullptr;
+        a.stamps = nullptr;
+        a.ws = fn::qsa::attn::carve(c.attn_ws);
     }
-    for (int32_t k = 0; k < j.lanes; ++k) {
-        card_ctx & c = *j.lane[k];
-        const layer_state & sk = *st[k];
-        fn::qsa::attn::args aa = {};
-        aa.qfull = c.ws.qfull;
-        aa.kv_k = c.ws.kv_k;
-        aa.kv_v = c.ws.kv_v;
-        aa.q_norm = w.q_norm;
-        aa.k_norm = w.k_norm;
-        aa.body = c.ws.sel_body;
-        aa.offsets = c.ws.sel_off;
-        aa.pos = c.pos;
-        aa.k_cache = sk.k_cache;
-        aa.v_cache = sk.v_cache;
-        aa.k_scale = sk.k_scale;
-        aa.v_scale = sk.v_scale;
-        aa.depth = c.n_before;
-        aa.max_cells = sk.n_cells;
-        aa.theta_scale = fn::qsa::attn::rope_theta_scale();
-        aa.out = c.ws.attn;
-        aa.codes = c.ws.mid_codes;
-        aa.scales = c.ws.mid_scales;
-        aa.k_f32 = nullptr;
-        aa.stamps = nullptr;
-        aa.ws = fn::qsa::attn::carve(c.attn_ws);
-        if (!fn::qsa::attn::attend(layer_max_rows, aa, c.stream)) {
-            return fail(err, "qsa attend");
-        }
-        note(c, "qsa.attend");
+    if (!fn::qsa::attn::attend_lanes(L, j.rows, aa, c0.stream)) {
+        return fail(err, "qsa attend (lanes)");
     }
+    note(c0, "qsa.attend");
     fn::dense::product_args out;
     out.k = GV;
     out.n_mats = 1;
     out.mats[0] = qmat(w.wo, ws.partial);
     out.x_codes = ws.mid_codes;
     out.x_scales = ws.mid_scales;
-    return joint_launch(j, out, fn::dense::joint_args(), dense_site::qsa_out, "qsa.out", err);
+    return joint_launch(j, out, xa_joint_args(j, u), dense_site::qsa_out, "qsa.out", err, &sent);
 }
 
-bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u, std::string & err) {
+bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u, bool & sent, std::string & err) {
     card_ctx & c0 = *j.lane[0];
     layer_ws & ws = c0.ws;
     fn::dense::product_args rt;
@@ -1926,11 +2054,14 @@ bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u,
     rt.route.ids = c0.ex.ids; // lane 0's view is the joint routing's base
     rt.route.wts = c0.ex.wts;
     rt.route.sg = ws.sg;
+    ja.router_tc = j.router_tc; // FMS5
     if (!joint_launch(j, rt, ja, dense_site::router, "ffn.router", err)) {
         return false;
     }
     // FMU2 (build item 1): every lane's gate/up in one launch, then every lane's down in one, each lane's units its own
-    // (fn::experts::gate_up_lanes); a form the lanes launch does not take runs each lane's experts alone
+    // (fn::experts::gate_up_lanes); a form the lanes launch does not take runs each lane's experts alone. FMS13: at
+    // R < 5 a gate/up the lanes launch does not take (IQ3 at R <= 3: no lanes form of its lone kernel) runs each lane's
+    // lone gate/up at B = R, then the lanes' down (both bitwise the lone launches)
     const auto f = static_cast<fn::experts::fmt>(w.ex_gu_fmt);
     const auto fg = static_cast<fn::dense::fmt>(w.sh_gate.fmt);
     const auto fu = static_cast<fn::dense::fmt>(w.sh_up.fmt);
@@ -1939,24 +2070,36 @@ bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u,
     fn::experts::gate_up_lanes_args ga;
     fn::experts::down_lanes_args da;
     bool lanes = true;
+    const int32_t                   R     = j.rows;
     for (int32_t k = 0; k < j.lanes; ++k) {
         lanes = lanes && j.lane[k]->ex_service == nullptr;
-        expert_args(*j.lane[k], w, layer_max_rows, u, ga.s[k], da.s[k]);
+        expert_args(*j.lane[k], w, R, u, ga.s[k], da.s[k]);
     }
-    if (lanes && fn::experts::gate_up_lanes_supported(f, fg, fu, j.lanes, ga) &&
-        fn::experts::down_lanes_supported(fd, fs, j.lanes, da)) {
-        if (!fn::experts::gate_up_lanes(f, fg, fu, j.lanes, ga, c0.stream)) {
-            return fail(err, "experts gate_up_lanes");
+    const bool gu_lanes = lanes && fn::experts::gate_up_lanes_supported(f, fg, fu, j.lanes, R, ga);
+    if (lanes && (gu_lanes || R < layer_max_rows) && fn::experts::down_lanes_supported(fd, fs, j.lanes, R, da)) {
+        if (gu_lanes) {
+            if (!fn::experts::gate_up_lanes(f, fg, fu, j.lanes, R, ga, c0.stream)) {
+                return fail(err, "experts gate_up_lanes");
+            }
+        } else {
+            for (int32_t k = 0; k < j.lanes; ++k) {
+                if (!fn::experts::gate_up(f, fg, fu, R, ga.s[k], c0.stream)) {
+                    return fail(err, "experts gate_up (a lane alone)");
+                }
+            }
         }
         note(c0, "ffn.ex_gate_up");
-        if (!fn::experts::down_lanes(fd, fs, j.lanes, da, c0.stream)) {
+        // FMS2 item 6: X-F sent by the down launch
+        if (!fn::experts::down_lanes_send(fd, fs, j.lanes, R, da, peer_slot_joint(j, 1, u), 1 - c0.card,
+                                          j.x16 ? j.jr->err(c0.card) : nullptr, c0.stream)) {
             return fail(err, "experts down_lanes");
         }
+        sent = true;
         note(c0, "ffn.ex_down");
         return true;
     }
     for (int32_t k = 0; k < j.lanes; ++k) {
-        if (!ffn_experts(*j.lane[k], w, layer_max_rows, u, nullptr, err)) {
+        if (!ffn_experts(*j.lane[k], w, R, u, nullptr, err)) {
             return false;
         }
     }
@@ -1967,17 +2110,23 @@ bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u,
 bool exchange_joint(joint_lanes & j, int32_t set, int32_t slot, bool send, std::string & err) {
     card_ctx & c0 = *j.lane[0];
     const int32_t r = c0.card;
-    const int32_t rows = joint_rows_of(j);
+    const int32_t       rows = joint_rows_of(j);  // x16 only (FMS13: the F32 forms move each lane's R rows)
     const fn::xchg::msg m = set == 0 ? fn::xchg::msg::a : fn::xchg::msg::f;
     if (send) {
-        if (!fn::xchg::send_half_joint(rows, 1 - r, c0.ws.partial, j.jr->slot(1 - r, m, slot), c0.stream)) {
+        float * const peer = j.jr->slot(1 - r, m, slot);
+        if (!(j.x16 ? fn::xchg::send_half_joint16(rows, 1 - r, c0.ws.partial, peer, j.jr->err(r), c0.stream) :
+                      fn::xchg::send_half_joint(j.lanes, j.rows, 1 - r, c0.ws.partial, peer, c0.stream))) {
             return fail(err, "send_half_joint");
         }
         note(c0, set == 0 ? "x.a.send" : "x.f.send");
         return true;
     }
-    if (!fn::xchg::recv_add_joint(rows, r, c0.ws.partial, j.jr->slot(r, m, slot), c0.ws.out[set], j.jr->err(r),
-                                  set == 0 ? fn::xchg::err_poll_a : fn::xchg::err_poll_f, c0.stream)) {
+    const uint32_t code = set == 0 ? fn::xchg::err_poll_a : fn::xchg::err_poll_f;
+    float * const own = j.jr->slot(r, m, slot);
+    if (!(j.x16 ?
+              fn::xchg::recv_add_joint16(rows, r, c0.ws.partial, own, c0.ws.out[set], j.jr->err(r), code, c0.stream) :
+              fn::xchg::recv_add_joint(j.lanes, j.rows, r, c0.ws.partial, own, c0.ws.out[set], j.jr->err(r), code,
+                                       c0.stream))) {
         return fail(err, "recv_add_joint");
     }
     note(c0, set == 0 ? "x.a.recv" : "x.f.recv");
@@ -2037,6 +2186,28 @@ size_t joint_route_bytes() {
                                fn::xchg::max_lanes * lane_ex_bytes());
 }
 
+namespace {
+
+int64_t lane_kernel_ws_bytes() {
+    return align256(int64_t(fn::qsa::workspace_bytes())) + align256(int64_t(fn::qsa::attn::workspace_bytes())) +
+           align256(int64_t(fn::gdn::workspace_bytes()));
+}
+
+} // namespace
+
+size_t joint_kernel_ws_bytes() {
+    return static_cast<size_t>(fn::xchg::max_lanes * lane_kernel_ws_bytes());
+}
+
+void joint_lane_kernel_ws(void * base, int32_t u, card_ctx & c) {
+    uint8_t * p = static_cast<uint8_t *>(base) + int64_t(u) * lane_kernel_ws_bytes();
+    c.qsa_ws = p;
+    p += align256(int64_t(fn::qsa::workspace_bytes()));
+    c.attn_ws = p;
+    p += align256(int64_t(fn::qsa::attn::workspace_bytes()));
+    c.gdn_ws = p;
+}
+
 void joint_lane_ex(void * base, int32_t u, ex_bufs & ex) {
     uint8_t * p = static_cast<uint8_t *>(base) + 2 * align256(int64_t(fn::xchg::joint_rows) * NU * 4) +
                   int64_t(u) * lane_ex_bytes();
@@ -2055,12 +2226,15 @@ namespace {
 
 // the joint step's checks: lanes 2..4 on one card and stream, resident banks, every lane's step (check_step)
 bool joint_check(const joint_lanes & j, const layer_weights & w, const layer_state * const st[], std::string & err) {
-    if (j.lanes < 2 || j.lanes > fn::xchg::max_lanes || j.jr == nullptr || j.dense_work == nullptr) {
-        return fail(err, "joint step: lanes outside 2 .. 4, or no joint rings or work");
+    if (j.lanes < 2 || j.lanes > fn::xchg::max_lanes || j.jr == nullptr || j.dense_work == nullptr || j.rows < 2 ||
+        j.rows > layer_max_rows || (j.x16 && j.rows != layer_max_rows)) {
+        return fail(err,
+                    "joint step: lanes outside 2 .. 4, rows outside 2 .. 5 (x16 at 5 only), or no joint "
+                    "rings or work");
     }
     for (int32_t k = 0; k < j.lanes; ++k) {
         const card_ctx & c = *j.lane[k];
-        if (!check_step(c, w, *st[k], layer_max_rows, err)) {
+        if (!check_step(c, w, *st[k], j.rows, err)) {
             return false;
         }
         if (c.ex_service != nullptr || c.kv != nullptr || c.card != j.lane[0]->card || c.stream != j.lane[0]->stream) {
@@ -2070,7 +2244,7 @@ bool joint_check(const joint_lanes & j, const layer_weights & w, const layer_sta
     return true;
 }
 
-// every lane's HC sublayer sub in one launch (hc::sub_joint: each lane's the lone B = 5 code on its ring); mode as
+// every lane's HC sublayer sub in one launch (hc::sub_joint: each lane's the lone B = R code on its ring); mode as
 // sub's (3 both phases; 1 and 2 the pair order's)
 bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input in[], int32_t sub, int32_t mode,
               const use_counters & u, std::string & err) {
@@ -2085,7 +2259,7 @@ bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input 
         ha[k] = hc_sub_args(c, hm, sub, hi.hres, hi.hpost, hi.hx, u);
     }
     if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err) ||
-        !fn::hc::sub_joint(j.lanes, mode, ha, j.lane[0]->stream)) {
+        !fn::hc::sub_joint(j.lanes, j.rows, mode, ha, j.lane[0]->stream)) {
         return err.empty() ? fail(err, "hc sub_joint") : false;
     }
     note(*j.lane[0], "hc.sub_joint");
@@ -2093,8 +2267,10 @@ bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input 
 }
 
 // the sublayer's body for every lane
+// sent: the body's producer sent the sublayer's X-A or X-F itself (FMS2 item 6), so no send_half_joint
 bool body_joint(joint_lanes & j, const layer_weights & w, const layer_state * const st[], const use_counters & u,
-                int32_t sub, std::string & err) {
+                int32_t sub, bool & sent, std::string & err) {
+    sent = false;
     const std::vector<std::string> missing = body_unbuilt(sub == 1 ? body::ffn : w.gdn ? body::gdn : body::qsa);
     if (!missing.empty()) {
         return fail(err, "joint step: a body piece is not built");
@@ -2102,11 +2278,10 @@ bool body_joint(joint_lanes & j, const layer_weights & w, const layer_state * co
     if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err)) {
         return false;
     }
-    return sub == 1 ? ffn_joint(j, w, u, err) : w.gdn ? gdn_joint(j, w, st, u, err) : qsa_joint(j, w, st, u, err);
-}
-
-int32_t exchange_slot(const use_counters & u, int32_t sub) {
-    return sub == 0 ? use_slot(u, u.a, u.graph_a) : use_slot(u, u.f, u.graph_f);
+    if (sub == 1) {
+        return ffn_joint(j, w, u, sent, err);
+    }
+    return w.gdn ? gdn_joint(j, w, st, u, sent, err) : qsa_joint(j, w, st, u, sent, err);
 }
 
 } // namespace
@@ -2117,11 +2292,12 @@ step_status layer_joint_step(joint_lanes & j, const layer_weights & w, const lay
         return step_status::failed;
     }
     for (int32_t sub = 0; sub < 2; ++sub) {
-        if (!hc_joint(j, w, in, sub, 3, u, err) || !body_joint(j, w, st, u, sub, err)) {
+        bool sent = false;
+        if (!hc_joint(j, w, in, sub, 3, u, err) || !body_joint(j, w, st, u, sub, sent, err)) {
             return step_status::failed;
         }
         const int32_t slot = exchange_slot(u, sub);
-        if (!exchange_joint(j, sub, slot, true, err) || !exchange_joint(j, sub, slot, false, err)) {
+        if (!(sent || exchange_joint(j, sub, slot, true, err)) || !exchange_joint(j, sub, slot, false, err)) {
             return step_status::failed;
         }
         advance(u, w, sub);
@@ -2152,11 +2328,15 @@ step_status layer_joint_pair_step(joint_lanes * const j[2], const layer_weights 
                 ok = hc_joint(*j[k], *w[k], in[k], sub, mode, u[k], err);
             }
         }
+        bool sent[2] = {};
         for (const int32_t k : {first, 1 - first}) {
-            ok = ok && body_joint(*j[k], *w[k], st[k], u[k], sub, err);
+            ok = ok && body_joint(*j[k], *w[k], st[k], u[k], sub, sent[k], err);
         }
         for (const bool send : {true, false}) {
             for (int32_t k = 0; k < 2 && ok; ++k) {
+                if (send && sent[k]) {
+                    continue; // the producer sent it
+                }
                 ok = cuda_ok(cudaSetDevice(j[k]->lane[0]->device), "cudaSetDevice", err) &&
                      exchange_joint(*j[k], sub, slot[k], send, err);
             }

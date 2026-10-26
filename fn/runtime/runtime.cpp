@@ -80,14 +80,15 @@ bool extend_ledger(target & t, const int32_t * tokens, int32_t n, std::string & 
     if (tokens == nullptr || n < 1) {
         return fail(err, "extend: no tokens");
     }
-    if (t.draft_n() < t.slot().n) {
+    // TTTS1: a split's front holds no draft (the back's catches up there)
+    if (!t.stage_front() && t.draft_n() < t.slot().n) {
         // a request that ended in a generate round left the draft one row short (that step has no catch-up)
         round_result r;
         if (!t.draft_catchup(static_cast<int32_t>(t.slot().n - t.draft_n()), r, err)) {
             return false;
         }
     }
-    if (t.draft_n() != t.slot().n) {
+    if (!t.stage_front() && t.draft_n() != t.slot().n) {
         return fail(err, "extend: the draft is not at N");
     }
     if (!t.keep_processed(err)) {
@@ -166,6 +167,15 @@ bool step_propose(target & t, int32_t budget, int32_t d_max, std::chrono::steady
 bool step_close(target & t, const std::vector<int32_t> & eog, const round_result & rv,
                 std::chrono::steady_clock::time_point t0, step_info & s, std::string & err) {
     round_result r;
+    if (!step_cut(t, eog, rv, t0, s, err) || !t.draft_catchup(s.n_out, r, err)) {
+        return false;
+    }
+    step_caught(eog, r, t0, s);
+    return true;
+}
+
+bool step_cut(target & t, const std::vector<int32_t> & eog, const round_result & rv,
+              std::chrono::steady_clock::time_point t0, step_info & s, std::string & err) {
     s.to_verify_s = after(t0, rv.t_done_s);
     s.a = rv.n_out - 1;
     s.n_out = rv.n_out;
@@ -185,14 +195,15 @@ bool step_close(target & t, const std::vector<int32_t> & eog, const round_result
             break;
         }
     }
-    if (!t.draft_catchup(s.n_out, r, err)) {
-        return false;
-    }
+    return true;
+}
+
+void step_caught(const std::vector<int32_t> & eog, const round_result & r, std::chrono::steady_clock::time_point t0,
+                 step_info & s) {
     s.to_catchup_s = after(t0, r.t_done_s);
     ++s.waits;
     s.end = is_eog(eog, s.out[s.n_out - 1]);
     s.wall_s = since(t0);
-    return true;
 }
 
 // ---- the engine: the slots behind the seam (MU1: one or 2..4) ----
@@ -208,6 +219,16 @@ constexpr int64_t step_cells = max_step_tokens + 64;
 engine::engine() = default;
 
 engine::~engine() {
+    shutdown();
+    m_.reset();
+}
+
+std::unique_ptr<model::model> engine::test_take_model() {
+    shutdown();
+    return std::move(m_);
+}
+
+void engine::shutdown() {
     // ME3 (Fable's load G ruling, Strata #267): no stream left waiting on a cache flag nobody writes, so the target's
     // synchronize ends; nothing when the streams are idle
     if (ex_ != nullptr) {
@@ -228,8 +249,9 @@ engine::~engine() {
             cudaStreamDestroy(static_cast<cudaStream_t>(st_[c]));
         }
     }
+    st_[0] = st_[1] = nullptr;
+    s_.clear();
     ex_.reset();
-    m_.reset();
 }
 
 void engine::lost(slot_rt & x) {
@@ -258,7 +280,12 @@ bool engine::init(std::unique_ptr<model::model> m, const engine_config & c, std:
     const int32_t n = m_->n_slots;
     // MU1: 2..4 slots on resident TP; MXMU1: two on one card with the expert cache and the host-backed KV
     const bool one_card = m_->single && m_->kv_host && c_.experts != nullptr;
-    if (n < 1 || n > 4 || (n > 1 && !one_card && (c_.experts != nullptr || m_->single || m_->kv_host)) ||
+    // TTTS1: a split stage serves up to 8 slots (resident TP on its window); one box up to 4
+    const int32_t max_n    = c_.stage != 0 ? max_split_slots : 4;
+    if (c_.stage != 0 && (int32_t(c_.stage_buf.size()) < n || c_.experts != nullptr || m_->single || m_->kv_host)) {
+        return fail(err, "engine: a split stage needs every slot's boundary buffers, resident TP, no expert cache");
+    }
+    if (n < 1 || n > max_n || (n > 1 && !one_card && (c_.experts != nullptr || m_->single || m_->kv_host)) ||
         (one_card && n > 2)) {
         return fail(err, "engine: " + std::to_string(n) +
                              " slots (1 .. 4 on resident TP, MU1; 1 .. 2 on one card with the host-backed KV, MXMU1)");
@@ -273,8 +300,11 @@ bool engine::init(std::unique_ptr<model::model> m, const engine_config & c, std:
     o.sampling.top_p = c_.top_p;
     o.sampling.min_p = c_.min_p;
     o.draft = c_.draft;
+    o.draft.on       = c_.stage != 1;  // TTTS1: the draft is the back's
     o.both_paths = true;
     o.eager = c_.eager;
+    o.pass.layer_lo  = m_->win.lo;                         // TTTS1: the box's window
+    o.pass.layer_hi  = m_->win.hi;
     o.defer_capture = c_.experts != nullptr && !c_.eager; // ME3: the graphs inside the cache's init (capture below)
     if (n > 1) {
         // MU1: one compute stream a card for every slot's rounds and the prompt path, and the shared rings' counters.
@@ -301,6 +331,19 @@ bool engine::init(std::unique_ptr<model::model> m, const engine_config & c, std:
     s_.resize(size_t(n));
     for (int32_t i = 0; i < n; ++i) {
         o.slot = i;
+        if (c_.stage != 0) {
+            // TTTS1: the slot's boundary buffers, fixed for its graphs (the front's send, the back's receive)
+            o.pass.stage     = model::pass_stage();
+            o.pass.stage.out = c_.stage == 1;
+            o.pass.stage.in  = c_.stage == 2;
+            for (int32_t c = 0; c < 2; ++c) {
+                if (c_.stage == 1) {
+                    o.pass.stage.send[c] = c_.stage_buf[size_t(i)][size_t(c)];
+                } else {
+                    o.pass.stage.recv[c] = c_.stage_buf[size_t(i)][size_t(c)];
+                }
+            }
+        }
         s_[size_t(i)].t = std::make_unique<target>();
         if (!s_[size_t(i)].t->init(*m_, o, err)) {
             return n > 1 ? fail(err, "slot " + std::to_string(i) + ": " + err) : false;
@@ -355,7 +398,8 @@ bool engine::init(std::unique_ptr<model::model> m, const engine_config & c, std:
     // FMU2: the joint round's frame on resident TP with two or more slots (eager: enqueued in phases, no graphs)
     if (n > 1 && c_.joint && c_.experts == nullptr && !m_->single && !m_->kv_host) {
         joint_ = std::make_unique<joint_frame>();
-        if (!joint_->init(*m_, st_, c_.joint_cache, c_.eager, err)) {
+        if (!joint_->init(*m_, st_, c_.joint_cache, c_.eager, c_.joint_x16, c_.joint_router_tc, c_.joint_dense_f16,
+                          err)) {
             return false;
         }
     }
@@ -396,13 +440,20 @@ std::string engine::settings() const {
         out += buf;
         if (joint_ != nullptr) {
             if (joint_->eager()) {
-                snprintf(buf, sizeof(buf), "; joint decode on (FMU2: frame %.1f / %.1f MiB on cards 0 / 1, eager)",
-                         double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0);
+                snprintf(buf, sizeof(buf),
+                         "; joint decode on (FMU2: frame %.1f / %.1f MiB on cards 0 / 1, eager; X-A/X-F 16-bit %s; "
+                         "router on the tensor cores %s (FMS5); dense FP16 at U 3, 4 %s (FMS6))",
+                         double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0,
+                         joint_->x16() ? "on" : "off", joint_->router_tc() ? "on" : "off",
+                         joint_->dense_f16() ? "on" : "off");
             } else {
                 snprintf(buf, sizeof(buf),
                          "; joint decode on (FMU2: frame %.1f / %.1f MiB on cards 0 / 1, %d graph "
-                         "pairs kept)",
-                         double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0, c_.joint_cache);
+                         "pairs kept; X-A/X-F 16-bit %s; router on the tensor cores %s (FMS5); dense FP16 at U 3, "
+                         "4 %s (FMS6))",
+                         double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0, c_.joint_cache,
+                         joint_->x16() ? "on" : "off", joint_->router_tc() ? "on" : "off",
+                         joint_->dense_f16() ? "on" : "off");
             }
         } else {
             snprintf(buf, sizeof(buf), "; joint decode off");
@@ -435,7 +486,9 @@ void engine::finish(slot_rt & x, const char * ended) {
     }
     x.open = false;
     std::string check = "not needed";
-    if (x.unchecked && x.valid) {
+    if (x.unchecked && x.valid && x.t->stage_front()) {
+        check = "the back's (a front stage decides nothing)";  // TTTS1
+    } else if (x.unchecked && x.valid) {
         bool checked = false;
         std::string e;
         if (!x.t->close_check(checked, e)) {
@@ -665,7 +718,8 @@ run_status engine::prefill(int32_t slot, const int32_t * tokens, int32_t n_token
     bool ok = false;
     const auto t0 = clk::now();
     // a pure extension continues the slot; the draft may be up to one step short (extend_ledger catches it up)
-    const bool draft_ok = t.draft_n() >= t.batch_start() && t.draft_n() <= l.n && l.n - t.draft_n() <= 4;
+    const bool draft_ok =
+        t.stage_front() || (t.draft_n() >= t.batch_start() && t.draft_n() <= l.n && l.n - t.draft_n() <= 4);
     int64_t from = 0;
     const char * how = "a pure extension";
     if (x.valid && n_reuse == l.n && draft_ok && !t.invalid()) {
@@ -711,7 +765,8 @@ run_status engine::set_draft(int32_t d, bool sparse) {
         return failed(run_status::bad_request, "set_draft: d " + std::to_string(d) + " outside 1 .. 4");
     }
     for (slot_rt & x : s_) {
-        if (!x.t->set_draft_sparse(sparse, err_)) {
+        // TTTS1: a split's front holds no draft (its form is the back's); it keeps the d alone
+        if (!x.t->stage_front() && !x.t->set_draft_sparse(sparse, err_)) {
             return failed(run_status::bad_request, "set_draft: " + err_);
         }
     }
@@ -819,6 +874,14 @@ run_status engine::step_leave(int32_t slot, bool ran, const step_info & s, int32
     x.unchecked = true;
     x.n_gen += s.n_out;
     x.steps.push_back(s);
+    if (c_.record_hash && !x.t->stage_front()) {
+        // TTTS1: the step's decision hash (spec run's records; a front stage's comes from the back)
+        uint64_t    h = 0;
+        std::string e;
+        if (x.t->decision_hash(h, e, x.round_bias)) {
+            x.steps.back().hash = h;
+        }
+    }
     for (int32_t j = 0; j < s.n_out; ++j) {
         out[j] = s.out[j];
     }
@@ -876,8 +939,9 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
             continue;
         }
         const target & t = *s_[size_t(slots[k])].t;
-        const bool lane = joint_ != nullptr && !joint_off_ && t.graph_executor() != joint_->eager() &&
-                          t.slot().u != 0 && b[k] >= 2 && std::min(c_.spec_d, b[k] - 1) == model::layer_max_rows - 1;
+        const bool     lane = joint_ != nullptr && !joint_off_ && t.graph_executor() != joint_->eager() &&
+                              t.slot().u != 0 && b[k] >= 2 &&
+                              std::min(c_.spec_d, b[k] - 1) == c_.spec_d;  // FMS13: the round's full d, any d in 1 .. 4
         (lane ? mem : alone).push_back(k);
     }
     if (mem.size() < 2) {
@@ -902,7 +966,7 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
         const int32_t nm = static_cast<int32_t>(mem.size());
         bool drafted = false;
         if (joint_frame::draft_fits(dt, nm)) {
-            const int32_t dd = model::layer_max_rows - 1; // every member's min(spec_d, budget - 1)
+            const int32_t dd = c_.spec_d;  // every member's min(spec_d, budget - 1) (FMS13: any d)
             round_result rr[fn::xchg::max_lanes];
             bool dok[fn::xchg::max_lanes] = {};
             std::string dwhy[fn::xchg::max_lanes], derr;
@@ -959,14 +1023,19 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
                         joint_->capture_failed() ? " (joint decode off from now on)" : "");
             }
         }
+        // each member's tokens and cut; then the catch-ups (FMS2 build item 2: one joint catch-up when two or more
+        // members reach theirs, else each alone); then each member's step closed
+        target * ct[fn::xchg::max_lanes] = {};
+        int32_t crows[fn::xchg::max_lanes] = {}, cm[fn::xchg::max_lanes] = {};
+        int32_t nc = 0;
         for (int32_t i = 0; i < g; ++i) {
             const int32_t k = go[size_t(i)];
             target & t = *tt[i];
             res[k].joint = joint;
             s[k].joint = joint;
-            bool ran = false;
+            bool cut = false;
             if (joint) {
-                ran = ok[i] && step_close(t, c_.eog, rv[i], t0, s[k], err_);
+                cut = ok[i] && step_cut(t, c_.eog, rv[i], t0, s[k], err_);
                 if (!ok[i]) {
                     err_ = why[i];
                 }
@@ -974,7 +1043,42 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
                 err_ = "joint round: " + jerr;
             } else {
                 round_result r1;
-                ran = t.verify(d[i], prop[i], bud[i], r1, err_) && step_close(t, c_.eog, r1, t0, s[k], err_);
+                cut = t.verify(d[i], prop[i], bud[i], r1, err_) && step_cut(t, c_.eog, r1, t0, s[k], err_);
+            }
+            if (!cut) {
+                leave(k, false, s[k]);
+                continue;
+            }
+            ct[nc] = &t;
+            crows[nc] = s[k].n_out;
+            cm[nc] = k;
+            ++nc;
+        }
+        round_result cr[fn::xchg::max_lanes];
+        bool cok[fn::xchg::max_lanes] = {};
+        std::string cwhy[fn::xchg::max_lanes], cerr;
+        bool caught = false;
+        if (nc >= 2 && !joint_off_ && joint_frame::catchup_fits(ct, nc)) {
+            caught = joint_->catchup(ct, nc, crows, cr, cok, cwhy, cerr);
+            if (!caught) {
+                joint_off_ = joint_off_ || joint_->capture_failed();
+                fprintf(stderr, "FNFL joint: %s; these slots catch up alone%s\n", cerr.c_str(),
+                        joint_->capture_failed() ? " (joint decode off from now on)" : "");
+            }
+        }
+        for (int32_t i = 0; i < nc; ++i) {
+            const int32_t k = cm[i];
+            bool ran = false;
+            if (caught) {
+                ran = cok[i];
+                if (!ran) {
+                    err_ = cwhy[i];
+                }
+            } else {
+                ran = ct[i]->draft_catchup(crows[i], cr[i], err_);
+            }
+            if (ran) {
+                step_caught(c_.eog, cr[i], t0, s[k]);
             }
             leave(k, ran, s[k]);
         }
@@ -984,6 +1088,39 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
         const bool ran = runtime::step(*s_[size_t(slots[k])].t, b[k], c_.spec_d, c_.eog, s, err_);
         leave(k, ran, s);
     }
+}
+
+// ---- TTTS1: a split stage's steps ----
+
+run_status engine::split_enter(int32_t slot, int32_t & b) {
+    int32_t out[max_step_tokens] = {};
+    return step_enter(slot, out, b);
+}
+
+run_status engine::split_leave(int32_t           slot,
+                               bool              ran,
+                               const step_info & s,
+                               int32_t *         out,
+                               int32_t &         n_out,
+                               bool &            end) {
+    return step_leave(slot, ran, s, out, n_out, end);
+}
+
+uint64_t engine::split_last_hash(int32_t slot) const {
+    if (!slot_ok(slot)) {
+        return 0;
+    }
+    const slot_rt & x = s_[size_t(slot)];
+    return !x.steps.empty() ? x.steps.back().hash : !x.last_steps.empty() ? x.last_steps.back().hash : 0;
+}
+
+int32_t engine::split_budget(int32_t slot) const {
+    if (!slot_ok(slot)) {
+        return -1;
+    }
+    const slot_rt & x = s_[size_t(slot)];
+    const int32_t   b = budget(x);
+    return b < 1 && x.steps.empty() ? 1 : b;  // a request's first step (the bootstrap) always returns its token
 }
 
 run_status engine::truncate(int32_t slot, int32_t n_keep) {
@@ -1018,11 +1155,13 @@ run_status engine::truncate(int32_t slot, int32_t n_keep) {
         const int32_t j = static_cast<int32_t>(n_keep - last.n_before);
         const int64_t nk = static_cast<int64_t>(l.tok.size()) > n_keep ? int64_t(n_keep) + 1 : int64_t(n_keep);
         bool ok = t.cut(j, nk, err_) && t.keep_processed(err_);
-        if (ok && t.draft_n() >= 0 && t.draft_n() < l.n) {
+        // TTTS1: a split's front holds no draft (the back's catches up there), so its cut alone keeps the rows
+        const bool    draftless = t.stage_front();
+        if (ok && !draftless && t.draft_n() >= 0 && t.draft_n() < l.n) {
             round_result r;
             ok = t.draft_catchup(static_cast<int32_t>(l.n - t.draft_n()), r, err_);
         }
-        if (ok && t.draft_n() == l.n && l.n == n_keep) {
+        if (ok && (draftless || t.draft_n() == l.n) && l.n == n_keep) {
             return run_status::ok;
         }
         fprintf(stderr, "FNFL: truncate to %d within the last step: %s; restore at the next prefill instead\n", n_keep,
@@ -1041,6 +1180,20 @@ run_status engine::truncate(int32_t slot, int32_t n_keep) {
     x.valid = false;
     x.keep = std::move(kept);
     return run_status::ok;
+}
+
+bool engine::in_place(int32_t slot) const {
+    return slot_ok(slot) && s_[size_t(slot)].valid;
+}
+
+void engine::to_restore(int32_t slot) {
+    if (!in_place(slot)) {
+        return;
+    }
+    slot_rt &      x = s_[size_t(slot)];
+    const ledger & l = x.t->slot();
+    x.keep.assign(l.tok.begin(), l.tok.begin() + l.n);
+    x.valid = false;
 }
 
 run_status engine::history(int32_t slot, std::vector<int32_t> & tokens, int32_t & pending) const {
@@ -1099,7 +1252,7 @@ bool engine::get_pool_info(pool_info & out) const {
     out.free_pages = p.free_pages();
     out.capacity_cells = m_->pool->capacity_cells();
     out.reclaims = reclaims_;
-    for (int32_t i = 0; i < n_slots() && i < 4; ++i) {
+    for (int32_t i = 0; i < n_slots() && i < max_split_slots; ++i) {
         out.mapped[i] = p.mapped(i);
         out.busy[i] = s_[size_t(i)].busy || s_[size_t(i)].job.live;
     }
@@ -1229,7 +1382,8 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
         n_tokens = 1;
         --n_reuse;
     }
-    const bool draft_ok = t.draft_n() >= t.batch_start() && t.draft_n() <= l.n && l.n - t.draft_n() <= 4;
+    const bool draft_ok =
+        t.stage_front() || (t.draft_n() >= t.batch_start() && t.draft_n() <= l.n && l.n - t.draft_n() <= 4);
     int64_t from = 0;
     bool ok = false;
     const char * how = "a pure extension";

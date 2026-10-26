@@ -84,6 +84,48 @@ bool embed(pass_card & p, int32_t rows, std::string & err) {
     return set_device(p, err) && (fn::embed::embed(rows, a, p.c.stream) ? true : fail(err, "embed"));
 }
 
+// TTTS1: the received boundary of a back stage (pass_stage::in) into the embedding boundary's buffers, layer lo's
+// input, host to device in stream order after the round's begin (the host launched the round after the receive)
+bool stage_in(pass_card & p, int32_t rows, const pass_options & o, std::string & err) {
+    const uint8_t * src = o.stage.recv[p.c.card];
+    cudaStream_t    s   = static_cast<cudaStream_t>(p.c.stream);
+    return src != nullptr && set_device(p, err) &&
+           cuda_ok(cudaMemcpyAsync(p.emb_hres, src, size_t(rows) * 4 * F * 4, cudaMemcpyHostToDevice, s),
+                   "stage in (hres)", err) &&
+           cuda_ok(cudaMemcpyAsync(p.emb_hpost, src + stage_hpost_at(rows), size_t(rows) * 4 * 4,
+                                   cudaMemcpyHostToDevice, s),
+                   "stage in (hpost)", err) &&
+           cuda_ok(cudaMemcpyAsync(p.emb_hx, src + stage_hx_at(rows), size_t(rows) * F * 4, cudaMemcpyHostToDevice, s),
+                   "stage in (hx)", err);
+}
+
+// TTTS1: a front stage's (pass_stage::out) layer hi output boundary into its send buffer, device to host in stream
+// order before the round's finish, so the completion record publishes it
+bool stage_out(pass_card & p, int32_t rows, const pass_options & o, std::string & err) {
+    uint8_t *         dst = o.stage.send[p.c.card];
+    const layer_input in  = layer_output(p.c);
+    cudaStream_t      s   = static_cast<cudaStream_t>(p.c.stream);
+    return dst != nullptr && set_device(p, err) &&
+           cuda_ok(cudaMemcpyAsync(dst, in.hres, size_t(rows) * 4 * F * 4, cudaMemcpyDeviceToHost, s),
+                   "stage out (hres)", err) &&
+           cuda_ok(
+               cudaMemcpyAsync(dst + stage_hpost_at(rows), in.hpost, size_t(rows) * 4 * 4, cudaMemcpyDeviceToHost, s),
+               "stage out (hpost)", err) &&
+           cuda_ok(cudaMemcpyAsync(dst + stage_hx_at(rows), in.hx, size_t(rows) * F * 4, cudaMemcpyDeviceToHost, s),
+                   "stage out (hx)", err);
+}
+
+// TTTS1: a front stage's round end: the completion record only (no commit: the host's, after the back's verdict)
+bool stage_finish(pass_card & p, std::string & err) {
+    const fn::round::finish_args fa = { p.desc, p.rstate, p.errs, p.n_err, p.done };
+    return set_device(p, err) && (fn::round::finish(fa, p.c.stream) ? true : fail(err, "stage finish"));
+}
+
+// the round's input: the embedding, or (a back stage) the received boundary
+bool round_input(pass_card & p, int32_t rows, const pass_options & o, std::string & err) {
+    return o.stage.in ? stage_in(p, rows, o, err) : embed(p, rows, err);
+}
+
 fn::ple::step_args ple_args(pass_card & p) {
     const int32_t r = p.c.card;
     const layer_input in = layer_output(p.c); // layer 0's output boundary
@@ -300,6 +342,10 @@ bool check_options(const pass_options & o, int32_t rows, std::string & err) {
         (o.n_records > 0 && (o.records[0] == nullptr || o.records[1] == nullptr))) {
         return fail(err, "pass: rows or options out of range");
     }
+    if ((o.stage.in && (o.layer_lo == 0 || o.stage.recv[0] == nullptr || o.stage.recv[1] == nullptr)) ||
+        (o.stage.out && (o.stage.send[0] == nullptr || o.stage.send[1] == nullptr))) {
+        return fail(err, "pass: a stage without its boundary buffers, or a received boundary at layer 0");
+    }
     return true;
 }
 
@@ -311,9 +357,12 @@ bool ple_runs(const pass_options & o) {
 
 bool pack_dense_all(model & m, std::string & err) {
     for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (!pack_dense(m, l, err)) {
+        if (m.win.layer(l) && !pack_dense(m, l, err)) {  // TTTS1: the box's layers
             return false;
         }
+    }
+    if (!m.win.head) {
+        return true;  // TTTS1: output.weight is the back's
     }
     const int32_t out = model::find("output.weight");
     return out >= 0 ? pack_dense_tensor(m, out, err) : fail(err, "output.weight: not in the placement");
@@ -325,30 +374,41 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     if (!resolve_card(m, card, stream, p.c, err)) {
         return false;
     }
+    // TTTS1: the box's window (fn/model/state.h): its layers, the PLE layer with layer 1, the head with the back
+    const window & win = m.win;
     for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (!resolve_weights(m, l, card, p.w[l], err) || !resolve_state(m, l, card, p.s[l], err)) {
+        if (win.layer(l) && (!resolve_weights(m, l, card, p.w[l], err) || !resolve_state(m, l, card, p.s[l], err))) {
             return false;
         }
     }
     p.token_embd = tensor_ptr(m, "token_embd.weight", card, err);
-    p.ple_w.key = tensor_ptr(m, "blk.1.ple_key.weight", card, err);
-    p.ple_w.value = tensor_ptr(m, "blk.1.ple_value.weight", card, err);
-    p.ple_w.norm_key = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_key.weight", card, err));
-    p.ple_w.norm_query = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_query.weight", card, err));
-    p.ple_w.norm_conv = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_conv.weight", card, err));
-    p.ple_w.conv = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "blk.1.ple_conv1d.weight", card, err)); // F16
-    p.head.w_down = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_down.weight", card, err));  // BF16
-    p.head.w_up = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_up.weight", card, err));
-    p.head.gamma = reinterpret_cast<const float *>(tensor_ptr(m, "output_hc_norm.weight", card, err));
-    p.out_w = tensor_ptr(m, "output.weight", card, err);
-    if (p.token_embd == nullptr || p.ple_w.key == nullptr || p.ple_w.value == nullptr || p.ple_w.norm_key == nullptr ||
-        p.ple_w.norm_query == nullptr || p.ple_w.norm_conv == nullptr || p.ple_w.conv == nullptr ||
-        p.head.w_down == nullptr || p.head.w_up == nullptr || p.head.gamma == nullptr || p.out_w == nullptr) {
+    if (p.token_embd == nullptr) {
         return false;
     }
-    const int32_t oi = model::find("output.weight");
-    if (oi < 0 || oi >= (int32_t)m.dense_packed.size() || m.dense_packed[size_t(oi)] == 0) {
-        return fail(err, "output.weight: not in DP2's packed layout (pack_dense_all)");
+    if (win.ple()) {
+        p.ple_w.key        = tensor_ptr(m, "blk.1.ple_key.weight", card, err);
+        p.ple_w.value      = tensor_ptr(m, "blk.1.ple_value.weight", card, err);
+        p.ple_w.norm_key   = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_key.weight", card, err));
+        p.ple_w.norm_query = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_query.weight", card, err));
+        p.ple_w.norm_conv  = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_conv.weight", card, err));
+        p.ple_w.conv = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "blk.1.ple_conv1d.weight", card, err));  // F16
+        if (p.ple_w.key == nullptr || p.ple_w.value == nullptr || p.ple_w.norm_key == nullptr ||
+            p.ple_w.norm_query == nullptr || p.ple_w.norm_conv == nullptr || p.ple_w.conv == nullptr) {
+            return false;
+        }
+    }
+    if (win.head) {
+        p.head.w_down = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_down.weight", card, err));  // BF16
+        p.head.w_up   = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_up.weight", card, err));
+        p.head.gamma  = reinterpret_cast<const float *>(tensor_ptr(m, "output_hc_norm.weight", card, err));
+        p.out_w       = tensor_ptr(m, "output.weight", card, err);
+        if (p.head.w_down == nullptr || p.head.w_up == nullptr || p.head.gamma == nullptr || p.out_w == nullptr) {
+            return false;
+        }
+        const int32_t oi = model::find("output.weight");
+        if (oi < 0 || oi >= (int32_t) m.dense_packed.size() || m.dense_packed[size_t(oi)] == 0) {
+            return fail(err, "output.weight: not in DP2's packed layout (pack_dense_all)");
+        }
     }
     // the reservation's buffers
     const reserved_class * rc = m.state_class("round and pass (TG1)");
@@ -370,9 +430,9 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     uint8_t * head = part(rc, "head activations (B <= 5)");
     uint8_t * logits = part(rc, "logits (B <= 5)");
     uint8_t * gw = part(rc, "greedy work");
-    uint8_t * hist = part(conv, "L1 PLE");
+    uint8_t * hist   = win.ple() ? part(conv, "L1 PLE") : nullptr;  // TTTS1: the PLE history with layer 1
     if (round == nullptr || commit == nullptr || ple_e == nullptr || ple_ws == nullptr || emb == nullptr ||
-        carry == nullptr || head == nullptr || logits == nullptr || gw == nullptr || hist == nullptr) {
+        carry == nullptr || head == nullptr || logits == nullptr || gw == nullptr || (win.ple() && hist == nullptr)) {
         return false;
     }
     p.desc = reinterpret_cast<fn::round::desc *>(round);
@@ -475,7 +535,10 @@ use_counters pass_graph_counters(const pass_options & o) {
     for (int32_t l = o.layer_lo; l <= o.layer_hi; ++l) {
         qsa += l % fn::full_attn_interval == fn::full_attn_interval - 1 ? 1 : 0;
     }
-    u.graph_subs = 2 * n + 1; // the layers' sublayers and the head
+    u.graph_subs = 2 * n + (o.stage.out ? 0 : 1);  // the layers' sublayers and the head (a front stage has none)
+    if (o.stage.in || o.stage.out) {
+        u.rule = hc_rule::stage;  // TTTS1: a stage graph's sublayer count is any; the rule keeps slot 1 last
+    }
     u.graph_a = n;
     u.graph_f = n;
     u.graph_select = qsa > 0 ? qsa : 1;
@@ -484,7 +547,7 @@ use_counters pass_graph_counters(const pass_options & o) {
 
 step_status pass_card_enqueue(pass_card & p, int32_t rows, const pass_options & o, use_counters & u,
                               std::string & err) {
-    if (!check_options(o, rows, err) || !round_begin(p, err) || !embed(p, rows, err)) {
+    if (!check_options(o, rows, err) || !round_begin(p, err) || !round_input(p, rows, o, err)) {
         return step_status::failed;
     }
     for (int32_t l = o.layer_lo; l <= o.layer_hi; ++l) {
@@ -506,6 +569,9 @@ step_status pass_card_enqueue(pass_card & p, int32_t rows, const pass_options & 
             return step_status::failed;
         }
     }
+    if (o.stage.out) {
+        return stage_out(p, rows, o, err) && stage_finish(p, err) ? step_status::ok : step_status::failed;
+    }
     for (int32_t part = 0; part < n_head_parts(o); ++part) {
         if (!head_part(p, rows, part, u, o, true, err)) {
             return step_status::failed;
@@ -521,7 +587,7 @@ step_status pass_pair_enqueue(pass_card * const p[2], int32_t rows, const pass_o
         return step_status::failed;
     }
     for (int32_t k = 0; k < 2; ++k) {
-        if (!round_begin(*p[k], err) || !embed(*p[k], rows, err)) {
+        if (!round_begin(*p[k], err) || !round_input(*p[k], rows, o, err)) {
             return step_status::failed;
         }
     }
@@ -554,6 +620,14 @@ step_status pass_pair_enqueue(pass_card * const p[2], int32_t rows, const pass_o
                 return step_status::failed;
             }
         }
+    }
+    if (o.stage.out) {
+        for (int32_t k = 0; k < 2; ++k) {
+            if (!stage_out(*p[k], rows, o, err) || !stage_finish(*p[k], err)) {
+                return step_status::failed;
+            }
+        }
+        return step_status::ok;
     }
     // ME12: on one device and stream the head HC's four phase launches are one (hc::head_pair) at part 0; the scratch
     // is card 0's ws.mom[1], which the target's BF16 layers leave unused (layer.cpp hc_pair_phase)
@@ -611,9 +685,9 @@ bool pass_bootstrap_enqueue(pass_card * const p[2], int32_t row, const pass_opti
 // ---- FMU2: the joint verify round ----
 
 bool pass_lane_init(const pass_card & slot, const fn::xchg::joint_rings & jr, int32_t u, const layer_ws & joint_ws,
-                    void * route, const uint32_t ** errs, pass_card & out, std::string & err) {
-    if (u < 0 || u >= fn::xchg::max_lanes || route == nullptr || errs == nullptr) {
-        return fail(err, "pass_lane_init: lane, routing or error list missing");
+                    void * route, void * kernel_ws, const uint32_t ** errs, pass_card & out, std::string & err) {
+    if (u < 0 || u >= fn::xchg::max_lanes || route == nullptr || kernel_ws == nullptr || errs == nullptr) {
+        return fail(err, "pass_lane_init: lane, routing, kernel workspaces or error list missing");
     }
     out = slot;
     const int32_t card = slot.c.card;
@@ -626,6 +700,7 @@ bool pass_lane_init(const pass_card & slot, const fn::xchg::joint_rings & jr, in
     out.c.ex.ids = ids + int64_t(u) * layer_max_rows * fn::n_expert_used;
     out.c.ex.wts = wts + int64_t(u) * layer_max_rows * fn::n_expert_used;
     joint_lane_ex(route, u, out.c.ex); // FMU2 (build item 1): the lane's GLU slots and meta (the status word shared)
+    joint_lane_kernel_ws(kernel_ws, u, out.c); // FMS2 (build item 3): the lane's QSA, attend and GDN workspaces
     out.c.record_mixed[0] = out.c.record_mixed[1] = nullptr;
     out.c.observe = nullptr;
     fn::samp::card_view & sv = out.samp;
@@ -660,15 +735,21 @@ namespace {
 
 // the joint pass's checks (lanes 2..4, each lane's options the whole model without records), j's lanes at the passes'
 bool joint_begin(joint_pass & jp, std::string & err) {
-    if (jp.lanes < 2 || jp.lanes > fn::xchg::max_lanes) {
-        return fail(err, "joint pass: lanes outside 2 .. 4");
+    if (jp.lanes < 2 || jp.lanes > fn::xchg::max_lanes || jp.j.rows < 2 || jp.j.rows > layer_max_rows) {
+        return fail(err, "joint pass: lanes outside 2 .. 4 or rows (R = d + 1) outside 2 .. 5");
     }
     jp.j.lanes = jp.lanes;
+    const pass_options & o0    = *jp.o[0];
+    // TTTS1: the whole model (or split-test's one-box window from layer 0), or a split stage's window; every lane the
+    // same layers and stage
+    const bool           whole = o0.layer_lo == 0 && !o0.stage.in && !o0.stage.out;
+    const bool           stage = o0.stage.in || o0.stage.out;
     for (int32_t k = 0; k < jp.lanes; ++k) {
         const pass_options & o = *jp.o[k];
-        if (!check_options(o, layer_max_rows, err) || o.layer_lo != 0 || o.layer_hi != fn::n_layer - 1 ||
-            o.n_records != 0) {
-            return fail(err, "joint pass: lane " + std::to_string(k) + ": the whole model without records only");
+        if (!check_options(o, jp.j.rows, err) || o.layer_lo != o0.layer_lo || o.layer_hi != o0.layer_hi ||
+            o.stage.in != o0.stage.in || o.stage.out != o0.stage.out || o.n_records != 0 || !(whole || stage)) {
+            return fail(err, "joint pass: lane " + std::to_string(k) +
+                                 ": the whole model or one split stage for every lane, without records only");
         }
         jp.j.lane[k] = &jp.lane[k]->c;
     }
@@ -691,7 +772,9 @@ bool joint_ple_products(joint_pass & jp, std::string & err) {
         ap[k] = &a[k];
     }
     uint8_t * work = static_cast<uint8_t *>(jp.j.dense_work) + joint_ple_work_offset();
-    return fn::ple::products_joint(jp.lanes, ap, work, jp.lane[0]->c.stream) ? true : fail(err, "ple joint products");
+    return fn::ple::products_joint(jp.lanes, jp.j.rows, ap, work, jp.lane[0]->c.stream) ?
+               true :
+               fail(err, "ple joint products");
 }
 
 // layer l's states and inputs of every lane
@@ -711,7 +794,8 @@ bool joint_head_hc(joint_pass & jp, int32_t mode, const use_counters & u, std::s
     if (!set_device(*jp.lane[0], err)) {
         return false;
     }
-    return fn::hc::head_sub_joint(jp.lanes, mode, ha, jp.lane[0]->c.stream) ? true : fail(err, "head hc sub_joint");
+    return fn::hc::head_sub_joint(jp.lanes, jp.j.rows, mode, ha, jp.lane[0]->c.stream) ? true :
+                                                                                         fail(err, "head hc sub_joint");
 }
 
 // every lane's logits in one launch into its own buffer (head::logits_joint)
@@ -732,8 +816,8 @@ bool joint_logits(joint_pass & jp, const use_counters & u, std::string & err) {
     if (!set_device(p0, err)) {
         return false;
     }
-    if (!fn::head::logits_joint(jp.lanes, la, static_cast<int32_t>(fn::xchg::joint_rings::lane_floats()),
-                                jp.j.jr->err(p0.c.card), p0.c.stream)) {
+    if (!fn::head::logits_joint(jp.lanes, jp.j.rows, la, static_cast<int32_t>(fn::xchg::joint_rings::lane_floats()),
+                                jp.j.jr->err(p0.c.card), jp.j.dense_f16, p0.c.stream)) {
         return fail(err, "head logits_joint");
     }
     return true;
@@ -749,7 +833,7 @@ bool joint_head_part(joint_pass & jp, int32_t k, int32_t part, const use_counter
     if (part >= n_head_parts(*jp.o[k])) {
         return true;
     }
-    if (!head_part(*jp.lane[k], layer_max_rows, part, u, *jp.o[k], true, err)) {
+    if (!head_part(*jp.lane[k], jp.j.rows, part, u, *jp.o[k], true, err)) {
         err = "lane " + std::to_string(k) + ": " + err;
         return false;
     }
@@ -767,7 +851,7 @@ int32_t joint_head_parts(const joint_pass & jp) {
 } // namespace
 
 step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & err) {
-    const int32_t rows = layer_max_rows;
+    const int32_t rows = jp.j.rows;  // FMS13: R = d + 1
     if (!joint_begin(jp, err)) {
         return step_status::failed;
     }
@@ -777,12 +861,13 @@ step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & 
         }
     }
     for (int32_t k = 0; k < jp.lanes; ++k) {
-        if (!embed(*jp.lane[k], rows, err)) {
+        if (!round_input(*jp.lane[k], rows, *jp.o[k], err)) {
             return step_status::failed;
         }
     }
-    for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (l == 1) {
+    const pass_options & o0 = *jp.o[0];
+    for (int32_t l = o0.layer_lo; l <= o0.layer_hi; ++l) {
+        if (l == 1 && ple_runs(o0)) {
             // FMU2: PLE's products in one joint launch (build item 4), then its parts 1 and 2 part-outer, lane-inner
             // (build item 3: each lane's kernels and buffers unchanged)
             if (!joint_ple_products(jp, err)) {
@@ -805,6 +890,14 @@ step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & 
             return ss;
         }
     }
+    if (o0.stage.out) {
+        for (int32_t k = 0; k < jp.lanes; ++k) {
+            if (!stage_out(*jp.lane[k], rows, *jp.o[k], err) || !stage_finish(*jp.lane[k], err)) {
+                return step_status::failed;
+            }
+        }
+        return step_status::ok;
+    }
     // the head HC of every lane in one launch, every lane's logits in one launch, then the lanes' decision, commit and
     // finish parts, part-outer and lane-inner (FMU2 build item 3: a lane's cross-card part waits once for its peer,
     // while the other lanes' parts of the same stage follow it; each lane's kernels and buffers are unchanged)
@@ -824,27 +917,28 @@ step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & 
 }
 
 step_status pass_joint_pair_enqueue(joint_pass * const jp[2], use_counters u[2], std::string & err) {
-    const int32_t rows = layer_max_rows;
+    const int32_t rows = jp[0]->j.rows;  // FMS13: R = d + 1
     for (int32_t c = 0; c < 2; ++c) {
         if (!joint_begin(*jp[c], err)) {
             return step_status::failed;
         }
     }
     const int32_t lanes = jp[0]->lanes;
-    if (jp[1]->lanes != lanes) {
-        err = "joint pair pass: the same lanes on both cards";
+    if (jp[1]->lanes != lanes || jp[1]->j.rows != rows) {
+        err = "joint pair pass: the same lanes and rows on both cards";
         return step_status::failed;
     }
     // pass_pair_enqueue's order: each card's begins and embeddings, then every phase on card 0 before card 1's
     for (int32_t c = 0; c < 2; ++c) {
         for (int32_t k = 0; k < lanes; ++k) {
-            if (!round_begin(*jp[c]->lane[k], err) || !embed(*jp[c]->lane[k], rows, err)) {
+            if (!round_begin(*jp[c]->lane[k], err) || !round_input(*jp[c]->lane[k], rows, *jp[c]->o[k], err)) {
                 return step_status::failed;
             }
         }
     }
-    for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (l == 1) {
+    const pass_options & o0 = *jp[0]->o[0];
+    for (int32_t l = o0.layer_lo; l <= o0.layer_hi; ++l) {
+        if (l == 1 && ple_runs(o0)) {
             for (int32_t c = 0; c < 2; ++c) {
                 if (!joint_ple_products(*jp[c], err)) {
                     return step_status::failed;
@@ -873,6 +967,16 @@ step_status pass_joint_pair_enqueue(joint_pass * const jp[2], use_counters u[2],
             err = "layer " + std::to_string(l) + ": " + err;
             return ss;
         }
+    }
+    if (o0.stage.out) {
+        for (int32_t c = 0; c < 2; ++c) {
+            for (int32_t k = 0; k < lanes; ++k) {
+                if (!stage_out(*jp[c]->lane[k], rows, *jp[c]->o[k], err) || !stage_finish(*jp[c]->lane[k], err)) {
+                    return step_status::failed;
+                }
+            }
+        }
+        return step_status::ok;
     }
     for (int32_t mode = 1; mode <= 2; ++mode) {
         for (int32_t c = 0; c < 2; ++c) {

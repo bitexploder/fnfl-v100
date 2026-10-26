@@ -174,6 +174,13 @@ bool load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char
     lp.kv_window = a.cache.kv_window; // ME3
     lp.kv_q8 = a.kv_q8;               // KV8
     lp.pool_cells = a.pool_cells;
+    lp.n_slots      = a.n_slots;
+    if (a.split_role != 0) {
+        // TTTS1: the stage's window (the front: layers 0 .. k - 1; the back: k .. 47 with the head)
+        lp.win.lo   = a.split_role == 1 ? 0 : a.split_k;
+        lp.win.hi   = a.split_role == 1 ? a.split_k - 1 : fn::n_layer - 1;
+        lp.win.head = a.split_role == 2;
+    }
     fn::loader::run_load_report lr;
     std::string err;
     if (!fn::loader::load_for_run(lp, n_cells, m, lr, err)) {
@@ -188,6 +195,7 @@ bool load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char
         printf("%s: %s\n", tool, line.c_str());
     }
     printf("%s: %s\n", tool, fn::loader::draft_expert_line(m).c_str()); // ME7
+    printf("%s: %s\n", tool, fn::loader::router_f16_line(m).c_str());   // FMS5
     return true;
 }
 
@@ -206,6 +214,13 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
     lp.expert_cache = a.cached();
     lp.kv_host = a.kv_host;
     lp.kv_window = a.cache.kv_window;
+    lp.n_slots      = a.n_slots;
+    if (a.split_role != 0) {
+        // TTTS1: the stage's window, as load's
+        lp.win.lo   = a.split_role == 1 ? 0 : a.split_k;
+        lp.win.hi   = a.split_role == 1 ? a.split_k - 1 : fn::n_layer - 1;
+        lp.win.head = a.split_role == 2;
+    }
     fn::loader::load_times lt;
     std::string err;
     for (int32_t c = 0; c < 2; ++c) {
@@ -231,6 +246,7 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
     sp.kv_window = m.kv_host ? m.kv_window : 0;
     sp.single = m.single;
     sp.kv_q8 = a.kv_q8; // KV8
+    sp.win             = m.win;   // TTTS1
     int64_t host_bytes = 0;
     if (!fn::loader::reserve_state(m, sp, a.n_slots, host_bytes, err, a.pool_cells)) {
         fprintf(stderr, "model-dry: %s\n", err.c_str());
@@ -698,6 +714,7 @@ bool bf16_then_q8(const fnfl_target_args & a, md::model & m, const std::vector<i
     sp.ple_conv_kernel = m.ple_conv_kernel;
     sp.ple_ngram = m.ple_ngram;
     sp.kv_q8 = true;
+    sp.win             = m.win;  // TTTS1
     int64_t host_bytes = 0;
     if (!fn::loader::reserve_state(m, sp, 1, host_bytes, err) || !fn::loader::fill_ex1_grids(m, err)) {
         fprintf(stderr, "model-test: the q8 reservation: %s\n", err.c_str());

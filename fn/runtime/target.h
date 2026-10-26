@@ -184,6 +184,11 @@ class target {
     void joint_release(const staged_round & sr);
     void joint_abandon();
     bool joint_verify_end(int32_t d, const int32_t * prop, staged_round & sr, round_result & r, std::string & err);
+    // FMS2 item 7 (TEST ONLY, fnfl-drive joint-kl): a forced round of rows rows (FMS13: R = d + 1, 2 .. 5, B = R <= U)
+    // as a lane of a joint round (joint_frame::forced), staged and collected as joint_verify_begin / end stage and
+    // collect a verify: every row committed, the ledger as forced's
+    bool                  joint_forced_begin(int32_t rows, uint64_t ple_use, staged_round & sr, std::string & err);
+    bool                  joint_forced_end(int32_t rows, staged_round & sr, round_result & r, std::string & err);
     // FMU2 (build item 2): a draft step as a lane of a joint draft step (joint_frame::draft). joint_draft_begin:
     // draft_step's checks and its descriptor staged (eagerly the start flag too); the caller launches the joint draft
     // and calls joint_release; nothing to undo when the launch fails. joint_draft_end: the completion wait and
@@ -191,6 +196,81 @@ class target {
     bool joint_draft_begin(int32_t d, staged_round & sr, std::string & err);
     bool joint_draft_end(int32_t d, const staged_round & sr, round_result & r, std::string & err);
     bool draft_pick_sampled() const { return dc_[0].sampled; }
+    // FMS2 (build item 2): a catch-up as a lane of a joint catch-up (joint_frame::catchup). joint_catchup_begin:
+    // draft_catchup's checks, the retained carry's pre-step copy and the descriptor staged (eagerly the start flag
+    // too); the caller launches the joint catch-up and calls joint_release; nothing to undo when the launch fails.
+    // joint_catchup_end: the completion wait and draft_catchup's checks and ledger (on a recovered error the retained
+    // carry back at its copy). test_draft_rewind (TEST ONLY, state-test mu1 catchup): the draft's length and index
+    // back at n (>= batch_start(), <= draft_n()) and no carry copy, so a check repeats a catch-up from one state
+    bool joint_catchup_begin(int32_t rows, staged_round & sr, std::string & err);
+    bool joint_catchup_end(int32_t rows, const staged_round & sr, round_result & r, std::string & err);
+    bool                  test_draft_rewind(int64_t n, std::string & err);
+
+    // ---- TTTS1: a split stage's rounds (fn/runtime/stage.h) ----
+    // A back stage (o.pass.stage.in) runs every round kind as one box does, its layers fed by the received boundary
+    // (the caller launches a round only after the receive completed; no PLE upload: PLE is the front's). A front stage
+    // (o.pass.stage.out) runs a round's layers, copies its boundary out and commits nothing on the cards: the back's
+    // verdict commits it. front_begin stages and launches a round of the ledger's next rows (forced: rows of the
+    // unprocessed tokens; generate: the pending token; verify: the pending token and prop[0 .. d - 1]); front_wait
+    // waits for both cards' completion records (the boundary is then in the send buffers) and checks their error
+    // words and committed slots (unchanged); front_end applies the back's verdict as one box's commit and cut leave
+    // the slot: the round's committed rows k (forced rows, generate 1, verify the decision's a + 1) enqueued on both
+    // cards in stream order (round::advance: version_slot(cur, k), gdn_after_round(gdn, k)), the ledger as one box's
+    // round, then, for a verify cut back at an end-of-generation token, cut (cut_rows kept rows, n_keep tokens).
+    // front_abandon undoes a begun round that will not end (the ledger's proposals off; the cards' words unchanged).
+    // front_bootstrap: the back's bootstrap token joins the ledger as one box's bootstrap leaves it; no round runs
+    // (the cards' round counters see only rounds with layer work).
+    struct front_round {
+        staged_round sr;
+        int32_t      kind = 0, rows = 0, d = 0;
+        int32_t      prop[fn::round::max_rows] = {};
+        bool         waited                    = false;
+    };
+
+    bool stage_front() const { return o_.pass.stage.out; }
+
+    bool stage_back() const { return o_.pass.stage.in; }
+
+    bool front_begin(int32_t         kind,
+                     int32_t         rows,
+                     const int32_t * prop,
+                     int32_t         budget,
+                     front_round &   fr,
+                     std::string &   err);
+    bool front_wait(front_round & fr, round_result & r, std::string & err);
+    bool front_end(const front_round & fr,
+                   int32_t             k,
+                   const int32_t *     out,
+                   int32_t             n_out,
+                   int32_t             cut_rows,
+                   int64_t             n_keep,
+                   std::string &       err);
+    void front_abandon(front_round & fr);
+    // TTTS1: a front verify as a lane of a joint round (joint_frame::front_verify): front_begin's checks and staging
+    // with the lane ring's PLE use, no launch (the caller launches the joint graphs and calls joint_release)
+    bool joint_front_begin(int32_t         d,
+                           const int32_t * prop,
+                           int32_t         budget,
+                           uint64_t        ple_use,
+                           front_round &   fr,
+                           std::string &   err);
+    // TTTS1 (the drive's tests): a front stage's lane of a joint forced round of rows ledger rows (joint_frame's
+    // front_forced), staged as joint_front_begin stages a verify
+    bool joint_front_forced_begin(int32_t rows, uint64_t ple_use, front_round & fr, std::string & err);
+    bool front_bootstrap(int32_t tok, std::string & err);
+    // TTTS1: a front stage's prompt handoff: the ledger as prompt_head leaves it (the last row retained; the head and
+    // its logits are the back's), after the last chunk's commit
+    bool front_prompt_handoff(std::string & err);
+    // TTTS1: the last decision's hash (card 0's sampler record), synchronous. round_bias: the rounds this target ran
+    // that one box's would not have (a split back's discarded early drafts): the record's own hash checked, then the
+    // hash at the round one box's numbering gives (the sampling does not depend on the round number)
+    bool decision_hash(uint64_t & h, std::string & err, uint64_t round_bias = 0);
+
+    // TTTS1: the next round's number (the split back counts the rounds of its early drafts)
+    uint64_t round_next() const { return next_round_; }
+
+    // TTTS1: the slot's cells (the first target KV layer of the window; m.n_cells when it holds none)
+    int32_t                     cells() const;
     // the eager executor's message use counters (the shared rings' when the engine shares them)
     model::use_counters * eager_counters() { return u_; }
     // FMU2: the joint graph's inputs from this slot: its pass options (the sampler's path) and decision variant
@@ -282,6 +362,8 @@ class target {
     // SP2: in the sparse form the draft index's cells too, holding what the memory holds, as the K and V do)
     bool draft_set_depth(int64_t depth, std::string & err);
     model::draft_card & draft(int32_t r) { return dc_[r]; }
+    // SR1's listing of one captured graph (a line a node; FMS2: the joint catch-up's too)
+    bool write_graph_nodes(void * graph, const std::string & path, std::string & err) const;
     // ME1: the host-backed KV tier (null without --kv-host); kv_flush makes its host history whole (state checks read
     // the KV classes there), synchronous
     model::kv_tier * tier() const { return tier_.get(); }
@@ -309,6 +391,7 @@ class target {
         int64_t target_graphs = 0, draft_graphs = 0, catchup_graphs = 0, eager_rounds = 0, eager_draft_rounds = 0;
         int64_t joint_rounds = 0; // FMU2: verify rounds run as a joint round's lane
         int64_t joint_drafts = 0; // FMU2: draft steps run as a joint draft step's lane
+        int64_t joint_catchups = 0; // FMS2: catch-ups run as a joint catch-up's lane
     };
     const submissions & submitted() const { return sub_; }
     const ple_params & ple() const { return ple_; }
@@ -321,6 +404,8 @@ class target {
                      std::string & err);
     bool round_collect(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k, const staged_round & sr,
                        round_result & r, std::string & err);
+    // round's launch of a staged round: both cards' graphs (or the eager phased enqueue) and the start flag
+    bool round_launch(int32_t rows, bool timed, staged_round & sr, std::string & err);
     bool verify_accept(const int32_t * prop, const round_result & r, std::string & err);
     bool forced_round(int32_t rows, round_result & r, std::string & err, bool upload_e, bool timed,
                       const float * const * staged);
@@ -331,7 +416,6 @@ class target {
     bool check_ledger(std::string & err);
     bool clear_errors(std::string & err);
     bool write_nodes(int32_t v, int32_t rows, int32_t card, std::string & err) const;
-    bool write_graph_nodes(void * graph, const std::string & path, std::string & err) const;
     bool capture_draft(int32_t card, int32_t kind, int32_t rows, std::string & err, int32_t v = 0, int32_t mode = 0);
     bool capture_draft_kind(int32_t kind, int32_t max_rows, int32_t v, std::string & err); // every captured form
     void index_written(int64_t first, int64_t rows); // SP2: index_n_ after a draft K/V write in the current form
@@ -352,6 +436,7 @@ class target {
     void set_pick(int32_t v); // the draft's pick for variant v (draft_card::sampled)
     bool draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, round_result & r, std::string & err);
     // draft_round's halves: the checks and the descriptor (eagerly the flag), and the wait and the checks
+    bool catchup_check(int32_t rows, std::string & err) const;
     bool draft_stage(int32_t kind, int32_t rows, int64_t first, int32_t hsrc, staged_round & sr, std::string & err);
     bool draft_collect(int32_t kind, int32_t rows, const staged_round & sr, round_result & r, std::string & err);
     bool draft_step_check(int32_t d, std::string & err) const;

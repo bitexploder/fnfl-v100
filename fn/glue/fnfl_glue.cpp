@@ -1,15 +1,16 @@
 // fnfl.h for the server: checks the GGUF against FNFL's model, loads it on both cards (the loader fnfl-drive uses) and
 // drives the runtime's engine (fn/runtime/runtime.h, SV1).
 
-#include "fn/fnfl.h"
-
 #include "fn/borrowed/gguf_meta.h"
+#include "fn/fnfl.h"
 #include "fn/loader/run_load.h"
 #include "fn/model/kv_pool.h"
 #include "fn/model/model.h"
 #include "fn/model/shapes.h"
 #include "fn/runtime/expert_cache.h"
 #include "fn/runtime/runtime.h"
+#include "fn/runtime/stage.h"
+#include "fn/xchg/link.h"
 
 #include <cuda_runtime_api.h>
 
@@ -27,8 +28,36 @@ constexpr const char * default_subset = "/home/jeremy/src/flashnext/work/DR1/sta
 
 } // namespace
 
+// TTTS1: the split's leader side: the link, its port, the boundary buffers, the prompt crossing, the leader and its
+// pipeline (fn/runtime/stage.h). Declared after rt in fnfl_engine, so it goes first (X-BYE, the link closed)
+struct fnfl_split_side {
+    fn::xchg::link::link                          link;
+    std::unique_ptr<fn::runtime::stage::port>     port;
+    fn::runtime::stage::buffers                   buf;
+    fn::runtime::stage::crossing                  cross;
+    fn::runtime::stage::leader                    lead;
+    std::unique_ptr<fn::runtime::stage::pipeline> pipe;
+
+    ~fnfl_split_side() {
+        if (pipe != nullptr) {
+            pipe->settle_all();
+            lead.bye();
+        }
+    }
+
+    // a call naming slot: its group in flight ends first, and a finished step not yet taken is dropped (the shell
+    // only names a slot between its requests or after its step's result)
+    void settle(int32_t slot) {
+        if (pipe != nullptr) {
+            pipe->settle(slot);
+            pipe->forget(slot);
+        }
+    }
+};
+
 struct fnfl_engine {
     fn::runtime::engine rt;
+    std::unique_ptr<fnfl_split_side> split;
 };
 
 static fnfl_status to_status(fn::runtime::run_status s) {
@@ -256,9 +285,18 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
     // refused before anything is read or loaded. MU1: 2..4 slots on resident TP (Config A); the expert-cached
     // configurations and the host KV serve one slot
     const bool cached_cfg = params.config.single_card >= 0 || params.config.cached_tp || params.config.kv_host;
-    if (params.n_parallel < 1 || params.n_parallel > 4) {
-        err =
-            "FNFL serves 1 to 4 slots: the slot count is " + std::to_string(params.n_parallel) + " (-np / --parallel)";
+    // TTTS1: the split (--fnfl-split-layer K) serves 1 to 8 slots on resident TP on each box
+    const int32_t split_k    = params.config.split_layer;
+    if (split_k != 0 && (split_k < 2 || split_k > fn::n_layer - 1 || cached_cfg)) {
+        err = "--fnfl-split-layer is 2 .. " + std::to_string(fn::n_layer - 1) +
+              " on resident TP (not with --fnfl-single-card, --fnfl-cached-tp or --fnfl-kv-host); it is " +
+              std::to_string(split_k);
+        return nullptr;
+    }
+    const int32_t max_slots = split_k != 0 ? fn::runtime::max_split_slots : 4;
+    if (params.n_parallel < 1 || params.n_parallel > max_slots) {
+        err = "FNFL serves 1 to " + std::to_string(max_slots) + " slots" + (split_k != 0 ? " on the split" : "") +
+              ": the slot count is " + std::to_string(params.n_parallel) + " (-np / --parallel)";
         return nullptr;
     }
     // MXMU1: two slots on one card with the host-backed KV; every other cached or host-KV launch serves one slot
@@ -400,6 +438,20 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
     lp.kv_window = sv.kv_window; // ME3: --fnfl-kv-window
     lp.kv_q8 = kv_q8;            // KV8
     lp.pool_cells = pool_cells;
+    auto e          = std::make_unique<fnfl_engine>();
+    if (split_k != 0) {
+        // TTTS1: this box the front: layers 0 .. k - 1 (with the embeddings; the head and the draft are the back's)
+        lp.win.lo   = 0;
+        lp.win.hi   = split_k - 1;
+        lp.win.head = false;
+        e->split    = std::make_unique<fnfl_split_side>();
+        if (!e->split->buf.alloc(params.n_parallel, nullptr, err)) {
+            err = "the split's boundary buffers: " + err;
+            return nullptr;
+        }
+        c.stage     = 1;
+        c.stage_buf = e->split->buf.slot;
+    }
     fprintf(stderr, "FNFL: --fnfl-kv-format %s%s\n", kvc.line.c_str(),
             kv_q8 ? "; KV8: int8 K and V codes, an FP16 scale a group of 64; the draft KV and index keys BF16/F16"
                   : "");
@@ -423,10 +475,67 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
         fprintf(stderr, "FNFL: %s\n", line.c_str());
     }
     fprintf(stderr, "FNFL: %s\n", fn::loader::draft_expert_line(*m).c_str()); // ME7
-    auto e = std::make_unique<fnfl_engine>();
+    fprintf(stderr, "FNFL: %s\n", fn::loader::router_f16_line(*m).c_str());   // FMS5
     if (!e->rt.init(std::move(m), c, err)) {
         err = "engine: " + err;
         return nullptr;
+    }
+    if (split_k != 0) {
+        // TTTS1: X-HELLO with the follower (connecting while it loads), the buffers mapped, the crossing on the
+        // prefiller, the leader and its pipeline
+        fnfl_split_side & s = *e->split;
+        namespace lk        = fn::xchg::link;
+        namespace st        = fn::runtime::stage;
+        lk::options lo;
+        lo.leader    = true;
+        lo.addr      = params.config.split_addr;
+        lo.port      = static_cast<uint16_t>(params.config.split_port);
+        lo.timeout_s = 60.0;
+        lo.connect_s = 1800.0;
+        lk::set_text(lo.me.commit, sizeof lo.me.commit, params.config.split_commit);
+        lk::set_text(lo.me.digest, sizeof lo.me.digest, params.config.split_digest);
+        const std::string settings = st::hello_settings(split_k, params.n_parallel, c.n_ctx_slot, pool_cells, kv_q8,
+                                                        c.spec_d, c.draft.attention, c.eog);
+        lk::set_text(lo.me.model, sizeof lo.me.model,
+                     st::hello_files(e->rt.test_model()) + "/" + st::hello_hash(settings));
+        lo.me.split = split_k;
+        lo.me.slots = params.n_parallel;
+        fprintf(stderr,
+                "FNFL: TTTS1 split at k %d: this box the front (layers 0 .. %d), the follower the back at %s:%d; the "
+                "shared settings: %s; UCX_TLS=%s UCX_NET_DEVICES=%s\n",
+                split_k, split_k - 1, lo.addr.c_str(), int(lo.port), settings.c_str(),
+                getenv("UCX_TLS") ? getenv("UCX_TLS") : "(unset)",
+                getenv("UCX_NET_DEVICES") ? getenv("UCX_NET_DEVICES") : "(unset)");
+        fflush(stderr);
+        if (!s.link.start(lo, err)) {
+            err = "the split's link: " + err;
+            return nullptr;
+        }
+        s.port = st::link_port(s.link);
+        for (auto & sl : s.buf.slot) {
+            for (uint8_t * p : sl) {
+                if (!s.port->map(p, size_t(fn::model::stage_bytes(fn::round::max_rows)), err)) {
+                    err = "the split's buffers: " + err;
+                    return nullptr;
+                }
+            }
+        }
+        if (!s.cross.init(*s.port, true, split_k, err)) {
+            err = "the split's crossing: " + err;
+            return nullptr;
+        }
+        e->rt.prefill_driver().set_stage(&s.cross);
+        if (!s.lead.init(e->rt, *s.port, s.cross, err)) {
+            err = "the split's leader: " + err;
+            return nullptr;
+        }
+        s.pipe = std::make_unique<st::pipeline>(s.lead);
+        fprintf(stderr,
+                "FNFL: TTTS1 split: connected (X-HELLO: commit %s, device code %s); transport %s; two pipelined "
+                "groups of up to four; one read at a time (no other-reader lane on the split)\n",
+                params.config.split_commit.empty() ? "(none given)" : params.config.split_commit.c_str(),
+                params.config.split_digest.empty() ? "(none given)" : params.config.split_digest.c_str(),
+                s.link.transport().c_str());
     }
     fprintf(stderr, "%s; state check %s (SV1 test switch)\n", e->rt.settings().c_str(),
             params.config.check_state ? "on" : "off");
@@ -456,6 +565,14 @@ fnfl_status fnfl_set_sampling(fnfl_engine * engine, int32_t slot, const fnfl_sam
     o.sampling.request = 0;
     o.max_tokens = params.max_tokens;
     o.n_ctx = params.n_ctx;
+    if (engine->split != nullptr) {
+        engine->split->settle(slot);
+        const fnfl_status st = to_status(engine->split->lead.set_sampling(slot, o));
+        if (st != FNFL_OK) {
+            err = engine->split->lead.error();
+        }
+        return st;
+    }
     const fnfl_status st = to_status(engine->rt.set_sampling(slot, o));
     if (st != FNFL_OK) {
         err = engine->rt.error();
@@ -475,7 +592,11 @@ fnfl_status fnfl_prefill(fnfl_engine * engine, int32_t slot, const int32_t * tok
             return progress(user, static_cast<int32_t>(from), static_cast<int32_t>(done), static_cast<int32_t>(total));
         };
     }
-    const fnfl_status st = to_status(engine->rt.prefill(slot, tokens, n_tokens, n_reuse, n, on_chunk));
+    // TTTS1: the split reads the prompt on both boxes (no progress calls: its chunks cross to the follower)
+    const fnfl_status st =
+        engine->split != nullptr ?
+            (engine->split->settle(slot), to_status(engine->split->lead.prefill(slot, tokens, n_tokens, n_reuse, n))) :
+            to_status(engine->rt.prefill(slot, tokens, n_tokens, n_reuse, n, on_chunk));
     if (n_processed != nullptr) {
         *n_processed = n;
     }
@@ -487,6 +608,18 @@ fnfl_status fnfl_step(fnfl_engine * engine, int32_t slot, fnfl_step_result & res
     if (engine == nullptr) {
         return FNFL_BAD_REQUEST;
     }
+    if (engine->split != nullptr) {
+        // one slot's step on the split: a group of one, synchronous
+        engine->split->settle(slot);
+        fn::runtime::joint_step_out out;
+        engine->split->lead.step_group(&slot, 1, &out);
+        for (int32_t j = 0; j < out.n_out; ++j) {
+            result.tokens[j] = out.out[j];
+        }
+        result.n_tokens = out.n_out;
+        result.end      = out.end;
+        return to_status(out.st);
+    }
     return to_status(engine->rt.step(slot, result.tokens, result.n_tokens, result.end));
 }
 
@@ -497,9 +630,53 @@ fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t
         return FNFL_BAD_REQUEST;
     }
     fn::runtime::joint_step_out out[4];
-    engine->rt.step_joint(slots, n, out);
+    if (engine->split != nullptr) {
+        for (int32_t k = 0; k < n; ++k) {
+            engine->split->settle(slots[k]);
+        }
+        engine->split->lead.step_group(slots, n, out);
+    } else {
+        engine->rt.step_joint(slots, n, out);
+    }
     for (int32_t k = 0; k < n; ++k) {
         results[k] = fnfl_step_result();
+        for (int32_t j = 0; j < out[k].n_out; ++j) {
+            results[k].tokens[j] = out[k].out[j];
+        }
+        results[k].n_tokens = out[k].n_out;
+        results[k].end      = out[k].end;
+        status[k]           = to_status(out[k].st);
+        errors[k]           = out[k].why;
+    }
+    return FNFL_OK;
+}
+
+bool fnfl_is_split(const fnfl_engine * engine) {
+    return engine != nullptr && engine->split != nullptr;
+}
+
+fnfl_status fnfl_step_pipe(fnfl_engine *      engine,
+                           const int32_t *    slots,
+                           int32_t            n,
+                           fnfl_step_result * results,
+                           fnfl_status *      status,
+                           std::string *      errors,
+                           bool *             done) {
+    if (engine == nullptr || engine->split == nullptr || slots == nullptr || results == nullptr || status == nullptr ||
+        errors == nullptr || done == nullptr || n < 1 || n > fn::runtime::max_split_slots) {
+        return FNFL_BAD_REQUEST;
+    }
+    fn::runtime::joint_step_out out[fn::runtime::max_split_slots];
+    bool                        fin[fn::runtime::max_split_slots] = {};
+    engine->split->pipe->step(slots, n, out, fin);
+    for (int32_t k = 0; k < n; ++k) {
+        results[k] = fnfl_step_result();
+        done[k]    = fin[k];
+        status[k]  = FNFL_OK;
+        errors[k].clear();
+        if (!fin[k]) {
+            continue;
+        }
         for (int32_t j = 0; j < out[k].n_out; ++j) {
             results[k].tokens[j] = out[k].out[j];
         }
@@ -515,10 +692,18 @@ fnfl_status fnfl_truncate(fnfl_engine * engine, int32_t slot, int32_t n_keep) {
     if (engine == nullptr) {
         return FNFL_BAD_REQUEST;
     }
+    if (engine->split != nullptr) {
+        engine->split->settle(slot);
+        return to_status(engine->split->lead.truncate(slot, n_keep));
+    }
     return to_status(engine->rt.truncate(slot, n_keep));
 }
 
 std::string fnfl_last_error(const fnfl_engine * engine) {
+    if (engine != nullptr && engine->split != nullptr) {
+        const std::string & e = engine->split->lead.error();
+        return engine->split->lead.lost() ? engine->split->lead.lost_why() : e.empty() ? engine->rt.error() : e;
+    }
     return engine == nullptr ? std::string("no engine") : engine->rt.error();
 }
 
@@ -526,6 +711,10 @@ fnfl_status fnfl_slot_tokens(const fnfl_engine * engine, int32_t slot, std::vect
                              int32_t & pending) {
     if (engine == nullptr) {
         return FNFL_BAD_REQUEST;
+    }
+    if (engine->split != nullptr) {
+        // the slot's group in flight ends first (the shell checks between calls)
+        engine->split->pipe->settle(slot);
     }
     return to_status(engine->rt.history(slot, tokens, pending));
 }
@@ -542,7 +731,11 @@ int32_t fnfl_read_begin(fnfl_engine * engine, int32_t slot, const int32_t * toke
         return -1;
     }
     int32_t n = 0;
-    const int32_t r = engine->rt.read_begin(slot, tokens, n_tokens, n_reuse, n);
+    if (engine->split != nullptr) {
+        engine->split->settle(slot);
+    }
+    const int32_t r = engine->split != nullptr ? engine->split->lead.read_begin(slot, tokens, n_tokens, n_reuse, n) :
+                                                 engine->rt.read_begin(slot, tokens, n_tokens, n_reuse, n);
     if (n_processed != nullptr) {
         *n_processed = n;
     }
@@ -556,7 +749,8 @@ fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_gr
     const fn::runtime::read_mode m = mode == FNFL_READ_LONE      ? fn::runtime::read_mode::lone
                                      : mode == FNFL_READ_WRITERS ? fn::runtime::read_mode::writers
                                                                  : fn::runtime::read_mode::shared;
-    switch (engine->rt.read_step(slot, n_groups, m)) {
+    switch (engine->split != nullptr ? engine->split->lead.read_step(slot, n_groups, m) :
+                                       engine->rt.read_step(slot, n_groups, m)) {
         case fn::runtime::read_status::yielded:
             return FNFL_READ_YIELDED;
         case fn::runtime::read_status::chunk_done:
@@ -572,7 +766,9 @@ fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_gr
 }
 
 void fnfl_read_cancel(fnfl_engine * engine, int32_t slot) {
-    if (engine != nullptr) {
+    if (engine != nullptr && engine->split != nullptr) {
+        engine->split->lead.read_cancel(slot);
+    } else if (engine != nullptr) {
         engine->rt.read_cancel(slot);
     }
 }
@@ -619,7 +815,8 @@ bool fnfl_set_read_group(fnfl_engine * engine, int32_t n_layers) {
 }
 
 int32_t fnfl_lane_rows(const fnfl_engine * engine, int32_t lane) {
-    return engine == nullptr ? 0 : engine->rt.lane_rows(lane);
+    // TTTS1: one read at a time on the split (the back runs its chunks in order, in the main lane)
+    return engine == nullptr || (engine->split != nullptr && lane != 0) ? 0 : engine->rt.lane_rows(lane);
 }
 
 int32_t fnfl_lane_owner(const fnfl_engine * engine, int32_t lane) {
@@ -627,6 +824,10 @@ int32_t fnfl_lane_owner(const fnfl_engine * engine, int32_t lane) {
 }
 
 fnfl_status fnfl_release_slot(fnfl_engine * engine, int32_t slot) {
+    if (engine != nullptr && engine->split != nullptr) {
+        engine->split->settle(slot);
+        return to_status(engine->split->lead.release_slot(slot));
+    }
     return engine == nullptr ? FNFL_BAD_REQUEST : to_status(engine->rt.release_slot(slot));
 }
 
@@ -646,7 +847,7 @@ bool fnfl_pool(const fnfl_engine * engine, fnfl_pool_report & out) {
     out.free_pages = p.free_pages;
     out.reclaims = p.reclaims;
     out.capacity_cells = p.capacity_cells;
-    for (int32_t i = 0; i < 4; ++i) {
+    for (int32_t i = 0; i < fn::runtime::max_split_slots; ++i) {
         out.mapped[i] = p.mapped[i];
         out.busy[i] = p.busy[i];
     }

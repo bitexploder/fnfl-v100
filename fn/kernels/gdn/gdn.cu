@@ -4,6 +4,7 @@
 #include "fn/kernels/gdn/gdn_conv.cuh"
 #include "fn/kernels/round/version.h"
 #include "fn/model/shapes.h"
+#include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
 
@@ -130,7 +131,9 @@ __device__ __forceinline__ float warp_sum(float v) {
 //             bank and k records), writes 1,572,864 + B 16,512 (the pre-step bank and B records) in place of
 //             B 1,572,864 versions; unmeasured.
 //   evidence: GD1 (gd-test, gd-bench); simulator node gdn.recur (family gdn_recur).
-template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(const core_args a) {
+// FMS2 (build item 3, W3): the kernel's body on a's head and split blockIdx.x (core_kernel's, and a lane's of
+// core_lanes_kernel)
+template <int32_t B> __device__ __forceinline__ void core_body(const core_args & a) {
     // the small values, one array (32-bit shared offsets): q [B][128], k [B][128], z [B][128], ssm_norm [128], v [B][22]
     constexpr int32_t o_q = 0, o_k = B * head_dim, o_z = 2 * B * head_dim, o_w = 3 * B * head_dim;
     constexpr int32_t o_v = o_w + head_dim, n_small = o_v + B * warps;
@@ -343,6 +346,21 @@ template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(c
     }
 }
 
+template <int32_t B> __global__ void __launch_bounds__(threads, 2) core_kernel(const core_args a) {
+    core_body<B>(a);
+}
+
+// FMS2 (build item 3, W3): the joint verify round's lanes in one launch, grid.y = U: lane blockIdx.y's 144 blocks are
+// core_kernel's on its own arguments (its rows, state, records, selector, outputs and workspace counters)
+struct core_lanes_kargs {
+    core_args a[fn::xchg::max_lanes];
+};
+
+template <int32_t B>
+__global__ void __launch_bounds__(threads, 2) core_lanes_kernel(const __grid_constant__ core_lanes_kargs p) {
+    core_body<B>(p.a[blockIdx.y]);
+}
+
 // conv_silu: the epilogue alone, one thread a channel (gdn.h)
 template <int32_t B> __global__ void __launch_bounds__(256) conv_kernel(const conv_args a) {
     const int32_t c = static_cast<int32_t>(blockIdx.x) * 256 + static_cast<int32_t>(threadIdx.x);
@@ -387,13 +405,21 @@ size_t workspace_bytes() {
     return size_t(n_head) * 4;
 }
 
+namespace {
+
+bool core_ok(const core_args & a) {
+    return !(a.rows < 1 || a.rows > max_rows || !aligned16(a.conv) || !aligned16(a.z) || !aligned16(a.alpha) ||
+             !aligned16(a.beta) || !aligned16(a.dt) || !aligned16(a.a) || !aligned16(a.norm_w) || !aligned16(a.state) ||
+             !aligned16(a.rec) || a.gsel == nullptr ||
+             (a.rec < a.state + n_bank * state_version_floats && a.state < a.rec + n_rec_set * rec_set_floats) ||
+             !aligned16(a.gated) || !aligned16(a.gated_q.codes) || !aligned16(a.gated_q.scales) || !aligned16(a.ws) ||
+             a.gated_q.rows != a.rows || a.gated_q.k != n_value);
+}
+
+} // namespace
+
 bool core(const core_args & a, void * stream) {
-    if (a.rows < 1 || a.rows > max_rows || !aligned16(a.conv) || !aligned16(a.z) || !aligned16(a.alpha) ||
-        !aligned16(a.beta) || !aligned16(a.dt) || !aligned16(a.a) || !aligned16(a.norm_w) || !aligned16(a.state) ||
-        !aligned16(a.rec) || a.gsel == nullptr ||
-        (a.rec < a.state + n_bank * state_version_floats && a.state < a.rec + n_rec_set * rec_set_floats) ||
-        !aligned16(a.gated) || !aligned16(a.gated_q.codes) || !aligned16(a.gated_q.scales) || !aligned16(a.ws) ||
-        a.gated_q.rows != a.rows || a.gated_q.k != n_value || stream == nullptr) {
+    if (stream == nullptr || !core_ok(a)) {
         return false;
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
@@ -412,6 +438,37 @@ bool core(const core_args & a, void * stream) {
             break;
         default:
             core_kernel<5><<<n_block, threads, 0, st>>>(a);
+            break;
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool core_lanes(int32_t lanes, const core_args * a, void * stream) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    core_lanes_kargs p = {};
+    const int32_t    rows = a[0].rows;
+    for (int32_t u = 0; u < lanes; ++u) {
+        if (!core_ok(a[u]) || a[u].rows != rows || rows < 2) {  // FMS13: every lane at the round's R = d + 1
+            return false;
+        }
+        p.a[u] = a[u];
+    }
+    const dim3         grid(n_block, lanes);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    switch (rows) {
+        case 2:
+            core_lanes_kernel<2><<<grid, threads, 0, st>>>(p);
+            break;
+        case 3:
+            core_lanes_kernel<3><<<grid, threads, 0, st>>>(p);
+            break;
+        case 4:
+            core_lanes_kernel<4><<<grid, threads, 0, st>>>(p);
+            break;
+        default:
+            core_lanes_kernel<max_rows><<<grid, threads, 0, st>>>(p);
             break;
     }
     return cudaPeekAtLastError() == cudaSuccess;
@@ -454,6 +511,23 @@ bool resources(int32_t rows, core_resources & out) {
     }
     out.threads = threads;
     out.blocks = n_block;
+    out.blocks_per_sm = per_sm;
+    out.regs = fa.numRegs;
+    out.local_bytes = static_cast<int32_t>(fa.localSizeBytes);
+    out.shared_bytes = fa.sharedSizeBytes;
+    return true;
+}
+
+bool lanes_resources(int32_t lanes, core_resources & out) {
+    const void * kf = reinterpret_cast<const void *>(&core_lanes_kernel<max_rows>);
+    cudaFuncAttributes fa = {};
+    int32_t per_sm = 0;
+    if (lanes < 2 || lanes > fn::xchg::max_lanes || cudaFuncGetAttributes(&fa, kf) != cudaSuccess ||
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kf, threads, 0) != cudaSuccess) {
+        return false;
+    }
+    out.threads = threads;
+    out.blocks = n_block * lanes;
     out.blocks_per_sm = per_sm;
     out.regs = fa.numRegs;
     out.local_bytes = static_cast<int32_t>(fa.localSizeBytes);

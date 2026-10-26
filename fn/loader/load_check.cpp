@@ -733,3 +733,114 @@ int fnfl_load_check(const fnfl_load_check_args & a) {
     printf("load-check: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
+
+// ---- TTTS1: the split's per-box plan ----
+
+namespace {
+
+struct stage_plan {
+    int64_t weights[2] = { 0, 0 };
+    int64_t slots[2] = { 0, 0 }, pool[2] = { 0, 0 }, engine[2] = { 0, 0 }, lanes[2] = { 0, 0 };
+
+    int64_t total(int32_t c) const { return weights[c] + slots[c] + pool[c] + engine[c] + lanes[c]; }
+};
+
+bool plan_stage(const std::string & model_path,
+                const std::string & draft_path,
+                int32_t             k,
+                bool                front,
+                int32_t             n_slots,
+                int32_t             slot_cells,
+                int32_t             pool_cells,
+                bool                kv_q8,
+                stage_plan &        p,
+                std::string &       err) {
+    loader::load_params lp;
+    lp.model_path = model_path;
+    lp.draft_path = draft_path;
+    lp.n_slots    = n_slots;
+    lp.kv_q8      = kv_q8;
+    lp.win.lo     = front ? 0 : k;
+    lp.win.hi     = front ? k - 1 : n_layer - 1;
+    lp.win.head   = !front;
+    model::model       m;
+    loader::load_times lt;
+    if (!loader::open_model(lp, m, lt, err)) {
+        return false;
+    }
+    model::state_params sp;
+    sp.n_cells         = slot_cells;
+    sp.ple_conv_kernel = m.ple_conv_kernel;
+    sp.ple_ngram       = m.ple_ngram;
+    sp.kv_q8           = kv_q8;
+    sp.win             = m.win;
+    p                  = stage_plan();
+    for (int32_t c = 0; c < 2; ++c) {
+        p.weights[c] = m.weight_alloc[c];
+        p.pool[c]    = model::bytes_per_cell(c, kv_q8, m.win) * int64_t(pool_cells);
+    }
+    for (const model::buffer_class & b : model::state_classes(sp)) {
+        if (model::pooled_class(b.name)) {
+            continue;  // the pool's, at pool_cells
+        }
+        for (int32_t c = 0; c < 2; ++c) {
+            (model::slot_class(b.name) ? p.slots[c] : p.engine[c]) +=
+                b.allocation(c) * (model::slot_class(b.name) ? n_slots : 1);
+        }
+    }
+    for (const model::buffer_class & b : n_slots > 1 ? model::lane_classes() : std::vector<model::buffer_class>()) {
+        for (int32_t c = 0; c < 2; ++c) {
+            p.lanes[c] += b.allocation(c);
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+int fnfl_split_plan(const fnfl_split_plan_args & a) {
+    std::string err;
+    printf(
+        "split-plan: %s, k %d: %d slots of %d cells, the KV pool %d cells (CPU only: the placement and the state "
+        "classes; no GPU)\n",
+        a.model_path.c_str(), a.k, a.slots, a.slot_cells, a.pool_cells);
+    for (int32_t role = 0; role < 2; ++role) {
+        const bool     front = role == 0;
+        const char *   box   = front ? "the front (Carlos: layers 0 .. k - 1, the embeddings)" :
+                                       "the back (Carlin: layers k .. 47, the head and the draft)";
+        const double * freem = front ? a.free_front : a.free_back;
+        // the calibration: the measured config's plan (its free figure measured with it)
+        stage_plan     cal;
+        const bool     have_cal = freem[0] >= 0 && !a.cal_model.empty();
+        if (have_cal && !plan_stage(a.cal_model, a.cal_draft, a.cal_k, front, a.cal_slots, a.cal_slot_cells,
+                                    a.cal_pool_cells, a.cal_q8, cal, err)) {
+            fprintf(stderr, "split-plan: the calibration's plan: %s\n", err.c_str());
+            return 1;
+        }
+        for (int32_t q8 = 0; q8 < 2; ++q8) {
+            stage_plan p;
+            if (!plan_stage(a.model_path, a.draft_path, a.k, front, a.slots, a.slot_cells, a.pool_cells, q8 != 0, p,
+                            err)) {
+                fprintf(stderr, "split-plan: %s\n", err.c_str());
+                return 1;
+            }
+            for (int32_t c = 0; c < 2; ++c) {
+                printf(
+                    "split-plan: %s, card %d, %s KV: weights %.3f GiB; state %.3f GiB (slot classes x %d %.3f, the "
+                    "KV pool %.3f, the engine's %.3f, the other-reader lane %.3f); planned %.3f GiB",
+                    box, c, q8 ? "q8" : "BF16", gib(p.weights[c]), gib(p.total(c) - p.weights[c]), a.slots,
+                    gib(p.slots[c]), gib(p.pool[c]), gib(p.engine[c]), gib(p.lanes[c]), gib(p.total(c)));
+                if (have_cal) {
+                    const double head = freem[c] - (gib(p.total(c)) - gib(cal.total(c)));
+                    printf(
+                        "; headroom %.3f GiB (measured free %.3f GiB at the calibration config, planned %.3f GiB "
+                        "there)%s",
+                        head, freem[c], gib(cal.total(c)),
+                        q8 && head < 1.0 ? ": UNDER 1 GiB (recorded for TTTS2)" : "");
+                }
+                printf("\n");
+            }
+        }
+    }
+    return 0;
+}

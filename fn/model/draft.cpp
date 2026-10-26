@@ -921,6 +921,246 @@ bool joint_phase(draft_joint & J, int32_t rows, int32_t ph, use_counters & u, st
     }
 }
 
+// ---- FMS2 (build item 2): the joint catch-up (draft.h catchup_joint) ----
+
+// the catch-up's K/V (and SP2's index key) product as the lone phase 3 forms it, on lane 0's frame: its outputs are
+// the joint layer_ws rows, lane k's at row 5 k (lane_ws)
+fn::dense::product_args catchup_kv(const catchup_joint & j) {
+    const pass_card & p0 = *j.p[0];
+    const draft_card & d0 = *j.d[0];
+    fn::dense::product_args kv;
+    kv.k = D;
+    kv.n_mats = d0.sparse ? 3 : 2;
+    kv.mats[0] = qmat(d0.w.wk, p0.c.ws.kv_k);
+    kv.mats[1] = qmat(d0.w.wv, p0.c.ws.kv_v);
+    if (d0.sparse) {
+        kv.mats[2] = bmat16(d0.iw.k_proj, fn::qsa::head_dim, p0.c.ws.ik);
+    }
+    return kv;
+}
+
+bool catchup_check(const catchup_joint & j, std::string & err) {
+    if (j.lanes < 2 || j.lanes > L || j.jr == nullptr || j.runs == nullptr) {
+        return fail(err, "joint catch-up: 2 .. 4 lanes on the joint frame");
+    }
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        const pass_card & p = *j.p[k];
+        const draft_card & d = *j.d[k];
+        if (p.c.card != j.p[0]->c.card || p.c.stream != j.p[0]->c.stream || p.c.kv != nullptr ||
+            d.sparse != j.d[0]->sparse || d.w.hc_attn.q8_down == nullptr || p.c.rings != &j.jr->lane(k)) {
+            return fail(err, "joint catch-up: lane " + std::to_string(k) +
+                                 ": not on lane 0's card and stream, the host-backed KV, another draft form, or not "
+                                 "on its lane ring");
+        }
+    }
+    const int32_t form = j.d[0]->sparse ? 1 : 0;
+    fn::dense::product_args kv = catchup_kv(j);
+    fn::dense::choose_splits(kv);
+    if (j.kv_work[form] == nullptr || fn::dense::joint_work_bytes(kv) == 0 ||
+        fn::dense::joint_work_bytes(kv) > j.kv_work_bytes[form]) {
+        return fail(err, "joint catch-up: the K/V product's joint work is missing or too small");
+    }
+    return true;
+}
+
+bool catchup_send(catchup_joint & j, const use_counters & u, std::string & err) {
+    fn::draft::send_args a[L] = {};
+    const int32_t * rows[L] = {};
+    const int32_t s = use_slot_of(u, u.draft, u.graph_draft);
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        pass_card & p = *j.p[k];
+        draft_card & d = *j.d[k];
+        const int32_t r = p.c.card;
+        fn::draft::send_args & x = a[k];
+        x.emb = p.emb_hres;
+        x.emb_stride = 4 * F;
+        x.carry = p.carry;
+        x.carry_prev = d.carry_prev;
+        x.h_nextn = d.h_nextn;
+        x.hsrc = &p.desc->hsrc;
+        x.chained = false;
+        x.g_e = d.w.enorm;
+        x.g_h = d.w.hnorm;
+        x.peer = p.c.rings->slot(1 - r, fn::xchg::msg::draft, s);
+        x.own = d.in_own;
+        rows[k] = &p.desc->rows;
+    }
+    if (!fn::draft::draft_in_send_lanes(j.lanes, a, rows, j.p[0]->c.stream)) {
+        return fail(err, "draft_in_send_lanes");
+    }
+    note_piece(j.p[0]->c, "draft.in.send.lanes");
+    return true;
+}
+
+bool catchup_recv(catchup_joint & j, const use_counters & u, std::string & err) {
+    fn::draft::recv_args a[L] = {};
+    const int32_t * rows[L] = {};
+    const int32_t s = use_slot_of(u, u.draft, u.graph_draft);
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        pass_card & p = *j.p[k];
+        draft_card & d = *j.d[k];
+        const int32_t r = p.c.card;
+        const fn::xchg::rings & rg = *p.c.rings;
+        fn::draft::recv_args & x = a[k];
+        x.own = d.in_own;
+        x.slot = rg.slot(r, fn::xchg::msg::draft, s);
+        x.codes = d.codes;
+        x.scales = d.scales;
+        x.f32 = nullptr;
+        x.err = rg.err(r);
+        x.card = r;
+        x.carry_prev = d.carry_prev;
+        x.carry = p.carry;
+        x.hsrc = &p.desc->hsrc;
+        rows[k] = &p.desc->rows;
+    }
+    if (!fn::draft::draft_in_recv_lanes(j.lanes, a, rows, j.p[0]->c.stream)) {
+        return fail(err, "draft_in_recv_lanes");
+    }
+    note_piece(j.p[0]->c, "draft.in.recv.lanes");
+    return true;
+}
+
+// lane k's eh_proj: its B_c calls (eh_proj's), gated on its descriptor's rows
+bool catchup_eh(pass_card & p, draft_card & d, std::string & err) {
+    fn::dense::product_args a;
+    a.k = 2 * D;
+    a.n_mats = 1;
+    a.mats[0] = qmat(d.w.eh, d.hres_d);
+    a.x_codes = d.codes;
+    a.x_scales = d.scales;
+    a.grids = p.c.dense_grids;
+    fn::dense::choose_splits(a);
+    fn::dense::work_layout l;
+    const int32_t site = static_cast<int32_t>(dense_site::draft_eh);
+    if (!fn::dense::layout_of(a, l) || !fn::dense::same_layout(l, p.c.dense_sites[site])) {
+        return fail(err, "draft eh_proj lanes: not the draft_eh site's layout");
+    }
+    a.work = static_cast<uint8_t *>(p.c.dense_work) + dense_work_offset(dense_site::draft_eh);
+    if (!fn::draft::eh_proj_gated(a, &p.desc->rows, p.c.stream)) {
+        return fail(err, "draft eh_proj gated");
+    }
+    note_piece(p.c, "draft.eh_proj.gated");
+    return true;
+}
+
+bool catchup_prepare(catchup_joint & j, const use_counters & u, std::string & err) {
+    fn::draft::prepare_args a[L] = {};
+    const int32_t s = hc_slot_of(u, u.sub);
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        pass_card & p = *j.p[k];
+        draft_card & d = *j.d[k];
+        const int32_t r = p.c.card;
+        const fn::xchg::rings & rg = *p.c.rings;
+        fn::draft::prepare_args & x = a[k];
+        x.qfull = nullptr;
+        x.kv_k = p.c.ws.kv_k;
+        x.kv_v = p.c.ws.kv_v;
+        x.q_norm = d.w.q_norm;
+        x.k_norm = d.w.k_norm;
+        x.n_before = &p.desc->n_before;
+        x.pos = p.desc->pos;
+        x.stride = &p.desc->rows;
+        x.row0 = 0;
+        x.theta_scale = fn::qsa::attn::rope_theta_scale();
+        x.k_cache = d.k_cache;
+        x.v_cache = d.v_cache;
+        x.max_cells = d.max_cells;
+        x.q16 = d.q16;
+        x.q_f32 = nullptr;
+        x.k_f32 = nullptr;
+        x.err = rg.err(r);
+        x.release_hc = rg.slot(r, fn::xchg::msg::hc, s);
+        x.release_hmix = rg.slot(r, fn::xchg::msg::hmix, s);
+    }
+    if (!fn::draft::datc_prepare_lanes(j.lanes, a, j.p[0]->c.stream)) {
+        return fail(err, "datc_prepare_lanes");
+    }
+    note_piece(j.p[0]->c, "draft.datc.prepare.lanes");
+    return true;
+}
+
+bool catchup_index(catchup_joint & j, std::string & err) {
+    fn::qsa::round_update_args a[L] = {};
+    const int32_t * rows[L] = {};
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        pass_card & p = *j.p[k];
+        draft_card & d = *j.d[k];
+        fn::qsa::round_update_args & x = a[k];
+        x.keys = d.idx_keys;
+        x.k_norm = d.iw.k_norm;
+        x.summaries = d.idx_summ;
+        x.rope = fn::qsa::model_rope();
+        x.ik = p.c.ws.ik;
+        x.depth = &p.desc->n_before;
+        x.rows = fn::draft::max_rows;
+        x.max_cells = d.max_cells;
+        rows[k] = &p.desc->rows;
+    }
+    if (!fn::qsa::summary_update_lanes(j.lanes, a, rows, j.p[0]->c.stream)) {
+        return fail(err, "draft summary_update_lanes");
+    }
+    note_piece(j.p[0]->c, "draft.summary.lanes");
+    return true;
+}
+
+// Phase ph of the joint catch-up on one card, the lone catch-up's phases (phase()) with every lane's piece of a phase
+// together: a phase that receives a message follows the phase in which both cards sent it (the pair form's order)
+bool catchup_phase(catchup_joint & j, int32_t ph, use_counters & u, std::string & err) {
+    card_ctx * c[L] = {};
+    layer_input in[L];
+    for (int32_t k = 0; k < j.lanes; ++k) {
+        c[k] = &j.p[k]->c;
+        in[k] = attn_input(*j.p[k], *j.d[k]);
+    }
+    if (!cuda_ok(cudaSetDevice(c[0]->device), "cudaSetDevice", err)) {
+        return false;
+    }
+    const hc_module & hc = j.d[0]->w.hc_attn;
+    switch (ph) {
+        case 0:
+            for (int32_t k = 0; k < j.lanes; ++k) {
+                if (!begin(*j.p[k], err)) {
+                    return false;
+                }
+            }
+            for (int32_t k = 0; k < j.lanes; ++k) {
+                // all five rows: the rows past B_c embed token 0 into the slot's boundary, which nothing reads
+                if (!embed(*j.p[k], j.p[k]->desc->tok, fn::draft::max_rows, err)) {
+                    return false;
+                }
+            }
+            return catchup_send(j, u, err);
+        case 1:
+            if (!catchup_recv(j, u, err)) {
+                return false;
+            }
+            u.draft++;
+            for (int32_t k = 0; k < j.lanes; ++k) {
+                if (!catchup_eh(*j.p[k], *j.d[k], err)) {
+                    return false;
+                }
+            }
+            return hc_sublayer_lanes(c, j.lanes, hc, 0, in, u, 0, j.runs, err);
+        case 2:
+            return hc_sublayer_lanes(c, j.lanes, hc, 0, in, u, 1, j.runs, err);
+        default: {
+            const int32_t form = j.d[0]->sparse ? 1 : 0;
+            if (!dense_joint_run(c, j.lanes, catchup_kv(j), *j.jr, j.kv_work[form], u, "draft.kv.joint", err) ||
+                !catchup_prepare(j, u, err) || (j.d[0]->sparse && !catchup_index(j, err))) {
+                return false;
+            }
+            u.sub++;
+            for (int32_t k = 0; k < j.lanes; ++k) {
+                if (!finish(*j.p[k], err)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+}
+
 uint8_t * class_part(const model & m, const char * cls, const char * name, int32_t card, std::string & err) {
     const reserved_class * rc = m.state_class(cls);
     const int32_t i = part_of(rc, name);
@@ -1146,6 +1386,59 @@ step_status draft_pair_enqueue(pass_card * const p[2], draft_card * const d[2], 
     for (int32_t ph = 0; ph < n_phases(kind, rows); ++ph) {
         for (int32_t k = 0; k < 2; ++k) {
             if (!phase(*p[k], *d[k], kind, rows, ph, u[k], err)) {
+                return step_status::failed;
+            }
+        }
+    }
+    return step_status::ok;
+}
+
+size_t catchup_kv_work_bytes(bool sparse) {
+    fn::dense::product_args kv;
+    kv.k = D;
+    kv.n_mats = sparse ? 3 : 2;
+    for (int32_t i = 0; i < 2; ++i) {
+        kv.mats[i].f = fn::dense::fmt::q8_0;
+        kv.mats[i].m = HD;
+    }
+    if (sparse) {
+        kv.mats[2].f = fn::dense::fmt::bf16;
+        kv.mats[2].m = fn::qsa::head_dim;
+    }
+    fn::dense::choose_splits(kv);
+    return fn::dense::joint_work_bytes(kv);
+}
+
+use_counters catchup_joint_counters() {
+    return draft_graph_counters(static_cast<int32_t>(fn::round::kind::draft_catchup), 1);
+}
+
+step_status catchup_joint_enqueue(catchup_joint & j, use_counters & u, std::string & err) {
+    if (!catchup_check(j, err)) {
+        return step_status::failed;
+    }
+    for (int32_t ph = 0; ph < catchup_phases; ++ph) {
+        if (!catchup_phase(j, ph, u, err)) {
+            return step_status::failed;
+        }
+    }
+    return step_status::ok;
+}
+
+step_status catchup_joint_pair_enqueue(catchup_joint * const j[2], use_counters u[2], std::string & err) {
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!catchup_check(*j[c], err)) {
+            return step_status::failed;
+        }
+    }
+    if (j[0]->lanes != j[1]->lanes || j[0]->p[0]->c.card != 0 || j[1]->p[0]->c.card != 1 ||
+        j[0]->p[0]->c.device == j[1]->p[0]->c.device) {
+        fail(err, "joint catch-up: the cards' lanes differ, or both cards on one device");
+        return step_status::failed;
+    }
+    for (int32_t ph = 0; ph < catchup_phases; ++ph) {
+        for (int32_t c = 0; c < 2; ++c) {
+            if (!catchup_phase(*j[c], ph, u[c], err)) {
                 return step_status::failed;
             }
         }

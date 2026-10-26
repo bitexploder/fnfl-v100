@@ -1040,7 +1040,13 @@ class script {
 
 } // namespace
 
-int fnfl_state_test_mu1(const std::string & run, int32_t dev0, int32_t dev1, bool kv_q8); // slots_gpu_test.cpp
+int fnfl_state_test_mu1(const std::string & run,
+                        int32_t             dev0,
+                        int32_t             dev1,
+                        bool                kv_q8,
+                        const std::string & nodes,
+                        bool                x16,
+                        int32_t             spec_d);                                      // slots_gpu_test.cpp
 int fnfl_state_test_mxmu1(const std::string & run, int32_t dev);                          // slots_gpu_test.cpp (MXMU1)
 
 int fnfl_state_test(int argc, char ** argv, bool kv_q8) {
@@ -1060,14 +1066,33 @@ int fnfl_state_test(int argc, char ** argv, bool kv_q8) {
     if (mode == "mu1") {
         // MU1: the multi-slot engine's pool and frames (slots_gpu_test.cpp)
         // peer access is enabled by part B's load (part A's peer copy needs none)
+        // FMS2: catchup and catchup-eager (the joint catch-up); after the cards, --nodes DIR: its graphs' node lists;
+        // --joint-x16 on|off (FMS2 item 7): the joint rounds' X-A and X-F in 16 bits (default off); --spec-d D
+        // (FMS13): the joint and catch-up runs' d, 1 .. 4 (default 4, the serving d)
+        std::string nodes;
+        bool x16 = false, args_ok = true;
+        int32_t     spec_d = 4;
+        for (int i = 6; i < argc; i += 2) {
+            const std::string k = argv[i], v = i + 1 < argc ? argv[i + 1] : "";
+            if (k == "--nodes" && !v.empty()) {
+                nodes = v;
+            } else if (k == "--joint-x16" && (v == "on" || v == "off")) {
+                x16 = v == "on";
+            } else if (k == "--spec-d" && v.size() == 1 && v[0] >= '1' && v[0] <= '4') {
+                spec_d = v[0] - '0';
+            } else {
+                args_ok = false;
+            }
+        }
         if ((run != "graph" && run != "eager" && run != "read" && run != "joint" && run != "joint-eager" &&
-             run != "joint-san") ||
-            dev0 == dev1) {
-            fprintf(stderr, "state-test: mu1 [graph|eager|read|joint|joint-eager|joint-san] [DEV0] [DEV1] "
-                            "(two distinct cards)\n");
+             run != "joint-san" && run != "catchup" && run != "catchup-eager") ||
+            dev0 == dev1 || !args_ok) {
+            fprintf(stderr,
+                    "state-test: mu1 [graph|eager|read|joint|joint-eager|joint-san|catchup|catchup-eager] "
+                    "[DEV0] [DEV1] [--nodes DIR] [--joint-x16 on|off] [--spec-d 1..4] (two distinct cards)\n");
             return 2;
         }
-        return fnfl_state_test_mu1(run, dev0, dev1, kv_q8);
+        return fnfl_state_test_mu1(run, dev0, dev1, kv_q8, nodes, x16, spec_d);
     }
     if ((mode != "all" && !san) || (run != "graph" && run != "eager") || dev0 == dev1) {
         fprintf(stderr, "state-test: [all|san] [graph|eager] [DEV0] [DEV1] (two distinct cards)\n");

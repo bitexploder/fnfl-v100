@@ -46,10 +46,12 @@
 #include "fn/model/model.h"
 #include "fn/runtime/joint.h"
 #include "fn/runtime/runtime.h"
+#include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/target_cmds.h"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -102,7 +104,7 @@ const char * const hash_names[11] = {"GDN states",   "GDN histories", "PLE histo
                                      "V cache",      "index keys",    "summaries",    "retained logits",
                                      "hidden carry", "draft carry",   "draft K and V"};
 
-slot_hash take(rt::engine & e, int32_t slot) {
+slot_hash take_one(rt::engine & e, int32_t slot) {
     slot_hash s;
     rt::target & t = e.test_target(slot);
     md::model & m = e.test_model();
@@ -110,17 +112,130 @@ slot_hash take(rt::engine & e, int32_t slot) {
         return s;
     }
     s.n = t.slot().n;
-    s.draft_n = t.draft_n();
+    s.draft_n = t.draft_on() ? t.draft_n() : 0;
     for (int32_t c = 0; c < 2; ++c) {
         const int32_t dev = m.device[c];
-        s.h[7] = hash_dev(s.h[7] ^ uint64_t(c), dev, t.card(c).logits, size_t(fn::head::n_vocab_card) * 4);
-        s.h[8] = hash_dev(s.h[8] ^ uint64_t(c), dev, t.card(c).carry, size_t(5) * 4 * 1280 * 4);
-        s.h[9] = hash_dev(s.h[9] ^ uint64_t(c), dev, t.draft(c).carry_prev, size_t(4) * 1280 * 4);
-        const size_t kv = size_t(std::max<int64_t>(0, s.draft_n)) * 256 * 2;
-        s.h[10] = hash_dev(hash_dev(s.h[10] ^ uint64_t(c), dev, t.draft(c).k_cache, kv), dev, t.draft(c).v_cache, kv);
+        if (m.win.head) {  // TTTS1: the head's buffers and the draft's live on the back stage
+            s.h[7] = hash_dev(s.h[7] ^ uint64_t(c), dev, t.card(c).logits, size_t(fn::head::n_vocab_card) * 4);
+            s.h[8] = hash_dev(s.h[8] ^ uint64_t(c), dev, t.card(c).carry, size_t(5) * 4 * 1280 * 4);
+        }
+        if (t.draft_on()) {
+            s.h[9]          = hash_dev(s.h[9] ^ uint64_t(c), dev, t.draft(c).carry_prev, size_t(4) * 1280 * 4);
+            const size_t kv = size_t(std::max<int64_t>(0, s.draft_n)) * 256 * 2;
+            s.h[10] =
+                hash_dev(hash_dev(s.h[10] ^ uint64_t(c), dev, t.draft(c).k_cache, kv), dev, t.draft(c).v_cache, kv);
+        }
     }
     s.ok = true;
     return s;
+}
+
+// TTTS1: the split's leader, when the test runs on the split (every slot's state is the front's and the back's)
+fn::runtime::stage::leader * g_lead = nullptr;
+
+slot_hash take(rt::engine & e, int32_t slot) {
+    slot_hash s = take_one(e, slot);
+    if (g_lead == nullptr || !s.ok) {
+        return s;
+    }
+    // the back's part (fnfl_mu1_slot_hash on the follower), each class's two hashes mixed
+    std::vector<uint8_t> b;
+    slot_hash            bs;
+    if (!g_lead->probe(slot, 0, b) || b.size() != sizeof(slot_hash)) {
+        s.ok = false;
+        return s;
+    }
+    std::memcpy(&bs, b.data(), sizeof bs);
+    if (!bs.ok || bs.n != s.n) {
+        s.ok = false;
+        return s;
+    }
+    s.draft_n = bs.draft_n;
+    for (int32_t i = 0; i < 11; ++i) {
+        s.h[i] = mix64(s.h[i] ^ mix64(bs.h[i] + uint64_t(i)));
+    }
+    return s;
+}
+
+// the engine's calls the test makes, on one box or through the split's leader (the front's own state for the rest)
+struct box {
+    rt::engine *                 e = nullptr;
+    fn::runtime::stage::leader * L = nullptr;
+
+    rt::run_status set_sampling(int32_t s, const rt::request_options & ro) {
+        return L != nullptr ? L->set_sampling(s, ro) : e->set_sampling(s, ro);
+    }
+
+    rt::run_status set_draft(int32_t d, bool sparse) {
+        return L != nullptr ? L->set_draft(d, sparse) : e->set_draft(d, sparse);
+    }
+
+    rt::run_status truncate(int32_t s, int32_t n) { return L != nullptr ? L->truncate(s, n) : e->truncate(s, n); }
+
+    rt::run_status release_slot(int32_t s) { return L != nullptr ? L->release_slot(s) : e->release_slot(s); }
+
+    int32_t read_begin(int32_t s, const int32_t * tok, int32_t n, int32_t reuse, int32_t & np) {
+        return L != nullptr ? L->read_begin(s, tok, n, reuse, np) : e->read_begin(s, tok, n, reuse, np);
+    }
+
+    rt::read_status read_step(int32_t s, int32_t groups, rt::read_mode mode = rt::read_mode::shared) {
+        return L != nullptr ? L->read_step(s, groups, mode) : e->read_step(s, groups, mode);
+    }
+
+    void read_cancel(int32_t s) {
+        if (L != nullptr) {
+            L->read_cancel(s);
+        } else {
+            e->read_cancel(s);
+        }
+    }
+
+    rt::run_status step(int32_t s, int32_t * out, int32_t & n_out, bool & end) {
+        if (L == nullptr) {
+            return e->step(s, out, n_out, end);
+        }
+        rt::joint_step_out r;
+        L->step_group(&s, 1, &r);
+        std::copy(r.out, r.out + r.n_out, out);
+        n_out = r.n_out;
+        end   = r.end;
+        return r.st;
+    }
+
+    void step_joint(const int32_t * sl, int32_t n, rt::joint_step_out * res) {
+        if (L != nullptr) {
+            L->step_group(sl, n, res);
+        } else {
+            e->step_joint(sl, n, res);
+        }
+    }
+
+    std::string error() const { return L != nullptr ? L->error() : e->error(); }
+
+    // the front's own (one box: the engine's)
+    rt::run_status history(int32_t s, std::vector<int32_t> & h, int32_t & pend) const { return e->history(s, h, pend); }
+
+    int64_t held(int32_t s) const { return e->held(s); }
+
+    bool get_read_info(int32_t s, rt::read_info & ri) const { return e->get_read_info(s, ri); }
+
+    int32_t lane_owner(int32_t lane) const { return e->lane_owner(lane); }
+
+    bool set_read_group(int32_t g) { return e->set_read_group(g); }
+
+    bool read_prefetch(int32_t a, int32_t b) { return e->read_prefetch(a, b); }
+
+    rt::target & test_target(int32_t s) { return e->test_target(s); }
+
+    const rt::joint_frame * test_joint() const { return e->test_joint(); }
+
+    std::unique_ptr<md::model> test_take_model() { return e->test_take_model(); }
+
+    std::string settings() const { return e->settings(); }
+};
+
+slot_hash take(box & b, int32_t slot) {
+    return take(*b.e, slot);
 }
 
 std::string diff(const slot_hash & a, const slot_hash & b) {
@@ -164,6 +279,13 @@ bool read_ids_file(const std::string & path, std::vector<int32_t> & out) {
 
 } // namespace
 
+bool fnfl_mu1_slot_hash(fn::runtime::engine & e, int32_t slot, std::vector<uint8_t> & out) {
+    const slot_hash s = take_one(e, slot);
+    out.resize(sizeof s);
+    std::memcpy(out.data(), &s, sizeof s);
+    return s.ok;
+}
+
 int fnfl_rollback_mu1(const fnfl_target_args & a) {
     const int32_t cells = 65536;
     // the tokens: the file's, repeated to length, or a seeded sequence of vocabulary IDs
@@ -206,6 +328,13 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
         lp.draft_path = a.draft_path;
         lp.ple_table = a.ple_table;
         lp.n_slots = 4;
+        lp.kv_q8      = a.kv_q8;
+        if (a.split_role == 1) {
+            // TTTS1: the split's front (layers 0 .. k - 1); the follower holds the back
+            lp.win.lo   = 0;
+            lp.win.hi   = a.split_k - 1;
+            lp.win.head = false;
+        }
         fn::loader::run_load_report lr;
         std::string err;
         if (!fn::loader::load_for_run(lp, cells, *m, lr, err)) {
@@ -230,12 +359,49 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
     c.spec_d = 4; // the serving d (MX0's recipe)
     c.timeout_s = joint_eager ? 1800.0 : 60.0; // the sanitizers' run: a round under racecheck outlasts 60 s
     c.eager = joint_eager;
-    rt::engine e;
+    c.joint_x16 = false;       // FMS2 item 7: section 7 is I3, every lane bitwise its lone step
+    c.joint_router_tc = false; // FMS5: likewise (the tensor-core router is judged by joint-kl)
+    c.joint_dense_f16 = false; // FMS6: likewise (the FP16 dense products are judged by dpj-test f16)
+    // TTTS1 (--split): this box the front; the follower (fnfl-drive stage) the back, rebuilt with these switches
+    fnfl_split  sp;
     std::string err;
-    if (!e.init(std::move(m), c, err)) {
+    const bool  split = a.split_role == 1;
+    if (split && !fnfl_split_prepare(a, 4, sp, c, err)) {
+        fprintf(stderr, "rollback-test mu1: the split: %s\n", err.c_str());
+        return 1;
+    }
+    rt::engine eng;
+    if (!eng.init(std::move(m), c, err)) {
         fprintf(stderr, "rollback-test mu1: engine: %s\n", err.c_str());
         return 1;
     }
+    fn::runtime::stage::leader * L = nullptr;
+    if (split) {
+        if (!fnfl_split_attach(a, eng, cells, sp, err)) {
+            fprintf(stderr, "rollback-test mu1: the split: %s\n", err.c_str());
+            return 1;
+        }
+        L = sp.lead.get();
+        L->set_block_reads(true);
+        g_lead = L;
+        fn::runtime::stage::ctrl rc;
+        rc.a    = a.kv_q8 ? 1 : 0;
+        rc.b    = c.spec_d;
+        rc.c    = (c.joint_x16 ? fn::runtime::stage::sw_joint_x16 : 0) |
+                  (c.joint_router_tc ? fn::runtime::stage::sw_router_tc : 0) |
+                  (c.joint_dense_f16 ? fn::runtime::stage::sw_dense_f16 : 0) |
+                  (c.eager ? fn::runtime::stage::sw_eager : 0);
+        rc.base = cells;
+        if (L->reconfigure(rc) != rt::run_status::ok) {
+            fprintf(stderr, "rollback-test mu1: the follower's switches: %s\n", L->error().c_str());
+            return 1;
+        }
+        printf(
+            "rollback-test mu1: TTTS1 split at k %d: this box the front, the follower the back with the same "
+            "switches (16-bit X-A/X-F %s, the router on the tensor cores %s, dense FP16 %s)\n",
+            a.split_k, c.joint_x16 ? "on" : "off", c.joint_router_tc ? "on" : "off", c.joint_dense_f16 ? "on" : "off");
+    }
+    box e{ &eng, L };
     printf("rollback-test mu1: %s\n", e.settings().c_str());
     rt::request_options ro;
     ro.sampling.temp = 0.0f;
@@ -266,20 +432,25 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
         return true;
     };
     if (joint_only) {
-        std::vector<int32_t> tok[4];
-        int32_t np = 0;
-        bool ok = true;
-        for (int32_t s = 0; s < 4 && ok; ++s) {
-            ok = e.read_begin(s, R[s].data(), int32_t(R[s].size()), 0, np) == 0;
-            rt::read_status st = rt::read_status::yielded;
-            while (ok && (st == rt::read_status::yielded || st == rt::read_status::chunk_done)) {
-                st = e.read_step(s, fn::n_layer);
+        // FMS13: at each d = 1 .. 4 in turn (set_draft finishes every slot, so each d reads its prompts again)
+        for (int32_t d = 1; d <= 4; ++d) {
+            std::vector<int32_t> tok[4];
+            int32_t              np = 0;
+            bool                 ok = e.set_draft(d, true) == rt::run_status::ok;
+            for (int32_t s = 0; s < 4 && ok; ++s) {
+                ok                 = e.truncate(s, 0) == rt::run_status::ok &&
+                                     e.read_begin(s, R[s].data(), int32_t(R[s].size()), 0, np) == 0;
+                rt::read_status st = rt::read_status::yielded;
+                while (ok && (st == rt::read_status::yielded || st == rt::read_status::chunk_done)) {
+                    st = e.read_step(s, fn::n_layer);
+                }
+                ok = ok && st == rt::read_status::done;
             }
-            ok = ok && st == rt::read_status::done;
+            joint_steps = 0;
+            ok          = ok && joint_call({ 0, 1, 2, 3 }, tok) && joint_call({ 0, 1, 2, 3 }, tok);
+            put("mu1-joint: d = " + std::to_string(d) + ": the bootstraps and one four-lane joint round",
+                ok && joint_steps == 4, std::to_string(joint_steps) + " joint steps");
         }
-        ok = ok && joint_call({0, 1, 2, 3}, tok) && joint_call({0, 1, 2, 3}, tok);
-        put("mu1-joint: the bootstraps and one four-lane joint round", ok && joint_steps == 4,
-            std::to_string(joint_steps) + " joint steps");
         printf("rollback-test mu1: %s\n", g_bad == 0 ? "PASS" : "FAIL");
         return g_bad == 0 ? 0 : 1;
     }
@@ -480,8 +651,12 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
     e.get_read_info(A, la6);
     const slot_hash a6 = take(e, A);
     const std::string d6a = diff(aq, a6);
-    put("6. FMU1 a lone read (one 48-layer group a chunk) against straight through: states",
-        ok && la6.layers == fn::n_layer && la6.steps == 2 && d6a.empty(),
+    // TTTS1: on the split the front's lone group is its window (layers 0 .. k - 1), and a chunk's 1-layer groups are
+    // its layers plus the chunk's end and finish
+    const int32_t     win_layers = split ? a.split_k : fn::n_layer;
+    put("6. FMU1 a lone read (one 48-layer group a chunk; the front's window on the split) against straight through: "
+        "states",
+        ok && la6.layers == win_layers && la6.steps == 2 && d6a.empty(),
         d6a.empty() ? "steps " + std::to_string(la6.steps) + ", layers " + std::to_string(la6.layers) : d6a);
     // 6b: the first chunk lone; a writer present from the second chunk's start
     ok = e.truncate(Bs, 0) == rt::run_status::ok && e.read_begin(Bs, Q.data(), int32_t(Q.size()), 0, np) == 0 &&
@@ -499,7 +674,7 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
     const std::string d6b = diff(aq, b6);
     put("6. FMU1 a writer arriving at a chunk boundary (the second chunk in 1-layer groups, its end and finish their "
         "own steps, a writer's step between each): states against straight through",
-        ok && d6b.empty() && wsteps == 50, d6b.empty() ? std::to_string(wsteps) + " steps" : d6b);
+        ok && d6b.empty() && wsteps == win_layers + 2, d6b.empty() ? std::to_string(wsteps) + " steps" : d6b);
     // 6c: a writer present for 10 groups of the first chunk, then lone (the writer left)
     ok = e.truncate(Bs, 0) == rt::run_status::ok && e.read_begin(Bs, Q.data(), int32_t(Q.size()), 0, np) == 0;
     for (int32_t g = 0; g < 10 && ok; ++g) {
@@ -516,11 +691,8 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
     ok = ok && steps(A, 4) && steps(Bs, 4);
     put("6. FMU1 the steps after the lone and mixed reads: tokens", ok && tokens[A] == tokens[Bs],
         std::to_string(tokens[A].size()) + " tokens");
-    // 7. FMU2: joint rounds against lone steps
-    for (int32_t s = 0; s < 4; ++s) {
-        e.release_slot(s);
-        tokens[s].clear();
-    }
+    // 7. FMU2: joint rounds against lone steps. FMS13: at each d = 1 .. 4 in turn, the draft sparse (as serving):
+    // set_draft finishes every slot, so each d takes its lone references again, then 7a, 7b and the rounds' count
     const auto read_all4 = [&]() {
         bool r = true;
         for (int32_t s = 0; s < 4 && r; ++s) {
@@ -529,73 +701,96 @@ int fnfl_rollback_mu1(const fnfl_target_args & a) {
         }
         return r;
     };
-    ok = read_all4();
-    for (int32_t s = 0; s < 4 && ok; ++s) {
-        ok = steps(s, 12);
-    }
-    slot_hash ref[4];
-    std::vector<int32_t> ref_tok[4];
-    for (int32_t s = 0; s < 4; ++s) {
-        ref[s] = take(e, s);
-        ref_tok[s] = tokens[s];
-    }
     const rt::joint_frame * jf = e.test_joint();
-    put("7. FMU2 the engine has a joint frame; the lone references", ok && jf != nullptr,
-        std::to_string(ref_tok[0].size()) + ", " + std::to_string(ref_tok[1].size()) + ", " +
-            std::to_string(ref_tok[2].size()) + ", " + std::to_string(ref_tok[3].size()) + " tokens");
-    const auto compare = [&](const std::string & what, std::vector<int32_t> * tok) {
+    for (int32_t d = 1; d <= 4; ++d) {
+        const std::string at = "7. FMU2 d = " + std::to_string(d) + ": ";
         for (int32_t s = 0; s < 4; ++s) {
-            const slot_hash h = take(e, s);
-            const std::string d = diff(ref[s], h);
-            put(what + ", slot " + std::to_string(s) + ": tokens and states against its lone steps",
-                ok && d.empty() && tok[s] == ref_tok[s],
-                d.empty() ? std::to_string(tok[s].size()) + " tokens" + (tok[s] == ref_tok[s] ? "" : " (differ)") : d);
+            e.release_slot(s);
+            tokens[s].clear();
         }
-    };
-    // 7a: four lanes, one call a step
-    std::vector<int32_t> jt[4];
-    ok = ok && read_all4();
-    joint_steps = 0;
-    for (int32_t i = 0; i < 12 && ok; ++i) {
-        ok = joint_call({0, 1, 2, 3}, jt);
-    }
-    const int32_t ja = joint_steps;
-    compare("7. FMU2 four lanes (" + std::to_string(ja) + " joint lane steps)", jt);
-    // 7b: lane orders rotated every step; every second step two two-member calls
-    for (int32_t s = 0; s < 4; ++s) {
-        jt[s].clear();
-    }
-    ok = ok && read_all4();
-    joint_steps = 0;
-    const int32_t rot[4] = {3, 1, 0, 2};
-    for (int32_t i = 0; i < 12 && ok; ++i) {
-        if (i % 2 == 0) {
-            std::vector<int32_t> sl;
-            for (int32_t k = 0; k < 4; ++k) {
-                sl.push_back(rot[(k + i / 2) % 4]);
+        ok = e.set_draft(d, true) == rt::run_status::ok;
+        ok = ok && read_all4();
+        for (int32_t s = 0; s < 4 && ok; ++s) {
+            ok = steps(s, 12);
+        }
+        slot_hash            ref[4];
+        std::vector<int32_t> ref_tok[4];
+        for (int32_t s = 0; s < 4; ++s) {
+            ref[s]     = take(e, s);
+            ref_tok[s] = tokens[s];
+        }
+        put(at + "the engine has a joint frame; the lone references", ok && jf != nullptr,
+            std::to_string(ref_tok[0].size()) + ", " + std::to_string(ref_tok[1].size()) + ", " +
+                std::to_string(ref_tok[2].size()) + ", " + std::to_string(ref_tok[3].size()) + " tokens");
+        const auto compare = [&](const std::string & what, std::vector<int32_t> * tok) {
+            for (int32_t s = 0; s < 4; ++s) {
+                const slot_hash   h  = take(e, s);
+                const std::string df = diff(ref[s], h);
+                put(what + ", slot " + std::to_string(s) + ": tokens and states against its lone steps",
+                    ok && df.empty() && tok[s] == ref_tok[s],
+                    df.empty() ? std::to_string(tok[s].size()) + " tokens" + (tok[s] == ref_tok[s] ? "" : " (differ)") :
+                                 df);
             }
-            ok = joint_call(sl, jt);
-        } else {
-            ok = joint_call({1, 3}, jt) && joint_call({2, 0}, jt);
+        };
+        const int32_t        c0 = jf != nullptr ? jf->captures() : 0;
+        const int64_t        r0 = jf != nullptr ? jf->rounds() : 0;
+        // 7a: four lanes, one call a step
+        std::vector<int32_t> jt[4];
+        ok          = ok && read_all4();
+        joint_steps = 0;
+        for (int32_t i = 0; i < 12 && ok; ++i) {
+            ok = joint_call({ 0, 1, 2, 3 }, jt);
         }
-    }
-    const int32_t jb = joint_steps;
-    compare("7. FMU2 rotated lanes and two-member rounds (" + std::to_string(jb) + " joint lane steps)", jt);
-    put("7. FMU2 the joint rounds ran", ja >= 4 * 10 && jb >= 4 * 10,
-        std::to_string(jf != nullptr ? jf->captures() : 0) + " captures, " +
-            std::to_string(jf != nullptr ? jf->rounds() : 0) + " rounds");
-    if (jf != nullptr) {
-        printf("rollback-test mu1: 7. the joint frame: %.1f / %.1f MiB; graphs kept %.1f / %.1f MiB; free after the "
-               "last capture %.3f / %.3f GiB\n",
-               double(jf->bytes(0)) / 1048576.0, double(jf->bytes(1)) / 1048576.0,
-               double(jf->graph_bytes(0)) / 1048576.0, double(jf->graph_bytes(1)) / 1048576.0,
-               double(jf->free_after_capture(0)) / 1073741824.0, double(jf->free_after_capture(1)) / 1073741824.0);
-        printf("rollback-test mu1: 7. the last joint capture (%d lanes): %lld / %lld graph nodes; slot 0's lone "
-               "five-row graph %lld / %lld\n",
-               jf->last_lanes(), static_cast<long long>(jf->last_nodes(0)), static_cast<long long>(jf->last_nodes(1)),
-               static_cast<long long>(e.test_target(0).graph_node_count(5, 0)),
-               static_cast<long long>(e.test_target(0).graph_node_count(5, 1)));
+        const int32_t ja = joint_steps;
+        compare(at + "four lanes (" + std::to_string(ja) + " joint lane steps)", jt);
+        // 7b: lane orders rotated every step; every second step two two-member calls
+        for (int32_t s = 0; s < 4; ++s) {
+            jt[s].clear();
+        }
+        ok                   = ok && read_all4();
+        joint_steps          = 0;
+        const int32_t rot[4] = { 3, 1, 0, 2 };
+        for (int32_t i = 0; i < 12 && ok; ++i) {
+            if (i % 2 == 0) {
+                std::vector<int32_t> sl;
+                for (int32_t k = 0; k < 4; ++k) {
+                    sl.push_back(rot[(k + i / 2) % 4]);
+                }
+                ok = joint_call(sl, jt);
+            } else {
+                ok = joint_call({ 1, 3 }, jt) && joint_call({ 2, 0 }, jt);
+            }
+        }
+        const int32_t jb = joint_steps;
+        compare(at + "rotated lanes and two-member rounds (" + std::to_string(jb) + " joint lane steps)", jt);
+        put(at + "the joint rounds ran", ja >= 4 * 10 && jb >= 4 * 10,
+            std::to_string(jf != nullptr ? jf->captures() - c0 : 0) + " captures, " +
+                std::to_string(jf != nullptr ? jf->rounds() - r0 : 0) + " rounds at this d");
+        if (jf != nullptr) {
+            printf(
+                "rollback-test mu1: %sthe joint frame: %.1f / %.1f MiB; graphs kept %.1f / %.1f MiB; free after "
+                "the last capture %.3f / %.3f GiB\n",
+                at.c_str(), double(jf->bytes(0)) / 1048576.0, double(jf->bytes(1)) / 1048576.0,
+                double(jf->graph_bytes(0)) / 1048576.0, double(jf->graph_bytes(1)) / 1048576.0,
+                double(jf->free_after_capture(0)) / 1073741824.0, double(jf->free_after_capture(1)) / 1073741824.0);
+            printf(
+                "rollback-test mu1: %sthe last joint capture (%d lanes): %lld / %lld graph nodes; slot 0's lone "
+                "%d-row graph %lld / %lld\n",
+                at.c_str(), jf->last_lanes(), static_cast<long long>(jf->last_nodes(0)),
+                static_cast<long long>(jf->last_nodes(1)), d + 1,
+                static_cast<long long>(e.test_target(0).graph_node_count(d + 1, 0)),
+                static_cast<long long>(e.test_target(0).graph_node_count(d + 1, 1)));
+        }
     }
     printf("rollback-test mu1: %s\n", g_bad == 0 ? "PASS" : "FAIL");
-    return g_bad == 0 ? 0 : 1;
+    if (g_bad != 0 || a.joint_kl.empty()) {
+        if (L != nullptr) {
+            L->bye();
+        }
+        return g_bad == 0 ? 0 : 1;
+    }
+    // FMS2 item 7 (--joint-kl DEEP, load 1): joint-kl on this load's model, its state laid out again (no reload)
+    fnfl_target_args ka = a;
+    ka.mode = a.mode == "mu1-dry" ? "dry" : "real";
+    return fnfl_joint_kl_on(ka, e.test_take_model(), cells, split ? &sp : nullptr);
 }

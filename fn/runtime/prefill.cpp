@@ -196,8 +196,10 @@ bool prefiller::init(target & t, model::model & m, std::string & err) {
     model::state_params sp;
     sp.ple_conv_kernel = m.ple_conv_kernel;
     sp.ple_ngram = m.ple_ngram;
+    sp.win    = m.win;  // TTTS1: the box's GDN layers, its PLE history (layer 1) and the draft's carry (the head)
     ck_bytes_ = model::checkpoint_bytes(sp);
-    if (ck_bytes_ != model::n_gdn_layers * (gdn_bytes + rec_set_bytes + conv_bytes) + ple_hist_bytes + carry_bytes) {
+    if (ck_bytes_ != m.win.gdn_layers() * (gdn_bytes + rec_set_bytes + conv_bytes) +
+                         (m.win.ple() ? ple_hist_bytes : 0) + (m.win.head ? carry_bytes : 0)) {
         return fail(err, "prefill: a checkpoint's size is not the PLE history's and the GDN states' (FC-ST1)");
     }
     for (int32_t c = 0; c < 2; ++c) {
@@ -469,13 +471,14 @@ bool prefiller::save(target & t, int32_t slot, std::string & err) {
             }
             off += gdn_bytes + rec_set_bytes + conv_bytes;
         }
-        if (gdn != model::n_gdn_layers ||
-            !cuda_ok(cudaMemcpyAsync(q + off, reinterpret_cast<const uint8_t *>(p.ple_hist) + cur * ple_hist_bytes,
-                                     size_t(ple_hist_bytes), cudaMemcpyDefault, s),
-                     "checkpoint PLE history", err)) {
-            return err.empty() ? fail(err, "prefill: not 36 GDN layers") : false;
+        if (gdn != m_->win.gdn_layers() ||
+            (p.ple_hist != nullptr &&
+             !cuda_ok(cudaMemcpyAsync(q + off, reinterpret_cast<const uint8_t *>(p.ple_hist) + cur * ple_hist_bytes,
+                                      size_t(ple_hist_bytes), cudaMemcpyDefault, s),
+                      "checkpoint PLE history", err))) {
+            return err.empty() ? fail(err, "prefill: not the window's GDN layers") : false;
         }
-        off += ple_hist_bytes;
+        off += p.ple_hist != nullptr ? ple_hist_bytes : 0;  // TTTS1: the PLE history is the front's
         if (t.draft_on() &&
             !cuda_ok(cudaMemcpyAsync(q + off, t.draft(c).carry_prev, size_t(carry_bytes), cudaMemcpyDefault, s),
                      "checkpoint retained carry", err)) {
@@ -512,12 +515,13 @@ bool prefiller::load(target & t, int32_t slot, std::string & err) {
             }
             off += gdn_bytes + rec_set_bytes + conv_bytes;
         }
-        if (!cuda_ok(cudaMemcpyAsync(reinterpret_cast<uint8_t *>(p.ple_hist) + cur * ple_hist_bytes, q + off,
+        if (p.ple_hist != nullptr &&
+            !cuda_ok(cudaMemcpyAsync(reinterpret_cast<uint8_t *>(p.ple_hist) + cur * ple_hist_bytes, q + off,
                                      size_t(ple_hist_bytes), cudaMemcpyDefault, s),
                      "restore PLE history", err)) {
             return false;
         }
-        off += ple_hist_bytes;
+        off += p.ple_hist != nullptr ? ple_hist_bytes : 0;
         if ((t.draft_on() &&
              !cuda_ok(cudaMemcpyAsync(t.draft(c).carry_prev, q + off, size_t(carry_bytes), cudaMemcpyDefault, s),
                       "restore retained carry", err)) ||
@@ -684,13 +688,15 @@ bool prefiller::run(target & t, pf_run_stats * st, std::string & err, const pref
             }
         }
     }
-    start_gather(pp, 0, plan[0]);
-    join();
-    if (!gather_ok_) {
-        return fail(err, gather_err_);
-    }
-    if (!upload(0, plan[0].rows, err)) {
-        return false;
+    if (m_->win.ple()) {  // TTTS1: the PLE rows are the front's; a back stage stages none
+        start_gather(pp, 0, plan[0]);
+        join();
+        if (!gather_ok_) {
+            return fail(err, gather_err_);
+        }
+        if (!upload(0, plan[0].rows, err)) {
+            return false;
+        }
     }
     s.bulk        = bulk_;
     const bool ok = bulk_ ? run_bulk(t, s, plan, progress, t0, err) : run_forced(t, s, plan, progress, err);
@@ -857,7 +863,8 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
         pf_chunk_stats   cs;
         cs.c         = ch;
         cs.gather_s = gather_s_;
-        bool next_up = k + 1 >= plan.size();
+        const bool ple     = m_->win.ple();  // TTTS1: a back stage stages no PLE rows
+        bool       next_up = k + 1 >= plan.size() || !ple;
         if (!next_up) {
             for (int32_t c = 0; c < nc; ++c) {
                 if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
@@ -868,7 +875,7 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
             start_gather(pp, 1 - sl, plan[k + 1]);
         }
         const auto tc = clk::now();
-        for (int32_t c = 0; c < nc; ++c) {
+        for (int32_t c = 0; c < nc && ple; ++c) {
             if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
                 !cuda_ok(cudaStreamWaitEvent(static_cast<cudaStream_t>(t.stream(c)),
                                              static_cast<cudaEvent_t>(uploaded_[sl][c]), 0),
@@ -888,7 +895,7 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
         pc.e[1]    = dev_[sl][1];
         pc.draft   = t.draft_on();
         pc.more    = k + 1 < plan.size();
-        if (!t.prompt_begin(err) || !pp_->chunk(pc, err)) {
+        if (!t.prompt_begin(err) || !chunk_window(t, *pp_, pc, err)) {
             return false;
         }
         for (int32_t c = 0; c < nc; ++c) {
@@ -950,8 +957,9 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
             return fail(err, "prefill: stopped at " + std::to_string(pos));
         }
     }
-    // the handoff (FC-PF2): the last row's head (its logits retained), every row processed, the draft at N
-    if (!pp_->head_input(last, err) || !t.prompt_head(err)) {
+    // the handoff (FC-PF2): the last row's head (its logits retained), every row processed, the draft at N; TTTS1: a
+    // front stage's ledger only (the head is the back's)
+    if (m_->win.head ? !pp_->head_input(last, err) || !t.prompt_head(err) : !t.front_prompt_handoff(err)) {
         return false;
     }
     const ledger & e = t.slot();
@@ -965,6 +973,23 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
         }
     }
     return true;
+}
+
+bool prefiller::chunk_window(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err) {
+    const model::window & w = m_->win;
+    if (w.lo == 0 && w.head) {
+        // the whole model (or split-test's one-box window): one chunk as before
+        return w.whole() ? pp.chunk(c, err) :
+                           pp.chunk_begin(c, err) && pp.chunk_layers(c, w.lo, w.hi + 1, err) && pp.chunk_end(c, err);
+    }
+    if (stage_ == nullptr) {
+        return fail(err, "prefill: a split stage without its crossing (set_stage)");
+    }
+    if (!pp.chunk_begin(c, err) || (w.lo > 0 && !stage_->in(t, pp, c, err)) ||
+        !pp.chunk_layers(c, w.lo, w.hi + 1, err)) {
+        return false;
+    }
+    return w.head ? pp.chunk_end(c, err) : stage_->out(t, pp, c, err);
 }
 
 // ---- MU1: the multi-slot engine's resumable reads ----
@@ -1120,7 +1145,12 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
     model::expert_service * const xs = t.card(0).c.ex_service;
     const bool lent = xs != nullptr && xs->prompt_lent();
     const bool res = resident(t);
-    if (lane == 0) {
+    if (!m_->win.ple()) {
+        // TTTS1: a back stage stages no PLE rows (the chunk's e is unread)
+        e[0]    = dev_[0][0];
+        e[1]    = dev_[0][1];
+        j.stage = -1;
+    } else if (lane == 0) {
         // the running gather (another job's next chunk, or this one's): finished before its slots are reused. FMU1
         // (resident TP): only this chunk's gather is waited for; another job's keeps running into its own slot (a
         // finished one is uploaded and tagged)
@@ -1233,10 +1263,12 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
     c.more = xs == nullptr && j.chunk + 1 < j.plan.size();
     j.lane = lane;
     j.group = 0;
-    // FMU1 (resident TP): the chunk's geometry by mode (pf_mode); else MU1's groups of `layers` layers
-    j.layers = !res || mode == pf_mode::shared ? layers : mode == pf_mode::lone ? fn::n_layer : 1;
+    // FMU1 (resident TP): the chunk's geometry by mode (pf_mode); else MU1's groups of `layers` layers. TTTS1: over the
+    // window's layers
+    const int32_t n_win     = m_->win.hi - m_->win.lo + 1;
+    j.layers    = !res || mode == pf_mode::shared ? std::min(layers, n_win) : mode == pf_mode::lone ? n_win : 1;
     j.end_group = res && mode == pf_mode::writers;
-    j.groups = (fn::n_layer + j.layers - 1) / j.layers + (j.end_group ? 1 : 0);
+    j.groups    = (n_win + j.layers - 1) / j.layers + (j.end_group ? 1 : 0);
     busy_[lane] = j.slot;
     if (lane == 0) {
         live_stage_ = j.stage;
@@ -1244,7 +1276,7 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
     // FMU1 (resident TP): only while this job is the one to follow its turn (prefetch), and not over a running gather
     // (it stages another job's chunk in the other slot)
     const bool ahead = !res || ((want_job_ < 0 || want_job_ == j.id) && !gather_.joinable());
-    if (lane == 0 && j.chunk + 1 < j.plan.size() && ahead &&
+    if (lane == 0 && m_->win.ple() && j.chunk + 1 < j.plan.size() && ahead &&
         !(gather_tag_job_ == j.id && gather_tag_chunk_ == int64_t(j.chunk + 1))) {
         // the job's next chunk's rows gathered on the staging thread while this chunk computes (run_bulk's pipeline)
         const int32_t sl = 1 - j.stage;
@@ -1350,7 +1382,7 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     }
     // the handoff (FC-PF2): the last row's head (its logits retained), every row processed, the draft at N
     model::prompt_path & hp = &pp == pp_.get() ? *pp_ : *pp2_;
-    if (!hp.head_input(last, err) || !t.prompt_head(err)) {
+    if (m_->win.head ? !hp.head_input(last, err) || !t.prompt_head(err) : !t.front_prompt_handoff(err)) {
         return false;
     }
     const ledger & e = t.slot();
@@ -1478,15 +1510,25 @@ pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t la
         if (end_only && ran > 0 && !lone) {
             break;
         }
-        const int32_t lo = end_only ? fn::n_layer : j.group * j.layers;
-        const int32_t hi = end_only ? fn::n_layer : std::min(fn::n_layer, lo + j.layers);
-        const bool end = end_only || (!j.end_group && hi == fn::n_layer);
-        if ((j.group == 0 && !pp.chunk_begin(j.pc, err)) || (lo < hi && !pp.chunk_layers(j.pc, lo, hi, err)) ||
-            (end && !pp.chunk_end(j.pc, err))) {
+        // TTTS1: the window's layers [L0, L1); a back stage takes its crossing after chunk_begin, a front stage sends
+        // its crossing at the end in place of the target's end and the draft
+        const int32_t L0 = m_->win.lo, L1 = m_->win.hi + 1;
+        const int32_t lo    = end_only ? L1 : L0 + j.group * j.layers;
+        const int32_t hi    = end_only ? L1 : std::min(L1, lo + j.layers);
+        const bool    end   = end_only || (!j.end_group && hi == L1);
+        const bool    split = !(L0 == 0 && m_->win.head);
+        if (split && stage_ == nullptr) {
+            err = "prefill: a split stage without its crossing (set_stage)";
             job_abandon(t, j);
             return pf_step::error;
         }
-        if (end && j.lane == 0) {
+        if ((j.group == 0 && (!pp.chunk_begin(j.pc, err) || (L0 > 0 && !stage_->in(t, pp, j.pc, err)))) ||
+            (lo < hi && !pp.chunk_layers(j.pc, lo, hi, err)) ||
+            (end && (m_->win.head ? !pp.chunk_end(j.pc, err) : !stage_->out(t, pp, j.pc, err)))) {
+            job_abandon(t, j);
+            return pf_step::error;
+        }
+        if (end && j.lane == 0 && j.stage >= 0) {
             for (int32_t c = 0; c < 2; ++c) {
                 // the staging slot's last readers: the device slot is overwritten only after them (upload)
                 if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||

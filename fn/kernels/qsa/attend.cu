@@ -4,6 +4,7 @@
 #include "fn/kernels/qsa/kv_q8.cuh"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/shapes.h"
+#include "fn/xchg/xchg.h"
 
 #include <cooperative_groups.h>
 #include <cuda_runtime.h>
@@ -706,6 +707,78 @@ template <bool H, bool Q8> __global__ void __launch_bounds__(threads, 2) attend_
     }
 }
 
+// FMS2 (build item 3, W3): lanes 2 .. 4 of the joint verify round in one cooperative launch (attend.h attend_lanes)
+struct lanes_kargs {
+    kargs a[fn::xchg::max_lanes];
+    int32_t lanes;
+};
+
+__device__ __forceinline__ bool refused(const kargs & a, const plan & p) {
+    return p.depth < 0 || p.depth > a.max_cells - a.rows;
+}
+
+// Every lane at the same rows (the host checks). Index spaces, lane after lane: prepare tasks 13 B a lane over the
+// grid's warps, units over the CTAs (a lane at a refused depth has none), finish tasks rows x 96 a lane over the warps.
+template <bool Q8>
+__global__ void __launch_bounds__(threads, 2) attend_lanes_kernel(const __grid_constant__ lanes_kargs p) {
+    __shared__ smem_t sm;
+    __shared__ plan pl[fn::xchg::max_lanes];
+    __shared__ int32_t cu[fn::xchg::max_lanes + 1]; // units before lane k's
+    const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32, lane = static_cast<int32_t>(threadIdx.x) % 32;
+    const int32_t gw = static_cast<int32_t>(blockIdx.x) + static_cast<int32_t>(gridDim.x) * warp;
+    const int32_t L = p.lanes;
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+    if (tid < L) {
+        plan_of(p.a[tid], pl[tid]);
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int32_t c = 0;
+        for (int32_t k = 0; k < L; ++k) {
+            cu[k] = c;
+            c += refused(p.a[k], pl[k]) ? 0 : pl[k].n_units;
+        }
+        cu[L] = c;
+    }
+    if (blockIdx.x == 0 && tid < L && refused(p.a[tid], pl[tid])) {
+        atomicOr(p.a[tid].error, 2u); // FC-RD1, as attend(): this lane writes nothing
+    }
+    __syncthreads();
+    const int32_t nt = n_task_row * p.a[0].rows;
+    {
+        const int32_t k = gw / nt;
+        if (k < L && !refused(p.a[k], pl[k])) {
+            prepare<Q8>(p.a[k], pl[k], gw % nt, lane);
+        }
+    }
+    int32_t prev = -1;
+    for (int32_t u = static_cast<int32_t>(blockIdx.x); u < cu[L]; u += static_cast<int32_t>(gridDim.x)) {
+        int32_t k = 0;
+        while (k + 1 < L && cu[k + 1] <= u) {
+            ++k;
+        }
+        run_unit<Q8>(p.a[k], pl[k], sm, u - cu[k], k != prev); // the CTA's first unit of lane k acquires lane k
+        prev = k;
+    }
+    // every lane's partials are written and every CTA has acquired each lane it ran; the counters are free
+    cooperative_groups::this_grid().sync();
+    if (gw < L && lane == 0) {
+        *p.a[gw].ready = 0;
+    }
+    const int32_t nf = p.a[0].rows * n_head * 8;
+    for (int32_t fu = gw; fu < L * nf; fu += static_cast<int32_t>(gridDim.x) * n_warp) {
+        const int32_t k = fu / nf;
+        if (!refused(p.a[k], pl[k])) {
+            finish(p.a[k], pl[k], fu % nf, lane);
+        }
+    }
+}
+
+const void * lanes_kernel_of(bool q8) {
+    return q8 ? reinterpret_cast<const void *>(attend_lanes_kernel<true>)
+              : reinterpret_cast<const void *>(attend_lanes_kernel<false>);
+}
+
 // the launch's instantiation: 0 resident BF16, 1 host-backed (ME3), 2 resident q8 (KV8)
 const void * kernel_of(int32_t variant) {
     return variant == 1   ? reinterpret_cast<const void *>(attend_kernel<true, false>)
@@ -785,21 +858,21 @@ int32_t grid_of(int32_t rows, int32_t device, int32_t variant) {
 
 } // namespace
 
-bool attend(int32_t rows, const args & a, void * stream) {
-    if (rows < 1 || rows > max_rows || stream == nullptr || a.depth == nullptr || a.max_cells < rows ||
-        a.max_cells > fn::qsa::max_cells || !aligned(a.qfull, 16) || !aligned(a.kv_k, 16) || !aligned(a.kv_v, 16) ||
-        a.q_norm == nullptr || a.k_norm == nullptr || a.body == nullptr || a.offsets == nullptr || a.pos == nullptr ||
-        !aligned(a.k_cache, 16) || !aligned(a.v_cache, 16) || !aligned(a.out, 16) || !aligned(a.codes, 16) ||
-        !aligned(a.scales, 8) || (a.k_f32 != nullptr && !aligned(a.k_f32, 16)) || !aligned(a.ws.q, 16) ||
-        !aligned(a.ws.acc, 16) || !aligned(a.ws.ml, 8) || a.ws.ready == nullptr || a.ws.error == nullptr ||
-        (a.k_scale == nullptr) != (a.v_scale == nullptr) || (a.k_scale != nullptr && a.shift != nullptr) ||
-        (a.k_scale != nullptr && (!aligned(a.k_scale, 2) || !aligned(a.v_scale, 2)))) {
-        return false;
-    }
-    int device = -1;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        return false;
-    }
+namespace {
+
+bool args_ok(int32_t rows, const args & a) {
+    return !(rows < 1 || rows > max_rows || a.depth == nullptr || a.max_cells < rows ||
+             a.max_cells > fn::qsa::max_cells || !aligned(a.qfull, 16) || !aligned(a.kv_k, 16) ||
+             !aligned(a.kv_v, 16) || a.q_norm == nullptr || a.k_norm == nullptr || a.body == nullptr ||
+             a.offsets == nullptr || a.pos == nullptr || !aligned(a.k_cache, 16) || !aligned(a.v_cache, 16) ||
+             !aligned(a.out, 16) || !aligned(a.codes, 16) || !aligned(a.scales, 8) ||
+             (a.k_f32 != nullptr && !aligned(a.k_f32, 16)) || !aligned(a.ws.q, 16) || !aligned(a.ws.acc, 16) ||
+             !aligned(a.ws.ml, 8) || a.ws.ready == nullptr || a.ws.error == nullptr ||
+             (a.k_scale == nullptr) != (a.v_scale == nullptr) || (a.k_scale != nullptr && a.shift != nullptr) ||
+             (a.k_scale != nullptr && (!aligned(a.k_scale, 2) || !aligned(a.v_scale, 2))));
+}
+
+kargs kargs_of(int32_t rows, const args & a) {
     kargs k = {};
     k.qfull = a.qfull;
     k.kv_k = a.kv_k;
@@ -829,6 +902,41 @@ bool attend(int32_t rows, const args & a, void * stream) {
     k.shift = a.shift;
     k.k_scale = a.k_scale;
     k.v_scale = a.v_scale;
+    return k;
+}
+
+int32_t lanes_ctas_per_sm(int32_t device, bool q8) {
+    static int32_t cache[2][16] = {}; // per kernel per device (R14)
+    if (device < 0 || device >= 16) {
+        return 0;
+    }
+    int32_t & c = cache[q8 ? 1 : 0][device];
+    if (c == 0) {
+        int n = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, lanes_kernel_of(q8), threads, 0) != cudaSuccess) {
+            return 0;
+        }
+        c = n;
+    }
+    return c;
+}
+
+int32_t lanes_grid(int32_t rows, int32_t lanes, int32_t device, bool q8) {
+    const int32_t n = 2 * max_chunks * rows * lanes, cap = lanes_ctas_per_sm(device, q8) * n_sm;
+    return n < cap ? n : cap;
+}
+
+} // namespace
+
+bool attend(int32_t rows, const args & a, void * stream) {
+    if (stream == nullptr || !args_ok(rows, a)) {
+        return false;
+    }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    kargs k = kargs_of(rows, a);
     const int32_t variant = a.shift != nullptr ? 1 : a.k_scale != nullptr ? 2 : 0;
     const int32_t g = variant == 0 ? grid(rows, device) : grid_of(rows, device, variant);
     if (g < 1 || n_task_row * rows > n_warp * g) {
@@ -842,6 +950,33 @@ bool attend(int32_t rows, const args & a, void * stream) {
     return true;
 }
 
+bool attend_lanes(int32_t lanes, int32_t rows, const args * a, void * stream) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    const bool q8 = a[0].k_scale != nullptr;
+    lanes_kargs p = {};
+    p.lanes = lanes;
+    for (int32_t u = 0; u < lanes; ++u) {
+        if (!args_ok(rows, a[u]) || a[u].shift != nullptr || a[u].stamps != nullptr ||
+            (a[u].k_scale != nullptr) != q8) {
+            return false;
+        }
+        p.a[u] = kargs_of(rows, a[u]);
+    }
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    const int32_t g = lanes_grid(rows, lanes, device, q8);
+    if (g < 1 || n_task_row * rows * lanes > n_warp * g) {
+        return false;
+    }
+    void * params[] = {&p};
+    return cudaLaunchCooperativeKernel(lanes_kernel_of(q8), dim3(g), dim3(threads), params, 0,
+                                       static_cast<cudaStream_t>(stream)) == cudaSuccess;
+}
+
 bool kernel_resources(resources & r, bool q8) {
     cudaFuncAttributes fa = {};
     int device = -1;
@@ -852,6 +987,20 @@ bool kernel_resources(resources & r, bool q8) {
     r.local_bytes = static_cast<int32_t>(fa.localSizeBytes);
     r.shared_bytes = static_cast<int32_t>(fa.sharedSizeBytes);
     r.ctas_per_sm = ctas_per_sm(device, q8 ? 2 : 0);
+    return true;
+}
+
+bool lanes_resources(resources & r, bool q8, int32_t rows, int32_t lanes, int32_t & grid_out) {
+    cudaFuncAttributes fa = {};
+    int device = -1;
+    if (cudaFuncGetAttributes(&fa, lanes_kernel_of(q8)) != cudaSuccess || cudaGetDevice(&device) != cudaSuccess) {
+        return false;
+    }
+    r.regs = fa.numRegs;
+    r.local_bytes = static_cast<int32_t>(fa.localSizeBytes);
+    r.shared_bytes = static_cast<int32_t>(fa.sharedSizeBytes);
+    r.ctas_per_sm = lanes_ctas_per_sm(device, q8);
+    grid_out = lanes_grid(rows, lanes, device, q8);
     return true;
 }
 

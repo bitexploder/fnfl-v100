@@ -95,6 +95,12 @@ struct core_args {
 // failed launch submission (the CUDA error is left for the caller).
 bool core(const core_args & a, void * stream);
 
+// FMS2 (build item 3, W3): core() of lanes 2 .. 4 of the joint verify round in one launch, grid.y = U: lane u's
+// 144 blocks are core()'s on a[u] (each lane its own state, records, selector, outputs and workspace), so each lane's
+// results are its core()'s bitwise. Every lane at the same rows, 2 .. max_rows (FMS13: R = d + 1). False, with nothing
+// enqueued, for an argument outside core()'s contract in any lane, lanes outside 2 .. 4 or lanes of unequal rows.
+bool core_lanes(int32_t lanes, const core_args * a, void * stream);
+
 // The convolution with SiLU alone: conv_silu_epilogue (gdn_conv.cuh) in a launch of its own, one thread a channel, for
 // gd-test and until LP1 wires the epilogue into DP2's producer; never timed as a result.
 struct conv_args {
@@ -116,5 +122,7 @@ struct core_resources {
     size_t shared_bytes = 0;
 };
 bool resources(int32_t rows, core_resources & out);
+// FMS2: core_lanes' kernel at lanes (blocks: the whole grid, 144 a lane)
+bool lanes_resources(int32_t lanes, core_resources & out);
 
 } // namespace fn::gdn

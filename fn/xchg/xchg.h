@@ -137,6 +137,26 @@ constexpr int32_t words_hc = 1300;   // F32 words a row
 // HC4: an X-HC slot holds the peer's moments (max_rows rows, from word 0) and then this card's own (max_rows rows from
 // hc_own_at), which HC's fused sublayer launch (fn::hc::sub) writes and polls in the same grid
 constexpr int32_t hc_own_at = max_rows * words_hc;
+// FMS2 item 5b: the joint X-HC layout (fn::hc's sub_joint only; the lone launches keep words_hc rows). A lane's region
+// of the slot (the peer's or its own, hc_own_at words each) holds the v words, row b's four at 4 b (stream s at
+// 4 b + s), then the 72 down blocks' moments block-major: block vb's 18 rows of row b at hcj_run_at(vb, b), so each
+// block's moments of a lane are one contiguous run of 90 words (a short block's unused words are written as zero).
+// The same words as the lone layout, placed by the readers; no padding fits the slot, so a block's run starts 8-byte
+// aligned.
+// Host and device: the CUDA compiler sees __host__ __device__; a host compiler sees a plain function.
+#if defined(__CUDACC__)
+#define FN_XCHG_HD __host__ __device__
+#else
+#define FN_XCHG_HD
+#endif
+constexpr int32_t hcj_rows_block = 18;                         // a down block's moment rows of one stream
+constexpr int32_t hcj_block_words = max_rows * hcj_rows_block; // 90
+constexpr int32_t hcj_v_words = 4 * max_rows;                  // 20
+constexpr int32_t hcj_blocks = 72;
+FN_XCHG_HD constexpr int32_t hcj_run_at(int32_t vb, int32_t b) {
+    return hcj_v_words + hcj_block_words * vb + hcj_rows_block * b;
+}
+static_assert(hcj_run_at(hcj_blocks, 0) == hc_own_at && hcj_v_words % 4 == 0, "the joint X-HC layout fills the region");
 constexpr int32_t words_hmix = 1280; // a card's half of the mixed row: F32 words, and codes a row of it
 constexpr int32_t words_half = 1280; // X-A, X-F: F32 words a row (the destination half)
 constexpr int32_t words_route = 24;  // X-ROUTE: 21 words a row (10 IDs, 10 weights, the shared gate), padded to 24
@@ -210,6 +230,7 @@ constexpr uint32_t err_samp_count = 1u << 23;  // SM1: a cut bin's members diffe
 constexpr uint32_t err_draft_depth = 1u << 24; // DR1: a draft row's cell outside the draft cache (fn::draft)
 constexpr uint32_t err_kv_tier = 1u << 27;     // ME1: a selection the KV tier cannot remap (fn::qsa::tier)
 constexpr uint32_t err_gdn_sel = 1u << 28;     // ME11: the GDN selector outside the contract at commit (fn::round)
+constexpr uint32_t err_x16_range = 1u << 29;   // FMS2 item 7: a finite joint X-A/X-F value beyond FP16 (sent as inf)
 
 struct error_bit {
     const char * name;
@@ -241,6 +262,7 @@ constexpr error_bit card_error_bits[] = {
     {"draft depth", err_draft_depth},
     {"KV tier", err_kv_tier},
     {"GDN selector", err_gdn_sel},
+    {"X-A/X-F FP16 range", err_x16_range},
 };
 constexpr bool card_error_bits_are_unique() {
     constexpr int32_t n = sizeof(card_error_bits) / sizeof(card_error_bits[0]);
@@ -448,11 +470,38 @@ bool send_half(int32_t rows, int32_t peer_card, const float * partial, float * p
 // same on either card); the slot is polled and reset. code: err_poll_a or err_poll_f.
 bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
               uint32_t code, void * stream);
-// FMU2: send_half and recv_add over a joint round's rows (1 .. joint_rows) on a joint slot (joint_rings::slot); the
-// same kernels and layout ([B][1280] a slot)
-bool send_half_joint(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream);
-bool recv_add_joint(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
-                    uint32_t code, void * stream);
+// FMU2: send_half and recv_add over a joint round's lanes (1 .. max_lanes) on a joint slot (joint_rings::slot), the
+// layout [B][1280] a slot. FMS13: lane k's rows 0 .. lane_rows - 1 (1 .. max_rows) are rows max_rows k + i of the
+// partial, the slot and out; only they are sent, polled, reset and written. lane_rows max_rows: send_half's kernels
+bool               send_half_joint(int32_t       lanes,
+                                   int32_t       lane_rows,
+                                   int32_t       peer_card,
+                                   const float * partial,
+                                   float *       peer_slot,
+                                   void *        stream);
+bool               recv_add_joint(int32_t       lanes,
+                                  int32_t       lane_rows,
+                                  int32_t       card,
+                                  const float * partial,
+                                  float *       slot,
+                                  float *       out,
+                                  uint32_t *    err,
+                                  uint32_t      code,
+                                  void *        stream);
+// FMS2 item 7: the joint X-A / X-F in 16 bits (joint rounds only, behind the joint frame's switch). The payload is the
+// peer's half as FP16, round to nearest even (x16_bits), row b at b x16_row_halves halves of the joint slot (the F32
+// slot's first half), and each 16-bit half is its own flag: the sentinel half 0xffff, a NaN, which no payload half
+// equals (every NaN is sent as x16_nan), so writers may store single halves of a 32-bit word. A finite value beyond
+// FP16's range is sent as an infinity and sets err_x16_range in the sender's err (the round fails). The receive polls
+// each 16-byte group until none of its 8 halves is the sentinel, resets it, and adds in F32: out = partial (own) +
+// the peer's value, today's order. send_half_joint16's err: the sending card's joint word.
+constexpr int32_t x16_row_halves = words_half; // 1280 halves (640 words) a row
+constexpr uint16_t x16_sentinel = 0xffffu;
+constexpr uint16_t x16_nan = 0x7e00u;
+bool send_half_joint16(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, uint32_t * err,
+                       void * stream);
+bool recv_add_joint16(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+                      uint32_t code, void * stream);
 // X-ROUTE send (router owner): ids_full [B][ids_stride] (the first 10 of each row), wts [B][10], sg [B]; also writes
 // the compact ids_local [B][10] the experts read on this card
 bool send_route(int32_t rows, const int32_t * ids_full, int32_t ids_stride, const float * wts, const float * sg,
@@ -467,6 +516,13 @@ bool send_select(int32_t rows, const int32_t * offsets, const uint32_t * body, f
 // header on the device (a length outside the contract sets err_select_body and writes no body). body has room for
 // B * select_row_words words.
 bool recv_select(int32_t rows, float * slot, int32_t * offsets, uint32_t * body, uint32_t * err, void * stream);
+// FMS2 (build item 3, W3): every lane's X-SELECT of the joint verify round, lanes 2 .. 4, in one send and one receive:
+// lane k's message is send_select's / recv_select's on its own arguments (offsets[k], body[k], its lane ring's slot
+// and error word), the same device code, so every lane's words are its own launches' bitwise
+bool send_select_lanes(int32_t lanes, int32_t rows, const int32_t * const * offsets, const uint32_t * const * body,
+                       float * const * peer_slot, void * stream);
+bool recv_select_lanes(int32_t lanes, int32_t rows, float * const * slot, int32_t * const * offsets,
+                       uint32_t * const * body, uint32_t * const * err, void * stream);
 
 // ---- E1: X-PLE-STATS (msg::ple), the PLE layer's 13 statistics a row (WP3 T-PLE; FC-PLE2) ----
 //

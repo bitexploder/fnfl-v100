@@ -296,7 +296,8 @@
                         }
                         row_dec rd;
                         if constexpr (C::f == fmt::iq2_xxs || C::f == fmt::iq2_xs) {
-                            [[maybe_unused]] const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid); // IQ2_XS
+                            // IQ2_XS
+                            [[maybe_unused]] const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                             for (int32_t h = 0; h < 2; ++h) {
                                 const int32_t mrow = 2 * c + h;
@@ -317,7 +318,7 @@
                                 sc8 = take8(v.z, v.w); // scales of rows 0..7
                                 continue;
                             }
-                            const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
+                            const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                             for (int32_t h = 0; h < 2; ++h) {
                                 const int32_t mrow = 2 * (c - 1) + h;
@@ -369,6 +370,7 @@
                     chunks([](const row_dec &, int32_t) {});
                 } else {
                     constexpr bool SPLIT = C::f == fmt::iq2_xs || C::f == fmt::iq2_s;
+                    constexpr bool SGN = signed_words(C::f);
                     const auto row_act = [&](int32_t b, uint32_t (&o)[8], float & d) {
                         const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
                         const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
@@ -392,16 +394,16 @@
                         float * red1 = red_buf + b0 * 64 * red_stride;
                         const uint32_t rest = mask & (mask - 1u);
                         chunks([&](const row_dec & rd, int32_t r) {
-                            row_out1<SPLIT>(rd, act1, da1, red1, r, w, lane);
-                            row_out_c<SPLIT>(rd, sv.xs, sv.xm, j, rest, red_buf, r, w, lane);
+                            row_out1<SPLIT, SGN>(rd, act1, da1, red1, r, w, lane);
+                            row_out_c<SPLIT, SGN>(rd, sv.xs, sv.xm, j, rest, red_buf, r, w, lane);
                         });
                     } else {
                         float * red1 = red_buf + b0 * 64 * red_stride;
                         const uint32_t rest = mask & (mask - 1u);
                         chunks([&](const row_dec & rd, int32_t r) {
-                            row_out1<SPLIT>(rd, act1, da1, red1, r, w, lane);
+                            row_out1<SPLIT, SGN>(rd, act1, da1, red1, r, w, lane);
                             if (rest != 0u) {
-                                row_out<SPLIT, B>(rd, act, da, rest, red_buf, r, w, lane);
+                                row_out<SPLIT, SGN, B>(rd, act, da, rest, red_buf, r, w, lane);
                             }
                         });
                     }

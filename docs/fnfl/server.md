@@ -11,10 +11,10 @@ build-fnfl/bin/llama-server --host 127.0.0.1 --port 8190 -np 1 --jinja \
 -m /path/to/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
 -md /path/to/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
 --fnfl-draft-subset models/draft-vocab-qwen3.8-flash-next.txt \
--c 262144 --fnfl-spec-d 4 --fnfl-draft-attention sparse
+-c 262144 --fnfl-spec-d 2 --fnfl-draft-attention sparse
 ```
 
-The last line gives the model's full context and the settings the project serves with: four proposals a step and sparse draft attention. Without the two FNFL settings, the server proposes two drafts a step with dense draft attention.
+The last line gives the model's full context and the settings the project serves with: two proposals a step (the default; see [`--fnfl-spec-d`](#fnfl-settings)) and sparse draft attention. Without `--fnfl-draft-attention sparse`, the draft attends to every cell.
 
 The server uses CUDA devices 0 and 1 and needs both. To run it on two other cards, set `CUDA_VISIBLE_DEVICES` so that they appear as 0 and 1. Nothing else may be using them, since the engine reserves nearly all of each card's memory.
 
@@ -24,7 +24,7 @@ Loading takes about 8 s when the model files are already in the page cache, and 
 FNFL: model loaded in 7.66 s (open 0.40, fill 7.24, reserve 0.02) at 262144 cells; free 3.086 / 3.088 GiB
 FNFL: --fnfl-ple-table lazy (default)
 FNFL: PLE table: lazy, not pinned (the plain mapping; PL1's hints before each gather)
-FNFL settings: slots 1; cells 262144; draft on, attention sparse (SP2's switch), d 4, subset ...; end-of-generation IDs [248044,248046,248063,248064,248065]; launch sampler T 1.00 top-k 20 top-p 0.95 min-p 0.05 ...
+FNFL settings: slots 1; cells 262144; draft on, attention sparse (SP2's switch), d 2, subset ...; end-of-generation IDs [248044,248046,248063,248064,248065]; launch sampler T 1.00 top-k 20 top-p 0.95 min-p 0.05 ...
 ... load_model: initializing, n_slots = 1, n_ctx_slot = 262144
 ... llama_server: listening on http://127.0.0.1:8190
 ```
@@ -68,16 +68,29 @@ To stop the server, send it SIGTERM. Both cards should then return to 0 MiB.
 - **`--fnfl-spec-d N`** (1 to 4, default 2): how many draft tokens each speculative step proposes.
   - More proposals pay off when the text is predictable, as code and tool calls tend to be.
   - The step that verifies them is dearer. At 130K–200K of history, a step takes about 16.2 ms with four proposals, against about 12.7 ms with two.
-  - The development machine serves with 4.
+  - **Use 2, the default, for several users and for agentic work.** Measured on the development machine with 0.3:
+    - four DeepSWE agents: 77.6 t/s each at d 2, 74.1 at d 3, 69.5 at d 4 (the same task, the first five minutes of each run);
+    - four users about 64K deep: 144.5 t/s together at d 2, 142.6 at d 3, 138.6 at d 4;
+    - four short greedy writers: 334.8 t/s together at d 2, 355.4 at d 3, 334.3 at d 4;
+    - one user: 219.8, 227.3 and 225.5 t/s at d 2, 3 and 4 at short context, and about 183, 182 and 170 at 64K.
+  - Since 0.3 several users decode together at every d. In 0.2 they did only at d 4.
 - **`--fnfl-draft-attention dense|sparse`** (default `dense`): how the draft attends to the conversation.
   - `dense` reads every cell.
   - `sparse` reads only the 512 blocks the target's own sparse-attention indexer picked, which is much cheaper at depth.
-  - The development machine serves with `sparse`, together with `--fnfl-spec-d 4`, and `fnfl-serve.sh` starts with both by default.
+  - The development machine serves with `sparse`, together with `--fnfl-spec-d 2`, and `fnfl-serve.sh` starts with both by default.
 - **`--fnfl-kv-format q8|bf16`** (default `q8` on the two-card engine): the KV cache's format. `q8` is int8 with an FP16 scale every 64 values and passed the engine's KL bounds; `bf16` is the 16-bit cache. The expert-cache configurations use `bf16` and refuse `q8`.
 - **`--fnfl-ple-table lazy|full`** (default `lazy`): what happens to the model's 26.9 GiB per-layer-embedding table.
   - `lazy` leaves it memory-mapped and hints the pages each step will read, so the first requests may fault some in from disk.
   - `full` reads the whole table into RAM at startup and pins it there. That makes startup longer and needs about 27 GiB of free host memory.
   - Either way the results are the same; only timing differs.
+
+### Two machines (experimental, new in 0.3)
+
+`--fnfl-split-layer K` (2 to 47; the default 0 is one machine) splits the model across two machines with two V100s each. This server runs layers 0 to K − 1. A second process, `fnfl-drive stage`, runs the rest, the output head and the draft on the other machine. Up to eight users run as two groups pipelined across the machines.
+
+- `--fnfl-split-addr IP` and `--fnfl-split-port P` name the second process (default `10.25.0.2:13371`). The link uses UCX.
+- `--fnfl-split-commit HEX` and `--fnfl-split-digest HEX` are build identities that both sides must agree on when they connect.
+- In 0.3 the second process loads the model from a fixed path on the development machine, so the split is not yet usable elsewhere. [`fn/tools/fnfl-serve.sh`](../../fn/tools/fnfl-serve.sh) `start --split` shows how it is launched there.
 
 ### Test switches
 
@@ -117,7 +130,7 @@ New in 0.2. Without it, each card holds 23.2 GiB of weights, which needs two 32 
 
 ### Commands
 
-Each starts from the quick-start command (`-m`, `-md`, `--fnfl-draft-subset`, `--jinja`, `--fnfl-spec-d 4 --fnfl-draft-attention sparse`) and adds:
+Each starts from the quick-start command (`-m`, `-md`, `--fnfl-draft-subset`, `--jinja`, `--fnfl-draft-attention sparse`; the figures were measured with `--fnfl-spec-d 4`) and adds:
 
 - **One 32 GB card, KV on the card (fastest one-card setup):** `-np 1 -c 131072 --fnfl-single-card 0`.
 - **One 32 GB card, two users:** `-np 2 -c 262144 --fnfl-single-card 0 --fnfl-kv-host`.
@@ -224,7 +237,8 @@ Tool calls still work. The chat template's own tool-call grammar travels with th
 
 With `-np 1` there is one slot, and a second request waits until the first ends. With `-np N` up to N requests run at once, and further requests wait for a free slot.
 
-- Slots that are generating decode together: one draft step and one verification step serve all of them, so the cards' weight reads are shared. Each user gets exactly the tokens it would get alone, at any temperature and seed.
+- Slots that are generating decode together: one draft step and one verification step serve all of them, so the cards' weight reads are shared. Since 0.3 this works at every draft depth; [d 2 is recommended](#fnfl-settings).
+- The shared step does some products in 16-bit on the tensor cores. A user's tokens can therefore drift from what it would get alone, typically after the first hundred or so; measured as KL against a lone user, the difference is a little larger than the 8-bit KV cache's.
 - A long prompt is read in slices between the writers' steps, so replies keep flowing while another user's prompt loads. Prompts read beside writers go more slowly than alone.
 - A lone active user runs on the single-user path at its full speed, whatever `-np` is.
 
@@ -282,13 +296,13 @@ FNFL request: ended eog; steps 8098 (bootstrap 1, speculative 8097, generate 0);
 
 [`fn/tools/fnfl-serve.sh`](../../fn/tools/fnfl-serve.sh) starts, stops and reports on the server on the development machine. Its model, draft and subset paths and its GPU-lock directory are written into the script, so it is a template elsewhere.
 
-- **`fnfl-serve.sh start [--temp T] [--top-k K] [--top-p P] [--min-p P] [--spec-d N] [--draft-attention dense|sparse]`**
+- **`fnfl-serve.sh start [--temp T] [--top-k K] [--top-p P] [--min-p P] [--spec-d N] [--draft-attention dense|sparse] [--split [--split-layer K] [--slots N]]`**
   1. Refuses if any compute process is on either card or a lock is held.
   2. Takes the three GPU locks (`gpu.lock`, `gpu0.lock` and `gpu1.lock`) with `flock` and hands them to the server process, which holds them for its lifetime.
   3. Starts the server detached on all interfaces.
   4. Waits up to 600 s for `/health`.
 
-  It records the binary's SHA-256 and the settings in `start.txt`. Its defaults are the serving settings: the full 262,144-token context, `--fnfl-spec-d 4` and `--fnfl-draft-attention sparse`. It always passes both FNFL settings to the server.
+  It records the binary's SHA-256 and the settings in `start.txt`. Its defaults are the serving settings: the full 262,144-token context, `--fnfl-spec-d 2` and `--fnfl-draft-attention sparse`. It always passes both FNFL settings to the server. `--split` starts the [two-machine split](#two-machines-experimental-new-in-03) on the development machines.
 - **`fnfl-serve.sh stop`:** sends SIGTERM to the recorded PID only, waits for it to exit, then checks both cards are at 0 MiB and the locks are free.
 - **`fnfl-serve.sh status`:** the PID, `/health` and the locks.
 - **Environment:**

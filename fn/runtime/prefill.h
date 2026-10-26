@@ -167,6 +167,17 @@ struct pf_job {
 
 enum class pf_step : int32_t { yielded, chunk_done, done, cancelled, error };
 
+// TTTS1: a split stage's side of each chunk's crossing (fn/runtime/stage.h implements it over the link). The front's
+// out: chunk c's crossing (model::prompt_path::crossing_out) after its last layer, then sent; the back's in: chunk c's
+// crossing received, c.seq taken from it (the front's), and copied in (crossing_in) before the back's first layer.
+// A chunk's layers are the model's window's (model::window); the whole model runs as before
+class pf_stage {
+  public:
+    virtual ~pf_stage()                                                                                     = default;
+    virtual bool out(target & t, model::prompt_path & pp, const model::prompt_chunk & c, std::string & err) = 0;
+    virtual bool in(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err)        = 0;
+};
+
 // FMU1: how a read step runs (resident TP; with the expert service every step is MU1's shared form). A chunk's geometry
 // is fixed when it starts:
 //   shared:  layers groups of `layers` layers, the chunk's end with its last group (MU1);
@@ -237,6 +248,9 @@ class prefiller {
     // MXMU1: the job whose chunk holds the prompt loan (the expert service's lent region and staging), -1: none
     int64_t loan_job() const { return held_job_; }
 
+    // TTTS1: the split stage's crossing (null: the whole model, no crossing)
+    void set_stage(pf_stage * s) { stage_ = s; }
+
     // PB1: the bulk path (the default) or PF1 Stage 1's forced B <= 4 slices (prefill-test's reference); the forced path
     // is kept selectable for the comparisons (PB1 item 9)
     void set_bulk(bool on) { bulk_ = on; }
@@ -275,6 +289,9 @@ class prefiller {
                   std::chrono::steady_clock::time_point t0,
                   std::string &                         err);
     bool run_short(target & t, pf_run_stats & s, std::string & err);
+    // TTTS1: chunk c's window on pp: chunk_begin, the back's crossing in, its layers, the end (the head's window) or
+    // the front's crossing out; the whole model: pp.chunk
+    bool chunk_window(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err);
     // ME3: the loan's spans for a plan: its staging slots' rows (both cards) and the arena's layout (both cards)
     void loan_spans(const std::vector<pf_chunk> & plan, std::vector<model::byte_span> & out) const;
     bool save(target & t, int32_t slot, std::string & err);
@@ -335,6 +352,7 @@ class prefiller {
     bool                 bulk_ = true;
     int64_t              seq_  = 0;  // the bulk path's chunks since init (prompt_chunk::seq)
     std::unique_ptr<model::prompt_path> pp_;
+    pf_stage *                          stage_ = nullptr;  // TTTS1
 };
 
 } // namespace fn::runtime

@@ -588,6 +588,9 @@ bool prompt_path::fill_replicas(std::string & err) {
         };
         // ME1, one device: the HC and PLE pointers are the peer's resident tensors (init); the draft's norms only
         for (int32_t l = 0; l < fn::n_layer && !m_->single; ++l) {
+            if (!m_->win.layer(l)) {
+                continue;  // TTTS1: the other box's layer
+            }
             for (int32_t sub = 0; sub < 2; ++sub) {
                 const card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
                 const hc_module &             src = sub == 0 ? p_[pc]->w[l].hc_attn : p_[pc]->w[l].hc_ffn;
@@ -599,12 +602,13 @@ bool prompt_path::fill_replicas(std::string & err) {
             }
         }
         const fn::ple::weights & pw = p_[pc]->ple_w;
-        if (!m_->single && (!peer(a.ple_key[pc], pw.key, ple_key_bytes, "PLE key replica") ||
-            !peer(a.ple_value[pc], pw.value, ple_value_bytes, "PLE value replica") ||
-            !peer(a.ple_nk[pc], pw.norm_key, ple_norm_bytes, "PLE norm replica") ||
-            !peer(a.ple_nq[pc], pw.norm_query, ple_norm_bytes, "PLE norm replica") ||
-            !peer(a.ple_nc[pc], pw.norm_conv, ple_norm_bytes, "PLE norm replica") ||
-            !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes, "PLE conv replica"))) {
+        if (!m_->single && m_->win.ple() &&
+            (!peer(a.ple_key[pc], pw.key, ple_key_bytes, "PLE key replica") ||
+             !peer(a.ple_value[pc], pw.value, ple_value_bytes, "PLE value replica") ||
+             !peer(a.ple_nk[pc], pw.norm_key, ple_norm_bytes, "PLE norm replica") ||
+             !peer(a.ple_nq[pc], pw.norm_query, ple_norm_bytes, "PLE norm replica") ||
+             !peer(a.ple_nc[pc], pw.norm_conv, ple_norm_bytes, "PLE norm replica") ||
+             !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes, "PLE conv replica"))) {
             return false;
         }
         if (d_[c] != nullptr) {
@@ -709,6 +713,12 @@ bool prompt_path::run_start(uint32_t cur, std::string & err) {
         } else if (!cuda_ok(cudaMemsetAsync(a.pred, 0, size_t(4) * D * 4, s), "predecessor", err)) {
             return false;
         }
+        if (!m_->win.ple()) {
+            if (!cuda_ok(cudaStreamSynchronize(s), "run start", err)) {
+                return false;
+            }
+            continue;  // TTTS1: the PLE history is the front's
+        }
         const float * peer_hist = p_[pc]->ple_hist + int64_t(fn::round::version_slot(cur, 0)) * ple_hist_card;
         if (!m_->single && !cuda_ok(cudaMemcpyPeerAsync(a.ple_stage, m_->device[c], peer_hist, m_->device[pc],
                                                         size_t(ple_hist_card) * 4, s),
@@ -752,7 +762,8 @@ bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
 
 bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
     if (c.rows < 1 || c.rows > rc_ || c.half[0] < 1 || c.half[0] > rh_ || c.half[1] < 0 || c.half[1] > rh_ ||
-        c.half[0] + c.half[1] != c.rows || c.tok == nullptr || c.e[0] == nullptr || c.e[1] == nullptr) {
+        c.half[0] + c.half[1] != c.rows || c.tok == nullptr ||
+        (m_->win.ple() && (c.e[0] == nullptr || c.e[1] == nullptr))) {
         return fail(err, "prompt: a chunk outside the layout's " + std::to_string(rc_) + " rows in halves of at most " +
                              std::to_string(rh_));
     }
@@ -783,6 +794,9 @@ bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
         }
     }
     test_fail_ = -1;
+    if (!m_->win.layer(0)) {
+        return true;  // TTTS1: a back stage takes its streams from the crossing (crossing_in), not the embedding
+    }
     // the embedding: each card's half, the message, the peer's half (MX6: on single, phase 0 populates both halves in a_[0])
     for (int32_t phase = 0; phase < (m_->single ? 1 : 3); ++phase) {
         for (int32_t k = 0; k < 2; ++k) {
@@ -870,9 +884,10 @@ bool prompt_path::chunk_layers(const prompt_chunk & c, int32_t lo, int32_t hi, s
 
 bool prompt_path::chunk_end(const prompt_chunk & c, std::string & err) {
     const int32_t nh = c.half[1] > 0 ? 2 : 1;
-    // the target's end: layer 47's FFN exchange into the final streams (phase 0 of a layer 48 attention sublayer)
+    // the target's end: layer 47's FFN exchange into the final streams (phase 0 of a layer 48 attention sublayer);
+    // TTTS1: the window's last layer's (split-test's one-box windows end before 48)
     for (int32_t h = 0; h < nh; ++h) {
-        if (!layer_half(c, fn::n_layer, 0, h, 0, err)) {
+        if (!layer_half(c, m_->win.hi + 1, 0, h, 0, err)) {
             return false;
         }
     }
@@ -904,7 +919,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
     const int32_t  r0       = h == 0 ? 0 : c.half[0];
     const int32_t  n        = c.half[h];
     const int64_t  pos0     = c.start + r0;
-    const bool     end      = l == fn::n_layer;
+    const bool     end      = l == m_->win.hi + 1;  // the window's end (TTTS1; the whole model: 48)
     const bool     gdn      = !end && l % fn::full_attn_interval != fn::full_attn_interval - 1;
     link &         lp       = links_[h == 0 ? lk_p0 : lk_p1];
     link &         ls       = links_[h == 0 ? lk_sel0 : lk_sel1];
@@ -1912,6 +1927,120 @@ bool prompt_path::check_errors(std::string & err) {
                      "partial's range, 30 a test failure), select %u, experts %u",
                      k, w[0], w[1], w[2]);
             return fail(err, b);
+        }
+    }
+    return true;
+}
+
+// ---- TTTS1: the split's crossing ----
+
+namespace {
+
+// the crossing's layout for half h of c: S (card 0's), inject of card 0 and 1, the FFN message of card 0 and 1
+struct crossing_half {
+    int64_t s = 0, inj[2] = { 0, 0 }, p[2] = { 0, 0 }, end = 0;
+};
+
+crossing_half crossing_at(const prompt_chunk & c, int32_t h, int64_t base) {
+    const int64_t n = c.half[h];
+    crossing_half x;
+    x.s      = base;
+    x.inj[0] = x.s + n * 4 * D * 4;
+    x.inj[1] = x.inj[0] + n * 4 * 4;
+    x.p[0]   = x.inj[1] + n * 4 * 4;
+    x.p[1]   = x.p[0] + fn::xchg::pmsg_bytes(n * D * 2);
+    x.end    = x.p[1] + fn::xchg::pmsg_bytes(n * D * 2);
+    return x;
+}
+
+}  // namespace
+
+int64_t prompt_path::crossing_bytes(const prompt_chunk & c) {
+    int64_t off = 0;
+    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+        off = crossing_at(c, h, off).end;
+    }
+    return off;
+}
+
+bool prompt_path::crossing_out(const prompt_chunk & c, int32_t k, uint8_t * dst, std::string & err) {
+    if (m_->single || k < 1 || k >= fn::n_layer || dst == nullptr) {
+        return fail(err, "prompt crossing out: two cards, k in 1 .. 47 and a buffer");
+    }
+    int64_t off = 0;
+    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+        const crossing_half x = crossing_at(c, h, off);
+        off                   = x.end;
+        const int32_t  r0     = h == 0 ? 0 : c.half[0];
+        const int64_t  n      = c.half[h];
+        link &         lp     = links_[h == 0 ? lk_p0 : lk_p1];
+        const uint64_t gen    = fn::xchg::pgen(c.seq, k - 1, 1, h, fn::xchg::pkind::ffn);
+        for (int32_t kk = 0; kk < 2; ++kk) {
+            card_arena & a = a_[size_t(kk)];
+            cudaStream_t s = static_cast<cudaStream_t>(p_[kk]->c.stream);
+            if (lp.g_prod[kk] != gen || lp.g_copied[1 - kk] != gen) {
+                return fail(err, "prompt crossing out: layer " + std::to_string(k - 1) +
+                                     "'s FFN message was not produced and copied");
+            }
+            if (!cuda_ok(cudaSetDevice(m_->device[kk]), "device", err) ||
+                (kk == 0 && !cuda_ok(cudaMemcpyAsync(dst + x.s, a.S + int64_t(r0) * 4 * D, size_t(n) * 4 * D * 4,
+                                                     cudaMemcpyDeviceToHost, s),
+                                     "crossing S", err)) ||
+                !cuda_ok(cudaMemcpyAsync(dst + x.inj[kk], a.inject + int64_t(r0) * 4, size_t(n) * 4 * 4,
+                                         cudaMemcpyDeviceToHost, s),
+                         "crossing inject", err) ||
+                !cuda_ok(cudaMemcpyAsync(dst + x.p[kk], a.p_send[h], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
+                                         cudaMemcpyDeviceToHost, s),
+                         "crossing partial", err) ||
+                // the consumer's release of the receive slot (layer k's phase 0 on one box)
+                !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[1 - kk]), 0), "crossing", err) ||
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.freed[kk]), s), "crossing freed", err)) {
+                return false;
+            }
+            lp.g_freed[kk]   = gen;
+            lp.any_freed[kk] = true;
+        }
+    }
+    return true;
+}
+
+bool prompt_path::crossing_in(const prompt_chunk & c, int32_t k, const uint8_t * src, std::string & err) {
+    if (m_->single || k < 1 || k >= fn::n_layer || src == nullptr) {
+        return fail(err, "prompt crossing in: two cards, k in 1 .. 47 and a buffer");
+    }
+    int64_t off = 0;
+    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+        const crossing_half x = crossing_at(c, h, off);
+        off                   = x.end;
+        const int32_t  r0     = h == 0 ? 0 : c.half[0];
+        const int64_t  n      = c.half[h];
+        link &         lp     = links_[h == 0 ? lk_p0 : lk_p1];
+        const uint64_t gen    = fn::xchg::pgen(c.seq, k - 1, 1, h, fn::xchg::pkind::ffn);
+        for (int32_t kk = 0; kk < 2; ++kk) {
+            card_arena & a = a_[size_t(kk)];
+            cudaStream_t s = static_cast<cudaStream_t>(p_[kk]->c.stream);
+            if (!cuda_ok(cudaSetDevice(m_->device[kk]), "device", err) ||
+                !cuda_ok(cudaMemcpyAsync(a.S + int64_t(r0) * 4 * D, src + x.s, size_t(n) * 4 * D * 4,
+                                         cudaMemcpyHostToDevice, s),
+                         "crossing S", err) ||
+                !cuda_ok(cudaMemcpyAsync(a.inject + int64_t(r0) * 4, src + x.inj[kk], size_t(n) * 4 * 4,
+                                         cudaMemcpyHostToDevice, s),
+                         "crossing inject", err) ||
+                !cuda_ok(cudaMemcpyAsync(a.p_send[h], src + x.p[kk], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
+                                         cudaMemcpyHostToDevice, s),
+                         "crossing partial", err) ||
+                !cuda_ok(cudaMemcpyAsync(a.p_recv[h], src + x.p[1 - kk], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
+                                         cudaMemcpyHostToDevice, s),
+                         "crossing peer partial", err) ||
+                // the exchange's copy stands done: card kk's message is in the peer's receive slot (the bookkeeping
+                // layer k's phase 0 checks; its data is ordered on each card's own stream above)
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.prod[kk]), s), "crossing produced", err) ||
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.copied[kk]), s), "crossing copied", err)) {
+                return false;
+            }
+            lp.g_prod[kk]     = gen;
+            lp.g_copied[kk]   = gen;
+            lp.any_copied[kk] = true;
         }
     }
     return true;

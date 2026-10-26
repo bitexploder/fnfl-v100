@@ -4,6 +4,7 @@
 
 #include "fn/xchg/xchg.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -16,6 +17,25 @@ constexpr uint32_t poll_budget = 1u << 20;
 // The payload rule: every NaN is sent as the canonical NaN, so no payload word equals the sentinel.
 __device__ __forceinline__ uint32_t canonical(float v) {
     return v != v ? canonical_nan : __float_as_uint(v);
+}
+
+// FMS2 item 7: a joint X-A / X-F value's FP16 bits (xchg.h): round to nearest even; every NaN x16_nan; a finite value
+// beyond FP16's range rounds to an infinity and sets over
+__device__ __forceinline__ uint16_t x16_bits(float v, bool & over) {
+    const uint16_t h = __half_as_ushort(__float2half_rn(v));
+    over = over || ((h & 0x7fffu) == 0x7c00u && fabsf(v) <= 3.402823466e38f);
+    return v != v ? x16_nan : h;
+}
+
+// all eight halves of a 16-byte group landed (none the sentinel half)
+__device__ __forceinline__ bool landed16(uint4 v) {
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    bool ok = true;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        ok = ok && (w[i] & 0xffffu) != x16_sentinel && (w[i] >> 16) != x16_sentinel;
+    }
+    return ok;
 }
 
 __device__ __forceinline__ bool landed(uint4 v, uint32_t sent = sentinel) {
@@ -57,6 +77,90 @@ __device__ __forceinline__ void poll(const uint4 * const (&p)[N], uint4 (&v)[N],
         if (n >= poll_budget) {
             atomicOr(err, code);
             return;
+        }
+    }
+}
+
+// FMS2 item 7: poll's form for 16-bit payloads, one 16-byte group (landed16)
+__device__ __forceinline__ void poll16(const uint4 * p, uint4 & v, uint32_t * err, uint32_t code) {
+    for (uint32_t n = 0;; ++n) {
+        v = load_poll(p);
+        if (landed16(v)) {
+            return;
+        }
+        if (n >= poll_budget) {
+            atomicOr(err, code);
+            return;
+        }
+    }
+}
+
+// FMS2 item 5b: poll's form for groups of which only some words are payload: polls the N 16-byte words p[i] until no
+// word j of group i with bit j of mask[i] set holds the sentinel (a group with mask 0 is not loaded). Returns 0, or
+// after poll_budget passes the groups still pending (bit i: group i), for the caller to report in their lanes' words.
+template <int N>
+__device__ __forceinline__ uint32_t poll_masked(const uint4 * const (&p)[N], uint4 (&v)[N], const uint32_t (&mask)[N]) {
+    uint32_t pending = 0u;
+#pragma unroll
+    for (int i = 0; i < N; ++i) {
+        pending |= mask[i] != 0u ? 1u << i : 0u;
+    }
+    for (uint32_t n = 0; pending != 0u && n <= poll_budget; ++n) {
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            if (pending >> i & 1u) {
+                v[i] = load_poll(p[i]);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < N; ++i) {
+            const uint32_t m = mask[i];
+            if (((m & 1u) == 0u || v[i].x != sentinel) && ((m & 2u) == 0u || v[i].y != sentinel) &&
+                ((m & 4u) == 0u || v[i].z != sentinel) && ((m & 8u) == 0u || v[i].w != sentinel)) {
+                pending &= ~(1u << i);
+            }
+        }
+    }
+    return pending;
+}
+
+// FMS2 item 5b: warp-collective send of n words (n <= 120) img[0 .. n-1] (shared memory, canonical bits) to words at ..
+// at+n-1 of a 16-byte aligned payload: lane q stores the run's words of the payload's 16-byte group q of it (one
+// 16-byte store for a whole group, an 8- or 4-byte store at the run's unaligned ends), to the peer and (if local is
+// not null) this card's own copy. Every lane of the warp calls it with the same at and n.
+__device__ __forceinline__ void put_words(uint32_t * local, uint32_t * peer, int32_t at, int32_t n,
+                                          const uint32_t * img) {
+    const int32_t q = threadIdx.x % 32;
+    const int32_t off = at & 3;
+    const int32_t lo = max(4 * q, off) - 4 * q; // the run's words in group q: lo .. hi-1
+    const int32_t hi = min(4 * q + 4, off + n) - 4 * q;
+    if (lo >= hi) {
+        return;
+    }
+    const int32_t g0 = at - off + 4 * q; // the group's first word
+    const int32_t i0 = 4 * q - off;      // img index of the group's first word
+    if (lo == 0 && hi == 4) {
+        const uint4 w = make_uint4(img[i0], img[i0 + 1], img[i0 + 2], img[i0 + 3]);
+        *reinterpret_cast<uint4 *>(peer + g0) = w; // 16-byte aligned: g0 % 4 == 0 and the payload is aligned
+        if (local != nullptr) {
+            *reinterpret_cast<uint4 *>(local + g0) = w;
+        }
+    } else if (hi - lo == 2 && (lo & 1) == 0) {
+        // 8-byte aligned (g0 + lo is even): one plain (weak) 8-byte store, as the uint4 one; a C++ uint2 store
+        // was split into two words
+        const uint32_t w0 = img[i0 + lo];
+        const uint32_t w1 = img[i0 + lo + 1];
+        asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(peer + g0 + lo), "r"(w0), "r"(w1) : "memory");
+        if (local != nullptr) {
+            asm volatile("st.global.v2.u32 [%0], {%1, %2};" ::"l"(local + g0 + lo), "r"(w0), "r"(w1) : "memory");
+        }
+    } else { // a lone word or three: rolled, as the joint X-HC runs are even and never reach it
+#pragma unroll 1
+        for (int32_t i = lo; i < hi; ++i) {
+            peer[g0 + i] = img[i0 + i];
+            if (local != nullptr) {
+                local[g0 + i] = img[i0 + i];
+            }
         }
     }
 }

@@ -43,26 +43,35 @@
 //        fnfl-drive ep-prep [REFS] [CACHE] [ROUTES] [all|q4]   (CPU only: ep-test's FP64 references; q4: ME1's)
 //        fnfl-drive ep-test [DEVICE] [ROWS] [FORMATS] [full|san] [REFS] [CACHE] [ROUTES]   (ROWS like 128,1536)
 //        fnfl-drive ep-bench [DEVICE] [all|ncu] [CACHE] [ROUTES]   (ROUTES: FN4's routes.txt)
-//        fnfl-drive grid-test [HEADER]   (CPU only: the grid tables against ggml-common.h at 66e11c3; default the
-//            pinned tree's)
+//        fnfl-drive grid-test [HEADER]   (the grid tables against ggml-common.h at 66e11c3, default the pinned
+//            tree's; FMS4: the IQ2 selector tables, and their recipe on device 0)
 //        fnfl-drive decode-check DIR   (CPU only: fn/quant's decoders bitwise against work/C1b/ref's pinned dump)
 //        fnfl-drive synth-check   (CPU only: fn/quant's synthetic-block generators)
 //        fnfl-drive xchg-test [DEV0] [DEV1] [ROUNDS] [ROWS]   (defaults 0 1 10000 1,3)
 //        fnfl-drive hc2-test [DEV0] [DEV1] [ROWS]   (default ROWS 1,2,3,4,5)
 //            (DEV0 == DEV1: loopback on one device and one stream, sends before reads: for Compute Sanitizer)
 //        fnfl-drive hcj-test [DEV0] [DEV1]   (FMU2: the joint sublayer against each lane's own; DEV0 == DEV1 loopback)
+//        fnfl-drive qsaj-test [DEV0] [DEV1]   (FMS2: the joint round's merged QSA launches against each lane's own;
+//            DEV0 == DEV1 loopback)
+//        fnfl-drive gdnj-test [DEV]   (FMS2: the joint round's one GDN core launch against each lane's core())
 //        fnfl-drive hc2-bench [DEV0] [DEV1] [all|ncu|ncu-up|ncu-fused|nsys|q8|cold]   (q8: DR1; cold, ncu-up, ncu-fused: HC4)
 //        fnfl-drive load-plan [OUT] [MODEL] [DRAFT]   (CPU only: the placement, the GGUF slice hashes, the dry run)
+//        fnfl-drive split-plan [--model GGUF] [--k K] [--slots N] [--slot-cells C] [--pool-cells P] [--cal ...]
+//            [--free-front G0,G1] [--free-back G0,G1]   (TTTS1, CPU only: each box's weights and state, BF16 and q8,
+//            and the headroom from a measured free figure; fn/loader/load_check.h)
 //        fnfl-drive load-check [OUT] [CELLS] [MODEL] [DRAFT]   (devices 0 and 1; default CELLS 198,720)
 //        fnfl-drive xchg2-test [DEV0] [DEV1] [ROUNDS]   (R2: X-A, X-F, X-ROUTE and X-SELECT, synthetic; default 0 1 200)
+//        fnfl-drive x16-test [DEV0] [DEV1]   (FMS2 item 7: the joint 16-bit X-A / X-F against the host's rounding)
 //        fnfl-drive px1-link [DEV0] [DEV1] [all|nsys|san] [CACHE] [ROUTES]   (PX1 Part A: large two-way messages
 //            beside the read kernel and EP1's gate/up; default 0 1 all)
 //        fnfl-drive dp-test [DEVICE] [ROWS|all] [full|san|all]   (DP1, DP2; ROWS like 1,3, default all; san: the
 //            vocabulary at 8,192 rows, full: at 124,160, all: both; default full)
-//        fnfl-drive dpj-test [DEVICE] [full|san] [CASE]   (FMU2: the joint product at U = 2, 3, 4 lanes against each
-//            lane's B = 5 launch, bitwise, and FP64; FMU4: then "sampled pick", the joint draft step's sampled pick
-//            against each lane's lone pick on DEVICE and the other, san: loopback; san: fewer cases, U = 2 and 4; CASE:
-//            only the cases whose name contains one of its '|'-separated parts)
+//        fnfl-drive dpj-test [DEVICE] [full|san|tc|f16] [CASE]   (FMU2: the joint product at U = 2, 3, 4 lanes
+//            against each lane's B = 5 launch, bitwise, and FP64; FMU4: then "sampled pick", the joint draft step's
+//            sampled pick against each lane's lone pick on DEVICE and the other, san: loopback; san: fewer cases, U = 2
+//            and 4; tc (FMS5): the router cases on the tensor cores, against FP64's bound; f16 (FMS6): the quantized
+//            cases at U = 3 and 4 with the dense FP16 switch on, against FP64's 2^-8 bound; CASE: only the cases whose
+//            name contains one of its '|'-separated parts)
 //        fnfl-drive dp-bench [DEVICE] [all|seq|nsys|ncu:POINT|group:NAME]   (DP1 steps 6-8, DP2 steps 5-7)
 //        fnfl-drive pd-test|hcp-test|gdp-test|qsp-test|pe-test|dcp-test [DEVICE] [full|san]   (PB1: the prompt
 //            kernels against their FP64 or bitwise references: dense and router, HC and the exchange, GDN, QSA,
@@ -122,6 +131,25 @@
 //            POSITIONS tokens (default 4,096, at most 7,000); model: one load)
 //        fnfl-drive rollback-test IDS OUT [real|dry|retain]   (SR1: scripted commits and truncates over 512 reference tokens on the real
 //            model, against a clean replay)
+//            FMS2 item 7: rollback-test IDS OUT mu1 --joint-kl DEEP runs joint-kl after mu1's PASS on its model
+//        fnfl-drive joint-kl DEEP OUT [real|dry]   (FMS2 item 7: KL(lone || joint) of four lanes, 16-bit joint X-A /
+//            X-F, against the lone BF16-KV yardstick; one load, or model-dry's zero weights)
+//        fnfl-drive split-test [all|san] [graph|eager] [--k LIST] [--cases lone,joint]   (TTTS1: one box against the
+//            split at k = 3, 27, 45, bitwise, on synthetic weights (no model data): lone rounds of 1 .. 5 rows, commits
+//            and cuts, a reset, joint rounds of U = 2 .. 4 at every d, the HC slot rule; san: layers 0 .. 5 at k = 3,
+//            eager, for Compute Sanitizer)
+//        fnfl-drive stage --split-layer K --draft-attention sparse [--slots N] [--cells N] [--pool-cells N]
+//            [--spec-d D] [--eog IDS] [--record-hash] [--split-addr IP]   (TTTS1: the split's follower, the back
+//            stage, until the leader's X-BYE); --split [--split-layer K] on spec run (and rollback-test, joint-kl):
+//            this process the leader, the front stage
+//        fnfl-drive pipe-test   (TTTS1: the split's two-group pipeline core against a fake leader and follower, CPU
+//            only: 1 .. 8 writers, joins and leaves at every point, cancels, ends of generation, readers interleaved,
+//            the follower's failure; its invariants checked at every action)
+//        fnfl-drive link-test leader|follower [--addr IP] [--port P] [--timeout S] [--cases all|LIST] [--stream N]
+//            [--devices D0,D1]   (TTTS1: the box-to-box link, one process a box: X-HELLO, the transport line,
+//            X-BOUNDARY decode and prompt forms with pattern payloads compared on the far cards, X-STEP, X-CTRL and
+//            X-ACK, N (100,000) messages alternating groups, refusals, and the follower killed mid-transfer; no
+//            timings printed)
 //        --ple-table lazy|full, anywhere after the command (PN1): the PLE table's residency in every model load;
 //            lazy (default, PN1 Amendment 1): the plain mapping and PL1's hints; full: read into RAM and pinned at
 //            the load; generate --evict-ple needs lazy
@@ -129,8 +157,8 @@
 #include "fn/fnfl.h"
 #include "fn/kernels/act/act_test.h"
 #include "fn/kernels/dense/dense_bench.h"
-#include "fn/kernels/dense/dense_prompt_test.h"
 #include "fn/kernels/dense/dense_joint_test.h"
+#include "fn/kernels/dense/dense_prompt_test.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/draft/draft_bench.h"
 #include "fn/kernels/draft/draft_prompt_test.h"
@@ -145,6 +173,7 @@
 #include "fn/kernels/gdn/gdn_bench.h"
 #include "fn/kernels/gdn/gdn_prompt_test.h"
 #include "fn/kernels/gdn/gdn_test.h"
+#include "fn/kernels/gdn/gdnj_test.h"
 #include "fn/kernels/hc/hc_bench.h"
 #include "fn/kernels/hc/hc_prompt_test.h"
 #include "fn/kernels/hc/hc_test.h"
@@ -158,6 +187,7 @@
 #include "fn/kernels/qsa/qsa_bench.h"
 #include "fn/kernels/qsa/qsa_prompt_test.h"
 #include "fn/kernels/qsa/qsa_test.h"
+#include "fn/kernels/qsa/qsaj_test.h"
 #include "fn/kernels/samp/samp_bench.h"
 #include "fn/kernels/samp/samp_ref.h"
 #include "fn/kernels/samp/samp_test.h"
@@ -168,10 +198,15 @@
 #include "fn/proto/xp1/xp1_test.h"
 #include "fn/quant/quant_test.h"
 #include "fn/runtime/layer_test.h"
+#include "fn/runtime/pipe.h"
 #include "fn/runtime/ple_host.h"
 #include "fn/runtime/ple_pin_test.h"
+#include "fn/runtime/split_stage_test.h"
+#include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/state_test.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/xchg/link_test.h"
+#include "fn/xchg/x16_test.h"
 #include "fn/xchg/xchg2_test.h"
 #include "fn/xchg/xchg_test.h"
 
@@ -426,6 +461,28 @@ static int settings_test() {
     return pass ? 0 : 1;
 }
 
+// TTTS1: the split's options (taken out of argv in main), applied to a command's arguments
+struct split_opts {
+    bool        leader = false;  // --split
+    int32_t     k      = 27;     // --split-layer K
+    std::string addr   = "10.25.0.2";
+    int32_t     port   = 13371;
+    std::string commit, digest;
+    bool        record_hash = false;
+    int32_t     groups = 0;  // --fnfl-split-groups (joint-kl on the split: 1 one U4 group, 2 two pipelined U2; 0 both)
+};
+
+void apply_split(fnfl_target_args & a, const split_opts & so, int32_t role) {
+    a.split_role   = role;
+    a.split_k      = so.k;
+    a.split_addr   = so.addr;
+    a.split_port   = so.port;
+    a.split_commit = so.commit;
+    a.split_digest = so.digest;
+    a.record_hash  = so.record_hash;
+    a.split_groups = so.groups;
+}
+
 int main(int argc, char ** argv) {
     // PN1: --ple-table lazy|full anywhere after the command sets the residency of every model load; it is taken out
     // of argv here so each command's own parsing is unchanged
@@ -443,10 +500,55 @@ int main(int argc, char ** argv) {
             --i;
         }
     }
-    // KV8: --kv-format bf16|q8 (or the server's --fnfl-kv-format) anywhere after the command, taken out of argv alike:
-    // the target KV's format for the target commands, qa2-test, qsp-test and state-test mu1 (bf16 unless given)
-    bool kv_q8 = false;
+    // TTTS1: --split, --split-layer K, --split-addr IP, --split-port P, --split-commit HEX, --split-digest HEX,
+    // --record-hash and --fnfl-split-groups N anywhere after the command, taken out of argv alike
+    split_opts so;
     for (int i = 2; i < argc; ++i) {
+        const std::string f    = argv[i];
+        const bool        has  = i + 1 < argc;
+        int               take = 0;
+        if (f == "--split") {
+            so.leader = true;
+            take      = 1;
+        } else if (f == "--record-hash") {
+            so.record_hash = true;
+            take           = 1;
+        } else if (has && (f == "--split-layer" || f == "--fnfl-split-layer")) {
+            so.k = atoi(argv[i + 1]);
+            take = 2;
+        } else if (has && f == "--split-addr") {
+            so.addr = argv[i + 1];
+            take    = 2;
+        } else if (has && f == "--split-port") {
+            so.port = atoi(argv[i + 1]);
+            take    = 2;
+        } else if (has && f == "--split-commit") {
+            so.commit = argv[i + 1];
+            take      = 2;
+        } else if (has && f == "--split-digest") {
+            so.digest = argv[i + 1];
+            take      = 2;
+        } else if (has && f == "--fnfl-split-groups") {
+            so.groups = atoi(argv[i + 1]);
+            take      = 2;
+        }
+        if (take > 0) {
+            for (int j = i; j + take <= argc; ++j) {
+                argv[j] = argv[j + take];
+            }
+            argc -= take;
+            --i;
+        }
+    }
+    if (so.k < 2 || so.k > 47 || so.groups < 0 || so.groups > 2) {
+        fprintf(stderr, "%s: --split-layer is 2 .. 47 and --fnfl-split-groups 1 or 2\n", argv[0]);
+        return 2;
+    }
+    // KV8: --kv-format bf16|q8 (or the server's --fnfl-kv-format) anywhere after the command, taken out of argv alike:
+    // the target KV's format for the target commands, qa2-test, qsp-test and state-test mu1 (bf16 unless given).
+    // TTTS1: also before the command (the pinned loads' form, fnfl-drive --kv-format q8 spec ...)
+    bool kv_q8 = false;
+    for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--kv-format") == 0 || strcmp(argv[i], "--fnfl-kv-format") == 0) {
             if (i + 1 >= argc || (strcmp(argv[i + 1], "bf16") != 0 && strcmp(argv[i + 1], "q8") != 0)) {
                 fprintf(stderr, "%s: --kv-format is bf16 or q8\n", argv[0]);
@@ -572,6 +674,9 @@ int main(int argc, char ** argv) {
         static const char * model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
                                     "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
         return fnfl_gd_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : model);
+    }
+    if (argc >= 2 && strcmp(argv[1], "gdnj-test") == 0) {
+        return fnfl_gdnj_test(argc >= 3 ? atoi(argv[2]) : 0);
     }
     if (argc >= 2 && strcmp(argv[1], "gd-bench") == 0) {
         return fnfl_gd_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
@@ -726,12 +831,16 @@ int main(int argc, char ** argv) {
         return fnfl_grid_test(argc >= 3 ? argv[2]
                                         : "/home/jeremy/src/flashnext-opt/work/REL2/engine/ggml/src/ggml-common.h");
     }
-    if (argc >= 2 && (strcmp(argv[1], "xchg-test") == 0 || strcmp(argv[1], "hc2-test") == 0 ||
-                      strcmp(argv[1], "hc2-bench") == 0 || strcmp(argv[1], "hcj-test") == 0)) {
+    if (argc >= 2 &&
+        (strcmp(argv[1], "xchg-test") == 0 || strcmp(argv[1], "hc2-test") == 0 || strcmp(argv[1], "hc2-bench") == 0 ||
+         strcmp(argv[1], "hcj-test") == 0 || strcmp(argv[1], "qsaj-test") == 0)) {
         const int dev0 = argc >= 3 ? atoi(argv[2]) : 0;
         const int dev1 = argc >= 4 ? atoi(argv[3]) : 1;
         if (strcmp(argv[1], "hcj-test") == 0) {
             return fnfl_hcj_test(dev0, dev1);
+        }
+        if (strcmp(argv[1], "qsaj-test") == 0) {
+            return fnfl_qsaj_test(dev0, dev1);
         }
         if (strcmp(argv[1], "hc2-bench") == 0) {
             if (dev0 == dev1) {
@@ -757,6 +866,49 @@ int main(int argc, char ** argv) {
         }
         return fnfl_hc2_test(dev0, dev1, mask);
     }
+    if (argc >= 2 && strcmp(argv[1], "split-test") == 0) {
+        return fn::runtime::fnfl_split_test(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "pipe-test") == 0) {
+        std::string report;
+        const bool  ok = fn::runtime::pipe::self_test(report);
+        fputs(report.c_str(), stdout);
+        return ok ? 0 : 1;
+    }
+    if (argc >= 2 && strcmp(argv[1], "link-test") == 0) {
+        fn::xchg::link::test_options o;
+        const bool role_ok = argc >= 3 && (strcmp(argv[2], "leader") == 0 || strcmp(argv[2], "follower") == 0);
+        bool       ok      = role_ok;
+        if (role_ok) {
+            o.leader = strcmp(argv[2], "leader") == 0;
+        }
+        for (int i = 3; ok && i < argc; ++i) {
+            const bool has = i + 1 < argc;
+            if (strcmp(argv[i], "--addr") == 0 && has) {
+                o.addr = argv[++i];
+            } else if (strcmp(argv[i], "--port") == 0 && has) {
+                o.port = static_cast<uint16_t>(atoi(argv[++i]));
+            } else if (strcmp(argv[i], "--timeout") == 0 && has) {
+                o.timeout_s = atof(argv[++i]);
+            } else if (strcmp(argv[i], "--cases") == 0 && has) {
+                o.cases = argv[++i];
+            } else if (strcmp(argv[i], "--stream") == 0 && has) {
+                o.stream_messages = atol(argv[++i]);
+            } else if (strcmp(argv[i], "--devices") == 0 && has) {
+                ok = sscanf(argv[++i], "%d,%d", &o.device[0], &o.device[1]) == 2;
+            } else {
+                ok = false;
+            }
+        }
+        if (!ok || o.timeout_s <= 0 || o.stream_messages < 1000) {
+            fprintf(stderr,
+                    "usage: fnfl-drive link-test leader|follower [--addr IP] [--port P] [--timeout S] "
+                    "[--cases all|decode,prompt,small,stream,refuse,kill] [--stream N >= 1000] "
+                    "[--devices D0,D1]\n");
+            return 2;
+        }
+        return fn::xchg::link::run_test(o);
+    }
     if (argc >= 2 && (strcmp(argv[1], "load-plan") == 0 || strcmp(argv[1], "load-check") == 0)) {
         const bool check = strcmp(argv[1], "load-check") == 0;
         fnfl_load_check_args a;
@@ -779,9 +931,61 @@ int main(int argc, char ** argv) {
         a.draft_path = argc > i + 1 ? argv[i + 1] : draft;
         return check ? fnfl_load_check(a) : fnfl_load_plan(a);
     }
+    if (argc >= 2 && strcmp(argv[1], "split-plan") == 0) {
+        // TTTS1 step 8 (CPU only): the split's per-box plan (fn/loader/load_check.h)
+        fnfl_split_plan_args a;
+        a.model_path =
+            "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
+        a.draft_path    = "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+        const auto pair = [](const char * v, double out[2]) {
+            return sscanf(v, "%lf,%lf", &out[0], &out[1]) == 2;
+        };
+        bool bad = false;
+        for (int i = 2; i < argc && !bad; ++i) {
+            const std::string f   = argv[i];
+            const bool        has = i + 1 < argc;
+            if (f == "--model" && has) {
+                a.model_path = argv[++i];
+            } else if (f == "--draft" && has) {
+                a.draft_path = argv[++i];
+            } else if (f == "--k" && has) {
+                a.k = atoi(argv[++i]);
+            } else if (f == "--slots" && has) {
+                a.slots = atoi(argv[++i]);
+            } else if (f == "--slot-cells" && has) {
+                a.slot_cells = atoi(argv[++i]);
+            } else if (f == "--pool-cells" && has) {
+                a.pool_cells = atoi(argv[++i]);
+            } else if (f == "--cal" && i + 6 < argc) {
+                a.cal_model      = argv[++i];
+                a.cal_draft      = argv[++i];
+                a.cal_k          = atoi(argv[++i]);
+                a.cal_slots      = atoi(argv[++i]);
+                a.cal_slot_cells = atoi(argv[++i]);
+                a.cal_pool_cells = atoi(argv[++i]);
+            } else if (f == "--free-front" && has) {
+                bad = !pair(argv[++i], a.free_front);
+            } else if (f == "--free-back" && has) {
+                bad = !pair(argv[++i], a.free_back);
+            } else {
+                bad = true;
+            }
+        }
+        if (bad || a.k < 2 || a.k > 47 || a.slots < 1 || a.slots > 8) {
+            fprintf(stderr,
+                    "usage: fnfl-drive split-plan [--model GGUF] [--draft GGUF] [--k K] [--slots N] "
+                    "[--slot-cells C] [--pool-cells P] [--cal MODEL DRAFT K SLOTS SLOT_CELLS POOL_CELLS] "
+                    "[--free-front G0,G1] [--free-back G0,G1]\n");
+            return 2;
+        }
+        return fnfl_split_plan(a);
+    }
     if (argc >= 2 && strcmp(argv[1], "px1-link") == 0) {
         return fnfl_px1_link(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1, argc >= 5 ? argv[4] : "all",
                              argc >= 6 ? argv[5] : ex_cache, argc >= 7 ? argv[6] : fn4);
+    }
+    if (argc >= 2 && strcmp(argv[1], "x16-test") == 0) {
+        return fnfl_x16_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1);
     }
     if (argc >= 2 && strcmp(argv[1], "xchg2-test") == 0) {
         const int32_t d0 = argc >= 3 ? atoi(argv[2]) : 0, d1 = argc >= 4 ? atoi(argv[3]) : 1;
@@ -969,7 +1173,38 @@ int main(int argc, char ** argv) {
         a.ids = argv[2];
         a.out_dir = argv[3];
         a.mode = argc >= 5 ? argv[4] : "real";
+        for (int i = 5; i < argc; ++i) { // FMS2 item 7: --joint-kl DEEP after mu1 (load 1)
+            if (strcmp(argv[i], "--joint-kl") == 0 && i + 1 < argc) {
+                a.joint_kl = argv[++i];
+            } else {
+                fprintf(stderr, "rollback-test: unknown argument %s\n", argv[i]);
+                return 2;
+            }
+        }
+        if (!a.joint_kl.empty() && a.mode != "mu1" && a.mode != "mu1-dry") {
+            fprintf(stderr, "rollback-test: --joint-kl follows mu1 or mu1-dry\n");
+            return 2;
+        }
+        apply_split(a, so,
+                    so.leader ? 1 : 0);  // TTTS1: --split: mu1 (and its joint-kl) on the split, this box the front
+        if (a.split_role != 0 && a.mode != "mu1" && a.mode != "mu1-dry") {
+            fprintf(stderr, "rollback-test: --split runs mu1 or mu1-dry\n");
+            return 2;
+        }
         return fnfl_rollback_test(a);
+    }
+    if (argc >= 2 && strcmp(argv[1], "joint-kl") == 0) {
+        if (argc < 4 || (argc >= 5 && strcmp(argv[4], "real") != 0 && strcmp(argv[4], "dry") != 0)) {
+            fprintf(stderr, "joint-kl: DEEP OUT [real|dry]\n");
+            return 2;
+        }
+        fnfl_target_args a;
+        a.ple_table = ple_table;
+        a.joint_kl = argv[2];
+        a.out_dir = argv[3];
+        a.mode = argc >= 5 ? argv[4] : "real";
+        apply_split(a, so, so.leader ? 1 : 0);  // TTTS1: --split [--fnfl-split-groups 1|2]
+        return fnfl_joint_kl(a);
     }
     if (argc >= 2 && strcmp(argv[1], "prefill-test") == 0) {
         fnfl_target_args a;
@@ -1087,10 +1322,54 @@ int main(int argc, char ** argv) {
         a.out_dir = rest[i++];
         return test ? fnfl_draft_test(a) : fnfl_draft_bench(a);
     }
+    if (argc >= 2 && strcmp(argv[1], "stage") == 0) {
+        // TTTS1: the follower (the back stage) of a split
+        fnfl_target_args a;
+        a.kv_q8     = kv_q8;
+        a.ple_table = ple_table;
+        apply_split(a, so, 2);
+        std::vector<std::string> rest;
+        if (!draft_flags(argc, argv, 2, a, rest)) {
+            return 2;
+        }
+        bool bad = false;
+        for (size_t i = 0; i < rest.size(); ++i) {
+            const bool more = i + 1 < rest.size();
+            if (rest[i] == "--dry") {
+                a.mode = "dry";  // model-dry's load: zero weights, no model data (the no-load checks)
+            } else if (rest[i] == "--slots" && more) {
+                a.n_slots = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--cells" && more) {
+                a.n_cells = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--pool-cells" && more) {
+                a.pool_cells = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--spec-d" && more) {
+                a.spec_d = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--eog" && more) {
+                const std::string & v = rest[++i];
+                for (size_t p = 0; p < v.size();) {
+                    const size_t q = v.find(',', p);
+                    a.eog.push_back(atoi(v.substr(p, q == std::string::npos ? std::string::npos : q - p).c_str()));
+                    p = q == std::string::npos ? v.size() : q + 1;
+                }
+            } else {
+                bad = true;
+            }
+        }
+        if (bad || a.n_slots < 1 || a.n_slots > 8 || a.spec_d < 1 || a.spec_d > 4) {
+            fprintf(stderr,
+                    "usage: fnfl-drive stage --split-layer K --draft-attention sparse [--dry] [--slots N (1 .. 8)] "
+                    "[--cells N] [--pool-cells N] [--spec-d D] [--eog IDS] [--record-hash] [--split-addr IP] "
+                    "[--split-port P] [--split-commit HEX] [--split-digest HEX] [--kv-format q8]\n");
+            return 2;
+        }
+        return fnfl_stage(a);
+    }
     if (argc >= 2 && strcmp(argv[1], "spec") == 0) {
         fnfl_target_args a;
         a.kv_q8 = kv_q8; // KV8
         a.ple_table = ple_table;
+        apply_split(a, so, so.leader ? 1 : 0);
         std::vector<std::string> rest, pos;
         if (!draft_flags(argc, argv, 2, a, rest)) {
             return 2;
@@ -1113,7 +1392,11 @@ int main(int argc, char ** argv) {
             } else if (sampling_flag(rest, i, cur.sampling)) {
                 continue;
             } else if (rest[i] == "--spec-d" && more) {
-                a.spec_d = atoi(rest[++i].c_str()); // SP2's switch: 1..4
+                // SP2's switch: 1..4. TTTS1: inside a setting, the setting's d (the first setting's is the process's)
+                cur.spec_d = atoi(rest[++i].c_str());
+                if (a.run_settings.empty()) {
+                    a.spec_d = cur.spec_d;
+                }
             } else if (rest[i] == "--arms" && more) {
                 a.arms = rest[++i]; // SP2 Amendment 3: spec ab's arms
             } else if (rest[i] == "--max-tokens" && more) {
@@ -1163,6 +1446,9 @@ int main(int argc, char ** argv) {
             } else if (rest[i] == "--cells" && more) {
                 a.n_cells = atoi(rest[++i].c_str()); // ME1: the slot's cells (198,720 unless given)
             } else if (rest[i] == "--and") {
+                if (cur.spec_d < 0 || cur.spec_d > 4) {
+                    bad = true;
+                }
                 a.run_settings.push_back(cur);
                 cur = fnfl_target_args::run_setting();
                 cur.sampling.temp = 1.0f;
@@ -1441,7 +1727,8 @@ int main(int argc, char ** argv) {
         "usage: %s "
         "act-test|act-bench|gd-test|gd-bench|hc-test|hc-bench|qa-test|qa-bench|qa2-test|qa2-bench|kv-tier-test|"
         "settings|kv-format-test|ex-calib|ex-prep|ex-cpu-test|ex-test|ex-bench|"
-        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|xchg-test|hc2-test|hcj-test|hc2-bench|load-plan|"
+        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|xchg-test|hc2-test|hcj-test|qsaj-test|gdnj-test|"
+        "hc2-bench|load-plan|"
         "load-check|xchg2-test|px1-link|layer-test|layer-bench|xp1-test|xp1-bench|dp-test|dpj-test|dp-bench|pd-test|"
         "hcp-test|gdp-test|qsp-test|pe-test|dcp-test|ple-test|ple-pin-test|ple-bench|state-test|"
         "prefill-test|rollback-test|spec|draft-kernel-test|draft-kernel-bench|draft-test|draft-bench|sampler-ref|"

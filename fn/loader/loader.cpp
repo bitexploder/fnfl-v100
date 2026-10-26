@@ -62,7 +62,7 @@ slice_info info_of(const model::model & m, int32_t t, int32_t card) {
     slice_info s;
     s.blk = tp.block_elems;
     s.bb = tp.block_bytes;
-    s.base = m.sources[t].file->data() + m.sources[t].offset;
+    s.base      = m.sources[t].synth != nullptr ? m.sources[t].synth : m.sources[t].file->data() + m.sources[t].offset;
     s.row_bytes = tp.ne[0] / tp.block_elems * tp.block_bytes;
     s.matrix_bytes = s.row_bytes * tp.ne[1];
     s.n_matrix = tp.ne[2];
@@ -196,7 +196,7 @@ card_plan plan_card(const model::model & m, int32_t card, int64_t piece_bytes) {
     card_plan cp;
     for (int32_t r = 0; r < (int32_t)m.regions[card].size(); ++r) {
         const model::region_place & rg = m.regions[card][r];
-        if (rg.bytes == 0 || rg.cached || rg.alias) {
+        if (rg.bytes == 0 || rg.cached || rg.alias || rg.absent) {
             continue;
         }
         if (rg.lay == layout::gguf) {
@@ -410,6 +410,20 @@ bool replicated(const model::region_place & rg) {
     return true;
 }
 
+// TTTS1: whether a box with window w places tensor tp: a layer's tensors (and the PLE layer's) with their layer, the
+// draft block's (layer 48) and the head's (output.weight, the HC head) with the head, the token embedding always
+bool holds(const model::window & w, const model::tensor_place & tp) {
+    const model::component & c = model::components[tp.component];
+    if (c.layer >= 0) {
+        return w.layer(c.layer);
+    }
+    const std::string key = c.key;
+    if (key == "global:VLog" || key == "global:HeadHCDown" || key == "global:HeadHCUp") {
+        return w.head;
+    }
+    return true;  // global:Embedding (and the host PLE table, which has no region)
+}
+
 bool plan_regions(model::model & m, std::string & err) {
     // region members from the table
     std::vector<std::array<int32_t, 2>> members(model::n_regions, {-1, -1});
@@ -462,7 +476,8 @@ bool plan_regions(model::model & m, std::string & err) {
             rg.cached = m.expert_cache && (rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) &&
                         model::components[m.tp(rg.members[0]).component].layer < fn::n_layer;
             rg.alias = m.single && card == 1 && replicated(rg);
-            if (rg.cached || rg.alias) {
+            rg.absent = !holds(m.win, m.tp(rg.members[0]));
+            if (rg.cached || rg.alias || rg.absent) {
                 rg.offset = rg.alias ? m.regions[0][r].offset : -1;
                 continue;
             }
@@ -528,6 +543,12 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
     m.expert_cache = p.expert_cache;
     m.kv_host = p.kv_host;
     m.kv_window = p.kv_window;
+    m.win          = p.win;
+    if (!m.win.valid() || (!m.win.whole() && (m.single || m.expert_cache || m.kv_host))) {
+        err = "TTTS1: a window (layers " + std::to_string(m.win.lo) + " .. " + std::to_string(m.win.hi) +
+              ") is resident TP on two devices only, inside 0 .. 47";
+        return false;
+    }
     if (m.kv_host && !m.single && !m.expert_cache) {
         err = "two-device host KV needs the expert cache (--cached-tp)";
         return false;
@@ -752,6 +773,74 @@ std::string draft_expert_line(const model::model & m) {
     return b;
 }
 
+namespace {
+
+// 0 when BF16 bits v are exact in FP16 (zero, infinities and NaN included), 1 below FP16's normal range, 2 beyond it
+int32_t f16_inexact(uint16_t v) {
+    const int32_t e = (v >> 7) & 0xff, mant = v & 0x7f;
+    if (e == 0xff || (e == 0 && mant == 0)) {
+        return 0;
+    }
+    if (e == 0) { // a BF16 subnormal: below 2^-126, far below FP16's smallest subnormal
+        return 1;
+    }
+    const int32_t x = e - 127; // the value is (128 + mant) 2^(x - 7)
+    if (x > 15) {
+        return 2;
+    }
+    if (x >= -14) {
+        return 0;
+    }
+    const int32_t sig = 128 + mant;
+    const int32_t low = x - 7 + __builtin_ctz(static_cast<uint32_t>(sig)); // its lowest set bit's exponent
+    return low >= -24 ? 0 : 1;                                             // FP16 subnormals: multiples of 2^-24
+}
+
+bool router_tensor(const char * name) {
+    const size_t n = std::strlen(name);
+    static const char * const ends[2] = {".ffn_gate_inp.weight", ".ffn_gate_inp_shexp.weight"};
+    for (const char * s : ends) {
+        const size_t k = std::strlen(s);
+        if (n > k && std::strcmp(name + n - k, s) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+std::string router_f16_line(const model::model & m) {
+    int64_t total = 0, below = 0, beyond = 0;
+    int32_t ts = 0;
+    for (int32_t t = 0; t < model::n_tensors; ++t) {
+        const model::tensor_place & p = model::tensors[t];
+        if (!router_tensor(p.name) || std::strcmp(p.format, "BF16") != 0 || size_t(t) >= m.sources.size() ||
+            m.sources[size_t(t)].file == nullptr) {
+            continue;
+        }
+        const model::tensor_source & s = m.sources[size_t(t)];
+        const uint8_t * b = s.file->data() + s.offset;
+        const int64_t n = p.stored_bytes / 2;
+        for (int64_t i = 0; i < n; ++i) {
+            uint16_t v;
+            std::memcpy(&v, b + 2 * i, 2);
+            const int32_t c = f16_inexact(v);
+            below += c == 1 ? 1 : 0;
+            beyond += c == 2 ? 1 : 0;
+        }
+        total += n;
+        ++ts;
+    }
+    char out[256];
+    std::snprintf(out, sizeof(out),
+                  "router BF16 to FP16 (FMS5's tensor-core router): %lld of %lld weights inexact (%lld below FP16's "
+                  "normal range, %lld beyond its range) over %d tensors",
+                  static_cast<long long>(below + beyond), static_cast<long long>(total), static_cast<long long>(below),
+                  static_cast<long long>(beyond), ts);
+    return out;
+}
+
 bool allocate_weights(model::model & m, std::string & err) {
     for (int32_t card = 0; card < 2; ++card) {
         if (!m.weights[card].allocate(m.device[card], (size_t)m.weight_alloc[card], err)) {
@@ -909,6 +998,69 @@ bool fill_weights(const load_params & p, model::model & m, load_times & t, std::
 }
 
 // ---- the GGUF side of the check ----
+
+bool fill_weights_synth(model::model & m, const synth_fn & synth, std::string & err) {
+    constexpr int64_t                 piece   = int64_t(64) << 20;
+    const card_plan                   plan[2] = { plan_card(m, 0, piece), plan_card(m, 1, piece) };
+    // each region's units on each card, in plan order
+    std::vector<std::vector<int32_t>> units[2];
+    int64_t                           most = 0;
+    for (int32_t c = 0; c < 2; ++c) {
+        units[c].assign(model::n_regions, {});
+        for (int32_t u = 0; u < (int32_t) plan[c].units.size(); ++u) {
+            units[c][size_t(plan[c].units[size_t(u)].region)].push_back(u);
+            most = std::max(most, plan[c].units[size_t(u)].bytes);
+        }
+    }
+    void * stage = nullptr;
+    if (!cuda_ok(cudaHostAlloc(&stage, size_t(std::max<int64_t>(most, 256)), cudaHostAllocPortable), "staging", err)) {
+        return false;
+    }
+    std::vector<uint8_t> whole[2];
+    bool                 ok = true;
+    for (int32_t r = 0; r < model::n_regions && ok; ++r) {
+        if (units[0][size_t(r)].empty() && units[1][size_t(r)].empty()) {
+            continue;
+        }
+        const model::region_place & rg = m.regions[units[0][size_t(r)].empty() ? 1 : 0][size_t(r)];
+        for (int32_t mi = 0; mi < 2 && ok; ++mi) {
+            const int32_t t = rg.members[mi];
+            if (t < 0) {
+                continue;
+            }
+            whole[mi].resize(size_t(m.tp(t).stored_bytes));
+            ok                         = synth(t, whole[mi].data(), m.tp(t).stored_bytes);
+            m.sources[size_t(t)].synth = whole[mi].data();
+            if (!ok) {
+                err = std::string("synthetic weights: ") + m.tp(t).name;
+            }
+        }
+        for (int32_t c = 0; c < 2 && ok; ++c) {
+            for (int32_t ui : units[c][size_t(r)]) {
+                const unit & u      = plan[c].units[size_t(ui)];
+                bool         repack = false;
+                if (!fill_unit(m, c, u, static_cast<uint8_t *>(stage), repack)) {
+                    ok  = false;
+                    err = std::string("synthetic weights: the layout of ") + m.tp(rg.members[0]).name;
+                    break;
+                }
+                if (!cuda_ok(cudaSetDevice(m.device[c]), "cudaSetDevice", err) ||
+                    !cuda_ok(cudaMemcpy(m.weights[c].data() + u.dst, stage, size_t(u.bytes), cudaMemcpyHostToDevice),
+                             "synthetic weights copy", err)) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        for (int32_t mi = 0; mi < 2; ++mi) {
+            if (rg.members[mi] >= 0) {
+                m.sources[size_t(rg.members[mi])].synth = nullptr;
+            }
+        }
+    }
+    cudaFreeHost(stage);
+    return ok;
+}
 
 bool hash_gguf_slices(const model::model & m, int32_t threads, std::vector<card_digests> & out, double & seconds) {
     const auto t0 = clock_type::now();

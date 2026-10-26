@@ -7,6 +7,7 @@
 // Capacity is in cells per slot (one slot: one user on two cards). R1's case: 196,608 + 2,048 output tokens + 64.
 
 #include "fn/kernels/round/version.h"
+#include "fn/model/shapes.h"
 
 #include <cstdint>
 #include <string>
@@ -33,6 +34,27 @@ constexpr int32_t ple_channels_card = 5120; // four streams x 1,280 own features
 // PF1: the prefill driver's checkpoints a slot (FC-ST1) and the rows of a device PLE staging slot (one chunk, FC-PF3)
 constexpr int32_t prefill_checkpoints = 8;
 constexpr int32_t prefill_stage_rows = 8192;
+
+// TTTS1: the layers and extras one box holds (the split's stage). The whole model by default. The split's front holds
+// layers 0 .. k - 1, the back layers k .. 47 with the head (the HC head, output.weight) and the MTP draft (layer 48);
+// both hold the token embedding (the draft embeds its tokens too). Weights, KV, index, GDN and history parts outside
+// the window are not placed or reserved.
+struct window {
+    int32_t lo   = 0;
+    int32_t hi   = fn::n_layer - 1;
+    bool    head = true;  // the HC head, output.weight and the draft block
+
+    bool whole() const { return lo == 0 && hi == fn::n_layer - 1 && head; }
+
+    // layer l (0 .. 47) is in the window; the draft block (l = fn::n_layer) goes with the head
+    bool layer(int32_t l) const { return l == fn::n_layer ? head : l >= lo && l <= hi; }
+
+    bool ple() const { return layer(1); }  // the PLE layer (it feeds layer 1)
+
+    int32_t gdn_layers() const;            // the window's GDN layers
+
+    bool valid() const { return lo >= 0 && hi < fn::n_layer && lo <= hi; }
+};
 
 struct part {
     std::string name;
@@ -66,6 +88,7 @@ struct state_params {
     // QSA layer's K and V int8 codes [cells][256], then the parts "K scales" and "V scales", FP16 [cells][64], cell-major
     // (cell c, QSA layer o, group g at [c * 64 + 4 o + g]; fn/kernels/qsa/kv_q8.cuh). Two devices, resident only
     bool kv_q8 = false;
+    window  win;  // TTTS1: the box's layers and extras (whole by default)
 };
 
 // TG1: the parts of the "round and pass (TG1)" class whose layout fn/model/pass.cpp carves (256-byte aligned pieces)
@@ -81,7 +104,7 @@ int64_t checkpoint_bytes(const state_params & p);
 
 // the per-cell bytes of the classes that grow with capacity, per card (KV, draft KV, index keys and summaries); KV8:
 // kv_q8 the 8-bit target KV's (codes and the 128-byte scale rows)
-int64_t bytes_per_cell(int32_t card, bool kv_q8 = false);
+int64_t           bytes_per_cell(int32_t card, bool kv_q8 = false, const window & w = window());
 // KV8: the FP16 scales a cell in each of the q8 scale parts (12 QSA layers x 4 groups of 64, padded to 64: 128 bytes,
 // so a 16,384-cell page's slice is 2 MiB, the VMM granularity)
 constexpr int32_t kv_q8_scale_stride = 64;

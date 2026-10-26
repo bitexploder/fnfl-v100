@@ -179,9 +179,12 @@ void workspace_offsets(size_t (&off)[n_ws + 1]);
 int64_t gate_up_bytes(fmt f);
 int64_t down_bytes(fmt f);
 
-// the grid tables' buffer: iq2xxs, iq2xs, iq2s, iq3xxs, iq3s grids and kvalues_iq4nl at fixed offsets
-constexpr size_t grid_bytes = 2048 + 4096 + 8192 + 1024 + 2048 + 16;
-// fill dst (grid_bytes) from the tables: src[i] and src_bytes[i] in the order above; false on a size mismatch
+// the grid tables' buffer: iq2xxs, iq2xs, iq2s, iq3xxs, iq3s grids and kvalues_iq4nl at fixed offsets, then (FMS4
+// item 2) the three IQ2 grids' selector tables, derived from the first three: 4 bytes an entry, nibble k the level code
+// of byte k (8 -> 0, 25 -> 1, 43 -> 2)
+constexpr size_t grid_bytes = 2048 + 4096 + 8192 + 1024 + 2048 + 16 + 1024 + 2048 + 4096;
+// fill dst (grid_bytes) from the tables: src[i] and src_bytes[i] in the order above, then the selector tables; false
+// on a size mismatch or an IQ2 grid byte other than 8, 25 and 43
 bool grid_table(const void * const src[6], const size_t src_bytes[6], uint8_t * dst);
 
 // Load-time repack of one expert's card half. gate and up: 320 GGUF rows of 2560 weights each (row_bytes apart);
@@ -294,15 +297,17 @@ bool gate_up_pair_supported(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t
 bool gate_up_pair(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
                   void * stream);
 
-// FMU2 (build item 1): a joint round's two to four lanes (fn/runtime/joint.h) at B = 5 on one card in one 72-block
-// launch each, the lanes' units never mixed. gate_up_lanes: lane k of n runs on blocks k NB .. k NB + NB - 1 (NB =
+// FMU2 (build item 1): a joint round's two to four lanes (fn/runtime/joint.h) at B = rows (FMS13: the round's R,
+// 2 .. 5, every lane alike; lane k's rows at the five-row lane stride) on one card in one 72-block launch each, the
+// lanes' units never mixed. gate_up_lanes: lane k of n runs on blocks k NB .. k NB + NB - 1 (NB =
 // 72 / n: 36, 24, 18) as its own gate_up launch's deal over NB blocks (ME10's form of the snake deal), with
 // gate_up_kernel_u's body on its own arguments s[k], so each lane's GLU, meta and status are bitwise its own gate_up
 // launch's (every unit's arithmetic, staging and reduction order are the block's alone). down_lanes: block i runs lane
 // k = i / NB and in it the lone launch's blocks n (i % NB) .. n (i % NB) + n - 1 in turn, their output rows and walk
 // unchanged, after one staging of the lane's GLU slots (which block runs an item changes no result: down_kernel), so
 // each lane's out is bitwise its own down launch's. Supported: the resident target formats down's and gate_up's map 2
-// or 3 bodies take at B = 5 (IQ2 and IQ3 routed gate/up with a deployed triple; Q2_0 or IQ4_NL down), no table (wt),
+// or 3 bodies take at B = rows (IQ2 routed gate/up at rows 2 .. 5 and IQ3 at 4 and 5, each with a deployed triple: the
+// lone IQ3 launch at B <= 3 is the per-triple kernel, which has no lanes form; Q2_0 or IQ4_NL down), no table (wt),
 // no run_if or skip, each lane valid for its lone launch, the lanes' distinct GLU, meta and out buffers (the status
 // word may be shared: every writer stores 1), the same class table and activation form (x or hmix). Unsupported:
 // false, nothing enqueued, and the caller launches each lane alone; false after a failed launch submission.
@@ -313,11 +318,22 @@ struct gate_up_lanes_args {
 struct down_lanes_args {
     down_args s[max_lanes];
 };
-bool gate_up_lanes_supported(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a);
-bool gate_up_lanes(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
-                   void * stream);
-bool down_lanes_supported(fmt f, fmt fs, int32_t lanes, const down_lanes_args & a);
-bool down_lanes(fmt f, fmt fs, int32_t lanes, const down_lanes_args & a, void * stream);
+
+bool gate_up_lanes_supported(fmt                        f,
+                             fn::dense::fmt             fg,
+                             fn::dense::fmt             fu,
+                             int32_t                    lanes,
+                             int32_t                    rows,
+                             const gate_up_lanes_args & a);
+bool gate_up_lanes(fmt                        f,
+                   fn::dense::fmt             fg,
+                   fn::dense::fmt             fu,
+                   int32_t                    lanes,
+                   int32_t                    rows,
+                   const gate_up_lanes_args & a,
+                   void *                     stream);
+bool down_lanes_supported(fmt f, fmt fs, int32_t lanes, int32_t rows, const down_lanes_args & a);
+bool down_lanes(fmt f, fmt fs, int32_t lanes, int32_t rows, const down_lanes_args & a, void * stream);
 
 // XB2: the routing meta of ids ([rows][10]) into meta (meta_bytes, 16-byte aligned) by a one-block launch of the
 // meta builder (experts_meta.cuh): the tests' and benches' reference, and the meta of a down launch that no gate_up
@@ -342,6 +358,22 @@ bool draft_q2_gate_up_inst(int32_t i, fmt & f, fn::dense::fmt & fg, fn::dense::f
 bool draft_q2_down_inst(int32_t i, fmt & f, fmt & fs, int32_t & first_layer);
 
 const char * fmt_name(fmt f);
+
+// FMS2 item 6 (XC-1): down_lanes with X-F sent by the launch. Each finished output value of the half peer_half (lane
+// k's row b < rows, joint row 5 k + b) is also stored to peer, canonical, joint row r at r words_half (the peer's joint
+// slot, as send_half_joint writes it); a block whose routing meta is bad sends zeros for its chunks of that half. peer
+// is 16-byte aligned, peer_half 0 or 1. FMS2 item 7: non-null x16_err, the send is 16-bit (fn/xchg/xchg.h
+// send_half_joint16's form: FP16 halves, joint row r at r x16_row_halves halves), and a value beyond FP16's range sets
+// err_x16_range there (the sending card's joint word).
+bool down_lanes_send(fmt                     f,
+                     fmt                     fs,
+                     int32_t                 lanes,
+                     int32_t                 rows,
+                     const down_lanes_args & a,
+                     uint32_t *              peer,
+                     int32_t                 peer_half,
+                     uint32_t *              x16_err,
+                     void *                  stream);
 
 } // namespace fn::experts
 

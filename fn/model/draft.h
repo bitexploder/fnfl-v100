@@ -135,4 +135,36 @@ struct draft_joint {
 step_status draft_joint_enqueue(draft_joint & j, int32_t rows, use_counters & u, std::string & err);
 step_status draft_joint_pair_enqueue(draft_joint * const j[2], int32_t rows, use_counters u[2], std::string & err);
 
+// FMS2 (build item 2): the joint catch-up. Lanes 2 .. 4, each a slot's catch-up of its own B_c rows (1 .. 5: its
+// descriptor's rows, read on the device, so one captured graph serves every round of the membership), in one launch
+// sequence a card on the joint frame: lane k's pass is its slot's with the lane frame (pass_lane_init: joint_rings'
+// lane k, the lane's rows of the joint layer_ws, its error list), its draft block its slot's. Per lane, its own
+// kernels: begin and stamp, the embedding (all five rows; the rows past B_c embed token 0 into the slot's boundary,
+// which nothing reads), eh_proj's B_c calls (fn::draft::eh_proj_gated), commit and finish. Every lane in one launch:
+// X-DRAFT-IN's send and receive (with the retained carry's update) and the K/V prepare (with the release of the
+// lane's slot 2) at each lane's B_c, the draft index's keys and summaries (sparse) at each lane's B_c, the HC
+// sublayer at B = 5 (fn::model::hc_sublayer_lanes), the K/V (and index key) product at five rows a lane
+// (dense_joint_run, acquiring each lane's X-HMIX). A lane's row below its B_c is bitwise its lone catch-up's (the
+// same device code at its B_c, or a kernel whose rows are each the row's own at any B: hc-test's rows alone, dense.h);
+// the rows past B_c of the HC and K/V work are computed from scratch and never read. Slots by the catch-up's rule on
+// every lane ring (catchup_joint_counters): the lane rings are left clean. Resident KV only, one draft form.
+struct catchup_joint {
+    int32_t lanes = 0;
+    pass_card * p[fn::xchg::max_lanes] = {};
+    draft_card * d[fn::xchg::max_lanes] = {};
+    const fn::xchg::joint_rings * jr = nullptr;
+    uint32_t * runs = nullptr;              // [max_lanes][fn::hc::n_runs_card] the lanes' up2 run counters, zeroed once
+    void * kv_work[2] = {nullptr, nullptr}; // the K/V product's joint work, dense and sparse forms, zeroed once
+    size_t kv_work_bytes[2] = {0, 0};
+};
+// the K/V product's joint work bytes of a draft form (fn::dense::joint_work_bytes of its shape)
+size_t catchup_kv_work_bytes(bool sparse);
+// the joint catch-up's counters, every round (a graph's, eagerly too): the catch-up's slot rule
+use_counters catchup_joint_counters();
+// One card's joint catch-up for a graph capture, and both cards in phases eagerly (the pair form's order). False
+// (failed), with nothing enqueued, for lanes outside 2 .. 4, lanes on other cards, streams or draft forms, the
+// host-backed KV, or a missing joint work region.
+step_status catchup_joint_enqueue(catchup_joint & j, use_counters & u, std::string & err);
+step_status catchup_joint_pair_enqueue(catchup_joint * const j[2], use_counters u[2], std::string & err);
+
 } // namespace fn::model

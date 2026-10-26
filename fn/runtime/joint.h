@@ -35,18 +35,71 @@ class joint_frame {
     joint_frame & operator=(const joint_frame &) = delete;
 
     // The joint rings, each card's joint layer_ws, dense work, routing and lanes' error lists, on the engine's
-    // streams; cache: graph pairs kept (1 .. 8); eager: no graphs, each round enqueued in phases. Synchronous.
-    bool init(model::model & m, void * const streams[2], int32_t cache, bool eager, std::string & err);
+    // streams; cache: graph pairs kept (1 .. 8); eager: no graphs, each round enqueued in phases; x16: the verify
+    // rounds' X-A and X-F in 16 bits (FMS2 item 7, fn/model/layer.h joint_lanes::x16); router_tc: the router on the tensor cores (FMS5,
+    // joint_lanes::router_tc); dense_f16: the quantized dense products at U = 3 and 4 in FP16 (FMS6,
+    // joint_lanes::dense_f16). Synchronous.
+    bool init(model::model & m,
+              void * const   streams[2],
+              int32_t        cache,
+              bool           eager,
+              bool           x16,
+              bool           router_tc,
+              bool           dense_f16,
+              std::string &  err);
     bool ready() const { return rings_ != nullptr; }
     bool eager() const { return eager_; }
+    bool x16() const { return x16_; }
+    bool router_tc() const { return router_tc_; }
+    bool dense_f16() const { return dense_f16_; }
 
-    // One joint round of n (2..4) members t[k], each a verify of d[k] = 4 proposals prop[k] under budget[k]: the
-    // graphs (captured on the membership's first round), every member staged, both cards' graphs launched, every
+    // One joint round of n (2..4) members t[k], each a verify of d[k] proposals prop[k] under budget[k] (FMS13: d in
+    // 1 .. 4, the same for every member; lanes of R = d + 1 rows): the graphs (captured on the membership's first
+    // round at that R), every member staged, both cards' graphs launched, every
     // member released, every member collected into r[k] / ok[k] / why[k] (a member's failure leaves the others' results
     // valid). False, with err, when the round did not launch: no member's state or ledger changed then, except as
     // `staged` says (its members were abandoned; the engine treats them as lost).
     bool verify(target * const t[], int32_t n, const int32_t d[], const int32_t * const prop[], const int32_t budget[],
                 round_result r[], bool ok[], std::string why[], bool & staged, std::string & err);
+    // TTTS1 (a split's front stage): verify's first half on the front's joint graphs: every member's front verify
+    // begun (target::joint_front_begin), both cards' graphs launched, every member released and waited
+    // (target::front_wait into fr[k] / r[k] / ok[k] / why[k]): the members' boundaries are then in their send buffers;
+    // each member's verdict is target::front_end, later. False, with err, when the round did not launch (as verify)
+    bool front_verify(target * const        t[],
+                      int32_t               n,
+                      const int32_t         d[],
+                      const int32_t * const prop[],
+                      const int32_t         budget[],
+                      target::front_round   fr[],
+                      round_result          r[],
+                      bool                  ok[],
+                      std::string           why[],
+                      bool &                staged,
+                      std::string &         err);
+    // TTTS1 (the drive's tests): a front stage's joint forced round of rows rows (2 .. 5) on n members (2 .. 4), on
+    // the verify's graphs; each member's completion seen (front_wait), its commit the back's (front_end)
+    bool front_forced(target * const      t[],
+                      int32_t             n,
+                      int32_t             rows,
+                      target::front_round fr[],
+                      round_result        r[],
+                      bool                ok[],
+                      std::string         why[],
+                      bool &              staged,
+                      std::string &       err);
+    // FMS2 item 7 (TEST ONLY, fnfl-drive joint-kl): one joint round of n (2..4) members t[k], each a forced round of
+    // rows (FMS13: R, 2 .. 5) of its ledger (target::joint_forced_begin), on the verify's graphs at R (the kind is the
+    // descriptor's):
+    // every row committed, each lane's logits in its slot's buffer. As verify otherwise; false, with err, when it did
+    // not launch. test_set_x16: the switch (init's x16) changed, the verify graphs dropped (captured again at use)
+    bool forced(target * const t[],
+                int32_t        n,
+                int32_t        rows,
+                round_result   r[],
+                bool           ok[],
+                std::string    why[],
+                std::string &  err);
+    void test_set_x16(bool on);
 
     // FMU2 (build item 2): one joint draft step of n (2..4) members t[k], each a draft step of d (1..4) chained steps
     // from its draft_n() as row k of one step (fn/model/draft.h draft_joint): the graphs (captured on the
@@ -61,12 +114,28 @@ class joint_frame {
     int32_t draft_captures() const { return draft_captures_; }
     int64_t draft_rounds() const { return draft_rounds_; }
 
+    // FMS2 (build item 2): one joint catch-up of n (2..4) members t[k], each a catch-up of rows[k] (1..5) from its
+    // draft_n() (target::draft_catchup's) as lane k of one launch sequence a card (fn/model/draft.h catchup_joint):
+    // the graphs (one pair a membership, its slots and draft form, captured at its first joint catch-up and cached
+    // as the verify's are; one graph serves every B_c), every member staged, both cards' graphs launched, every
+    // member released and collected into r[k] / ok[k] / why[k] (a member's failure leaves the others' results valid).
+    // False, with err, when it did not launch: no member's state changed, so each catches up alone. catchup_fits:
+    // every member drafting, in one draft attention form.
+    bool catchup(target * const t[], int32_t n, const int32_t rows[], round_result r[], bool ok[], std::string why[],
+                 std::string & err);
+    static bool catchup_fits(target * const t[], int32_t n);
+    int32_t catchup_captures() const { return catchup_captures_; }
+    int64_t catchup_rounds() const { return catchup_rounds_; }
+    // TEST ONLY (state-test mu1 catchup): each joint catch-up capture's node list written to dir (empty: none), one
+    // file a card, named by its lanes and draft form
+    void test_graph_nodes(const std::string & dir) { nodes_dir_ = dir; }
+
     // the resources' bytes on a card (init's), and the cached graphs' (measured at capture)
     int64_t bytes(int32_t card) const { return bytes_[card]; }
     int64_t graph_bytes(int32_t card) const;
     int32_t captures() const { return captures_; }
     int64_t rounds() const { return rounds_; }
-    // the last verify did not launch because its membership's graphs failed to capture
+    // the last verify (FMS2: or joint catch-up) did not launch because its membership's graphs failed to capture
     bool capture_failed() const { return capture_failed_; }
     // the last capture's free memory left on each card (cudaMemGetInfo after its upload), and its graph's nodes
     int64_t free_after_capture(int32_t card) const { return free_after_[card]; }
@@ -75,20 +144,36 @@ class joint_frame {
 
   private:
     struct graph_pair {
-        std::vector<int32_t> key; // per lane: slot, variant, expert map
+        std::vector<int32_t> key;  // per lane: slot, variant, expert map; FMS13: then R (verify graphs)
         void * graph[2] = {nullptr, nullptr};
         void * exec[2] = {nullptr, nullptr};
         int64_t bytes[2] = {0, 0};
         uint64_t used = 0;
     };
-    bool lanes(target * const t[], int32_t n, int32_t c, std::vector<std::unique_ptr<model::pass_card>> & lane,
-               model::joint_pass & jp, std::string & err);
-    bool capture(target * const t[], int32_t n, const std::vector<int32_t> & key, graph_pair & g, std::string & err);
-    bool enqueue_eager(target * const t[], int32_t n, std::string & err);
+
+    bool         lanes(target * const                                   t[],
+                       int32_t                                          n,
+                       int32_t                                          rows,
+                       int32_t                                          c,
+                       std::vector<std::unique_ptr<model::pass_card>> & lane,
+                       model::joint_pass &                              jp,
+                       std::string &                                    err);
+    bool         capture(target * const               t[],
+                         int32_t                      n,
+                         int32_t                      rows,
+                         const std::vector<int32_t> & key,
+                         graph_pair &                 g,
+                         std::string &                err);
+    bool         enqueue_eager(target * const t[], int32_t n, int32_t rows, std::string & err);
     void draft_lanes(target * const t[], int32_t n, int32_t c, model::draft_joint & j);
     bool capture_draft(target * const t[], int32_t n, int32_t d, const std::vector<int32_t> & key, graph_pair & g,
                        std::string & err);
+    bool catchup_lanes(target * const t[], int32_t n, int32_t c, std::vector<std::unique_ptr<model::pass_card>> & lane,
+                       model::catchup_joint & j, std::string & err);
+    bool capture_catchup(target * const t[], int32_t n, const std::vector<int32_t> & key, graph_pair & g,
+                         std::string & err);
     graph_pair * cached(std::vector<graph_pair> & cache, const std::vector<int32_t> & key);
+    bool         verify_graphs(target * const t[], int32_t n, int32_t rows, graph_pair *& g, std::string & err);
     void drop(graph_pair & g);
     bool clear_after_error(std::string & err);
 
@@ -100,12 +185,16 @@ class joint_frame {
     void * route_[2] = {nullptr, nullptr}; // the joint routing (IDs, weights)
     void * errs_[2] = {nullptr, nullptr};  // max_lanes error lists of fn::round::max_err pointers
     void * jd_[2] = {nullptr, nullptr};    // the joint draft's rows: tokens, retained carries, head output, the word 1
+    void * cu_[2] = {nullptr, nullptr};    // FMS2: the joint catch-up's lanes' up2 run counters and K/V work
+    void * kw_[2] = {nullptr, nullptr};    // FMS2: the lanes' kernel workspaces (model::joint_kernel_ws_bytes)
     model::layer_ws lws_[2];
     model::dense_layouts layouts_{};
     uint64_t ple_use_[fn::xchg::max_lanes] = {}; // each lane ring's PLE uses (its X-PLE-STATS slot sequence)
     std::vector<graph_pair> cache_;
     std::vector<graph_pair> dcache_; // the joint draft's graphs (key: per lane its slot, then d, the draft form and
                                      // the pick kind)
+    std::vector<graph_pair> ccache_; // FMS2: the joint catch-up's graphs (key: per lane its slot, then the draft form)
+    std::string nodes_dir_;
     int32_t cache_max_ = 2;
     uint64_t use_clock_ = 0;
     int64_t bytes_[2] = {0, 0};
@@ -115,9 +204,15 @@ class joint_frame {
     int32_t captures_ = 0;
     int32_t draft_captures_ = 0;
     int64_t draft_rounds_ = 0;
+    int32_t catchup_captures_ = 0;
+    int64_t catchup_rounds_ = 0;
     int64_t rounds_ = 0;
     bool capture_failed_ = false;
     bool eager_ = false;
+    bool                    x16_                   = false;
+    bool router_tc_ = false;
+    bool dense_f16_ = false;
+    bool refused_noted_[model::layer_max_rows + 1] = {};  // FMS13: x16 / group refused at this R, named once
 };
 
 } // namespace fn::runtime

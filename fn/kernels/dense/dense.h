@@ -194,6 +194,12 @@ bool product(int32_t rows, const product_args & a, void * stream);
 
 const char * fmt_name(fmt f);
 
+// FMS2 (build item 2, the joint catch-up's eh_proj): product(4, a), whose blocks all return at once, writing nothing,
+// when the device word *gate <= at (read on the device, so a captured graph holds the launch whatever the round's
+// rows): the lone launch's device code otherwise, so its outputs are product(4, a)'s bitwise. Four rows, no router
+// and no F32 matrix (else false, with nothing enqueued).
+bool product_gated(int32_t rows, const product_args & a, const int32_t * gate, int32_t at, void * stream);
+
 // FMU2, the joint product: U lanes (2 .. max_lanes) of lane_rows rows in one launch that reads every weight once. Row
 // b = lane_rows u + i is lane u's row i. Each row's arithmetic is the lone launch's at B = 5 (the same per-lane dot
 // products, shuffle trees and part order; splits and tiles from the shape), so every output of lane u is bitwise equal
@@ -206,6 +212,12 @@ const char * fmt_name(fmt f);
 // layout, joint_layout_of), zeroed once, private to joint launches of the same layout (any U). Dynamic shared memory:
 // U x 5 x 1.5 K bytes of staged activations (92,160 B at U = 4, K 3,072) plus the IQ3_S grid, or the router's 20 rows
 // (51,200 B) when larger, above the 48 KB default (the launch sets the kernel's opt-in attribute).
+// FMS13: joint_args::rows = R (2 .. lane_rows, the round's d + 1) rows a lane, every lane alike. The buffers keep the
+// lane_rows stride (lane u's rows at row lane_rows u), and only rows 0 .. R - 1 of each lane are read or written; each
+// row's arithmetic is the lone launch's at B = R (describe(R): its splits and checks), so with the non-bitwise switches
+// off every output of lane u is bitwise product(R, ...) on lane u's rows. Inside the kernel the U R rows are packed
+// (row b = R u + i), and the forms are keyed on U R: the integer step at up to 10 rows, FP16 (dense_f16) at 12 or more,
+// BF16's shared wide form at up to 15 and its per-lane form above.
 constexpr int32_t lane_rows = max_rows;
 constexpr int32_t max_lanes = 4;
 constexpr int32_t max_joint_rows = lane_rows * max_lanes;
@@ -213,6 +225,7 @@ constexpr int32_t max_lane_mats = 2; // matrices with lane outputs (joint_args::
 
 struct joint_args {
     int32_t lanes = 0;
+    int32_t       rows             = lane_rows;  // FMS13: R, every lane's rows (2 .. lane_rows)
     int32_t hmix_lane_floats = 0; // X-HMIX: from lane u's slot to lane u + 1's (a multiple of 4)
     conv_args conv[max_lanes];
     // lane outputs: F32-epilogue matrix i's lane u rows go to out[i][u] (lane_rows rows of m, 16-byte aligned;
@@ -222,6 +235,38 @@ struct joint_args {
     // per-lane F32 activations (PLE, FMU2 build item 4): lane u's lane_rows rows of K at x_f32[u] (16-byte aligned;
     // BF16 matrices only, a.x_f32 ignored); all null: a.x_f32's (or X-HMIX's) rows
     const float * x_f32[max_lanes] = {};
+    // FMS2 item 6 (XC-1): X-A sent by the producer. Non-null: matrix 0 (the only matrix: F32 epilogue, split > 1, m =
+    // 2 words_half, no lane outputs) also stores each finished value of its rows' half peer_half, as its tile's last
+    // split arrives, to peer: canonical words, row b at b words_half (the peer's joint slot, as send_half_joint)
+    uint32_t * peer = nullptr;
+    int32_t peer_half = 0;
+    // FMS2 item 7: non-null with peer, the send is 16-bit (xchg.h send_half_joint16's form: FP16 halves, row b at b
+    // x16_row_halves halves) and a value beyond FP16's range sets err_x16_range here (the sending card's joint word)
+    uint32_t * x16_err = nullptr;
+    // FMS5 (engine_config::joint_router_tc; ends at FMS5's disposition): the router launch (route set, the target's
+    // BF16 logits [2560 -> 512] and shared gate [2560 -> 1], no lane outputs, no peer) on the tensor cores. Not
+    // bitwise the lone launch: each logit within 2^-14 x sum |w x| of FP64 on the same BF16 weights and F32
+    // activations (dense_joint_test), the IDs, weights and gate then by the lone epilogue on those logits. Contract:
+    //   weights: BF16 bits to F32 (exact), then FP16 round to nearest in registers (exact for 2^-14 <= |w| <= 65,504;
+    //            the loader counts the rest); activations x as hi = f16(x) and lo = f16(x - hi) (about 22 bits;
+    //            |x| < 65,504 assumed); products W hi + W lo by mma.sync m8n8k4 (HMMA.884) with F32 accumulators.
+    //   layout:  72 blocks, 9 row groups (8 of 64 logit rows, then the gate's row) x 8 K slices of 320; warp w takes
+    //            8 rows (m-tile w % 8) and K half w / 8 of its block's slice, the U x 5 rows padded to 8s on the N
+    //            side; the quadpairs' K chunks summed by xor 4 then 8, the halves in shared memory (half 0 + half 1);
+    //            each block's partials [slice][24 rows][576] F32 to work, the last of a group's 8 blocks summing the
+    //            slices in slice order. Deterministic: two runs are bitwise identical.
+    //   work:    joint_work_bytes reserves the group counters and partials after the joint layout's words.
+    bool router_tc = false;
+    // FMS6 (engine_config::joint_dense_f16; ends at FMS6's disposition): the quantized matrices at U = 3 and 4 in FP16
+    // on the tensor cores (U = 2, the BF16 matrices and the epilogues as without it). Not bitwise the lone launch:
+    // each output within 2^-8 x sum |w| |x| of FP64 on the same decoded weights and activations (code x d), with
+    // |c f| + |m| for |w| in Q4_K and Q5_K (dense_joint_test). Contract:
+    //   weights: the code's exact integer in FP16 (Q6_K: c - 32), times the part's scale RN16(f) (Q6_K: RN16(d sc)),
+    //            Q4_K and Q5_K c RN16(f) - RN16(m) in one HFMA2, one rounding each;
+    //   activations: the staged code s exactly in FP16, times RN16(d) of its 32-run, one rounding;
+    //   products by mma.sync m8n8k4 (HMMA.884) with F32 accumulators carried over the unit's whole K, the quarters
+    //   summed by xor 4 then 8; layout, splits and part order as without it. Deterministic.
+    bool dense_f16 = false;
 };
 
 // The joint launch's work layout, the same at every U: lone layout_of's counters and router counter; a split or glu

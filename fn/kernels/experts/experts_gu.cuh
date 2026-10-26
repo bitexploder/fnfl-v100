@@ -18,12 +18,42 @@ namespace {
 using dfmt = fn::dense::fmt;
 
 // One row's sub-block, decoded: 8 grid words, their 8 sign masks and the sub-block scale(s) (two for the formats
-// with a 4-bit scale per 16 weights). dw1 is unused when split is false.
+// with a 4-bit scale per 16 weights). dw1 is unused when split is false. FMS4: for the signed formats (signed_words)
+// g holds the signed words themselves and m is unused.
 struct row_dec {
     uint32_t g[8];
     uint32_t m[8];
     float dw0, dw1;
 };
+
+// FMS4: the formats whose decoders write signed grid words into row_dec::g: IQ3_S (item 1, its grid bytes are odd)
+// and the three IQ2 formats (item 2, their selector tables)
+__host__ __device__ constexpr bool signed_words(fmt f) {
+    return f == fmt::iq3_s || f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s;
+}
+
+// A row's integer sums over its sub-block: lo over words 0..3 and hi over 4..7 (SPLIT), or lo over all 8. SGN: rd.g
+// holds signed words, one dp4a a word; else dot_word's mask form, p - 2n. Both are the same integers.
+template <bool SPLIT, bool SGN>
+__device__ __forceinline__ void row_sums(const row_dec & rd, const uint32_t (&act)[8], int32_t & lo, int32_t & hi) {
+    if constexpr (SGN) {
+        lo = 0;
+        hi = 0;
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            int32_t & s = i < 4 || !SPLIT ? lo : hi;
+            s = __dp4a(static_cast<int32_t>(rd.g[i]), static_cast<int32_t>(act[i]), s);
+        }
+    } else {
+        dot2 l = {0, 0}, h = {0, 0};
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            dot_word(i < 4 || !SPLIT ? l : h, rd.g[i], rd.m[i], act[i]);
+        }
+        lo = l.p - 2 * l.n;
+        hi = h.p - 2 * h.n;
+    }
+}
 
 // ---- gate/up ----------------------------------------------------------------------------------------------------
 constexpr int32_t x_meta = n_sub * 16; // bytes of a row's staged run meta {d, s, sum of codes 0..15, 16..31}
@@ -161,7 +191,7 @@ __device__ __forceinline__ void block_units(const meta_c<C> & m, const class_tab
 
 // Row partials: for each routed row b, (dw * da_b) * isum, summed over the 4 records of the warp that share rs, then
 // stored for the cross-warp sum: red[buf][b][r][w], r = rs + 8 m.
-template <bool SPLIT, int B, typename DA>
+template <bool SPLIT, bool SGN, int B, typename DA>
 __device__ __forceinline__ void row_out(const row_dec & rd, const uint32_t (&act)[B][8], const DA & da, uint32_t mask,
                                         float * red_buf, int32_t r, int32_t w, int32_t lane) {
 #pragma unroll
@@ -169,17 +199,13 @@ __device__ __forceinline__ void row_out(const row_dec & rd, const uint32_t (&act
         if (((mask >> b) & 1u) == 0) {
             continue;
         }
-        dot2 lo = {0, 0}, hi = {0, 0};
-#pragma unroll
-        for (int32_t i = 0; i < 8; ++i) {
-            dot_word(i < 4 || !SPLIT ? lo : hi, rd.g[i], rd.m[i], act[b][i]);
-        }
+        int32_t lo, hi;
+        row_sums<SPLIT, SGN>(rd, act[b], lo, hi);
         float part;
         if (SPLIT) {
-            part =
-                (rd.dw0 * static_cast<float>(lo.p - 2 * lo.n) + rd.dw1 * static_cast<float>(hi.p - 2 * hi.n)) * da[b];
+            part = (rd.dw0 * static_cast<float>(lo) + rd.dw1 * static_cast<float>(hi)) * da[b];
         } else {
-            part = (rd.dw0 * da[b]) * static_cast<float>(lo.p - 2 * lo.n);
+            part = (rd.dw0 * da[b]) * static_cast<float>(lo);
         }
         part += __shfl_xor_sync(0xffffffffu, part, 8);
         part += __shfl_xor_sync(0xffffffffu, part, 16);
@@ -192,19 +218,16 @@ __device__ __forceinline__ void row_out(const row_dec & rd, const uint32_t (&act
 // XB3 K1 (K1's row_out1, k1 99460ed): row_out for a unit with one routed row b0, without the row test: act and da
 // are row b0's, read for the unit, and red_row = red_buf + b0 * 64 * red_stride, so the partial lands where row_out
 // puts row b0's (the same dots in the same order: bitwise row_out's)
-template <bool SPLIT>
+template <bool SPLIT, bool SGN>
 __device__ __forceinline__ void row_out1(const row_dec & rd, const uint32_t (&act)[8], float da, float * red_row,
                                          int32_t r, int32_t w, int32_t lane) {
-    dot2 lo = {0, 0}, hi = {0, 0};
-#pragma unroll
-    for (int32_t i = 0; i < 8; ++i) {
-        dot_word(i < 4 || !SPLIT ? lo : hi, rd.g[i], rd.m[i], act[i]);
-    }
+    int32_t lo, hi;
+    row_sums<SPLIT, SGN>(rd, act, lo, hi);
     float part;
     if (SPLIT) {
-        part = (rd.dw0 * static_cast<float>(lo.p - 2 * lo.n) + rd.dw1 * static_cast<float>(hi.p - 2 * hi.n)) * da;
+        part = (rd.dw0 * static_cast<float>(lo) + rd.dw1 * static_cast<float>(hi)) * da;
     } else {
-        part = (rd.dw0 * da) * static_cast<float>(lo.p - 2 * lo.n);
+        part = (rd.dw0 * da) * static_cast<float>(lo);
     }
     part += __shfl_xor_sync(0xffffffffu, part, 8);
     part += __shfl_xor_sync(0xffffffffu, part, 16);
@@ -224,7 +247,7 @@ struct smem_da {
 // SP2, B = 5: row_out for the routed rows b0 + 1 + k (bit k of rest, k < 4) with each row's activation fragment of
 // sub-block j and its d read from shared memory at the record (xs, xm: the staged rows), so no row's fragment is held
 // in registers across the unit; each row's dots, partial and stores are row_out's (bitwise the same partials)
-template <bool SPLIT>
+template <bool SPLIT, bool SGN>
 __device__ __forceinline__ void row_out_s(const row_dec & rd, const uint8_t * xs, const float4 * xm, int32_t j,
                                           int32_t b1, uint32_t rest, float * red_buf, int32_t r, int32_t w,
                                           int32_t lane) {
@@ -238,16 +261,13 @@ __device__ __forceinline__ void row_out_s(const row_dec & rd, const uint8_t * xs
         const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
         const uint32_t act[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
         const float da = xm[b * n_sub + j].x;
-        dot2 lo = {0, 0}, hi = {0, 0};
-#pragma unroll
-        for (int32_t i = 0; i < 8; ++i) {
-            dot_word(i < 4 || !SPLIT ? lo : hi, rd.g[i], rd.m[i], act[i]);
-        }
+        int32_t lo, hi;
+        row_sums<SPLIT, SGN>(rd, act, lo, hi);
         float part;
         if (SPLIT) {
-            part = (rd.dw0 * static_cast<float>(lo.p - 2 * lo.n) + rd.dw1 * static_cast<float>(hi.p - 2 * hi.n)) * da;
+            part = (rd.dw0 * static_cast<float>(lo) + rd.dw1 * static_cast<float>(hi)) * da;
         } else {
-            part = (rd.dw0 * da) * static_cast<float>(lo.p - 2 * lo.n);
+            part = (rd.dw0 * da) * static_cast<float>(lo);
         }
         part += __shfl_xor_sync(0xffffffffu, part, 8);
         part += __shfl_xor_sync(0xffffffffu, part, 16);
@@ -262,7 +282,7 @@ __device__ __forceinline__ void row_out_s(const row_dec & rd, const uint8_t * xs
 // from shared memory (xs, xm: the staged rows) at its turn, so the unit holds no fragment but b0's. Each row's dots,
 // partial and slot are row_out's (bitwise the same partials); the store is row_out1's predicated one. The loop's
 // control is the unit's mask, block-uniform, so the full-mask shuffles see every lane.
-template <bool SPLIT>
+template <bool SPLIT, bool SGN>
 __device__ __forceinline__ void row_out_c(const row_dec & rd, const uint8_t * xs, const float4 * xm, int32_t j,
                                           uint32_t rest, float * red_buf, int32_t r, int32_t w, int32_t lane) {
 #pragma unroll 1
@@ -272,16 +292,13 @@ __device__ __forceinline__ void row_out_c(const row_dec & rd, const uint8_t * xs
         const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
         const uint32_t act[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
         const float da = xm[b * n_sub + j].x;
-        dot2 lo = {0, 0}, hi = {0, 0};
-#pragma unroll
-        for (int32_t i = 0; i < 8; ++i) {
-            dot_word(i < 4 || !SPLIT ? lo : hi, rd.g[i], rd.m[i], act[i]);
-        }
+        int32_t lo, hi;
+        row_sums<SPLIT, SGN>(rd, act, lo, hi);
         float part;
         if (SPLIT) {
-            part = (rd.dw0 * static_cast<float>(lo.p - 2 * lo.n) + rd.dw1 * static_cast<float>(hi.p - 2 * hi.n)) * da;
+            part = (rd.dw0 * static_cast<float>(lo) + rd.dw1 * static_cast<float>(hi)) * da;
         } else {
-            part = (rd.dw0 * da) * static_cast<float>(lo.p - 2 * lo.n);
+            part = (rd.dw0 * da) * static_cast<float>(lo);
         }
         part += __shfl_xor_sync(0xffffffffu, part, 8);
         part += __shfl_xor_sync(0xffffffffu, part, 16);
@@ -370,6 +387,8 @@ __device__ __forceinline__ void dec_iq3_xxs(row_dec & rd, uint2 q, uint32_t sg, 
     rd.dw0 = dh * (0.5f + static_cast<float>(sg >> 28)) * 0.5f;
 }
 
+// FMS4 item 1: the signed words, g ^ (m & 0xfefefefe) with m the sign mask (0xff in each negative byte). Every IQ3_S
+// grid byte u is odd, so u ^ 0xfe is -u exactly (fnfl/evidence/fms4-decode-recipes/verify.py): one LOP3 a word.
 __device__ __forceinline__ void dec_iq3_s(row_dec & rd, uint2 q, uint32_t sg, uint32_t qh, uint32_t sc, float dh,
                                           const uint32_t * grid) {
 #pragma unroll
@@ -380,47 +399,38 @@ __device__ __forceinline__ void dec_iq3_s(row_dec & rd, uint2 q, uint32_t sg, ui
 #pragma unroll
     for (int32_t l = 0; l < 4; ++l) {
         const uint32_t s = (sg >> (8 * l)) & 0xffu;
-        rd.m[2 * l] = sign_lo(s);
-        rd.m[2 * l + 1] = sign_hi(s);
+        rd.g[2 * l] ^= sign_lo(s) & 0xfefefefeu;
+        rd.g[2 * l + 1] ^= sign_hi(s) & 0xfefefefeu;
     }
     rd.dw0 = dh * static_cast<float>(1 + 2 * static_cast<int32_t>(sc));
 }
 
-__device__ __forceinline__ void dec_iq2_xxs(row_dec & rd, uint2 q, float dh, const uint2 * grid) {
+// FMS4 item 2: the IQ2 decoders give the signed words (m unused), from the selector tables (grid: 4 bytes an entry)
+__device__ __forceinline__ void dec_iq2_xxs(row_dec & rd, uint2 q, float dh, const uint32_t * grid) {
 #pragma unroll
     for (int32_t l = 0; l < 4; ++l) {
-        const uint2 g = grid[__byte_perm(q.x, 0, 0x4440 + l)];
-        rd.g[2 * l] = g.x;
-        rd.g[2 * l + 1] = g.y;
-        sign_masks7((q.y >> (7 * l)) & 0x7fu, rd.m[2 * l], rd.m[2 * l + 1]);
+        iq2_signed(grid[__byte_perm(q.x, 0, 0x4440 + l)], sign8_of7((q.y >> (7 * l)) & 0x7fu), rd.g[2 * l],
+                   rd.g[2 * l + 1]);
     }
     rd.dw0 = dh * (0.5f + static_cast<float>(q.y >> 28)) * 0.25f;
 }
 
-__device__ __forceinline__ void dec_iq2_xs(row_dec & rd, uint2 q, uint32_t sc, float dh, const uint2 * grid) {
+__device__ __forceinline__ void dec_iq2_xs(row_dec & rd, uint2 q, uint32_t sc, float dh, const uint32_t * grid) {
 #pragma unroll
     for (int32_t l = 0; l < 4; ++l) {
         const uint32_t v = ((l < 2 ? q.x : q.y) >> (16 * (l & 1))) & 0xffffu;
-        const uint2 g = grid[v & 511u];
-        rd.g[2 * l] = g.x;
-        rd.g[2 * l + 1] = g.y;
-        sign_masks7(v >> 9, rd.m[2 * l], rd.m[2 * l + 1]);
+        iq2_signed(grid[v & 511u], sign8_of7(v >> 9), rd.g[2 * l], rd.g[2 * l + 1]);
     }
     rd.dw0 = dh * (0.5f + static_cast<float>(sc & 0xfu)) * 0.25f;
     rd.dw1 = dh * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
 }
 
 __device__ __forceinline__ void dec_iq2_s(row_dec & rd, uint32_t qs, uint32_t sg, uint32_t qh, uint32_t sc, float dh,
-                                          const uint2 * grid) {
+                                          const uint32_t * grid) {
 #pragma unroll
     for (int32_t l = 0; l < 4; ++l) {
         const uint32_t idx = __byte_perm(qs, 0, 0x4440 + l) | ((qh << (8 - 2 * l)) & 0x300u);
-        const uint2 g = grid[idx];
-        rd.g[2 * l] = g.x;
-        rd.g[2 * l + 1] = g.y;
-        const uint32_t s = (sg >> (8 * l)) & 0xffu;
-        rd.m[2 * l] = sign_lo(s);
-        rd.m[2 * l + 1] = sign_hi(s);
+        iq2_signed(grid[idx], sg >> (8 * l), rd.g[2 * l], rd.g[2 * l + 1]); // the sign byte's 8 explicit bits
     }
     rd.dw0 = dh * (0.5f + static_cast<float>(sc & 0xfu)) * 0.25f;
     rd.dw1 = dh * (0.5f + static_cast<float>(sc >> 4)) * 0.25f;
@@ -568,7 +578,7 @@ template <fmt F> struct gu_fc {
 // XB3 part 6, the IQ2 body: one gate_up symbol a B for the three IQ2 routed formats and every shared pair they meet,
 // the formats run-time data (gate_up_args' u_f, u_fg, u_fu). Its shared memory holds the largest IQ2 grid (IQ2_S's) and
 // always the IQ3_S grid of a shared matrix after it.
-constexpr int32_t gu_u_table = 8192;
+constexpr int32_t gu_u_table = 4096; // FMS4 item 2: IQ2_S's selector table
 static_assert(gu_layout_of(fmt::iq2_xxs).grid_len <= gu_u_table && gu_layout_of(fmt::iq2_xs).grid_len <= gu_u_table &&
                   gu_layout_of(fmt::iq2_s).grid_len <= gu_u_table,
               "the IQ2 grids fit the body's grid region");
@@ -936,7 +946,7 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                     }
                     [[maybe_unused]] row_dec rd;
                     if constexpr (F == fmt::iq2_xxs || F == fmt::iq2_xs) {
-                        const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
+                        const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                         for (int32_t h = 0; h < 2; ++h) {
                             const int32_t mrow = 2 * c + h;
@@ -957,7 +967,7 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                             sc8 = take8(v.z, v.w); // scales of rows 0..7
                             continue;
                         }
-                        const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
+                        const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                         for (int32_t h = 0; h < 2; ++h) {
                             const int32_t mrow = 2 * (c - 1) + h;
@@ -1044,6 +1054,7 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                 });
             } else {
                 constexpr bool SPLIT = F == fmt::iq2_xs || F == fmt::iq2_s;
+                constexpr bool SGN = signed_words(F);
                 const auto row_act = [&](int32_t b, uint32_t (&o)[8], float & d) {
                     const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
                     const uint4 c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
@@ -1066,10 +1077,10 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                     // activation registers stay act1's (B = 4's actr beside act1 already sat at the cap)
                     chunks([&](const row_dec & rd, int32_t r) {
                         const int32_t bb = opaque(b0);
-                        row_out1<SPLIT>(rd, act1, da1, red_buf + bb * 64 * red_stride, r, w, lane);
+                        row_out1<SPLIT, SGN>(rd, act1, da1, red_buf + bb * 64 * red_stride, r, w, lane);
                         const uint32_t rest = mask >> (bb + 1); // bit k: row b0 + 1 + k
                         if (rest != 0u) {
-                            row_out_s<SPLIT>(rd, sv.xs, sv.xm, j, bb + 1, rest, red_buf, r, w, lane);
+                            row_out_s<SPLIT, SGN>(rd, sv.xs, sv.xm, j, bb + 1, rest, red_buf, r, w, lane);
                         }
                     });
                 } else if constexpr (B == 4) {
@@ -1082,21 +1093,21 @@ __global__ void __launch_bounds__(gu_threads, 1) gate_up_kernel(gate_up_args a) 
                     // the rows' places and the rest's mask from b0 at each use (opaque): held a unit, they spilled
                     chunks([&](const row_dec & rd, int32_t r) {
                         const int32_t bb = opaque(b0);
-                        row_out1<SPLIT>(rd, act1, da1, red_buf + bb * 64 * red_stride, r, w, lane);
+                        row_out1<SPLIT, SGN>(rd, act1, da1, red_buf + bb * 64 * red_stride, r, w, lane);
                         const uint32_t rest = mask >> (bb + 1); // bit k: row b0 + 1 + k
                         if (rest != 0u) {
                             const smem_da dar = {sv.xm + (bb + 1) * n_sub + j};
-                            row_out<SPLIT, B - 1>(rd, actr, dar, rest, red_buf + (bb + 1) * 64 * red_stride, r, w,
-                                                  lane);
+                            row_out<SPLIT, SGN, B - 1>(rd, actr, dar, rest, red_buf + (bb + 1) * 64 * red_stride, r,
+                                                       w, lane);
                         }
                     });
                 } else {
                     float * red1 = red_buf + b0 * 64 * red_stride;
                     const uint32_t rest = mask & (mask - 1u);
                     chunks([&](const row_dec & rd, int32_t r) {
-                        row_out1<SPLIT>(rd, act1, da1, red1, r, w, lane);
+                        row_out1<SPLIT, SGN>(rd, act1, da1, red1, r, w, lane);
                         if (rest != 0u) {
-                            row_out<SPLIT, B>(rd, act, da, rest, red_buf, r, w, lane);
+                            row_out<SPLIT, SGN, B>(rd, act, da, rest, red_buf, r, w, lane);
                         }
                     });
                 }
@@ -1210,7 +1221,7 @@ static_assert(gp_warps * 2 == gp_parts && 2 * gp_warps == 20, "the shared unit's
 // row_out over the unit's active rows, held as compact fragments: slot k is the unit's k-th active row (slot 0 the
 // first, always active), roff[k] its partials' offset; the slots past n_act are neither loaded nor read. Each row's
 // dots and partial are row_out's.
-template <bool SPLIT, int B>
+template <bool SPLIT, bool SGN, int B>
 __device__ __forceinline__ void rows_out_p(const row_dec & rd, const uint32_t (&act)[B][8], const float (&da)[B],
                                            const int32_t (&roff)[B], int32_t n_act, float * red_buf, int32_t r,
                                            int32_t part_w, int32_t lane) {
@@ -1219,17 +1230,13 @@ __device__ __forceinline__ void rows_out_p(const row_dec & rd, const uint32_t (&
         if (k > 0 && k >= n_act) {
             break;
         }
-        dot2 lo = {0, 0}, hi = {0, 0};
-#pragma unroll
-        for (int32_t i = 0; i < 8; ++i) {
-            dot_word(i < 4 || !SPLIT ? lo : hi, rd.g[i], rd.m[i], act[k][i]);
-        }
+        int32_t lo, hi;
+        row_sums<SPLIT, SGN>(rd, act[k], lo, hi);
         float part;
         if (SPLIT) {
-            part = (rd.dw0 * static_cast<float>(lo.p - 2 * lo.n) + rd.dw1 * static_cast<float>(hi.p - 2 * hi.n)) *
-                   da[k];
+            part = (rd.dw0 * static_cast<float>(lo) + rd.dw1 * static_cast<float>(hi)) * da[k];
         } else {
-            part = (rd.dw0 * da[k]) * static_cast<float>(lo.p - 2 * lo.n);
+            part = (rd.dw0 * da[k]) * static_cast<float>(lo);
         }
         part += __shfl_xor_sync(0xffffffffu, part, 4);
         part += __shfl_xor_sync(0xffffffffu, part, 8);
@@ -1468,6 +1475,7 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
             constexpr int32_t CC = FC::CC;
             constexpr int32_t QQ = 2 * CC; // a unit's chunks: two records
             constexpr bool SPLIT = FC::f == fmt::iq2_xs || FC::f == fmt::iq2_s;
+            constexpr bool SGN = signed_words(FC::f);
             // The block's routed unit i, then its next one (none: -1); the ring slot of chunk q2 is (P + q2) %
             // gp_depth, a constant, and the last refills target the next unit (or this tile again after the last)
             const auto run_unit = [&](auto phase, int32_t i, int32_t buf) {
@@ -1494,7 +1502,7 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
                     roff[k] = b * 64 * red_stride;
                 }
                 const auto out = [&](const row_dec & rd, int32_t r) {
-                    rows_out_p<SPLIT, B>(rd, act, da, roff, n_act, red_buf, r, part_w, lane);
+                    rows_out_p<SPLIT, SGN, B>(rd, act, da, roff, n_act, red_buf, r, part_w, lane);
                 };
 
                 float dh8[8];
@@ -1524,7 +1532,7 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
                     const int32_t c = q - 1 - FC::NA;
                     row_dec rd;
                     if constexpr (FC::f == fmt::iq2_xxs || FC::f == fmt::iq2_xs) {
-                        const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
+                        const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                         for (int32_t h = 0; h < 2; ++h) {
                             const int32_t mrow = 2 * c + h;
@@ -1542,7 +1550,7 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
                             sc8 = take8(v.z, v.w); // scales of rows 0..7
                             continue;
                         }
-                        const uint2 * grid = reinterpret_cast<const uint2 *>(sv.grid);
+                        const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
 #pragma unroll
                         for (int32_t h = 0; h < 2; ++h) {
                             const int32_t mrow = 2 * (c - 1) + h;
@@ -1758,39 +1766,65 @@ bool gate_up_pair_u(fmt f, dfmt fg, dfmt fu, int32_t rows, const gate_up_pair_ar
     return rows == 4 ? launch_gate_up_pair<4, FAM>(u, st) : rows == 5 && launch_gate_up_pair<5, FAM>(u, st);
 }
 
-// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B = 5, NB = 72 / lanes blocks a
-// lane; the caller (experts.cu gate_up_lanes) has checked the lanes and the triple
+// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B rows a lane (FMS13: the
+// round's R; 5 before), NB = 72 / lanes blocks a lane; the caller (experts.cu gate_up_lanes) has checked the lanes, the
+// rows and the triple
 static_assert(gu_list_ok<5, n_sm / 3>() && gu_list_ok<5, n_sm / 4>(), "a lane's units over 24 or 18 blocks: one warp");
-template <typename FAM, int NB> bool launch_gate_up_lanes(const gate_up_lanes_args & a, cudaStream_t st) {
-    constexpr int32_t smem = gu_u_smem_bytes<5, FAM, NB>();
+
+template <typename FAM, int B, int NB> bool launch_gate_up_lanes(const gate_up_lanes_args & a, cudaStream_t st) {
+    static_assert(gu_list_ok<cap_of(B), NB>(), "a lane's units over NB blocks: one warp");
+    constexpr int32_t smem = gu_u_smem_bytes<B, FAM, NB>();
     static_assert(smem <= 96 * 1024, "one block's shared memory");
     static std::atomic<uint32_t> attr_done{0u};
-    const void * k = reinterpret_cast<const void *>(gate_up_kernel_u_lanes<FAM, 5, gu_depth, NB>);
+    const void *                 k = reinterpret_cast<const void *>(gate_up_kernel_u_lanes<FAM, B, gu_depth, NB>);
     if (!detail::smem_attr_once(attr_done, k, smem)) {
         return false;
     }
-    gate_up_kernel_u_lanes<FAM, 5, gu_depth, NB><<<n_sm, gu_threads, smem, st>>>(a);
+    gate_up_kernel_u_lanes<FAM, B, gu_depth, NB><<<n_sm, gu_threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+template <typename FAM, int B> bool gate_up_lanes_b(int32_t lanes, const gate_up_lanes_args & u, cudaStream_t st) {
+    switch (lanes) {
+        case 2:
+            return launch_gate_up_lanes<FAM, B, n_sm / 2>(u, st);
+        case 3:
+            return launch_gate_up_lanes<FAM, B, n_sm / 3>(u, st);
+        case 4:
+            return launch_gate_up_lanes<FAM, B, n_sm / 4>(u, st);
+        default:
+            return false;
+    }
+}
+
+// FMS13: the lone launch's body at B = rows: the IQ2 body at 2 .. 5; the IQ3 body is B = 4 and 5 only (at B <= 3 the
+// lone IQ3 launch is the per-triple gate_up_kernel, which has no lanes form: experts.cu refuses those lanes)
 template <typename FAM>
-bool gate_up_lanes_u(fmt f, dfmt fg, dfmt fu, int32_t lanes, const gate_up_lanes_args & a, cudaStream_t st) {
+bool gate_up_lanes_u(fmt                        f,
+                     dfmt                       fg,
+                     dfmt                       fu,
+                     int32_t                    lanes,
+                     int32_t                    rows,
+                     const gate_up_lanes_args & a,
+                     cudaStream_t               st) {
     gate_up_lanes_args u = a;
     for (int32_t k = 0; k < lanes; ++k) {
         u.s[k].u_f = int32_t(f);
         u.s[k].u_fg = int32_t(fg);
         u.s[k].u_fu = int32_t(fu);
     }
-    switch (lanes) {
-        case 2:
-            return launch_gate_up_lanes<FAM, n_sm / 2>(u, st);
-        case 3:
-            return launch_gate_up_lanes<FAM, n_sm / 3>(u, st);
-        case 4:
-            return launch_gate_up_lanes<FAM, n_sm / 4>(u, st);
-        default:
-            return false;
+    if constexpr (!FAM::iq3) {
+        if (rows == 2) {
+            return gate_up_lanes_b<FAM, 2>(lanes, u, st);
+        }
+        if (rows == 3) {
+            return gate_up_lanes_b<FAM, 3>(lanes, u, st);
+        }
     }
+    if (rows == 4) {
+        return gate_up_lanes_b<FAM, 4>(lanes, u, st);
+    }
+    return rows == 5 && gate_up_lanes_b<FAM, 5>(lanes, u, st);
 }
 
 // routed format F's deployed triples (experts_inst.h); false for any other (fg, fu). The IQ2 formats launch the IQ2

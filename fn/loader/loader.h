@@ -29,6 +29,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -59,6 +60,8 @@ struct load_params {
     // pool_cells (more than one slot): the KV pool's physical cells, at least a slot's (0: a slot's)
     bool kv_q8 = false;
     int32_t pool_cells = 0;
+    // TTTS1: this box's window (fn/model/state.h): the tensors outside it are not placed (model::win)
+    model::window          win;
 };
 
 // Wall times are measured with steady_clock on the host; busy times are summed over threads (thread-seconds).
@@ -87,6 +90,14 @@ bool allocate_weights(model::model & m, std::string & err);
 
 // fill both cards' weights from the mappings
 bool fill_weights(const load_params & p, model::model & m, load_times & t, std::string & err);
+
+// TTTS1 (split-test: random weights, no model data): every region the window places filled from synthetic GGUF bytes
+// in place of the mapping, through the loader's own layouts (the same slices, HC layouts and EX1 packs as
+// fill_weights): region by region, each member tensor's whole GGUF bytes written by synth(t, dst, stored_bytes) into
+// host memory, its card units laid out and copied to the card. The same synth gives every window the same bytes of
+// each tensor. Synchronous.
+using synth_fn = std::function<bool(int32_t tensor, uint8_t * dst, int64_t bytes)>;
+bool fill_weights_synth(model::model & m, const synth_fn & synth, std::string & err);
 
 using card_digests = std::array<digest, 2>;
 
@@ -145,6 +156,10 @@ bool pack_expert_entry(const model::model & m, const expert_layer & l, int32_t e
 // the opt-in Q2_0), their packed bytes on each card and the placement's Q8_0 bytes, and the cards' weight totals that
 // follow (open_model's; the target cache's pool is sized after them)
 std::string draft_expert_line(const model::model & m);
+// FMS5: the startup line on the target's BF16 router weights (every layer's ffn_gate_inp and ffn_gate_inp_shexp, from
+// the file mappings): how many the tensor-core router's BF16 to FP16 conversion does not keep exactly, below FP16's
+// normal range (2^-14) and beyond its range (65,504). Reported, not a gate (fn/kernels/dense/dense.h router_tc)
+std::string router_f16_line(const model::model & m);
 bool native_expert_layer(const model::model & m, const expert_layer & l, experts::cpu::native_layer & out,
                          std::string & err);
 

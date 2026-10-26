@@ -160,7 +160,7 @@ uint8_t * model::region_ptr(int32_t tensor, int32_t card) const {
         return nullptr;
     }
     const int32_t r = region_of[tensor];
-    if (r < 0 || regions[card][r].bytes == 0 || regions[card][r].cached) {
+    if (r < 0 || regions[card][r].bytes == 0 || regions[card][r].cached || regions[card][r].absent) {
         return nullptr;
     }
     const int32_t owner = regions[card][r].alias ? 0 : card; // ME1: card 1 reads card 0's copy on one device

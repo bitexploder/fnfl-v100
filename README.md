@@ -29,6 +29,8 @@ These are PCIe cards:
 - Stable enough to run DeepSWE 1.1 all night without leaking or crashing
 - This quant solves DeepSWE at the same rate as the full quant in my single full bench
 - New in 0.2: up to four users at once. Four DeepSWE agents on one server decoded at about 60 t/s each, about 240 t/s together, with no stalls or errors
+- New in 0.3: several users decode faster together, at any draft depth. Four writers went from 272 to 335 t/s together, 355 at draft depth 3. The recommended draft depth is now 2 (see [Draft depth](#draft-depth))
+- Also in 0.3, experimental: the model split across two machines with two V100s each, serving up to eight users. On the development machines eight DeepSWE agents got about 2.3 times one machine's output. It is not yet set up to run anywhere else
 - MoE cache on ONE card solved the same DeepSWE task: 79 t/s on a 32GB card, 48 t/s on a 16GB card
 
 I care about agentic coding, so that is what I had time to bench so far. It's still fast on other stuff. It may not be as smart, but this quant has proven strong. 
@@ -51,6 +53,13 @@ Who doesn't love some benchmaxx metrics that make their engine look good?
 272 t/s together, about 70 t/s each, with four users writing at once with greedy sampling (short prompts).  
 258 t/s together at temperature 1.0.  
 A lone user is not slowed by having four slots open, and every user gets the same tokens it would get alone.
+
+**Four users at once (0.3):**
+
+335 t/s together with four users writing at once with greedy sampling, at draft depth 2 (355 t/s at depth 3; 0.2 was 272).  
+145 t/s together with four users each about 64K tokens deep.  
+One user alone is unchanged: 220 t/s at depth 2, 225 at depth 4.  
+To get there the shared step does some of its math in 16-bit on the tensor cores, so a user's tokens can now drift from what it would get alone after the first hundred or so. A lone user still runs the exact single-user path.
 
 **MoE cache, one card, a whole DeepSWE task (sql-formatter, solved):**
 
@@ -105,7 +114,7 @@ This repository began as a fork of llama.cpp. Upstream llama.cpp's own README is
   - The server checks the file's architecture (`qwen4exp`) and shapes at load and refuses any other model.
 - **Draft model:** Unsloth's shared MTP head, `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (2.79 GB). The draft is required, since speculative decoding is the only decode path.
 - **Context:** up to 262,144 tokens a conversation. With more than one user, `-c` is a pool the users share (409,600 tokens fits four users), and each conversation can still grow to 262,144.
-- **Several users:** up to four conversations decode together in one step on both cards, which is where the extra throughput comes from. Every user gets exactly the tokens it would get alone.
+- **Several users:** up to four conversations decode together in one step on both cards, which is where the extra throughput comes from. A lone user gets the exact single-user path. Users decoding together share a step that does some products in 16-bit on the tensor cores, so their tokens can drift from what each would get alone after the first hundred or so; measured as KL against a lone user, that difference is a little larger than the 8-bit KV cache's.
 - **KV cache:** 8-bit (int8 with a scale every 64 values) by default: about 2.5 GiB a card at the full 262,144 tokens instead of 3.9. It passed the same KL bounds the rest of the engine is held to against llama.cpp. `--fnfl-kv-format bf16` selects the 16-bit cache.
 - **Sampling:** temperature, top-k (1 to 256), top-p and min-p, with the model's recommended defaults (T 1.0, top-k 20, top-p 0.95, min-p 0.05). Speculative decoding samples exactly from the model's own distribution.
 
@@ -119,6 +128,7 @@ This repository began as a fork of llama.cpp. Upstream llama.cpp's own README is
 - **NVIDIA driver 580.** That series is the last to support Volta.
 - **CUDA 12.x**, with 12.8 tested. CUDA 13 dropped `sm_70`.
 - **Linux** (Ubuntu 26.04 tested), GCC/G++ 14, CMake (4.2 tested), Ninja and Python 3. The OpenSSL development headers are optional; without them the server builds without HTTPS.
+- **UCX** (`libucx-dev` on Ubuntu), new in 0.3. The link between two machines uses it, and the build needs it even for one machine.
 - **Host memory:** 128 GB tested.
   - The model files are memory-mapped.
   - The model's per-layer embedding table (26.9 GiB) stays in host memory and is read a few rows per token.
@@ -152,12 +162,12 @@ build-fnfl/bin/llama-server --host 127.0.0.1 --port 8190 -np 1 --jinja \
 -m models/flash-next/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
 -md models/flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
 --fnfl-draft-subset models/draft-vocab-qwen3.8-flash-next.txt \
--c 262144 --fnfl-spec-d 4 --fnfl-draft-attention sparse
+-c 262144 --fnfl-spec-d 2 --fnfl-draft-attention sparse
 ```
 
 - The server finds the second shard by name.
 - `--fnfl-draft-subset` names the draft's 65,536-token vocabulary list. That file ships in this repository.
-- The last line gives the model's full context and the settings the project serves with: four draft proposals a step and sparse draft attention.
+- The last line gives the model's full context and the settings the project serves with: two draft proposals a step ([Draft depth](#draft-depth)) and sparse draft attention.
 - Startup prints the memory left on each card and the engine's settings. The server is ready when it logs `listening on`.
 
 For up to four users at once, change `-np 1` to `-np 4` and `-c 262144` to `-c 409600`:
@@ -167,7 +177,7 @@ build-fnfl/bin/llama-server --host 127.0.0.1 --port 8190 -np 4 --jinja \
 -m models/flash-next/IQ3_XXS/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
 -md models/flash-next/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
 --fnfl-draft-subset models/draft-vocab-qwen3.8-flash-next.txt \
--c 409600 --fnfl-spec-d 4 --fnfl-draft-attention sparse
+-c 409600 --fnfl-spec-d 2 --fnfl-draft-attention sparse
 ```
 
 - With more than one user, `-c` must be a multiple of 16,384 (the KV pool's page).
@@ -181,6 +191,17 @@ curl -s http://127.0.0.1:8190/v1/chat/completions -H 'Content-Type: application/
 ```
 
 The web UI is at `http://127.0.0.1:8190/` when the build embedded it. Any OpenAI-compatible client works against `/v1`, and Anthropic-style clients work against `/v1/messages`.
+
+## Draft depth
+
+`--fnfl-spec-d N` (1 to 4) sets how many tokens the draft head proposes each step. In 0.2 several users decoded together only at depth 4; in 0.3 they do at every depth.
+
+**Use `--fnfl-spec-d 2`, the default, for several users and for agentic work.** Measured on the development machine with 0.3:
+
+- Four DeepSWE agents on one server: 77.6 t/s each at depth 2, 74.1 at depth 3, 69.5 at depth 4 (the same task, the first five minutes of each run).
+- Four users each about 64K tokens deep: 144.5 t/s together at depth 2, 142.6 at 3, 138.6 at 4.
+- Four short writers, greedy: depth 3 is best, 355.4 t/s together, against 334.8 at depth 2 and 334.3 at depth 4.
+- One user alone: 219.8, 227.3 and 225.5 t/s at depths 2, 3 and 4 at short context; at 64K of history about 183, 182 and 170, so depth 4 loses about 7% deep.
 
 ## What it does not do
 

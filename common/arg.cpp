@@ -4237,6 +4237,43 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fnfl.kv_format = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // TTTS1: the split across two boxes
+    add_opt(common_arg({ "--fnfl-split-layer" }, "K",
+                       "FNFL (TTTS1): split Flash-Next across two boxes at layer K (2..47): this server the leader, "
+                       "the front (layers "
+                       "0..K-1), its follower `fnfl-drive stage` the back (layers K..47, the head and the draft); up "
+                       "to eight slots in "
+                       "two pipelined groups (default: 0, one box)",
+                       [](common_params & params, int value) {
+                           if (value != 0 && (value < 2 || value > 47)) {
+                               throw std::invalid_argument("--fnfl-split-layer is 2..47 (0: one box)");
+                           }
+                           params.fnfl.split_layer = value;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg({ "--fnfl-split-addr" }, "IP",
+                       "FNFL (TTTS1): the follower's address on the box-to-box link (default: 10.25.0.2)",
+                       [](common_params & params, const std::string & value) { params.fnfl.split_addr = value; })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg({ "--fnfl-split-port" }, "P", "FNFL (TTTS1): the follower's port (default: 13371)",
+                       [](common_params & params, int value) {
+                           if (value < 1 || value > 65535) {
+                               throw std::invalid_argument("--fnfl-split-port is 1..65535");
+                           }
+                           params.fnfl.split_port = value;
+                       })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(
+        common_arg(
+            { "--fnfl-split-commit" }, "HEX",
+            "FNFL (TTTS1): the source commit X-HELLO compares with the follower's (the launch script's git rev-parse)",
+            [](common_params & params, const std::string & value) { params.fnfl.split_commit = value; })
+            .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(
+        common_arg({ "--fnfl-split-digest" }, "HEX",
+                   "FNFL (TTTS1): the device-code digest X-HELLO compares with the follower's (the launch script's)",
+                   [](common_params & params, const std::string & value) { params.fnfl.split_digest = value; })
+            .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--fnfl-device-cap-mib"}, "N",
         "FNFL (ME1): a ceiling on the device's whole use in MiB; the expert cache's pool shrinks under it (default: "

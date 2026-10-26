@@ -778,11 +778,11 @@ bool hmix_slot_reset(fn::xchg::rings & rg, int32_t sl, int64_t & bad) {
     return true;
 }
 
-// each card's half of the inputs (enqueued on its stream)
-bool put_inputs(card2 * c[2], const inputs & in) {
+// each card's half of the inputs (enqueued on its stream); rows in.rows .. 4 hold tail (FMS13's sentinel test: NaN)
+bool put_inputs(card2 * c[2], const inputs & in, float tail = 0.0f) {
     bool ok = true;
     for (int32_t r = 0; r < 2 && ok; ++r) {
-        std::vector<float> h(card2::n_x, 0.0f), v(card2::n_h, 0.0f), post(size_t(fn::hc::max_rows) * S, 0.0f);
+        std::vector<float> h(card2::n_x, tail), v(card2::n_h, tail), post(size_t(fn::hc::max_rows) * S, tail);
         for (int32_t b = 0; b < in.rows; ++b) {
             for (int32_t s = 0; s < S; ++s) {
                 for (int32_t i = 0; i < F; ++i) {
@@ -1853,8 +1853,8 @@ bool joint_fresh(const jlanes & ln) {
     return ok && devices_idle(ln);
 }
 
-// lane k's sequence alone, a snapshot after every sublayer
-bool joint_lone(const jlanes & ln, size_t k, bool head, int32_t subs, std::vector<uint32_t> & out) {
+// lane k's sequence alone at rows (FMS13: R, 2 .. 5), a snapshot after every sublayer
+bool joint_lone(const jlanes & ln, size_t k, bool head, int32_t subs, int32_t rows, std::vector<uint32_t> & out) {
     jlane & l = *ln[k];
     const bool loopback = l.c[0]->dev == l.c[1]->dev;
     out.clear();
@@ -1863,9 +1863,9 @@ bool joint_lone(const jlanes & ln, size_t k, bool head, int32_t subs, std::vecto
         for (const int32_t mode : {loopback ? 1 : 3, loopback ? 2 : 0}) {
             for (int32_t r = 0; r < 2 && ok && mode != 0; ++r) {
                 const fn::hc::sub_args a = joint_lane_args(l, *ln[0]->c[r], r, n, head);
-                ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
-                     (head ? fn::hc::head_sub(fn::hc::max_rows, mode, a, launch_stream(l.c, r))
-                           : fn::hc::sub(fn::hc::max_rows, mode, a, launch_stream(l.c, r)));
+                ok                       = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                                           (head ? fn::hc::head_sub(rows, mode, a, launch_stream(l.c, r)) :
+                                                   fn::hc::sub(rows, mode, a, launch_stream(l.c, r)));
             }
         }
         ok = ok && wait_two(l.c, hc2_timeout_s) && snapshot(l.c, l.rg, n, head, out);
@@ -1873,8 +1873,8 @@ bool joint_lone(const jlanes & ln, size_t k, bool head, int32_t subs, std::vecto
     return ok;
 }
 
-// the lanes' sequence jointly (lanes' launches on lane 0's streams), each lane's snapshots
-bool joint_run(const jlanes & ln, int32_t lanes, bool head, int32_t subs, std::vector<uint32_t> * out) {
+// the lanes' sequence jointly at rows a lane (lanes' launches on lane 0's streams), each lane's snapshots
+bool joint_run(const jlanes & ln, int32_t lanes, bool head, int32_t subs, int32_t rows, std::vector<uint32_t> * out) {
     const bool loopback = ln[0]->c[0]->dev == ln[0]->c[1]->dev;
     for (int32_t k = 0; k < lanes; ++k) {
         out[k].clear();
@@ -1888,8 +1888,8 @@ bool joint_run(const jlanes & ln, int32_t lanes, bool head, int32_t subs, std::v
                     a[k] = joint_lane_args(*ln[k], *ln[0]->c[r], r, n, head);
                 }
                 ok = cuda_ok(cudaSetDevice(ln[0]->c[r]->dev), "cudaSetDevice") &&
-                     (head ? fn::hc::head_sub_joint(lanes, mode, a, launch_stream(ln[0]->c, r))
-                           : fn::hc::sub_joint(lanes, mode, a, launch_stream(ln[0]->c, r)));
+                     (head ? fn::hc::head_sub_joint(lanes, rows, mode, a, launch_stream(ln[0]->c, r)) :
+                             fn::hc::sub_joint(lanes, rows, mode, a, launch_stream(ln[0]->c, r)));
             }
         }
         ok = ok && wait_two(ln[0]->c, hc2_timeout_s);
@@ -1900,17 +1900,97 @@ bool joint_run(const jlanes & ln, int32_t lanes, bool head, int32_t subs, std::v
     return ok;
 }
 
-// U lanes, a sequence each way: every lane's snapshots bitwise its lone run's, the second joint run bitwise the first;
-// the error words zero except a lane of special inputs (held equal instead)
-bool joint_case(const jlanes & ln, int32_t lanes, const kind * kinds, bool head) {
+// FMS2 item 5b: a joint run's snapshots with each X-HC region (peer and own, every slot, both cards) moved from the
+// joint layout (xchg.h hcj_run_at) to the lone one (rows of words_hc words, or the head's 1,284), every word to its
+// lone place and the rest the sentinel; a short head block's unused words must be zero or the sentinel (bad counts
+// the others)
+void hcj_to_lone(std::vector<uint32_t> & v, bool head, size_t card_words, size_t & bad) {
+    using fn::xchg::msg;
+    constexpr int32_t region = fn::xchg::hc_own_at;
+    const int32_t stride = head ? 1284 : fn::xchg::words_hc;
+    const size_t slot = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    std::vector<uint32_t> lone(static_cast<size_t>(region));
+    for (size_t c0 = 0; c0 + card_words <= v.size(); c0 += card_words) {
+        for (int32_t sl = 0; sl < fn::xchg::n_slot; ++sl) {
+            for (int32_t half = 0; half < 2; ++half) {
+                uint32_t * w = v.data() + c0 + size_t(sl) * slot + size_t(half) * region;
+                std::fill(lone.begin(), lone.end(), fn::xchg::sentinel);
+                for (int32_t jw = 0; jw < region; ++jw) {
+                    int32_t at = -1;
+                    if (jw < fn::xchg::hcj_v_words) {
+                        at = (jw / 4) * stride + jw % 4;
+                    } else {
+                        const int32_t vb = (jw - fn::xchg::hcj_v_words) / fn::xchg::hcj_block_words;
+                        const int32_t rem = (jw - fn::xchg::hcj_v_words) % fn::xchg::hcj_block_words;
+                        const int32_t b = rem / fn::xchg::hcj_rows_block, r = rem % fn::xchg::hcj_rows_block;
+                        const int32_t s = vb % 4, j = (vb / 4) * fn::xchg::hcj_rows_block + r;
+                        if (!head || j < 320) {
+                            at = b * stride + (j < 320 ? 4 + 320 * s + j : 1284 + 4 * s + (j - 320));
+                        }
+                    }
+                    if (at >= 0) {
+                        lone[size_t(at)] = w[jw];
+                    } else if (w[jw] != 0u && w[jw] != fn::xchg::sentinel) {
+                        ++bad;
+                    }
+                }
+                std::copy(lone.begin(), lone.end(), w);
+            }
+        }
+    }
+}
+
+// FMS13's sentinel test: the words of rows rows .. 4 in a lone-layout snapshot (hcj_to_lone's) that are no longer
+// their initial values: every slot's X-HC regions (the sentinel) and X-HMIX regions (the sentinels), x and inject (the
+// poison)
+size_t tail_touched(const std::vector<uint32_t> & v, bool head, size_t card_words, int32_t rows) {
+    using fn::xchg::msg;
+    using hl                   = fn::xchg::hmix_layout;
+    constexpr int32_t region   = fn::xchg::hc_own_at;
+    const int32_t     stride   = head ? 1284 : fn::xchg::words_hc;
+    const size_t      hc_words = size_t(fn::xchg::slot_words(msg::hc)), slot = hc_words + size_t(hl::slot_words);
+    size_t            bad = 0;
+    const auto        run = [&](size_t at, size_t n, uint32_t want) {
+        for (size_t i = 0; i < n && at + i < v.size(); ++i) {
+            bad += v[at + i] != want ? 1 : 0;
+        }
+    };
+    for (size_t c0 = 0; c0 + card_words <= v.size(); c0 += card_words) {
+        for (int32_t b = rows; b < fn::hc::max_rows; ++b) {
+            for (int32_t sl = 0; sl < fn::xchg::n_slot; ++sl) {
+                const size_t s0 = c0 + size_t(sl) * slot;
+                for (int32_t half = 0; half < 2; ++half) {
+                    run(s0 + size_t(half) * region + size_t(b) * stride, size_t(stride), fn::xchg::sentinel);
+                }
+                const size_t m0 = s0 + hc_words;
+                run(m0 + size_t(b) * hl::width, size_t(hl::width), fn::xchg::sentinel);
+                run(m0 + size_t(hl::code_at) + size_t(b) * hl::width / 4, size_t(hl::width / 4),
+                    fn::xchg::code_sentinel);
+                run(m0 + size_t(hl::scale_at) + size_t(b) * hl::runs * 2, size_t(hl::runs * 2), fn::xchg::sentinel);
+            }
+            const size_t x0 = c0 + size_t(fn::xchg::n_slot) * slot;
+            run(x0 + size_t(b) * S * F, size_t(S) * F, ~0u);
+            if (!head) {
+                run(x0 + card2::n_x + size_t(b) * J, size_t(J), ~0u);
+            }
+        }
+    }
+    return bad;
+}
+
+// U lanes at rows a lane (FMS13: 2 .. 5), a sequence each way: every lane's snapshots bitwise its lone run's at B =
+// rows, the second joint run bitwise the first, rows .. 4 untouched; the error words zero except a lane of special
+// inputs (held equal instead)
+bool joint_case(const jlanes & ln, int32_t lanes, const kind * kinds, bool head, int32_t rows) {
     const int32_t subs = head ? n_joint_head : n_joint_sub;
-    const std::string label = std::string(head ? "hcj head" : "hcj sub") + " U" + std::to_string(lanes);
+    const std::string label =
+        std::string(head ? "hcj head" : "hcj sub") + " R" + std::to_string(rows) + " U" + std::to_string(lanes);
     std::vector<uint32_t> want[fn::xchg::max_lanes], got[fn::xchg::max_lanes], again[fn::xchg::max_lanes];
     bool ok = true;
     for (int32_t k = 0; k < lanes && ok; ++k) {
-        ok = joint_lone(ln, size_t(k), head, subs, want[k]);
+        ok = joint_lone(ln, size_t(k), head, subs, rows, want[k]);
     }
-    ok = ok && joint_run(ln, lanes, head, subs, got) && joint_run(ln, lanes, head, subs, again);
+    ok = ok && joint_run(ln, lanes, head, subs, rows, got) && joint_run(ln, lanes, head, subs, rows, again);
     if (!ok) {
         printf("hc-test %-14s not run: %s  FAIL\n", label.c_str(), cudaGetErrorString(cudaGetLastError()));
         return false;
@@ -1918,25 +1998,31 @@ bool joint_case(const jlanes & ln, int32_t lanes, const kind * kinds, bool head)
     using fn::xchg::msg;
     const size_t slots = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
     const size_t card_words = size_t(fn::xchg::n_slot) * slots + card2::n_x + (head ? 0 : card2::n_j) + 1;
-    size_t bad = 0, bad2 = 0, words = 0;
+    size_t       bad = 0, bad2 = 0, words = 0, gap = 0, touched = 0;
     bool clean = true;
     for (int32_t k = 0; k < lanes; ++k) {
+        hcj_to_lone(got[k], head, card_words, gap);
+        hcj_to_lone(again[k], head, card_words, gap);
+        touched += tail_touched(got[k], head, card_words, rows);
         bad += words_differ(want[k], got[k]);
         bad2 += words_differ(got[k], again[k]);
         words += want[k].size();
         clean = clean &&
                 (kinds[k] == kind::special || (got[k].back() == 0u && got[k][got[k].size() - 1 - card_words] == 0u));
     }
-    printf("hc-test %-14s each lane bitwise its lone launches after each of %d sublayers (X-HC and X-HMIX slots, x%s, "
-           "error words; both cards; %zu words): %s; second joint run: %s%s\n",
-           label.c_str(), subs, head ? "" : ", inject", words, bad == 0 ? "yes" : "NO  FAIL",
-           bad2 == 0 ? "bitwise" : "DIFFERS  FAIL", clean ? "" : "; error words not zero  FAIL");
-    return bad == 0 && bad2 == 0 && clean;
+    printf(
+        "hc-test %-14s each lane bitwise its lone launches after each of %d sublayers (X-HC and X-HMIX slots, x%s, "
+        "error words; both cards; %zu words; X-HC from the joint layout, %zu unused words not zero%s): %s; second "
+        "joint run: %s%s; rows %d .. 4 words touched %zu%s\n",
+        label.c_str(), subs, head ? "" : ", inject", words, gap, gap == 0 ? "" : "  FAIL",
+        bad == 0 ? "yes" : "NO  FAIL", bad2 == 0 ? "bitwise" : "DIFFERS  FAIL",
+        clean ? "" : "; error words not zero  FAIL", rows, touched, touched == 0 ? "" : "  FAIL");
+    return bad == 0 && bad2 == 0 && clean && gap == 0 && touched == 0;
 }
 
 // refused with nothing enqueued (every lane's X-HMIX slots still the sentinels): lanes 1 and 5, mode 0, two lanes on
 // one ring, lanes on different cards, a lane's reset of a slot another lane writes, a lane on other weights (down, up
-// or gamma: the launch streams lane 0's), and the head form's one lane
+// or gamma: the launch streams lane 0's), the head form's one lane, and (FMS13) rows 1 and 6
 bool joint_rejects(const jlanes & ln) {
     const card2 & w = *ln[0]->c[0];
     fn::hc::sub_args a[fn::xchg::max_lanes] = {};
@@ -1944,30 +2030,31 @@ bool joint_rejects(const jlanes & ln) {
         a[k] = joint_lane_args(*ln[k], w, 0, 1, false);
     }
     cudaStream_t st = ln[0]->c[0]->st;
+    constexpr int32_t R5      = fn::hc::max_rows;
     bool ok = joint_fresh(ln) && cuda_ok(cudaSetDevice(w.dev), "cudaSetDevice");
     int32_t refused = 0, cases = 0;
     const auto refuse = [&](bool launched) {
         ++cases;
         refused += launched ? 0 : 1;
     };
-    refuse(fn::hc::sub_joint(1, 3, a, st));
-    refuse(fn::hc::sub_joint(5, 3, a, st));
-    refuse(fn::hc::sub_joint(2, 0, a, st));
+    refuse(fn::hc::sub_joint(1, R5, 3, a, st));
+    refuse(fn::hc::sub_joint(5, R5, 3, a, st));
+    refuse(fn::hc::sub_joint(2, R5, 0, a, st));
     fn::hc::sub_args b[fn::xchg::max_lanes];
     std::copy_n(a, fn::xchg::max_lanes, b);
     b[1] = joint_lane_args(*ln[0], w, 0, 1, false); // lane 1 on lane 0's ring
     b[1].x = a[1].x;
     b[1].inject = a[1].inject;
-    refuse(fn::hc::sub_joint(2, 3, b, st));
+    refuse(fn::hc::sub_joint(2, R5, 3, b, st));
     std::copy_n(a, fn::xchg::max_lanes, b);
     b[1] = joint_lane_args(*ln[1], *ln[0]->c[1], 1, 1, false); // lane 1 card 1's
-    refuse(fn::hc::sub_joint(2, 3, b, st));
+    refuse(fn::hc::sub_joint(2, R5, 3, b, st));
     std::copy_n(a, fn::xchg::max_lanes, b);
     b[2].hc_reset = b[0].hc_ring; // lane 2 resets lane 0's X-HC slot
-    refuse(fn::hc::sub_joint(3, 3, b, st));
+    refuse(fn::hc::sub_joint(3, R5, 3, b, st));
     std::copy_n(a, fn::xchg::max_lanes, b);
     b[3].hmix_reset = b[1].hmix_own; // lane 3 resets lane 1's X-HMIX slot
-    refuse(fn::hc::sub_joint(4, 3, b, st));
+    refuse(fn::hc::sub_joint(4, R5, 3, b, st));
     for (int32_t which = 0; which < 3; ++which) { // a lane on other weights (16-byte aligned, valid addresses)
         std::copy_n(a, fn::xchg::max_lanes, b);
         if (which == 0) {
@@ -1977,9 +2064,12 @@ bool joint_rejects(const jlanes & ln) {
         } else {
             b[1].gamma = a[0].gamma + 4;
         }
-        refuse(fn::hc::sub_joint(2, 3, b, st));
+        refuse(fn::hc::sub_joint(2, R5, 3, b, st));
     }
-    refuse(fn::hc::head_sub_joint(1, 3, a, st));
+    refuse(fn::hc::head_sub_joint(1, R5, 3, a, st));
+    refuse(fn::hc::sub_joint(2, 1, 3, a, st));
+    refuse(fn::hc::sub_joint(2, R5 + 1, 3, a, st));
+    refuse(fn::hc::head_sub_joint(2, 1, 3, a, st));
     ok = ok && cuda_ok(cudaStreamSynchronize(st), "refused") && cuda_ok(cudaGetLastError(), "refused");
     // nothing reached the rings: every lane's slots still the sentinels
     int64_t touched = 0;
@@ -2167,17 +2257,24 @@ int fnfl_hcj_test(int dev0, int dev1) {
                  c.w_down.put(w.w_down[r], c.st) && c.w_up.put(w.w_up[r], c.st) && c.gamma.put(w.gamma_card[r], c.st) &&
                  c.hw_down.put(hbf, c.st) && cuda_ok(cudaStreamSynchronize(c.st), "weights");
         }
-        // each lane its own inputs
+        // each lane its own inputs, at R rows (FMS13: 2 .. 5; rows R .. 4 NaN); the rejects at five rows
         const kind kinds[fn::xchg::max_lanes] = {kind::plain, kind::stress, kind::zero_hx, kind::special};
-        for (int32_t k = 0; k < fn::xchg::max_lanes && ok; ++k) {
-            inputs in;
-            make_inputs(in, fn::hc::max_rows, kinds[k]);
-            ok = put_inputs(ln[size_t(k)]->c, in) && devices_idle(ln);
-        }
-        ok = ok && joint_rejects(ln);
-        for (int32_t lanes = 2; lanes <= fn::xchg::max_lanes && ok; ++lanes) {
-            for (const bool head : {false, true}) {
-                ok = joint_case(ln, lanes, kinds, head) && ok;
+        const auto lanes_inputs               = [&](int32_t rows) {
+            bool good = true;
+            for (int32_t k = 0; k < fn::xchg::max_lanes && good; ++k) {
+                inputs in;
+                make_inputs(in, rows, kinds[k]);
+                good = put_inputs(ln[size_t(k)]->c, in, std::numeric_limits<float>::quiet_NaN()) && devices_idle(ln);
+            }
+            return good;
+        };
+        ok = ok && lanes_inputs(fn::hc::max_rows) && joint_rejects(ln);
+        for (int32_t rows = 2; rows <= fn::hc::max_rows && ok; ++rows) {
+            ok = lanes_inputs(rows);
+            for (int32_t lanes = 2; lanes <= fn::xchg::max_lanes && ok; ++lanes) {
+                for (const bool head : { false, true }) {
+                    ok = joint_case(ln, lanes, kinds, head, rows) && ok;
+                }
             }
         }
         ok = devices_idle(ln) && ok;

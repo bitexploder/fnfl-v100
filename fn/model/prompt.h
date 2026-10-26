@@ -155,6 +155,18 @@ class prompt_path {
     // decode head (the caller runs it)
     bool head_input(const prompt_chunk & c, std::string & err);
 
+    // TTTS1: a split stage's crossing of chunk c at layer k, the back's first layer. Per half, the state layer k's first
+    // sublayer takes (PB3 folds layer k - 1's FFN exchange into layer k's HC, so the exchange is not combined here):
+    // the half's streams S (card 0's copy), each card's inject rows, and each card's FFN partial message (its header,
+    // with its generation, and its FP16 payload), laid out for c as crossing_bytes counts them. crossing_out (the
+    // front, after chunk_layers up to k) enqueues the copies device to host on the compute streams and releases the FFN
+    // links as their consumer would; crossing_in (the back, after chunk_begin) enqueues them host to device and stands
+    // for the exchange's copies (the links' generations and events), so layer k runs as on one box. The back's chunk
+    // carries the front's seq (the generations): the caller sets it.
+    static int64_t crossing_bytes(const prompt_chunk & c);
+    bool           crossing_out(const prompt_chunk & c, int32_t k, uint8_t * dst, std::string & err);
+    bool           crossing_in(const prompt_chunk & c, int32_t k, const uint8_t * src, std::string & err);
+
     // TEST ONLY: card r's prompt error word set during the next chunk (a failed chunk's invalidation)
     void test_fail_next(int32_t card) { test_fail_ = card; }
 

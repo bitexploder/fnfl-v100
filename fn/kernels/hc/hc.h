@@ -238,8 +238,11 @@ bool head_sub(int32_t rows, int32_t mode, const sub_args & a, void * stream);
 // False, with nothing enqueued, for lanes outside 2..4, any lane sub would refuse at max_rows, lanes on different
 // cards or weights (w_down, w_up, gamma), two lanes sharing an X-HC or X-HMIX slot, or a lane's reset of a slot
 // another lane writes; false after a failed launch submission. head_sub_joint: head_sub's form (no inject).
-bool sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream);
-bool head_sub_joint(int32_t lanes, int32_t mode, const sub_args * a, void * stream);
+// FMS13: rows (2 .. max_rows, the round's R = d + 1, every lane alike) in place of max_rows above: each lane's rows
+// take sub's B = rows arithmetic, so a lane's outputs are bitwise its own sub launch's at rows; only rows 0 .. rows - 1
+// of a lane's slots and buffers are written, sent or polled (its X-HC run of 18 rows words, its rows v words).
+bool sub_joint(int32_t lanes, int32_t rows, int32_t mode, const sub_args * a, void * stream);
+bool head_sub_joint(int32_t lanes, int32_t rows, int32_t mode, const sub_args * a, void * stream);
 
 // ---- ME12: both logical shards of a sublayer on one device, one launch ----
 // One cooperative launch (as sub's: 72 blocks of 640 threads, one an SM) that does both cards' sub mode 3 on one device
@@ -315,6 +318,15 @@ struct up2_q8_args {
 bool down2_q8(int32_t rows, const down2_q8_args & a, void * stream);
 bool up2_q8(int32_t rows, const up2_q8_args & a, void * stream);
 bool head_down2_q8(int32_t rows, const down2_q8_args & a, void * stream);
+
+// FMS2 (build item 2, the joint catch-up): down2_q8 and up2_q8 at B = 5 for lanes 2 .. 4 in one launch each, the
+// grid (72, lanes): lane u's blocks are the lone launch's on a[u] (its slots, buffers and error word; the weights may
+// be one copy), the same device code, so lane u's outputs are bitwise down2_q8 / up2_q8 (5, a[u]) alone, and a row
+// below 5 is bitwise its lone launch at any B that holds it (each row's arithmetic is the row's own: hc-test's rows
+// alone). up2: each lane its own run counters (refused otherwise). False, with nothing enqueued, for lanes outside
+// 2 .. 4 or an argument down2_q8 / up2_q8 rejects.
+bool down2_q8_lanes(int32_t lanes, const down2_q8_args * a, void * stream);
+bool up2_q8_lanes(int32_t lanes, const up2_q8_args * a, void * stream);
 bool head_up2_q8(int32_t rows, const up2_q8_args & a, void * stream);
 
 } // namespace fn::hc

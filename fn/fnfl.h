@@ -55,6 +55,16 @@ struct fnfl_config {
     // resident TP on two cards only; with more than one slot the KV pool is then n_ctx cells (each slot's context
     // stays at most the training context)
     std::string kv_format;
+    // TTTS1 (--fnfl-split-layer K, 2 .. 47; 0: one box): the split across two boxes, resident TP on each. This server
+    // is the leader, the front (layers 0 .. K - 1, the embeddings), connecting to its follower, `fnfl-drive stage`
+    // (the back: layers K .. 47, the head and the draft), at split_addr:split_port (--fnfl-split-addr IP,
+    // --fnfl-split-port P). Up to eight slots in two pipelined groups. split_commit, split_digest (--fnfl-split-commit,
+    // --fnfl-split-digest): X-HELLO's source commit and device-code digest, the launch script's
+    int32_t                                          split_layer = 0;
+    std::string                                      split_addr  = "10.25.0.2";
+    int32_t                                          split_port  = 13371;
+    std::string                                      split_commit;
+    std::string                                      split_digest;
 };
 
 // KV8 Amendment 1 (operator, 2026-10-22: q8 the serving default): the target KV's format from c alone (its kv_format
@@ -162,6 +172,21 @@ fnfl_status fnfl_step(fnfl_engine * engine, int32_t slot, fnfl_step_result & res
 fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t n, fnfl_step_result * results,
                             fnfl_status * status, std::string * errors);
 
+// TTTS1: the engine is the split's leader (fnfl_config::split_layer)
+bool        fnfl_is_split(const fnfl_engine * engine);
+// TTTS1 (the split): one turn of the two-group pipeline over the generating slots (1 .. 8, distinct): each idle group
+// with members begins (its front rounds and its send to the follower), then the older group in flight ends (its
+// answers applied). done[k]: slots[k]'s step finished in this call (results[k], status[k], errors[k] then its);
+// false while its group is in flight. Every other call naming a slot whose group is in flight ends that group first.
+// Returns FNFL_BAD_REQUEST for no split engine or arrays, else FNFL_OK
+fnfl_status fnfl_step_pipe(fnfl_engine *      engine,
+                           const int32_t *    slots,
+                           int32_t            n,
+                           fnfl_step_result * results,
+                           fnfl_status *      status,
+                           std::string *      errors,
+                           bool *             done);
+
 // keep the slot's first n_keep tokens (cancellation and prefix reuse)
 fnfl_status fnfl_truncate(fnfl_engine * engine, int32_t slot, int32_t n_keep);
 
@@ -219,8 +244,8 @@ struct fnfl_pool_report {
     bool on = false;
     int32_t pages = 0, page_cells = 0, free_pages = 0, reclaims = 0;
     int64_t capacity_cells = 0;
-    int32_t mapped[4] = {0, 0, 0, 0};
-    bool busy[4] = {false, false, false, false};
+    int32_t mapped[8]      = {};  // TTTS1: up to eight slots on the split
+    bool    busy[8]        = {};
 };
 
 // a slot's read prepared: the input owned, the reuse decided and executed (a pure extension, the slot's latest

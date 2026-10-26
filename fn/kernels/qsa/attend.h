@@ -140,6 +140,16 @@ int32_t grid(int32_t rows, int32_t device);
 // a failed submission (the CUDA error is left for the caller).
 bool attend(int32_t rows, const args & a, void * stream);
 
+// FMS2 (build item 3, W3): attend() of lanes 2 .. 4 of the joint verify round in one cooperative launch, lane u on its
+// own arguments a[u] (its rows, caches, selection and workspace; every lane BF16 or every lane KV8, resident, no
+// stamps). The grid is the co-resident limit or the lanes' deepest units. Each lane's prepare tasks, units and finish
+// are attend()'s on its arguments, lane after lane in one index space each; a CTA acquires a lane's counter before
+// its first unit of that lane, and the grid barrier orders every lane's units before every finish. A unit's result
+// does not depend on its CTA, so each lane's outputs and cache cells are its attend()'s bitwise. A lane at a refused
+// depth sets its error word (2) and writes nothing; the other lanes run. False, with nothing enqueued, for an argument
+// outside attend()'s contract in any lane, or lanes outside 2 .. 4.
+bool attend_lanes(int32_t lanes, int32_t rows, const args * a, void * stream);
+
 // the launch's resources on the current device, for the bench and the Result
 struct resources {
     int32_t regs;
@@ -149,5 +159,7 @@ struct resources {
 };
 // q8: the KV8 instantiation's (attend_kernel<false, true>)
 bool kernel_resources(resources & r, bool q8 = false);
+// FMS2: attend_lanes' kernel (attend_lanes_kernel<q8>) and its grid at rows and lanes
+bool lanes_resources(resources & r, bool q8, int32_t rows, int32_t lanes, int32_t & grid_out);
 
 } // namespace fn::qsa::attn

@@ -98,22 +98,38 @@ static_assert(gdn_record_step_bytes == int64_t(fn::gdn::rec_step_floats) * 4 &&
                   gdn_record_bytes == fn::gdn::records_bytes && gdn_banks == fn::gdn::n_bank,
               "ME11: state.h's GDN layout is gdn.h's");
 
-int64_t checkpoint_bytes(const state_params & p) {
-    const int64_t gdn = int64_t(gdn_heads_card) * gdn_head_dim * gdn_head_dim * 4 + gdn_record_bytes / 2;
-    const int64_t conv = int64_t(gdn_conv_channels_card) * gdn_conv_history * 4;
-    const int64_t ple = int64_t(ple_channels_card) * (p.ple_conv_kernel - 1) * p.ple_ngram * 4;
-    return int64_t(n_gdn_layers) * (gdn + conv) + ple + int64_t(4) * 1280 * 4;
+int32_t window::gdn_layers() const {
+    int32_t n = 0;
+    for (int32_t l = lo; l <= hi; ++l) {
+        n += l % fn::full_attn_interval != fn::full_attn_interval - 1 ? 1 : 0;
+    }
+    return n;
 }
 
-int64_t bytes_per_cell(int32_t card, bool kv_q8) {
-    // K0: BF16 K and V; KV8: int8 codes and the two scale rows
-    const int64_t kv = kv_q8 ? int64_t(n_qsa_layers) * 2 * kv_head_dim + int64_t(2) * kv_q8_scale_stride * 2
-                             : int64_t(n_qsa_layers) * 2 * kv_head_dim * 2;
-    const int64_t draft_kv = int64_t{2} * kv_head_dim * 2;          // F16 K and V
-    const int64_t index = int64_t(n_index_owned) * (fn::qsa::head_dim * 2 + fn::qsa::head_dim * 4 / fn::qsa::ratio);
+int64_t checkpoint_bytes(const state_params & p) {
+    // TTTS1: the window's GDN layers, its PLE history (layer 1) and the draft's carry (the head)
+    const int64_t gdn = int64_t(gdn_heads_card) * gdn_head_dim * gdn_head_dim * 4 + gdn_record_bytes / 2;
+    const int64_t conv = int64_t(gdn_conv_channels_card) * gdn_conv_history * 4;
+    const int64_t ple  = p.win.ple() ? int64_t(ple_channels_card) * (p.ple_conv_kernel - 1) * p.ple_ngram * 4 : 0;
+    return int64_t(p.win.gdn_layers()) * (gdn + conv) + ple + (p.win.head ? int64_t(4) * 1280 * 4 : 0);
+}
+
+int64_t bytes_per_cell(int32_t card, bool kv_q8, const window & w) {
+    // TTTS1: the window's QSA layers (and their owned indexers), the draft's KV and index with the head
+    int32_t qsa = 0, owned = 0;
+    for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
+        if (w.layer(l)) {
+            ++qsa;
+            owned += index_owner(l) == card ? 1 : 0;
+        }
+    }
+    // K0: BF16 K and V; KV8: int8 codes and the two scale rows (the scale rows keep every layer's groups)
+    const int64_t kv          = kv_q8 ? int64_t(qsa) * 2 * kv_head_dim + int64_t(2) * kv_q8_scale_stride * 2 :
+                                        int64_t(qsa) * 2 * kv_head_dim * 2;
+    const int64_t draft_kv    = w.head ? int64_t{ 2 } * kv_head_dim * 2 : 0;  // F16 K and V
+    const int64_t index       = int64_t(owned) * (fn::qsa::head_dim * 2 + fn::qsa::head_dim * 4 / fn::qsa::ratio);
     // SP2: the draft index on both cards (card 1's weight copies are fixed bytes, not per cell)
-    (void)card;
-    const int64_t draft_index = fn::qsa::head_dim * 2 + fn::qsa::head_dim * 4 / fn::qsa::ratio;
+    const int64_t draft_index = w.head ? fn::qsa::head_dim * 2 + fn::qsa::head_dim * 4 / fn::qsa::ratio : 0;
     return kv + draft_kv + index + draft_index;
 }
 
@@ -136,6 +152,9 @@ std::vector<buffer_class> state_classes(const state_params & p) {
         {}};
     const int64_t kv_elem = p.kv_q8 ? 1 : 2;
     for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
+        if (!p.win.layer(l)) {
+            continue;  // TTTS1: the other box's layer
+        }
         kv.parts.push_back(both("L" + std::to_string(l) + " K", cells * kv_head_dim * kv_elem));
         kv.parts.push_back(both("L" + std::to_string(l) + " V", cells * kv_head_dim * kv_elem));
     }
@@ -146,9 +165,13 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     }
     out.push_back(kv);
 
-    out.push_back({"draft KV (F16)",
-                   "kv-cache-design.md: the draft block's F16 K and V, one head a card",
-                   {both("L48 K", cells * kv_head_dim * 2), both("L48 V", cells * kv_head_dim * 2)}});
+    if (p.win.head) {  // TTTS1: the draft goes with the head
+        out.push_back({
+            "draft KV (F16)",
+            "kv-cache-design.md: the draft block's F16 K and V, one head a card",
+            { both("L48 K", cells * kv_head_dim * 2), both("L48 V", cells * kv_head_dim * 2) }
+        });
+    }
 
     if (p.kv_window > 0) {
         const int64_t arena = kv_tier::arena_cells(p.kv_window, cells) * kv_head_dim * 2;
@@ -174,6 +197,9 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     buffer_class target_keys{
         "target index keys (ME6)", "qsa.h: raw keys BF16 [cell][128] on the owner (kv_tier.h)", {}};
     for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
+        if (!p.win.layer(l)) {
+            continue;
+        }
         const int32_t c = index_owner(l);
         (key_tier ? target_keys : index).parts.push_back(one("L" + std::to_string(l) + " keys", c,
                                                              cells * fn::qsa::head_dim * 2));
@@ -201,8 +227,10 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     draft_index.parts.push_back(one("indexer q_norm copy", 1, int64_t(fn::qsa::head_dim) * 4));
     draft_index.parts.push_back(one("indexer k_norm copy", 1, int64_t(fn::qsa::head_dim) * 4));
     draft_index.parts.push_back(both("select depth", 4));
-    out.push_back(draft_index);
-    if (key_tier) {
+    if (p.win.head) {
+        out.push_back(draft_index);
+    }
+    if (key_tier && p.win.head) {
         out.push_back({"draft index keys (ME6)",
                        "qsa.h: the draft index's raw keys BF16 [cell][128] on both cards (kv_tier.h)",
                        {both("L48 keys", cells * fn::qsa::head_dim * 2)}});
@@ -210,11 +238,15 @@ std::vector<buffer_class> state_classes(const state_params & p) {
 
     // DR1 Stage A's re-shard (98.68% of the subset's IDs fall in card 0's vocabulary shard): each card's copy of half
     // the draft subset's output.weight rows, filled at load by head::pack_draft_head from head::draft_ids
-    out.push_back({"draft head copy (DR1)",
-                   "head.h: 32,768 Q5_K rows of 2,560 (head::draft_head_bytes, 57,671,680 bytes) and their ID map, "
-                   "I32 [32,768], on each card",
-                   {both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card)),
-                    both("draft head ID map", int64_t(fn::head::n_draft_card) * 4)}});
+    if (p.win.head) {
+        out.push_back({
+            "draft head copy (DR1)",
+            "head.h: 32,768 Q5_K rows of 2,560 (head::draft_head_bytes, 57,671,680 bytes) and their ID map, "
+            "I32 [32,768], on each card",
+            { both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card)),
+              both("draft head ID map", int64_t(fn::head::n_draft_card) * 4) }
+        });
+    }
 
     // ME11: two banks and two five-step record sets a layer and card (fn/kernels/gdn/gdn.h), in place of six versions
     buffer_class gdn{"GDN state",
@@ -222,7 +254,7 @@ std::vector<buffer_class> state_classes(const state_params & p) {
                      "sets of 5 steps x 16,512 bytes (Ln records), selected by the round state's GDN word",
                      {}};
     for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (l % fn::full_attn_interval != fn::full_attn_interval - 1) {
+        if (l % fn::full_attn_interval != fn::full_attn_interval - 1 && p.win.layer(l)) {
             gdn.parts.push_back(both("L" + std::to_string(l),
                                      int64_t(gdn_banks) * gdn_heads_card * gdn_head_dim * gdn_head_dim * 4));
             gdn.parts.push_back(both("L" + std::to_string(l) + " records", gdn_record_bytes));
@@ -235,13 +267,15 @@ std::vector<buffer_class> state_classes(const state_params & p) {
                       "(conv_kernel - 1) x ngram positions F32 (qwen4exp.cpp build_ple); base + 5 row versions (SP2)",
                       {}};
     for (int32_t l = 0; l < fn::n_layer; ++l) {
-        if (l % fn::full_attn_interval != fn::full_attn_interval - 1) {
+        if (l % fn::full_attn_interval != fn::full_attn_interval - 1 && p.win.layer(l)) {
             conv.parts.push_back(both("L" + std::to_string(l) + " GDN",
                                       int64_t(gdn_versions) * gdn_conv_channels_card * gdn_conv_history * 4));
         }
     }
     const int64_t ple_hist = int64_t(p.ple_conv_kernel - 1) * p.ple_ngram;
-    conv.parts.push_back(both("L1 PLE", int64_t(gdn_versions) * ple_channels_card * ple_hist * 4));
+    if (p.win.ple()) {
+        conv.parts.push_back(both("L1 PLE", int64_t(gdn_versions) * ple_channels_card * ple_hist * 4));
+    }
     out.push_back(conv);
 
     // the selection body U32 [B][517] and its offsets I32 [B + 1], q F32 [B][4][128]
@@ -281,22 +315,25 @@ std::vector<buffer_class> state_classes(const state_params & p) {
           both("greedy work", (int64_t)fn::head::greedy_work_bytes())}});
     // DR1 Stage C: the draft rounds' buffers outside the layer workspace (fn/model/draft.h carves them); the draft
     // rounds reuse the layer workspace, the embedding boundary, the head's moments and pairs and the greedy work
-    out.push_back(
-        {"draft round (DR1)",
-         "draft.h: the retained carry and the draft's hidden output [4][1280] F32 (4 streams); X-DRAFT-IN's own "
-         "payload [5][6408]; eh_proj's input codes [5][4][5120] and scales [5][4][160][2] and output [5][4][1280]; "
-         "DA-TC's q16 [5][12][256] F16 and partials; the draft logits [4][32768] F32 and the head product's work "
-         "(SP2: five catch-up rows, four steps)",
-         {both("retained carry", int64_t(4) * 1280 * 4), both("draft hidden output", int64_t(4) * 1280 * 4),
-          both("X-DRAFT-IN own payload", int64_t(fn::draft::max_rows) * fn::xchg::words_draft * 4),
-          both("eh_proj input codes", int64_t(fn::draft::max_rows) * 4 * 5120),
-          both("eh_proj input scales", int64_t(fn::draft::max_rows) * 4 * 160 * 8),
-          both("eh_proj output", int64_t(fn::draft::max_rows) * 4 * 1280 * 4),
-          both("DA-TC q16", int64_t(fn::draft::max_rows) * 12 * 256 * 2),
-          both("DA-TC partials", (int64_t)fn::draft::part_bytes()),
-          both("draft logits", int64_t(fn::samp::max_drafts) * fn::head::n_draft_card * 4),
-          both("draft head work",
-               std::max<int64_t>(256, (int64_t)fn::head::logits_work_bytes(fn::head::n_draft_card)))}});
+    if (p.win.head) {
+        out.push_back({
+            "draft round (DR1)",
+            "draft.h: the retained carry and the draft's hidden output [4][1280] F32 (4 streams); X-DRAFT-IN's own "
+            "payload [5][6408]; eh_proj's input codes [5][4][5120] and scales [5][4][160][2] and output [5][4][1280]; "
+            "DA-TC's q16 [5][12][256] F16 and partials; the draft logits [4][32768] F32 and the head product's work "
+            "(SP2: five catch-up rows, four steps)",
+            { both("retained carry", int64_t(4) * 1280 * 4), both("draft hidden output", int64_t(4) * 1280 * 4),
+              both("X-DRAFT-IN own payload", int64_t(fn::draft::max_rows) * fn::xchg::words_draft * 4),
+              both("eh_proj input codes", int64_t(fn::draft::max_rows) * 4 * 5120),
+              both("eh_proj input scales", int64_t(fn::draft::max_rows) * 4 * 160 * 8),
+              both("eh_proj output", int64_t(fn::draft::max_rows) * 4 * 1280 * 4),
+              both("DA-TC q16", int64_t(fn::draft::max_rows) * 12 * 256 * 2),
+              both("DA-TC partials", (int64_t) fn::draft::part_bytes()),
+              both("draft logits", int64_t(fn::samp::max_drafts) * fn::head::n_draft_card * 4),
+              both("draft head work",
+              std::max<int64_t>(256, (int64_t) fn::head::logits_work_bytes(fn::head::n_draft_card))) }
+        });
+    }
     // SM1: the sampler's per-slot state (samp.h): the options and decision record, the bias table and penalty counts
     // over the whole vocabulary (both cards hold them, so the re-sharded draft head reads them too), the window's ring
     // (up to the slot's capacity: penalty_last_n = -1), the retained q of 4 draft rows (SP2; kept lists, and the target

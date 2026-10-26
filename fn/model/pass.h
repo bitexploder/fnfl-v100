@@ -38,6 +38,35 @@ struct pass_record_layer {
 };
 constexpr int32_t pass_max_records = 4;
 
+// TTTS1: a split stage's boundary (fn/runtime/stage.h): one card's layer-boundary triple of a round's R rows, as the
+// layer after it combines it (x = hres + hpost * hx, layer.h layer_input), in pinned host memory laid out [hres R]
+// [hpost R][hx R] (stage_bytes(R) = R x 25,616 bytes). in: layer lo's input is the received triple, copied (host to
+// device, in stream order after the round's begin) into the embedding boundary's buffers (emb_hres, emb_hpost,
+// emb_hx), which layer_in reads for layer lo, in place of the embedding. out: the pass ends after layer hi with that
+// layer's output triple copied (device to host) into send, then the round's finish: no head, decision or commit (the
+// front's commit is the host's, after the back's verdict: round::advance). recv and send are a slot's own buffers,
+// fixed for its graphs.
+struct pass_stage {
+    bool            in      = false;
+    bool            out     = false;
+    const uint8_t * recv[2] = { nullptr, nullptr };
+    uint8_t *       send[2] = { nullptr, nullptr };
+};
+
+constexpr int64_t stage_row_bytes = int64_t(4 * 1280 + 4 + 1280) * 4;  // 25,616
+
+constexpr int64_t stage_bytes(int32_t rows) {
+    return rows * stage_row_bytes;
+}
+
+constexpr int64_t stage_hpost_at(int32_t rows) {
+    return int64_t(rows) * 4 * 1280 * 4;
+}
+
+constexpr int64_t stage_hx_at(int32_t rows) {
+    return stage_hpost_at(rows) + int64_t(rows) * 4 * 4;
+}
+
 struct pass_options {
     // the layers the pass runs: lo .. hi (the racecheck option: 8 .. 11, with layer lo's input the embedding and no
     // PLE unless lo <= 1 <= hi); the whole model: 0 .. 47
@@ -49,6 +78,8 @@ struct pass_options {
     // SM1: the request's sampler (FC-DEC2): the decision's stages (samp.h) after the logits, with the decision hash;
     // null: V1's greedy as TG1 built it (model-test, model-bench). Forced rounds decide nothing either way.
     const fn::samp::options * sampling = nullptr;
+    // TTTS1: the split stage's boundary (none: the whole model's pass)
+    pass_stage                stage;
 };
 
 // one card's resources for the pass
@@ -121,7 +152,8 @@ use_counters pass_graph_counters(const pass_options & o);
 // and each lane's logits, decision, commit and finish. A lane's pieces outside the joint launches are its slot's pass
 // with the lane frame, so each lane's round reads its own descriptor, writes its own state, logits, carry and sampler
 // record and finishes into its own completion record; its lane ring sees the lone pass's sequence (slot rules by
-// position, pass_graph_counters). The whole model only (layers 0 .. 47, no records).
+// position, pass_graph_counters). The whole model (layers 0 .. 47) or, TTTS1, a split stage's window (every lane the
+// same layers and stage), no records. A stage's lanes copy their own boundaries in and out (pass_stage).
 struct joint_pass {
     int32_t lanes = 0;
     pass_card * lane[fn::xchg::max_lanes] = {};       // pass_lane_init's
@@ -133,9 +165,11 @@ struct joint_pass {
 // exchange slots and error word; the joint layer_ws's lane view (lane_ws); the joint routing's rows 5u .. (ids
 // [20][10], wts [20][10]) and the lane's GLU slots and meta (joint_lane_ex), from route (joint_route_bytes, on the
 // card); the commit's error list in errs (device memory, fn::round::max_err pointers on the
-// card): the lane ring's word, attend's, select's, the experts' status and the joint word. Synchronous.
+// card): the lane ring's word, attend's, select's, the experts' status and the joint word. FMS2 (build item 3, W3): the
+// lane's own QSA select, attend and gdn_core workspaces in kernel_ws (joint_lane_kernel_ws; joint_kernel_ws_bytes on
+// the card), so attend's and select's words are the lane's. Synchronous.
 bool pass_lane_init(const pass_card & slot, const fn::xchg::joint_rings & jr, int32_t u, const layer_ws & joint_ws,
-                    void * route, const uint32_t ** errs, pass_card & out, std::string & err);
+                    void * route, void * kernel_ws, const uint32_t ** errs, pass_card & out, std::string & err);
 
 // One card's joint round, for a graph capture; u: the joint graph's counters (pass_graph_counters of the whole pass)
 step_status pass_joint_enqueue(joint_pass & jp, use_counters & u, std::string & err);

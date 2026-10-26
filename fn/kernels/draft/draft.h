@@ -138,6 +138,14 @@ struct recv_args {
 bool draft_in_send(int32_t rows, const send_args & a, void * stream);
 bool draft_in_recv(int32_t rows, const recv_args & a, void * stream);
 
+// FMS2 (build item 2, the joint catch-up): the catch-up's send and receive of lanes 2 .. 4 in one launch each, lane u
+// on a[u] (its ring's slots and its buffers) at *rows[u] rows (1 .. max_rows, read on the device: its descriptor's):
+// lane u's blocks are draft_in_send / draft_in_recv (*rows[u], a[u])'s, the same device code, and the blocks of rows
+// past *rows[u] write nothing. Unchained sends and receives with the retained carry's update only. False, with
+// nothing enqueued, for lanes outside 2 .. 4 or an argument the lone launch rejects.
+bool draft_in_send_lanes(int32_t lanes, const send_args * a, const int32_t * const * rows, void * stream);
+bool draft_in_recv_lanes(int32_t lanes, const recv_args * a, const int32_t * const * rows, void * stream);
+
 // ---- DA-TC ----
 
 struct prepare_args {
@@ -194,12 +202,20 @@ size_t part_bytes();
 // call it lands in (dense.h: splits depend on the shape only). base: k 5120, one matrix, X-HMIX not used (hmix null).
 // False, with nothing enqueued, for positions outside 1..5 or a base the rule rejects.
 bool eh_proj(int32_t positions, const fn::dense::product_args & base, void * stream);
+// FMS2 (build item 2, the joint catch-up): eh_proj's five calls, call b gated on the device word *positions (call b
+// runs when b < *positions, else its blocks return at once: fn::dense::product_gated), so a captured graph holds a
+// lane's catch-up at any B_c, and its rows are eh_proj (*positions, base)'s bitwise
+bool eh_proj_gated(const fn::dense::product_args & base, const int32_t * positions, void * stream);
 
 // ME3 (the host-backed KV's graphs, fn/model/kv_tier.h): shift, when set, is a device word w: the launch addresses
 // cell c at k_cache + (c - *w) * 256 (v_cache alike), *w read on the device (separate instantiations; the attend's for
 // the sparse form only); null: the resident launches
 bool datc_prepare(int32_t rows, const prepare_args & a, void * stream, const int64_t * shift = nullptr);
 bool datc_attend(const attend_args & a, void * stream, const int64_t * shift = nullptr);
+// FMS2 (build item 2, the joint catch-up): the catch-up's prepare (qfull null, row0 0, both releases set, resident)
+// of lanes 2 .. 4 in one launch, lane u on a[u] at its descriptor's rows (*a[u].stride, read on the device): lane
+// u's blocks are datc_prepare (*a[u].stride, a[u])'s, the same device code. False, with nothing enqueued, otherwise.
+bool datc_prepare_lanes(int32_t lanes, const prepare_args * a, void * stream);
 
 // FMU2 (build item 2, the joint draft step, fn/model/draft.h draft_joint_enqueue): up to max_copy_segs word copies
 // in one launch, block i segment i: dst[w] = src[w * src_stride] for w < words (the lanes' tokens and retained

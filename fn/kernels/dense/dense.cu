@@ -2,6 +2,7 @@
 
 #include "fn/kernels/act/act_warp.cuh"
 #include "fn/kernels/dense/dense_dec.cuh"
+#include "fn/kernels/dense/dense_mma.cuh"
 #include "fn/kernels/dense/iq3s.cuh"
 #include "fn/kernels/gdn/gdn_conv.cuh"
 #include "fn/kernels/round/version.h"
@@ -739,8 +740,8 @@ template <bool W32> __device__ __forceinline__ void prefetch_first_unit(const la
 
 // W32 (DR1): the instantiation with the F32 path, launched only when a matrix is F32 (the draft's router), so the
 // target's launches keep the kernels without it (their code and registers as before DR1)
-template <int B, bool W32>
-__global__ void __launch_bounds__(n_threads, 1) product_kernel(const __grid_constant__ launch_desc L) {
+// FMS2 (build item 2): product_kernel's body, shared with the gated launch (product_gated_kernel)
+template <int B, bool W32> __device__ __forceinline__ void product_body(const launch_desc & L) {
     extern __shared__ uint4 smem4[];
     uint8_t * sm = reinterpret_cast<uint8_t *>(smem4);
     const int32_t nblk = L.k / 32;
@@ -848,11 +849,29 @@ __global__ void __launch_bounds__(n_threads, 1) product_kernel(const __grid_cons
     }
 }
 
+template <int B, bool W32>
+__global__ void __launch_bounds__(n_threads, 1) product_kernel(const __grid_constant__ launch_desc L) {
+    product_body<B, W32>(L);
+}
+
+// FMS2 (build item 2, the joint catch-up's eh_proj): the lone launch, whose blocks all return at once when
+// *gate <= at (a device word, read once a block, so every block takes the same branch)
+template <int B>
+__global__ void __launch_bounds__(n_threads, 1) product_gated_kernel(const __grid_constant__ launch_desc L,
+                                                                     const int32_t * gate, int32_t at) {
+    if (*gate <= at) {
+        return;
+    }
+    product_body<B, false>(L);
+}
+
 // ---- FMU2: the joint product (dense.h) ------------------------------------------------------------------------------
-// U lanes of lane_rows rows; row b = 5 u + i. A unit decodes each weight once and dots it with every row (dots at U x 5
-// rows: each row's chain is the B = 5 chain). Partial sums [tile][part][8 rows][20] (every U alike, so one region
-// serves a site at every U), summed in part order as the lone launch sums its parts; the counters are the lone
-// launch's.
+// U lanes of LR rows (FMS13: the round's R = d + 1, 2 .. 5; lane_rows before). Inside the kernel's tiles row b = LR u +
+// i is lane u's row i; in memory (activations, outputs, per-row buffers, X-HMIX slots, the peer's slot) it is row 5 u +
+// i (mrow), so rows LR .. 4 of every lane are neither read nor written. A unit decodes each weight once and dots it
+// with every row (dots at U x LR rows: each row's chain is the B = LR chain). Partial sums [tile][part][8 rows][20]
+// (every U alike, so one region serves a site at every U), summed in part order as the lone launch sums its parts; the
+// counters are the lone launch's.
 struct joint_desc {
     launch_desc L; // the matrices; activations, outputs and per-row buffers of row 0, rows contiguous; lane 0's X-HMIX
     int32_t lanes;
@@ -861,51 +880,86 @@ struct joint_desc {
     const uint32_t * cur[max_lanes]; // and its committed slot's word
     float * out[max_lane_mats][max_lanes]; // joint_args::out: lane u's rows of matrix i (null: md.out's rows)
     const float * xf[max_lanes];           // joint_args::x_f32: lane u's F32 activation rows (null: L.xf's rows)
+    uint32_t * peer;                       // joint_args::peer (FMS2 item 6): matrix 0's peer half, or null
+    int32_t peer_half;
+    uint32_t * x16_err; // joint_args::x16_err (FMS2 item 7): non-null, the send is 16-bit
+    uint32_t * rtc_cnt; // FMS5 (joint_args::router_tc): the row groups' arrival counters, or null
+    float * rtc_part;   // and the slices' partial sums [slice][rtc_cols][rtc_row_slots]
 };
+static_assert(fn::xchg::words_half % tile_q == 0 && fn::xchg::words_half % tile_bf == 0,
+              "a tile's rows lie in one half");
 
 constexpr int32_t joint_slot = tile_q * max_joint_rows; // floats a unit's partial sums take
 
-// row b's output row of an F32 matrix: lane b / 5's own buffer in a launch with lane outputs, else row b of md.out
-__device__ __forceinline__ float * joint_out(const joint_desc & J, const mat_desc & md, int32_t b) {
+// FMS13: packed row b's memory row (b itself at LR = lane_rows, so that code is unchanged)
+template <int LR> __device__ __forceinline__ int32_t mrow(int32_t b) {
+    if constexpr (LR == lane_rows) {
+        return b;
+    } else {
+        return lane_rows * (b / LR) + b % LR;
+    }
+}
+
+// row b's output row of an F32 matrix: lane b / LR's own buffer in a launch with lane outputs, else its memory row of
+// md.out
+template <int LR> __device__ __forceinline__ float * joint_out(const joint_desc & J, const mat_desc & md, int32_t b) {
     const int32_t i = static_cast<int32_t>(&md - J.L.mats);
-    return J.out[0][0] != nullptr ? J.out[i][b / lane_rows] + (b % lane_rows) * md.m : md.out + b * md.m;
+    return J.out[0][0] != nullptr ? J.out[i][b / LR] + (b % LR) * md.m : md.out + mrow<LR>(b) * md.m;
 }
 
 // row b's finished value v for matrix row `row` (row r of its tile): written (an unsplit plain product) or put in the
 // unit's partial slot
-template <int U>
-__device__ __forceinline__ void joint_put(const joint_desc & J, const mat_desc & md, int32_t tile, int32_t kp,
-                                          int32_t r, int32_t row, int32_t b, float v) {
+template <int U, int LR>
+__device__ __forceinline__ void joint_put(const joint_desc & J,
+                                          const mat_desc &   md,
+                                          int32_t            tile,
+                                          int32_t            kp,
+                                          int32_t            r,
+                                          int32_t            row,
+                                          int32_t            b,
+                                          float              v) {
     const launch_desc & L = J.L;
     if (md.split == 1 && md.e == static_cast<int32_t>(epi::f32)) {
-        joint_out(J, md, b)[row] = scaled(md, b, v);
+        joint_out<LR>(J, md, b)[row] = scaled(md, mrow<LR>(b), v);
     } else {
         L.part[md.part_off + (tile * md.split + kp) * joint_slot + r * max_joint_rows + b] = v;
     }
 }
 
-// The joint GLU's last arriver: glu_finish's rows over the U x 5 rows of the joint slot
-__device__ __noinline__ void glu_finish_joint(const float * gp, const float * up, int32_t split, int32_t m,
-                                              int32_t group, int32_t lane, int8_t * codes, float * scales, float * f32,
-                                              int32_t rows) {
+// The joint GLU's last arriver: glu_finish's rows over the U x LR rows of the joint slot, each to its memory row
+template <int LR>
+__device__ __noinline__ void glu_finish_joint(const float * gp,
+                                              const float * up,
+                                              int32_t       split,
+                                              int32_t       m,
+                                              int32_t       group,
+                                              int32_t       lane,
+                                              int8_t *      codes,
+                                              float *       scales,
+                                              float *       f32,
+                                              int32_t       rows) {
     const int32_t t = 4 * group + (lane >> 3), slot = joint_slot, at = (lane & 7) * max_joint_rows;
 #pragma unroll 1
     for (int32_t b = 0; b < rows; ++b) {
         const float g = sum_parts(gp + t * split * slot + at + b, split, slot);
         const float u = sum_parts(up + t * split * slot + at + b, split, slot);
         const float y = g / (1.0f + expf(-g)) * u;
-        fn::act::put_run_warp(y, lane, codes + b * m + 32 * group, scales + 2 * (b * (m / 32) + group));
+        const int32_t mb = mrow<LR>(b);
+        fn::act::put_run_warp(y, lane, codes + mb * m + 32 * group, scales + 2 * (mb * (m / 32) + group));
         if (f32 != nullptr) {
-            f32[b * m + 32 * group + lane] = y;
+            f32[mb * m + 32 * group + lane] = y;
         }
     }
 }
 
 // A unit's end after its joint_put calls: finish's hand-off (fence, count, the last arriver sums in part order)
-template <int U>
-__device__ __forceinline__ void joint_arrive(const joint_desc & J, const mat_desc & md, int32_t tile,
-                                             int32_t rows_tile, int32_t lane) {
-    constexpr int32_t R = lane_rows * U;
+template <int U, int LR>
+__device__ __forceinline__ void joint_arrive(const joint_desc & J,
+                                             const mat_desc &   md,
+                                             int32_t            tile,
+                                             int32_t            rows_tile,
+                                             int32_t            lane) {
+    constexpr int32_t   R = LR * U;
     const launch_desc & L = J.L;
     if (md.split == 1 && md.e == static_cast<int32_t>(epi::f32)) {
         return;
@@ -925,31 +979,303 @@ __device__ __forceinline__ void joint_arrive(const joint_desc & J, const mat_des
         return;
     }
     __threadfence();
-    if (!glu) {
+    constexpr int32_t hw = fn::xchg::words_half;
+    if (!glu && J.peer != nullptr && &md == L.mats && rows_tile * tile / hw == J.peer_half) {
+        // FMS2 item 6: a tile of the peer's half, lanes along its rows (coalesced peer stores), each value also to the
+        // peer
+        const float * part = L.part + md.part_off + tile * md.split * joint_slot;
+        const int32_t col = rows_tile * tile - J.peer_half * hw; // the tile's first column in the half
+        if (J.x16_err != nullptr) {                              // FMS2 item 7: FP16 halves, each its own flag (xchg.h)
+            uint16_t * peer = reinterpret_cast<uint16_t *>(J.peer) + col;
+            bool over = false;
+#pragma unroll 1
+            for (int32_t i = lane; i < rows_tile * R; i += 32) {
+                const int32_t bb = i / rows_tile, rr = i - bb * rows_tile, row2 = rows_tile * tile + rr;
+                const int32_t mb = mrow<LR>(bb);
+                const float   v  = scaled(md, mb, sum_parts(part + rr * max_joint_rows + bb, md.split, joint_slot));
+                joint_out<LR>(J, md, bb)[row2]           = v;
+                peer[mb * fn::xchg::x16_row_halves + rr] = fn::xchg::x16_bits(v, over);
+            }
+            if (over) {
+                atomicOr(J.x16_err, fn::xchg::err_x16_range);
+            }
+        } else {
+            uint32_t * peer = J.peer + col;
+#pragma unroll 1
+            for (int32_t i = lane; i < rows_tile * R; i += 32) {
+                const int32_t bb = i / rows_tile, rr = i - bb * rows_tile, row2 = rows_tile * tile + rr;
+                const int32_t mb = mrow<LR>(bb);
+                const float   v  = scaled(md, mb, sum_parts(part + rr * max_joint_rows + bb, md.split, joint_slot));
+                joint_out<LR>(J, md, bb)[row2] = v;
+                peer[mb * hw + rr]             = fn::xchg::canonical(v);
+            }
+        }
+    } else if (!glu) {
         const float * part = L.part + md.part_off + tile * md.split * joint_slot;
 #pragma unroll 1
         for (int32_t i = lane; i < rows_tile * R; i += 32) {
             const int32_t rr = i / R, bb = i - rr * R, row2 = rows_tile * tile + rr;
             if (row2 < md.m) {
-                joint_out(J, md, bb)[row2] =
-                    scaled(md, bb, sum_parts(part + rr * max_joint_rows + bb, md.split, joint_slot));
+                // FMS13: bb itself at five rows, as before: passing mrow<5>(bb), the same value, let the compiler
+                // sink rr * 20 into this branch and changed U = 4's SASS (the R = 5 identity check)
+                joint_out<LR>(J, md, bb)[row2] =
+                    scaled(md, LR == lane_rows ? bb : mrow<LR>(bb),
+                           sum_parts(part + rr * max_joint_rows + bb, md.split, joint_slot));
             }
         }
     } else {
         const mat_desc & gm = md.e == static_cast<int32_t>(epi::glu_gate) ? md : L.mats[md.pair];
         const mat_desc & um = md.e == static_cast<int32_t>(epi::glu_up) ? md : L.mats[md.pair];
-        glu_finish_joint(L.part + gm.part_off, L.part + um.part_off, md.split, md.m, group, lane, L.glu_codes,
-                         L.glu_scales, L.glu_f32, R);
+        glu_finish_joint<LR>(L.part + gm.part_off, L.part + um.part_off, md.split, md.m, group, lane, L.glu_codes,
+                             L.glu_scales, L.glu_f32, R);
     }
     if (lane == 0) {
         *cnt = 0u;
     }
 }
 
-template <fmt F, int U>
-__device__ __forceinline__ void run_q_joint(const joint_desc & J, const mat_desc & md, int32_t tile, int32_t kp,
-                                            const act & x, const uint32_t * grid) {
-    constexpr int32_t R = lane_rows * U;
+// ---- FMS2 build item 4 (W2): the joint quantized product on the tensor cores ----------------------------------------
+// run_q's integer dots as m8n8k4 products of exact FP16 integers. Lane L of quadpair p = (L >> 2) & 3 is run_q's decode
+// lane (r, q) = (frag_row(L), p): it decodes weight row frag_row(L) at quarter p and holds that row's codes as its A
+// row. Its B column n of n-tile t is activation row 8 t + n (rows past R repeat row R - 1, unused). Each part of a step
+// (a 32-weight sub-block; Q6_K a 16-weight group) is a fresh accumulator set D, seeded with the bias terms, so D's
+// element (r, b) ends as run_q's integer sum `is` (Q6_K: is - 32 sum16) of row r, quarter p, activation row b,
+// exactly: the activations are staged as unsigned codes s + 128 and enter as 1,152 + s, the weights as their values,
+// and D starts at -1,152 times the part's code sum (every partial sum stays below 2^24). Then each element takes
+// run_q's F32 steps in run_q's order, with its row's scales from the row's decode lane, and the quarters are summed
+// over the quadpairs (lanes xor 4, then xor 8: run_q's (a0 + a1) + (a2 + a3)).
+
+template <int R> constexpr int32_t joint_tiles = (R + 7) / 8; // n-tiles of 8 activation rows
+
+// the weight codes' bias (A): signed codes are flipped to unsigned and less 1,152; Q2_0's codes are q + 1 (less 1,025)
+template <fmt F> __device__ __forceinline__ constexpr bool signed_codes() {
+    return F == fmt::q8_0 || F == fmt::iq4_xs || F == fmt::iq4_nl || F == fmt::iq3_s;
+}
+template <fmt F> __device__ __forceinline__ void weight16(uint32_t w, uint32_t & lo, uint32_t & hi) {
+    if constexpr (signed_codes<F>()) {
+        mma::codes16(w ^ 0x80808080u, 0x64806480u, lo, hi);
+    } else if constexpr (F == fmt::q2_0) {
+        mma::codes16(w, 0x64016401u, lo, hi);
+    } else {
+        mma::codes16(w, 0x64006400u, lo, hi);
+    }
+}
+
+// one step s of the lane's decoded unit o. live: the quadpair's quarter is in the matrix (a tail step's quarters past
+// nq are not: their products run, as mma.sync is warp-wide, but load nothing and add nothing).
+template <fmt F, int R>
+__device__ __forceinline__ void mma_step(const dec64 & o, int32_t s, bool live, const act & x,
+                                         float (&acc)[joint_tiles<R>][8]) {
+    constexpr int32_t NT = joint_tiles<R>;
+    constexpr bool q6 = F == fmt::q6_k;
+    constexpr bool kq = F == fmt::q4_k || F == fmt::q5_k;
+    constexpr int32_t NP = q6 ? 4 : 2, WP = 16 / NP; // parts a step, code words a part
+    const int32_t lane = lane_id(); // read each step, so the lane's terms are recomputed, not held across the loop
+    const int32_t p = (lane >> 2) & 3, n = mma::frag_row(lane);
+    const int32_t row0 = mma::c_row(lane, 0); // the lane's accumulator rows row0 (i & 2 = 0) and row0 | 2
+    const int32_t src0 = mma::frag_lane(lane, row0), src1 = mma::frag_lane(lane, row0 | 2);
+    const float dd0 = q6 ? __shfl_sync(0xffffffffu, o.d, src0) : 0.0f;
+    const float dd1 = q6 ? __shfl_sync(0xffffffffu, o.d, src1) : 0.0f;
+#pragma unroll
+    for (int32_t g = 0; g < NP; ++g) {
+        int32_t sw = 0;
+#pragma unroll
+        for (int32_t t = 0; t < WP; ++t) {
+            sw = dp4a(o.w[WP * g + t], 0x01010101u, sw);
+        }
+        sw -= F == fmt::q2_0 ? 4 * WP : 0;
+        const float fs = q6 ? static_cast<float>(o.sc[g]) : (g ? o.f1 : o.f0);
+        const float f0 = __shfl_sync(0xffffffffu, fs, src0), f1 = __shfl_sync(0xffffffffu, fs, src1);
+        float m0 = 0.0f, m1 = 0.0f;
+        if constexpr (kq) {
+            const float ms = g ? o.m1 : o.m0;
+            m0 = __shfl_sync(0xffffffffu, ms, src0);
+            m1 = __shfl_sync(0xffffffffu, ms, src1);
+        }
+        const float c0 = static_cast<float>(-1152 * __shfl_sync(0xffffffffu, sw, src0));
+        const float c1 = static_cast<float>(-1152 * __shfl_sync(0xffffffffu, sw, src1));
+        // the part's chunks and activation run (run_q's dots)
+        const int32_t ch = q6 ? 16 * s + 8 * (p >> 1) + (p & 1) + 2 * g : 16 * s + 4 * p + 2 * g;
+        const int32_t run = q6 ? 8 * s + 4 * (p >> 1) + g : 8 * s + 2 * p + g;
+#pragma unroll
+        for (int32_t nt = 0; nt < NT; ++nt) {
+            const int32_t bn = min(8 * nt + n, R - 1);
+            float d[8] = {c0, c0, c1, c1, c0, c0, c1, c1};
+#pragma unroll
+            for (int32_t c = 0; c < WP / 4; ++c) {
+                const uint4 v = live ? mma::lds128(x.xs + bn * x.k + 16 * swz(ch + c)) : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                for (int32_t t = 0; t < 4; ++t) {
+                    uint32_t a0, a1, b0, b1;
+                    weight16<F>(o.w[WP * g + 4 * c + t], a0, a1); // per product: a part's 16 A words held spilled
+                    mma::biased16(word(v, t), b0, b1);
+                    mma::mma884(d, a0, a1, b0, b1);
+                }
+            }
+            if (!live) {
+                continue;
+            }
+            // the lane's columns j = 0, 1, 4, 5 (accumulators j and j | 2: rows row0 and row0 | 2), one meta load each
+#pragma unroll
+            for (int32_t j = 0; j < 8; j += (j & 1) ? 3 : 1) {
+                if (8 * nt + j >= R) { // no lane's column j is a row (compile time)
+                    continue;
+                }
+                const int32_t b = min(8 * nt + mma::c_col(lane, j), R - 1);
+                const float4 * mb = x.meta + b * (x.k / 32) + run; // the activation run's {d, s, sum16 0, sum16 1}
+                if constexpr (q6) {
+                    const uint32_t * mw = reinterpret_cast<const uint32_t *>(mb); // d, then sum16 0 and 1 at words 2, 3
+                    const float xd = __uint_as_float(mma::lds32(mw));
+                    const float s16 = static_cast<float>(32 * static_cast<int32_t>(mma::lds32(mw + 2 + (p & 1))));
+                    acc[nt][j] = fmaf(dd0 * xd, f0 * (d[j] - s16), acc[nt][j]);
+                    acc[nt][j | 2] = fmaf(dd1 * xd, f1 * (d[j | 2] - s16), acc[nt][j | 2]);
+                } else {
+                    const float2 m = mma::lds64f(mb);
+                    acc[nt][j] = fmaf(m.x * f0, d[j], acc[nt][j]);
+                    acc[nt][j | 2] = fmaf(m.x * f1, d[j | 2], acc[nt][j | 2]);
+                    if constexpr (kq) {
+                        acc[nt][j] = fmaf(-m0, m.y, acc[nt][j]);
+                        acc[nt][j | 2] = fmaf(-m1, m.y, acc[nt][j | 2]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// FMS6 (dense.h joint_args::dense_f16): one step s in FP16 on the tensor cores, accumulating in place. A is each
+// weight's value in FP16, the part's scales folded in on the decode lane (the lane's own row, so no shuffles); B is
+// each activation's value code x RN16(d); acc[nt] carries the F32 sums across every part and step of the unit, and
+// the quarters are summed as mma_step's. A is converted once per 16-byte chunk and reused across the n-tiles. live:
+// as mma_step; a quarter that is not live has A = 0 (its tail decode) and takes activation scale 0, its meta not read
+// (the run index can point past the meta array).
+template <fmt F, int R>
+__device__ __forceinline__ void mma_step_f16(const dec64 & o, int32_t s, bool live, const act & x,
+                                             float (&acc)[joint_tiles<R>][8]) {
+    constexpr int32_t NT = joint_tiles<R>;
+    constexpr bool q6 = F == fmt::q6_k;
+    constexpr bool kq = F == fmt::q4_k || F == fmt::q5_k;
+    constexpr int32_t NP = q6 ? 4 : 2, WP = 16 / NP; // parts a step, code words a part
+    constexpr uint32_t b1152 = 0x64806480u;           // 1,152 in both halves: biased16's 1,024 + the staging's 128
+    const int32_t lane = lane_id();
+    const int32_t p = (lane >> 2) & 3, n = mma::frag_row(lane);
+#pragma unroll
+    for (int32_t g = 0; g < NP; ++g) {
+        // the part's weight scale (Q6_K: d sc) and, Q4_K and Q5_K, its min, rounded to FP16 once
+        const uint32_t fw = mma::f16x2(q6 ? o.d * static_cast<float>(o.sc[g]) : (g ? o.f1 : o.f0));
+        const uint32_t mw = kq ? mma::f16x2(-(g ? o.m1 : o.m0)) : 0u;
+        const int32_t ch = q6 ? 16 * s + 8 * (p >> 1) + (p & 1) + 2 * g : 16 * s + 4 * p + 2 * g;
+        const int32_t run = q6 ? 8 * s + 4 * (p >> 1) + g : 8 * s + 2 * p + g;
+        uint32_t xd[NT]; // the lane's B column's activation scale d of the run, RN16
+#pragma unroll
+        for (int32_t nt = 0; nt < NT; ++nt) {
+            const int32_t bn = min(8 * nt + n, R - 1);
+            xd[nt] = mma::f16x2(live ? __uint_as_float(mma::lds32(x.meta + bn * (x.k / 32) + run)) : 0.0f);
+        }
+#pragma unroll
+        for (int32_t c = 0; c < WP / 4; ++c) {
+            uint32_t a[8];
+#pragma unroll
+            for (int32_t t = 0; t < 4; ++t) {
+                const uint32_t w = o.w[WP * g + 4 * c + t];
+                uint32_t lo, hi;
+                if constexpr (q6) {
+                    mma::codes16(w, 0x64206420u, lo, hi); // c - 32, exact (weight16's 0x6400 gives c)
+                } else {
+                    weight16<F>(w, lo, hi); // the code's integer value, exact
+                }
+                if constexpr (kq) {
+                    a[2 * t] = mma::hfma2(lo, fw, mw); // c f - m, one rounding
+                    a[2 * t + 1] = mma::hfma2(hi, fw, mw);
+                } else {
+                    a[2 * t] = mma::hmul2(lo, fw);
+                    a[2 * t + 1] = mma::hmul2(hi, fw);
+                }
+            }
+#pragma unroll
+            for (int32_t nt = 0; nt < NT; ++nt) {
+                const int32_t bn = min(8 * nt + n, R - 1);
+                const uint4 v = live ? mma::lds128(x.xs + bn * x.k + 16 * swz(ch + c)) : make_uint4(0u, 0u, 0u, 0u);
+#pragma unroll
+                for (int32_t t = 0; t < 4; ++t) {
+                    uint32_t b0, b1;
+                    mma::biased16(word(v, t), b0, b1); // 1,152 + s
+                    b0 = mma::hmul2(mma::hsub2(b0, b1152), xd[nt]);
+                    b1 = mma::hmul2(mma::hsub2(b1, b1152), xd[nt]);
+                    mma::mma884(acc[nt], a[2 * t], a[2 * t + 1], b0, b1);
+                }
+            }
+        }
+    }
+}
+
+template <fmt F, int R, bool F16>
+__device__ __forceinline__ void step_of(const dec64 & o, int32_t s, bool live, const act & x,
+                                        float (&acc)[joint_tiles<R>][8]) {
+    if constexpr (F16) {
+        mma_step_f16<F, R>(o, s, live, x, acc);
+    } else {
+        mma_step<F, R>(o, s, live, x, acc);
+    }
+}
+
+// the unit's tile and split part, from its index u (opaque: formed where used, so nothing of the unit but u is held
+// across the step loop)
+struct joint_unit {
+    int32_t tile, kp;
+};
+__device__ __forceinline__ joint_unit unit_of(const mat_desc & md, int32_t u) {
+    const int32_t rel = opaque(u) - md.unit_base, tile = rel / md.split;
+    return {tile, rel - tile * md.split};
+}
+
+// the IQ3_S grid in shared memory past the staged activations and meta (joint_kernel), formed where used
+template <int U, int LR> __device__ const __forceinline__ uint32_t * joint_grid(const launch_desc & L) {
+    constexpr int32_t       R = LR * U;
+    extern __shared__ uint4 smem4[];
+    const int32_t k = opaque(L.k);
+    return reinterpret_cast<const uint32_t *>(reinterpret_cast<uint8_t *>(smem4) +
+                                              (L.need_xq ? R * k + R * (k / 32) * 16 : 0));
+}
+
+// the warp's conv_silu scratch: tile_q x R floats past the grid (launch_joint)
+template <int U, int LR> __device__ __forceinline__ float * conv_scratch(const launch_desc & L) {
+    constexpr int32_t R = LR * U;
+    return reinterpret_cast<float *>(const_cast<uint32_t *>(joint_grid<U, LR>(L)) +
+                                     (L.need_grid ? iq3s_grid_bytes / 4 : 0)) +
+           static_cast<int32_t>(threadIdx.x >> 5) * tile_q * R;
+}
+
+// a full step's loads at sp, the lane's cursor formed from the lane id here. Q6_K loads only the two scale words of
+// the lane's half (decode reads no others).
+template <fmt F> __device__ __forceinline__ void load_joint(raw<F> & v, const uint8_t * sp) {
+    const int32_t lane = lane_id();
+    const cursor c = make_cursor<F>(sp, mma::frag_row(lane), (lane >> 2) & 3);
+    if constexpr (F == fmt::q6_k) {
+        v.a = ldw4(c.p[0]);
+        v.b = ldw4(c.p[0] + 512);
+        v.c = ldw4(c.p[0] + 1024);
+        const uint2 h = ldw2(c.p[1] + 8 * ((lane >> 3) & 1)); // scale words n, n + 1 of the row (n = q >> 1)
+        v.sc = make_uint4(h.x, h.y, h.x, h.y);
+        v.d = ldh1(c.p[2]);
+    } else {
+        load_full<F, 0>(v, c);
+    }
+}
+
+// FMS3 item 1: U = 2's quantized step on the integer dots, main 2c288390's run_q_joint (before FMS2 item 4). At 10
+// rows item 4's tensor-core step has more instructions than this loop (its activation conversions and n-tile address
+// math do not shrink with the rows). The activations are staged as signed codes at U = 2 (joint_kernel). Both loops
+// give run_q's exact integer sums, then the same F32 steps in the same order. FMS13: the form of every U LR <= 10.
+template <fmt F, int U, int LR>
+__device__ __forceinline__ void run_q_joint_int(const joint_desc & J,
+                                                const mat_desc &   md,
+                                                int32_t            tile,
+                                                int32_t            kp,
+                                                const act &        x,
+                                                const uint32_t *   grid) {
+    static_assert(U * LR <= 10, "the integer joint step serves up to 10 rows");
+    constexpr int32_t   R    = LR * U;
     const launch_desc & L = J.L;
     const int32_t lane = lane_id();
     const int32_t r = lane >> 2, q = lane & 3;
@@ -997,20 +1323,37 @@ __device__ __forceinline__ void run_q_joint(const joint_desc & J, const mat_desc
         acc[b] += __shfl_xor_sync(0xffffffffu, acc[b], 2);
     }
     const int32_t row = tile_q * tile + r;
-    if (md.e == static_cast<int32_t>(epi::conv_silu)) { // unsplit: lane (r, q = u) runs lane u's five rows
-        float xu[lane_rows];
+    if (md.e == static_cast<int32_t>(epi::conv_silu)) {  // unsplit: lane (r, q = u) runs lane u's LR rows
+        if constexpr (LR == lane_rows) {
+            float xu[lane_rows];
 #pragma unroll
-        for (int32_t i = 0; i < lane_rows; ++i) {
-            float t = acc[i];
+            for (int32_t i = 0; i < lane_rows; ++i) {
+                float t = acc[i];
 #pragma unroll
-            for (int32_t u = 1; u < U; ++u) {
-                t = q == u ? acc[lane_rows * u + i] : t;
+                for (int32_t u = 1; u < U; ++u) {
+                    t = q == u ? acc[lane_rows * u + i] : t;
+                }
+                xu[i] = t;
             }
-            xu[i] = t;
-        }
-        if (q < U && row < md.m) {
-            conv_finish5(L.conv_w, J.hist[q], J.cur[q], md.out + q * lane_rows * fn::gdn::n_channel, row, xu[0], xu[1],
-                         xu[2], xu[3], xu[4]);
+            if (q < U && row < md.m) {
+                conv_finish5(L.conv_w, J.hist[q], J.cur[q], md.out + q * lane_rows * fn::gdn::n_channel, row, xu[0],
+                             xu[1], xu[2], xu[3], xu[4]);
+            }
+        } else {
+            float xu[4] = { 0.0f, 0.0f, 0.0f, 0.0f };  // conv_finish<LR> reads rows 0 .. LR - 1 only
+#pragma unroll
+            for (int32_t i = 0; i < LR; ++i) {
+                float t = acc[i];
+#pragma unroll
+                for (int32_t u = 1; u < U; ++u) {
+                    t = q == u ? acc[LR * u + i] : t;
+                }
+                xu[i] = t;
+            }
+            if (q < U && row < md.m) {
+                conv_finish<LR>(L.conv_w, J.hist[q], J.cur[q], md.out + q * lane_rows * fn::gdn::n_channel, row, xu[0],
+                                xu[1], xu[2], xu[3]);
+            }
         }
         return;
     }
@@ -1018,21 +1361,231 @@ __device__ __forceinline__ void run_q_joint(const joint_desc & J, const mat_desc
 #pragma unroll
         for (int32_t b = 0; b < R; ++b) {
             if ((b & 3) == q) {
-                joint_put<U>(J, md, tile, kp, r, row, b, acc[b]);
+                joint_put<U, LR>(J, md, tile, kp, r, row, b, acc[b]);
             }
         }
     }
-    joint_arrive<U>(J, md, tile, tile_q, lane);
+    joint_arrive<U, LR>(J, md, tile, tile_q, lane);
 }
 
-// BF16 weights: every lane's rows from one load of each weight (FMU2 build item 4), WR of the tile's rows a pass (all
-// four at U = 2; two at U = 3 and 4, for the registers). Each (weight row, activation row) chain is run_wide<5>'s: the
-// same lane slice, steps and FMA order, then the same xor tree. Activation row b is lane b / 5's row b % 5: its
-// J.xf buffer, its X-HMIX slot or row b of L.xf.
-template <fmt F, int U>
+// F16 (FMS6): each step on mma_step_f16, else mma_step (bitwise the lone launch)
+template <fmt F, int U, int LR, bool F16>
+__device__ __forceinline__ void run_q_joint(const joint_desc & J,
+                                            const mat_desc &   md,
+                                            int32_t            u,
+                                            const act &        x,
+                                            const uint32_t *   grid) {
+    constexpr int32_t   R    = LR * U;
+    constexpr int32_t NT = joint_tiles<R>;
+    const launch_desc & L = J.L;
+    const int32_t lane = lane_id();
+    const int32_t r = mma::frag_row(lane), q = (lane >> 2) & 3; // the decode lane (r, q)
+    constexpr bool iq4 = F == fmt::iq4_xs || F == fmt::iq4_nl;
+    const uint4 kv = iq4 ? __ldg(reinterpret_cast<const uint4 *>(L.grids + iq3s_grid_bytes)) : make_uint4(0, 0, 0, 0);
+    constexpr int32_t full = step_bytes(F, 4);
+    const auto unit_w = [&](const joint_unit & un) { // the unit's weight tile
+        return md.w + un.tile * (int64_t(tile_q) * sb_bytes(F) * L.k / step_k);
+    };
+    const joint_unit un0 = unit_of(md, u);
+    const int32_t s0 = un0.kp * md.sp;
+    const int32_t n_full = min(s0 + md.sp, L.k / step_k) - s0;
+    float acc[NT][8];
+#pragma unroll
+    for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int32_t e = 0; e < 8; ++e) {
+            acc[nt][e] = 0.0f;
+        }
+    }
+    raw<F> v;
+    dec64 o;
+    if (n_full > 0) {
+        // the step's weights: the lane's segment pointers are formed again each step from this one pointer, not held
+        const uint8_t * sp = unit_w(un0) + int64_t(s0) * full;
+        load_joint<F>(v, sp);
+        const int32_t s_last = s0 + n_full - 1;
+        // the step index the only counter; decoded, then v takes the next step's load (no copy of v)
+#pragma unroll 1
+        for (int32_t s = s0; s < s_last; ++s) {
+            // q and the grid formed again: not held across the step
+            decode<F>(v, (lane_id() >> 2) & 3, kv, F == fmt::iq3_s ? joint_grid<U, LR>(L) : grid, o);
+            sp += full;
+            load_joint<F>(v, sp);
+            step_of<F, R, F16>(o, s, true, x, acc);
+        }
+        decode<F>(v, q, kv, grid, o);
+        step_of<F, R, F16>(o, s_last, true, x, acc);
+    }
+    if constexpr (has_tail(F)) {
+        const int32_t k = opaque(L.k), nq = (k % step_k) / 64;
+        const joint_unit un = unit_of(md, u);
+        const int32_t st = min((un.kp + 1) * md.sp, k / step_k); // the tail step, when the unit reaches it
+        if (nq > 0 && (un.kp + 1) * md.sp * step_k > k) {
+            raw<F> rt = {};
+            if (q < nq) {
+                load_tail<F>(rt, unit_w(un) + int64_t(st) * full, r, q, nq);
+            }
+            decode<F>(rt, q, kv, grid, o);
+            step_of<F, R, F16>(o, st, q < nq, x, acc);
+        }
+    }
+    // the quarters: every quadpair's lane ends with the element's sum
+#pragma unroll
+    for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int32_t e = 0; e < 8; ++e) {
+            acc[nt][e] += __shfl_xor_sync(0xffffffffu, acc[nt][e], 4);
+            acc[nt][e] += __shfl_xor_sync(0xffffffffu, acc[nt][e], 8);
+        }
+    }
+    const bool conv = md.e == static_cast<int32_t>(epi::conv_silu);
+    const joint_unit un = unit_of(md, u);
+    const int32_t tile = un.tile, kp = un.kp;
+    float *          cx = conv ? conv_scratch<U, LR>(L) : nullptr;
+    // quadpair q writes (conv: into the scratch) or puts its elements e with e & 3 = q
+#pragma unroll
+    for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int32_t e = 0; e < 8; ++e) {
+            const int32_t er = mma::c_row(lane, e), b = 8 * nt + mma::c_col(lane, e);
+            const int32_t erow = tile_q * tile + er;
+            if (8 * nt + ((e & 1) | (e & 4)) >= R || (e & 3) != q || b >= R) {
+                continue;
+            }
+            if (conv) {
+                cx[er * R + b] = acc[nt][e];
+            } else if (erow < md.m) {
+                joint_put<U, LR>(J, md, tile, kp, er, erow, b, acc[nt][e]);
+            }
+        }
+    }
+    if (conv) {  // unsplit: lane (r, u) = (lane >> 2, lane & 3) runs lane u's LR rows of row r
+        __syncwarp();
+        const int32_t cr = lane >> 2, u = lane & 3, row = tile_q * tile + cr;
+        if (u < U && row < md.m) {
+            const float * xr = cx + cr * R + LR * u;
+            if constexpr (LR == lane_rows) {
+                conv_finish5(L.conv_w, J.hist[u], J.cur[u], md.out + u * lane_rows * fn::gdn::n_channel, row, xr[0],
+                             xr[1], xr[2], xr[3], xr[4]);
+            } else {  // rows LR .. 3 neither read (past the lane's scratch) nor used by conv_finish<LR>
+                conv_finish<LR>(L.conv_w, J.hist[u], J.cur[u], md.out + u * lane_rows * fn::gdn::n_channel, row, xr[0],
+                                xr[1], LR > 2 ? xr[2] : 0.0f, LR > 3 ? xr[3] : 0.0f);
+            }
+        }
+        __syncwarp();
+        return;
+    }
+    joint_arrive<U, LR>(J, md, tile, tile_q, lane);
+}
+
+// FMS2 build item 1: BF16 weights at U = 4, a lane at a time (the form before FMU2 build item 4): the tile's 8 weight
+// rows loaded once a lane, lane u's 5 rows each run_wide<5>'s chain (the same lane slice, steps and FMA order, then the
+// same xor tree), so a lane's sums are the shared form's bits. The shared form held 4 x 5 activation rows and took 13
+// local accesses a step at U = 4; this form holds 5. Activation row i of lane u: its J.xf buffer, its X-HMIX slot or
+// row 5u + i of L.xf. FMS13: lane u's LR rows each run_wide<LR>'s chain, the form of U LR > 15.
+template <fmt F, int U, int LR>
+__device__ __forceinline__ void run_wide_per_lane(const joint_desc & J, const mat_desc & md, int32_t tile, int32_t kp) {
+    static_assert(F == fmt::bf16, "the joint launch's wide format");
+    constexpr int32_t   WB = wide_w<F>::bytes, SK = wide_w<F>::sub_k, LW = wide_w<F>::lane_w, B = LR;
+    const launch_desc & L = J.L;
+    const int32_t lane = lane_id();
+    const int32_t k = L.k;
+    const uint8_t * base = md.w + int64_t(tile_bf) * tile * k * WB + 16 * lane;
+    const int32_t s0 = kp * md.sp, s1 = s0 + md.sp;
+    const int32_t n_rows = min(tile_bf, md.m - tile_bf * tile);
+    const int32_t rl = lane >> 2, ql = lane & 3, row = tile_bf * tile + rl;
+#pragma unroll 1
+    for (int32_t u = 0; u < U; ++u) {
+        const float * xf = J.xf[0] != nullptr  ? J.xf[u]
+                           : L.hmix != nullptr ? L.hmix + u * J.hmix_lane
+                                               : L.xf + u * lane_rows * k;
+        uint4 ra[tile_bf], rb[tile_bf];
+        const auto ld = [&](uint4(&v)[tile_bf], int32_t s) {
+#pragma unroll
+            for (int32_t r = 0; r < tile_bf; ++r) {
+                v[r] = r < n_rows ? ldw4(base + (int64_t(r) * k + int64_t(s) * SK) * WB) : make_uint4(0, 0, 0, 0);
+            }
+        };
+        float acc[tile_bf][B];
+#pragma unroll
+        for (int32_t r = 0; r < tile_bf; ++r) {
+#pragma unroll
+            for (int32_t b = 0; b < B; ++b) {
+                acc[r][b] = 0.0f;
+            }
+        }
+        const auto fma_step = [&](const uint4(&v)[tile_bf], int32_t s) {
+#pragma unroll
+            for (int32_t b = 0; b < B; ++b) {
+                const float4 * xp = reinterpret_cast<const float4 *>(xf + b * k + SK * s + LW * lane);
+                const float4 x0 = __ldg(xp), x1 = __ldg(xp + 1);
+                const float xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+#pragma unroll
+                for (int32_t r = 0; r < tile_bf; ++r) {
+#pragma unroll
+                    for (int32_t i = 0; i < 4; ++i) {
+                        const uint32_t wd = word(v[r], i);
+                        acc[r][b] = fmaf(__uint_as_float(wd << 16), xv[2 * i], acc[r][b]);
+                        acc[r][b] = fmaf(__uint_as_float(wd & 0xffff0000u), xv[2 * i + 1], acc[r][b]);
+                    }
+                }
+            }
+        };
+        ld(ra, s0);
+        int32_t s = s0;
+#pragma unroll 1
+        for (; s + 3 <= s1; s += 2) {
+            ld(rb, s + 1);
+            fma_step(ra, s);
+            ld(ra, s + 2);
+            fma_step(rb, s + 1);
+        }
+        if (s + 2 == s1) {
+            ld(rb, s + 1);
+            fma_step(ra, s);
+            fma_step(rb, s + 1);
+        } else {
+            fma_step(ra, s);
+        }
+        // lane (rl, ql) puts (rl, ql) and, ql 0, (rl, 4)
+        float v = 0.0f, v4 = 0.0f;
+#pragma unroll
+        for (int32_t r = 0; r < tile_bf; ++r) {
+#pragma unroll
+            for (int32_t b = 0; b < B; ++b) {
+                float a = acc[r][b];
+#pragma unroll
+                for (int32_t off = 16; off > 0; off >>= 1) {
+                    a += __shfl_xor_sync(0xffffffffu, a, off);
+                }
+                v = (rl == r && ql == b) ? a : v;
+                if (b == 4) {
+                    v4 = rl == r ? a : v4;
+                }
+            }
+        }
+        if (rl < tile_bf && row < md.m) {
+            if constexpr (LR == lane_rows) {
+                joint_put<U, LR>(J, md, tile, kp, rl, row, lane_rows * u + ql, v);
+                if (ql == 0) {
+                    joint_put<U, LR>(J, md, tile, kp, rl, row, lane_rows * u + 4, v4);
+                }
+            } else if (ql < LR) {
+                joint_put<U, LR>(J, md, tile, kp, rl, row, LR * u + ql, v);
+            }
+        }
+    }
+    joint_arrive<U, LR>(J, md, tile, tile_bf, lane);
+}
+
+// BF16 weights at U = 2 and 3: every lane's rows from one load of each weight (FMU2 build item 4), WR of the tile's
+// rows a pass (U = 4 takes run_wide_per_lane). Each (weight row, activation row) chain is run_wide<5>'s: the same lane
+// slice, steps and FMA order, then the same xor tree. Activation row b is lane b / LR's row b % LR: its J.xf buffer,
+// its X-HMIX slot or row 5 (b / LR) + b % LR of L.xf. FMS13: the form of U LR <= 15.
+template <fmt F, int U, int LR>
 __device__ __forceinline__ void run_wide_joint(const joint_desc & J, const mat_desc & md, int32_t tile, int32_t kp) {
     static_assert(F == fmt::bf16, "the joint launch's wide format");
-    constexpr int32_t WB = wide_w<F>::bytes, SK = wide_w<F>::sub_k, LW = wide_w<F>::lane_w, R = lane_rows * U;
+    constexpr int32_t   WB = wide_w<F>::bytes, SK = wide_w<F>::sub_k, LW = wide_w<F>::lane_w, R = LR * U;
     constexpr int32_t WR = 2, NO = (WR * R + 31) / 32;
     const launch_desc & L = J.L;
     const int32_t lane = lane_id();
@@ -1042,8 +1595,8 @@ __device__ __forceinline__ void run_wide_joint(const joint_desc & J, const mat_d
     const int32_t n_rows = min(tile_bf, md.m - tile_bf * tile);
     // activation row b's lane slice of sub-step s; the offset opaque, so the 5U row addresses are formed at each use,
     // not hoisted and held (they spilled at U = 4)
-    const auto row_x = [&](int32_t b, int32_t s) {
-        const int32_t u = b / lane_rows, i = b - u * lane_rows;
+    const auto          row_x  = [&](int32_t b, int32_t s) {
+        const int32_t u = b / LR, i = b - u * LR;
         const float * x = J.xf[0] != nullptr   ? J.xf[u]
                           : L.hmix != nullptr ? L.hmix + u * J.hmix_lane
                                               : L.xf + u * lane_rows * k;
@@ -1123,16 +1676,19 @@ __device__ __forceinline__ void run_wide_joint(const joint_desc & J, const mat_d
         for (int32_t j = 0; j < NO; ++j) {
             const int32_t f = 32 * j + lane, r = r0 + f / R;
             if (f < WR * R && r < n_rows) {
-                joint_put<U>(J, md, tile, kp, r, tile_bf * tile + r, f % R, o[j]);
+                joint_put<U, LR>(J, md, tile, kp, r, tile_bf * tile + r, f % R, o[j]);
             }
         }
     }
-    joint_arrive<U>(J, md, tile, tile_bf, lane);
+    joint_arrive<U, LR>(J, md, tile, tile_bf, lane);
 }
 
-template <fmt F, int U>
-__device__ __forceinline__ void run_units_joint(const joint_desc & J, int32_t mi, const act & x,
-                                                const uint32_t * grid) {
+// FMS13: the forms keyed on the round's rows U LR (FMS3 and FMS6 chose them at U = 2: 10 rows, U = 3 and 4: 15, 20)
+template <fmt F, int U, int LR, bool F16>
+__device__ __forceinline__ void run_units_joint(const joint_desc & J,
+                                                int32_t            mi,
+                                                const act &        x,
+                                                const uint32_t *   grid) {
     const launch_desc & L = J.L;
     const mat_desc & md = L.mats[mi];
     const int32_t gw = static_cast<int32_t>(threadIdx.x >> 5) * n_sm + static_cast<int32_t>(blockIdx.x);
@@ -1154,16 +1710,22 @@ __device__ __forceinline__ void run_units_joint(const joint_desc & J, int32_t mi
                 }
             }
         }
-        if constexpr (wide) {
-            run_wide_joint<F, U>(J, md, tile, kp);
+        if constexpr (wide && U * LR > 15) {  // FMS2 build item 1: the shared form spilled at 20 rows
+            run_wide_per_lane<F, U, LR>(J, md, tile, kp);
+        } else if constexpr (wide) {
+            run_wide_joint<F, U, LR>(J, md, tile, kp);
+        } else if constexpr (U * LR <= 10) {  // FMS3 item 1
+            run_q_joint_int<F, U, LR>(J, md, tile, kp, x, grid);
         } else {
-            run_q_joint<F, U>(J, md, tile, kp, x, grid);
+            run_q_joint<F, U, LR, F16>(J, md, u, x, grid);
         }
     }
 }
 
-template <int U> __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_constant__ joint_desc J) {
-    constexpr int32_t R = lane_rows * U;
+// F16 (FMS6, U = 3 and 4; FMS13: U LR >= 12): the quantized products on mma_step_f16
+template <int U, int LR, bool F16>
+__global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_constant__ joint_desc J) {
+    constexpr int32_t       R = LR * U;
     const launch_desc & L = J.L;
     extern __shared__ uint4 smem4[];
     uint8_t * sm = reinterpret_cast<uint8_t *>(smem4);
@@ -1180,13 +1742,14 @@ template <int U> __global__ void __launch_bounds__(n_threads, 1) joint_kernel(co
             uint4 c0, c1;
             float2 sc;
             if (L.hmix != nullptr) {
-                const int32_t u = b / lane_rows;
-                fn::xchg::hmix_run(L.hmix + u * J.hmix_lane, L.hmix_peer, b - u * lane_rows, j, c0, c1, sc, L.err);
+                const int32_t u = b / LR;
+                fn::xchg::hmix_run(L.hmix + u * J.hmix_lane, L.hmix_peer, b - u * LR, j, c0, c1, sc, L.err);
             } else {
-                const uint4 * src = reinterpret_cast<const uint4 *>(L.xc + b * L.k + 32 * j);
+                const int32_t mb  = mrow<LR>(b);
+                const uint4 * src = reinterpret_cast<const uint4 *>(L.xc + mb * L.k + 32 * j);
                 c0 = __ldg(src);
                 c1 = __ldg(src + 1);
-                sc = __ldg(L.xs + i);
+                sc                = __ldg(L.xs + (LR == lane_rows ? i : mb * nblk + j));
             }
             int32_t slo = 0, shi = 0;
 #pragma unroll
@@ -1195,14 +1758,22 @@ template <int U> __global__ void __launch_bounds__(n_threads, 1) joint_kernel(co
                 shi = dp4a(word(c1, t), 0x01010101u, shi);
             }
             uint4 * xs = reinterpret_cast<uint4 *>(sm + b * L.k);
-            xs[swz(2 * j)] = c0;
-            xs[swz(2 * j + 1)] = c1;
+            if constexpr (U * LR <= 10) {  // FMS3 item 1: signed codes, the integer dots' operand (main's staging)
+                xs[swz(2 * j)] = c0;
+                xs[swz(2 * j + 1)] = c1;
+            } else {
+                // FMS2 build item 4: staged as unsigned codes s + 128, the tensor cores' biased B
+                // (the sums are the codes')
+                const uint4 flip = make_uint4(0x80808080u, 0x80808080u, 0x80808080u, 0x80808080u);
+                xs[swz(2 * j)] = make_uint4(c0.x ^ flip.x, c0.y ^ flip.y, c0.z ^ flip.z, c0.w ^ flip.w);
+                xs[swz(2 * j + 1)] = make_uint4(c1.x ^ flip.x, c1.y ^ flip.y, c1.z ^ flip.z, c1.w ^ flip.w);
+            }
             meta[i] = make_float4(sc.x, sc.y, __int_as_float(slo), __int_as_float(shi));
         }
     }
     if (L.hmix != nullptr && L.need_xf) {
         for (int32_t u = 0; u < U; ++u) {
-            fn::xchg::hmix_acquire_f32(L.hmix + u * J.hmix_lane, L.hmix_peer, lane_rows, tid, n_threads, L.err);
+            fn::xchg::hmix_acquire_f32(L.hmix + u * J.hmix_lane, L.hmix_peer, LR, tid, n_threads, L.err);
         }
     }
     if (L.need_grid) {
@@ -1215,31 +1786,31 @@ template <int U> __global__ void __launch_bounds__(n_threads, 1) joint_kernel(co
     for (int32_t mi = 0; mi < L.n_mats; ++mi) {
         switch (static_cast<fmt>(L.mats[mi].f)) {
             case fmt::q4_k:
-                run_units_joint<fmt::q4_k, U>(J, mi, x, grid);
+                run_units_joint<fmt::q4_k, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::q5_k:
-                run_units_joint<fmt::q5_k, U>(J, mi, x, grid);
+                run_units_joint<fmt::q5_k, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::q6_k:
-                run_units_joint<fmt::q6_k, U>(J, mi, x, grid);
+                run_units_joint<fmt::q6_k, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::iq4_xs:
-                run_units_joint<fmt::iq4_xs, U>(J, mi, x, grid);
+                run_units_joint<fmt::iq4_xs, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::iq3_s:
-                run_units_joint<fmt::iq3_s, U>(J, mi, x, grid);
+                run_units_joint<fmt::iq3_s, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::q8_0:
-                run_units_joint<fmt::q8_0, U>(J, mi, x, grid);
+                run_units_joint<fmt::q8_0, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::iq4_nl:
-                run_units_joint<fmt::iq4_nl, U>(J, mi, x, grid);
+                run_units_joint<fmt::iq4_nl, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::q2_0:
-                run_units_joint<fmt::q2_0, U>(J, mi, x, grid);
+                run_units_joint<fmt::q2_0, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::bf16:
-                run_units_joint<fmt::bf16, U>(J, mi, x, grid);
+                run_units_joint<fmt::bf16, U, LR, F16>(J, mi, x, grid);
                 break;
             case fmt::f32: // rejected by product_joint
                 break;
@@ -1261,10 +1832,217 @@ template <int U> __global__ void __launch_bounds__(n_threads, 1) joint_kernel(co
         if (__syncthreads_or(last) != 0) {
             // the rows in blocks of n_warps: warp w runs row b0 + w through the lone epilogue on the rows from b0 (its
             // shared memory slot reused block to block), so the lone kernel's epilogue stays as it was (I1)
+            if constexpr (LR == lane_rows) {
+#pragma unroll 1
+                for (int32_t b0 = 0; b0 < R; b0 += n_warps) {
+                    route_epilogue(L.mats[L.route_logits].out + b0 * route_experts, L.mats[L.route_gate].out + b0,
+                                   L.ids + b0 * route_used, L.wts + b0 * route_used, L.sg + b0, sm, R - b0);
+                    __syncwarp();
+                }
+            } else {  // FMS13: a lane's LR memory rows at a time
+#pragma unroll 1
+                for (int32_t b0 = 0; b0 < lane_rows * U; b0 += lane_rows) {
+                    route_epilogue(L.mats[L.route_logits].out + b0 * route_experts, L.mats[L.route_gate].out + b0,
+                                   L.ids + b0 * route_used, L.wts + b0 * route_used, L.sg + b0, sm, LR);
+                    __syncwarp();
+                }
+            }
+        }
+    }
+}
+
+// ---- FMS5: the router on the tensor cores (dense.h joint_args::router_tc) -------------------------------------------
+// 72 blocks: row group g = block / 8 (groups 0..7 the logits' rows 64 g .. 64 g + 63, group 8 the shared gate's row)
+// and K slice ks = block % 8 (320 of 2,560). The block stages its slice of every activation row as FP16 hi and lo;
+// warp w takes m-tile w % 8 (8 weight rows) and K half w / 8 (160): per step of 32 K, quadpair p holds K 8p .. 8p + 7.
+constexpr int32_t rtc_k = 2560;                                            // the target's hidden size
+constexpr int32_t rtc_slices = 8;                                          // K slices
+constexpr int32_t rtc_slice = rtc_k / rtc_slices;                          // 320
+constexpr int32_t rtc_half = rtc_slice / 2;                                // a warp's K
+constexpr int32_t rtc_groups = 9;                                          // row groups
+constexpr int32_t rtc_cols = 24;                                           // activation rows padded to 8s at U = 4
+constexpr int32_t rtc_row_slots = rtc_groups * 64;                         // partial rows: 512 logits, the gate's 64
+constexpr int32_t rtc_part_floats = rtc_slices * rtc_cols * rtc_row_slots; // 110,592
+constexpr int32_t rtc_cnt_words = 16;                                      // 9 used
+constexpr int32_t rtc_hi_bytes = rtc_slice * 2;                            // a staged row's hi halves: 640
+constexpr int32_t rtc_stage = 2 * rtc_hi_bytes + 32; // a staged row: hi, lo, 32 bytes so a step's reads miss no bank
+static_assert(rtc_groups * rtc_slices == n_sm && route_experts == (rtc_groups - 1) * 64 &&
+                  rtc_half == 5 * 32 && rtc_cols >= lane_rows * max_lanes && fn::xchg::words_hmix % rtc_slice == 0 &&
+                  fn::xchg::hmix_layout::width == rtc_k,
+              "the tensor-core router's layout");
+
+// a word of two BF16 (k even low, k odd high) as two FP16: BF16 to F32 is exact, F32 to FP16 rounds to nearest
+__device__ __forceinline__ uint32_t rtc_f16(uint32_t v) {
+    const half2 h = __floats2half2_rn(__uint_as_float(v << 16), __uint_as_float(v & 0xffff0000u));
+    return *reinterpret_cast<const uint32_t *>(&h); // reinterpret: half2 is the word's two halves
+}
+
+// FMS13: U lanes of LR rows, packed as joint_kernel's (row b = LR u + i, memory row mrow(b))
+template <int U, int LR>
+__global__ void __launch_bounds__(n_threads, 1) router_tc_kernel(const __grid_constant__ joint_desc J) {
+    constexpr int32_t       R = LR * U, NT = (R + 7) / 8, steps = rtc_half / 32;
+    const launch_desc & L = J.L;
+    extern __shared__ uint4 smem4[];
+    uint8_t * sm = reinterpret_cast<uint8_t *>(smem4);
+    float * red = reinterpret_cast<float *>(sm + NT * 8 * rtc_stage); // [8 m-tiles][NT][8][8 quadpair-0 lanes]
+    const int32_t tid = static_cast<int32_t>(threadIdx.x), lane = lane_id(), w = tid >> 5;
+    const int32_t g = static_cast<int32_t>(blockIdx.x) / rtc_slices, ks = static_cast<int32_t>(blockIdx.x) % rtc_slices;
+    const int32_t mt = w % 8, kh = w / 8, r = mma::frag_row(lane), p = (lane >> 2) & 3;
+    const mat_desc & lm = L.mats[L.route_logits];
+    const mat_desc & gm = L.mats[L.route_gate];
+    // the warp's weights first (row r of its m-tile, K 8p .. 8p + 7 of each step): ahead of the staging and its poll.
+    // Group 8 has the gate's row only: its other rows are zero.
+    const bool live = g < rtc_groups - 1 || (mt == 0 && r == 0);
+    const uint8_t * wrow = (g < rtc_groups - 1 ? lm.w + int64_t(64 * g + 8 * mt + r) * rtc_k * 2 : gm.w) +
+                           (ks * rtc_slice + kh * rtc_half + 8 * p) * 2;
+    uint4 wv[steps];
+#pragma unroll
+    for (int32_t it = 0; it < steps; ++it) {
+        wv[it] = live ? ldw4(wrow + 64 * it) : make_uint4(0, 0, 0, 0);
+    }
+    // the slice of row b as hi = f16(x), lo = f16(x - hi); rows R .. 8 NT - 1 zero. The peer's half is polled
+    // (X-HMIX's acquire, xchg.h) and its polled values used; this card's half was written before the launch.
+    const bool polled = L.hmix != nullptr && ks / (rtc_slices / 2) == L.hmix_peer;
+    for (int32_t q = tid; q < NT * 8 * (rtc_slice / 4); q += n_threads) {
+        const int32_t b = q / (rtc_slice / 4), c = q - b * (rtc_slice / 4);
+        float4 x = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (b < R) {
+            const int32_t  u = b / LR, i = b - u * LR;
+            const float *  row = J.xf[0] != nullptr ? J.xf[u] + i * rtc_k :
+                                 L.hmix != nullptr  ? L.hmix + u * J.hmix_lane + i * rtc_k :
+                                                      L.xf + mrow<LR>(b) * rtc_k;
+            const float4 * src = reinterpret_cast<const float4 *>(row + ks * rtc_slice) + c;
+            if (polled) {
+                const uint4 * const pp[1] = {reinterpret_cast<const uint4 *>(src)};
+                uint4 v[1];
+                fn::xchg::poll<1>(pp, v, L.err, fn::xchg::err_poll_hmix);
+                x = make_float4(__uint_as_float(v[0].x), __uint_as_float(v[0].y), __uint_as_float(v[0].z),
+                                __uint_as_float(v[0].w));
+            } else {
+                x = __ldg(src);
+            }
+        }
+        const half2 h0 = __floats2half2_rn(x.x, x.y), h1 = __floats2half2_rn(x.z, x.w);
+        const float2 f0 = __half22float2(h0), f1 = __half22float2(h1);
+        const half2 l0 = __floats2half2_rn(x.x - f0.x, x.y - f0.y), l1 = __floats2half2_rn(x.z - f1.x, x.w - f1.y);
+        uint8_t * dst = sm + b * rtc_stage + 8 * c;
+        *reinterpret_cast<uint2 *>(dst) = make_uint2(*reinterpret_cast<const uint32_t *>(&h0),
+                                                     *reinterpret_cast<const uint32_t *>(&h1));
+        *reinterpret_cast<uint2 *>(dst + rtc_hi_bytes) = make_uint2(*reinterpret_cast<const uint32_t *>(&l0),
+                                                                    *reinterpret_cast<const uint32_t *>(&l1));
+    }
+    __syncthreads();
+    // W hi + W lo: B column r of n-tile nt is activation row 8 nt + r
+    float d[NT][8];
+#pragma unroll
+    for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            d[nt][i] = 0.0f;
+        }
+    }
+    const uint8_t * xs = sm + r * rtc_stage + (kh * rtc_half + 8 * p) * 2;
+#pragma unroll
+    for (int32_t it = 0; it < steps; ++it) {
+        const uint32_t a0 = rtc_f16(wv[it].x), a1 = rtc_f16(wv[it].y), a2 = rtc_f16(wv[it].z), a3 = rtc_f16(wv[it].w);
+#pragma unroll
+        for (int32_t nt = 0; nt < NT; ++nt) {
+            const uint8_t * s = xs + nt * 8 * rtc_stage + 64 * it;
+            const uint4 hi = mma::lds128(s), lo = mma::lds128(s + rtc_hi_bytes);
+            mma::mma884(d[nt], a0, a1, hi.x, hi.y);
+            mma::mma884(d[nt], a2, a3, hi.z, hi.w);
+            mma::mma884(d[nt], a0, a1, lo.x, lo.y);
+            mma::mma884(d[nt], a2, a3, lo.z, lo.w);
+        }
+    }
+    // the quadpairs' K chunks (an element's copies sit at lane ^ 4 and ^ 8), then half 0 + half 1 in shared memory
+#pragma unroll
+    for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            d[nt][i] += __shfl_xor_sync(0xffffffffu, d[nt][i], 4);
+            d[nt][i] += __shfl_xor_sync(0xffffffffu, d[nt][i], 8);
+        }
+    }
+    const int32_t ql = (lane & 3) | ((lane >> 4) << 2); // quadpair 0's lanes: 0 .. 7
+    const bool q0 = (lane & 12) == 0;
+    if (kh == 1 && q0) {
+#pragma unroll
+        for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int32_t i = 0; i < 8; ++i) {
+                red[((mt * NT + nt) * 8 + i) * 8 + ql] = d[nt][i];
+            }
+        }
+    }
+    __syncthreads();
+    float * part = J.rtc_part + ks * rtc_cols * rtc_row_slots + 64 * g + 8 * mt;
+    if (kh == 0 && q0) {
+#pragma unroll
+        for (int32_t nt = 0; nt < NT; ++nt) {
+#pragma unroll
+            for (int32_t i = 0; i < 8; ++i) {
+                const int32_t col = 8 * nt + mma::c_col(lane, i);
+                if (col < R) {
+                    part[col * rtc_row_slots + mma::c_row(lane, i)] = d[nt][i] + red[((mt * NT + nt) * 8 + i) * 8 + ql];
+                }
+            }
+        }
+    }
+    // the group's last block sums its 8 slices in slice order: the logits (group g < 8) or the gate (group 8)
+    __threadfence();
+    __syncthreads();
+    int32_t last = 0;
+    if (tid == 0) {
+        last = atomicAdd(J.rtc_cnt + g, 1u) == static_cast<uint32_t>(rtc_slices) - 1 ? 1 : 0;
+        if (last != 0) {
+            __threadfence();
+            J.rtc_cnt[g] = 0u;
+        }
+    }
+    if (__syncthreads_or(last) != 0) {
+        const float * src = J.rtc_part + 64 * g;
+        const auto slices = [&](int32_t b, int32_t n) {
+            float s = __ldcg(src + b * rtc_row_slots + n);
+#pragma unroll
+            for (int32_t k = 1; k < rtc_slices; ++k) {
+                s += __ldcg(src + (k * rtc_cols + b) * rtc_row_slots + n);
+            }
+            return s;
+        };
+        if (g < rtc_groups - 1) {
+            for (int32_t q = tid; q < R * 64; q += n_threads) {
+                const int32_t b = q / 64, n = q - b * 64;
+                lm.out[mrow<LR>(b) * route_experts + 64 * g + n] = slices(b, n);
+            }
+        } else if (tid < R) {
+            gm.out[mrow<LR>(tid)] = slices(tid, 0);
+        }
+    }
+    // the router's hand-off, as joint_kernel's
+    __threadfence();
+    __syncthreads();
+    last = 0;
+    if (tid == 0) {
+        last = atomicAdd(L.route_cnt, 1u) == static_cast<uint32_t>(n_sm) - 1 ? 1 : 0;
+        if (last != 0) {
+            __threadfence();
+            *L.route_cnt = 0u;
+        }
+    }
+    if (__syncthreads_or(last) != 0) {
+        if constexpr (LR == lane_rows) {
 #pragma unroll 1
             for (int32_t b0 = 0; b0 < R; b0 += n_warps) {
-                route_epilogue(L.mats[L.route_logits].out + b0 * route_experts, L.mats[L.route_gate].out + b0,
-                               L.ids + b0 * route_used, L.wts + b0 * route_used, L.sg + b0, sm, R - b0);
+                route_epilogue(lm.out + b0 * route_experts, gm.out + b0, L.ids + b0 * route_used,
+                               L.wts + b0 * route_used, L.sg + b0, sm, R - b0);
+                __syncwarp();
+            }
+        } else {  // FMS13: a lane's LR memory rows at a time
+#pragma unroll 1
+            for (int32_t b0 = 0; b0 < lane_rows * U; b0 += lane_rows) {
+                route_epilogue(lm.out + b0 * route_experts, gm.out + b0, L.ids + b0 * route_used,
+                               L.wts + b0 * route_used, L.sg + b0, sm, LR);
                 __syncwarp();
             }
         }
@@ -1492,6 +2270,22 @@ template <int B> bool launch(launch_desc & L, cudaStream_t st) {
 }
 
 } // namespace
+
+bool product_gated(int32_t rows, const product_args & a, const int32_t * gate, int32_t at, void * stream) {
+    launch_desc L;
+    if (rows != 4 || gate == nullptr || stream == nullptr || !describe(rows, a, L) || L.route_cnt != nullptr) {
+        return false;
+    }
+    for (int32_t i = 0; i < L.n_mats; ++i) {
+        if (static_cast<fmt>(L.mats[i].f) == fmt::f32) {
+            return false;
+        }
+    }
+    const size_t smem = (L.need_xq ? size_t(4) * L.k * 3 / 2 : 0) + (L.need_grid ? iq3s_grid_bytes : 0);
+    L.smem_route = static_cast<int32_t>(smem);
+    product_gated_kernel<4><<<n_sm, n_threads, smem, static_cast<cudaStream_t>(stream)>>>(L, gate, at);
+    return cudaGetLastError() == cudaSuccess;
+}
 
 const char * fmt_name(fmt f) {
     switch (f) {
@@ -1844,10 +2638,23 @@ bool joint_layout_of(const product_args & a, work_layout & out) {
     return true;
 }
 
+// FMS5: the tensor-core router's words in a router site's region, after the joint layout's (16-byte aligned): the row
+// groups' counters, then the partials. Every router site has them, so the switch never changes a site's region.
+namespace {
+
+int64_t rtc_at(const work_layout & l) {
+    return (int64_t(l.part_floats) + l.cnt_words + 1 + 3) / 4 * 4;
+}
+
+} // namespace
+
 size_t joint_work_bytes(const product_args & a) {
     work_layout l;
     if (!joint_layout_of(a, l)) {
         return 0;
+    }
+    if (has_route(a)) {
+        return size_t(rtc_at(l) + rtc_cnt_words + rtc_part_floats) * 4;
     }
     return (size_t(l.part_floats) + size_t(l.cnt_words) + (l.route_cnt >= 0 ? 1 : 0)) * 4;
 }
@@ -1858,17 +2665,61 @@ static_assert(size_t(max_joint_rows) * max_k_b5 * 3 / 2 + iq3s_grid_bytes <= 96 
                   size_t(max_joint_rows) * route_row_bytes <= 96 * 1024,
               "the joint product's dynamic shared memory (the V100's 96 KB opt-in)");
 
-template <int U> bool launch_joint(const joint_desc & J, cudaStream_t st) {
-    constexpr int32_t R = lane_rows * U;
+template <int U, int LR, bool F16> bool launch_joint_k(const joint_desc & J, cudaStream_t st) {
+    constexpr int32_t   R    = LR * U;
     const launch_desc & L = J.L;
     size_t smem = (L.need_xq ? size_t(R) * L.k * 3 / 2 : 0) + (L.need_grid ? iq3s_grid_bytes : 0);
+    // run_q_joint's conv scratch (the integer step at up to 10 rows, FMS3 item 1, needs none)
+    smem += R > 10 && L.conv_w != nullptr ? size_t(n_warps) * tile_q * R * sizeof(float) : 0;
     smem = L.route_cnt != nullptr ? std::max(smem, route_smem(R)) : smem;
-    if (smem > 48 * 1024 && cudaFuncSetAttribute(joint_kernel<U>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+    if (smem > 96 * 1024) {
+        return reject("joint: dynamic shared memory past 96 KB", -1);
+    }
+    if (smem > 48 * 1024 && cudaFuncSetAttribute(joint_kernel<U, LR, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                                  static_cast<int>(smem)) != cudaSuccess) {
         return false;
     }
-    joint_kernel<U><<<n_sm, n_threads, smem, st>>>(J);
+    joint_kernel<U, LR, F16><<<n_sm, n_threads, smem, st>>>(J);
     return cudaGetLastError() == cudaSuccess;
+}
+
+// FMS6: f16 takes the FP16 step at U = 3 and 4; U = 2 keeps the integer step (FMS3 item 1). FMS13: keyed on the rows,
+// the FP16 step at 12 rows or more (12 take 16's two n-tiles), the integer step at up to 10
+template <int U, int LR> bool launch_joint(const joint_desc & J, bool f16, cudaStream_t st) {
+    if constexpr (U * LR >= 12) {
+        if (f16) {
+            return launch_joint_k<U, LR, true>(J, st);
+        }
+    }
+    return launch_joint_k<U, LR, false>(J, st);
+}
+
+// FMS5: the staging, the halves' reduction and, after them, the route epilogue's rows
+template <int U, int LR> bool launch_router_tc(const joint_desc & J, cudaStream_t st) {
+    constexpr int32_t R = LR * U, NT = (R + 7) / 8;
+    const size_t smem = std::max(size_t(NT) * 8 * rtc_stage + size_t(8) * NT * 64 * sizeof(float), route_smem(R));
+    static_assert(size_t(rtc_cols) * rtc_stage + size_t(8) * (rtc_cols / 8) * 64 * sizeof(float) <= 96 * 1024,
+                  "the tensor-core router's shared memory");
+    if (smem > 48 * 1024 && cudaFuncSetAttribute(router_tc_kernel<U, LR>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                 static_cast<int>(smem)) != cudaSuccess) {
+        return false;
+    }
+    router_tc_kernel<U, LR><<<n_sm, n_threads, smem, st>>>(J);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// FMS13: the launches at U lanes of LR rows
+template <int U> bool launch_joint_u(const joint_desc & J, int32_t rows, bool router_tc, bool f16, cudaStream_t st) {
+    switch (rows) {
+        case 2:
+            return router_tc ? launch_router_tc<U, 2>(J, st) : launch_joint<U, 2>(J, f16, st);
+        case 3:
+            return router_tc ? launch_router_tc<U, 3>(J, st) : launch_joint<U, 3>(J, f16, st);
+        case 4:
+            return router_tc ? launch_router_tc<U, 4>(J, st) : launch_joint<U, 4>(J, f16, st);
+        default:
+            return router_tc ? launch_router_tc<U, lane_rows>(J, st) : launch_joint<U, lane_rows>(J, f16, st);
+    }
 }
 
 } // namespace
@@ -1876,6 +2727,9 @@ template <int U> bool launch_joint(const joint_desc & J, cudaStream_t st) {
 bool product_joint(const product_args & a, const joint_args & j, void * stream) {
     if (j.lanes < 2 || j.lanes > max_lanes) {
         return reject("joint: lanes outside 2..4", -1);
+    }
+    if (j.rows < 2 || j.rows > lane_rows) {
+        return reject("joint: rows a lane outside 2..5", -1);
     }
     for (int32_t i = 0; i < a.n_mats && i < max_mats; ++i) {
         if (a.mats[i].f == fmt::f32) {
@@ -1905,12 +2759,14 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
     product_args l = a;
     l.conv = j.conv[0];
     for (int32_t i = 0; lane_out && i < a.n_mats; ++i) {
-        l.mats[i].out = j.out[i][0]; // B = 5's contract on lane 0's buffers
+        l.mats[i].out = j.out[i][0];  // B = R's contract on lane 0's buffers
     }
     l.x_f32 = lane_x ? j.x_f32[0] : l.x_f32;
     joint_desc J;
     memset(&J, 0, sizeof(J));
-    if (!describe(lane_rows, l, J.L)) { // B = 5's contract on every matrix, X-HMIX lane 0 and lane 0's convolution
+    // B = R's contract on every matrix, X-HMIX lane 0 and lane 0's convolution: lone B = R's splits and checks, so a
+    // switch-off joint launch is bitwise each lane's lone launch at B = R (FMS13)
+    if (!describe(j.rows, l, J.L)) {
         return false;
     }
     work_layout wl;
@@ -1936,6 +2792,19 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
     for (int32_t u = 0; lane_x && u < j.lanes; ++u) {
         J.xf[u] = j.x_f32[u];
     }
+    if (j.peer != nullptr) {
+        const mat_desc & m0 = L.mats[0];
+        if (a.n_mats != 1 || m0.e != static_cast<int32_t>(epi::f32) || m0.split < 2 ||
+            m0.m != 2 * fn::xchg::words_half || lane_out || (j.peer_half != 0 && j.peer_half != 1) ||
+            !aligned(j.peer, 16)) {
+            return reject("joint: the producer's X-A send needs one F32 matrix of 2 halves, split, on a 16-byte "
+                          "aligned slot",
+                          0);
+        }
+        J.peer = j.peer;
+        J.peer_half = j.peer_half;
+        J.x16_err = j.x16_err;
+    }
     if (a.hmix != nullptr && (j.hmix_lane_floats < fn::xchg::hmix_layout::slot_words || j.hmix_lane_floats % 4 != 0)) {
         return reject("joint: X-HMIX lanes' slots overlap or are not 16-byte aligned", -1);
     }
@@ -1949,13 +2818,29 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
         }
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (j.router_tc && has_route(a)) { // FMS5
+        const mat_desc & lm = L.mats[L.route_logits];
+        const mat_desc & gm = L.mats[L.route_gate];
+        if (a.n_mats != 2 || L.k != rtc_k || a.route.logits < 0 || a.route.gate < 0 ||
+            lm.f != static_cast<int32_t>(fmt::bf16) || lm.m != route_experts ||
+            gm.f != static_cast<int32_t>(fmt::bf16) || gm.m != 1 || lane_out || j.peer != nullptr ||
+            !aligned(a.work, 16)) {
+            return reject("joint: the tensor-core router needs the BF16 logits [2560 -> 512] and gate [2560 -> 1], "
+                          "no lane outputs, no peer and a 16-byte aligned region",
+                          -1);
+        }
+        float * work = static_cast<float *>(a.work) + rtc_at(wl);
+        J.rtc_cnt = reinterpret_cast<uint32_t *>(work);
+        J.rtc_part   = work + rtc_cnt_words;
+    }
+    const bool rtc = j.router_tc && has_route(a);
     switch (j.lanes) {
         case 2:
-            return launch_joint<2>(J, st);
+            return launch_joint_u<2>(J, j.rows, rtc, j.dense_f16, st);
         case 3:
-            return launch_joint<3>(J, st);
+            return launch_joint_u<3>(J, j.rows, rtc, j.dense_f16, st);
         default:
-            return launch_joint<4>(J, st);
+            return launch_joint_u<4>(J, j.rows, rtc, j.dense_f16, st);
     }
 }
 

@@ -122,8 +122,10 @@ int64_t host_available_bytes() {
 
 bool reserve_state(model::model & m, const model::state_params & sp, int32_t n_slots, int64_t & host_bytes,
                    std::string & err, int32_t pool_cells) {
-    if (n_slots < 1 || n_slots > 4) {
-        err = "reserve: " + std::to_string(n_slots) + " slots (1 .. 4)";
+    // TTTS1: a split stage (a window) serves up to 8 slots; one box up to 4
+    const int32_t max_slots = m.win.whole() ? 4 : 8;
+    if (n_slots < 1 || n_slots > max_slots) {
+        err = "reserve: " + std::to_string(n_slots) + " slots (1 .. " + std::to_string(max_slots) + ")";
         return false;
     }
     if (sp.kv_q8 && (m.single || m.kv_host)) {
@@ -132,6 +134,11 @@ bool reserve_state(model::model & m, const model::state_params & sp, int32_t n_s
     }
     m.n_slots = n_slots;
     m.kv_q8 = sp.kv_q8;
+    m.n_cells = sp.n_cells;
+    if (!(sp.win.lo == m.win.lo && sp.win.hi == m.win.hi && sp.win.head == m.win.head)) {
+        err = "reserve: the state's window is not the model's (TTTS1)";
+        return false;
+    }
     const std::vector<model::buffer_class> plans = model::state_classes(sp);
     // MU1: resident TP shares the KV pool among 2..4 slots. MXMU1: one card with the expert cache and the host-backed
     // tier serves two, each slot's classes its own (its history in host memory, its window on the device), no pool
@@ -288,6 +295,7 @@ bool load_for_run(const load_params & p, int32_t n_cells, model::model & m, run_
     sp.kv_window = m.kv_host ? m.kv_window : 0;
     sp.single = m.single;
     sp.kv_q8 = p.kv_q8;
+    sp.win             = m.win;  // TTTS1
     if (!reserve_state(m, sp, p.n_slots, rep.host_state_bytes, err, p.pool_cells)) {
         return false;
     }

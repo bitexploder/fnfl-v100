@@ -14,6 +14,7 @@
 #include "fn/runtime/expert_policy.h"
 #include "fn/runtime/split_test.h"
 #include "fn/tools/test_dump.h"
+#include "fn/xchg/x16_ref.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -760,6 +761,10 @@ const char * map_tag(int32_t map) {
 }
 bool is_iq2(fmt f) {
     return f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s;
+}
+
+bool is_iq3(fmt f) {
+    return f == fmt::iq3_xxs || f == fmt::iq3_s;
 }
 // the instances map changes at B 4 and 5: maps 1 and 3 every target format, map 2 the IQ2 formats (the IQ3 formats
 // and Q8_0 run SP2's kernels under it)
@@ -3772,234 +3777,387 @@ void fmu2_rows_alone(test_ctx & c, const std::vector<gu_inst_t> & gus, const std
     }
 }
 
-void fmu2_lanes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vector<dn_inst_t> & dns,
-                const row_case & master) {
-    std::mt19937 rng(0x464d5532u);
-    std::vector<row_case> cases = {prefix(master, max_rows)};
-    for (row_case & rc : sp4_route_cases(c, master, max_rows, rng)) {
-        cases.push_back(std::move(rc));
-    }
+// FMS13: every case at R = 2 .. 5 rows a lane against each lane's own launches at B = R. Each lane's inputs sit in
+// five-row buffers whose bytes past its R rows are 0xff (ids -1, weights and gates NaN, the activation's tail); every
+// output's rows R .. 4 keep their fill, and the X-F send leaves rows R .. 4 of each lane's five-row stride the
+// sentinel. IQ3 at R <= 3: gate_up_lanes refuses (its lanes body is B = 4 and 5) and the joint layer runs each lane's
+// own gate_up (layer.cpp ffn_joint), as here; down_lanes then runs on those outputs.
+void fmu2_lanes(test_ctx &                     c,
+                const std::vector<gu_inst_t> & gus,
+                const std::vector<dn_inst_t> & dns,
+                const row_case &               master) {
     std::vector<dn_inst_t> rdn;
     for (const dn_inst_t & d : dns) {
         if ((d.f == fmt::q2_0 || d.f == fmt::iq4_nl) && (d.fs == fmt::q2_0 || d.fs == fmt::iq4_nl)) {
             rdn.push_back(d);
         }
     }
-    int32_t n_gu = 0, n_dn = 0, n_bad = 0, n_formats = 0, n_undef = 0;
+    int32_t n_gu = 0, n_dn = 0, n_bad = 0, n_formats = 0, n_undef = 0, n_xf = 0, n_xf16 = 0, n_x16_over = 0;
+    int32_t        n_iq3_alone = 0;  // FMS13: IQ3 sets at R <= 3, gate_up_lanes refused and each lane's own gate_up run
+    int64_t n_x16_finite = 0; // FMS2 item 7: halves compared whose value is finite within FP16's range
     void * const s = cudaStreamPerThread;
-    for (const fmt f : {fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s}) {
-        const auto gi = std::find_if(gus.begin(), gus.end(), [&](const gu_inst_t & g) { return g.f == f; });
-        if (gi == gus.end()) {
-            continue;
+    const row_case full         = prefix(master, max_rows);  // the five-row buffers' sizes
+    for (int32_t rr = 2; rr <= max_rows; ++rr) {
+        std::mt19937          rng(0x464d5532u + uint32_t(rr));
+        std::vector<row_case> cases = { prefix(master, rr) };
+        for (row_case & rc : sp4_route_cases(c, master, rr, rng)) {
+            cases.push_back(std::move(rc));
         }
-        const gu_inst_t g = *gi;
-        ++n_formats;
-        const class_table cw = class_weights(g.f, g.fg, g.fu);
-        for (const int32_t map : {3, 2}) {
-            if (map == 2 && !is_iq2(f)) {
+        for (const fmt f : { fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s }) {
+            const auto gi = std::find_if(gus.begin(), gus.end(), [&](const gu_inst_t & g) { return g.f == f; });
+            if (gi == gus.end()) {
                 continue;
             }
-            for (int32_t lanes = 2; lanes <= max_lanes; ++lanes) {
-                const int32_t card = lanes % 2;
-                const dev_mem * w = dev_packed(c, f, false, card);
-                for (const int32_t hm : {0, 1}) {
-                    const int32_t first = (lanes + hm + map) % int32_t(cases.size());
-                    // per lane: its inputs; per form (0 separate, 1 lanes) and lane: its outputs
-                    std::vector<std::unique_ptr<dev_mem>> x, ids, wts, sg, hs;
-                    std::unique_ptr<dev_mem> glu[2][max_lanes], gf[2][max_lanes], meta[2][max_lanes], er[2][max_lanes],
-                        out[2][max_lanes], st[2][max_lanes];
-                    bool ok = w != nullptr;
-                    const auto rc_of = [&](int32_t k) -> const row_case & {
-                        return cases[size_t((first + k) % int32_t(cases.size()))];
-                    };
-                    for (int32_t k = 0; k < lanes && ok; ++k) {
-                        const row_case & rc = rc_of(k);
-                        x.push_back(std::make_unique<dev_mem>(rc.xq.size()));
-                        ids.push_back(std::make_unique<dev_mem>(rc.ids.size() * 4));
-                        wts.push_back(std::make_unique<dev_mem>(rc.wts.size() * 4));
-                        sg.push_back(std::make_unique<dev_mem>(rc.sg.size() * 4));
-                        hs.push_back(std::make_unique<dev_mem>(size_t(fn::xchg::hmix_layout::slot_words) * 4));
-                        const std::vector<uint32_t> hw = hmix_slot(rc, card, false);
-                        ok = x.back()->put(rc.xq.data(), rc.xq.size()) &&
-                             ids.back()->put(rc.ids.data(), ids.back()->n) &&
-                             wts.back()->put(rc.wts.data(), wts.back()->n) &&
-                             sg.back()->put(rc.sg.data(), sg.back()->n) && hs.back()->put(hw.data(), hs.back()->n);
-                        for (int32_t form = 0; form < 2 && ok; ++form) {
-                            glu[form][k] = std::make_unique<dev_mem>(glu_buf_bytes);
-                            gf[form][k] = std::make_unique<dev_mem>(size_t(glu_slots) * n_ff_card * 4);
-                            meta[form][k] = std::make_unique<dev_mem>(meta_bytes);
-                            er[form][k] = std::make_unique<dev_mem>(4);
-                            out[form][k] = std::make_unique<dev_mem>(size_t(max_rows) * D * 4);
-                            st[form][k] = std::make_unique<dev_mem>(4);
-                            for (const dev_mem * d :
-                                 {glu[form][k].get(), gf[form][k].get(), meta[form][k].get(), out[form][k].get()}) {
-                                ok = ok && cuda_ok(cudaMemset(d->p, 0xa5, d->n), "memset");
+            const gu_inst_t g = *gi;
+            n_formats += rr == max_rows ? 1 : 0;
+            const class_table cw = class_weights(g.f, g.fg, g.fu);
+            for (const int32_t map : { 3, 2 }) {
+                if (map == 2 && !is_iq2(f)) {
+                    continue;
+                }
+                for (int32_t lanes = 2; lanes <= max_lanes; ++lanes) {
+                    const int32_t   card = lanes % 2;
+                    const dev_mem * w    = dev_packed(c, f, false, card);
+                    for (const int32_t hm : { 0, 1 }) {
+                        const int32_t                         first = (lanes + hm + map) % int32_t(cases.size());
+                        // per lane: its inputs; per form (0 separate, 1 lanes) and lane: its outputs
+                        std::vector<std::unique_ptr<dev_mem>> x, ids, wts, sg, hs;
+                        std::unique_ptr<dev_mem>              glu[2][max_lanes], gf[2][max_lanes], meta[2][max_lanes],
+                            er[2][max_lanes], out[2][max_lanes], st[2][max_lanes];
+                        bool       ok    = w != nullptr;
+                        const auto rc_of = [&](int32_t k) -> const row_case & {
+                            return cases[size_t((first + k) % int32_t(cases.size()))];
+                        };
+                        for (int32_t k = 0; k < lanes && ok; ++k) {
+                            const row_case & rc = rc_of(k);
+                            x.push_back(std::make_unique<dev_mem>(full.xq.size()));
+                            ids.push_back(std::make_unique<dev_mem>(full.ids.size() * 4));
+                            wts.push_back(std::make_unique<dev_mem>(full.wts.size() * 4));
+                            sg.push_back(std::make_unique<dev_mem>(full.sg.size() * 4));
+                            hs.push_back(std::make_unique<dev_mem>(size_t(fn::xchg::hmix_layout::slot_words) * 4));
+                            const std::vector<uint32_t> hw = hmix_slot(rc, card, false);
+                            for (const auto * d :
+                                 { x.back().get(), ids.back().get(), wts.back().get(), sg.back().get() }) {
+                                ok = ok && cuda_ok(cudaMemset(d->p, 0xff, d->n), "memset");  // FMS13: past R rows
                             }
-                            ok = ok && cuda_ok(cudaMemset(er[form][k]->p, 0, 4), "memset") &&
-                                 cuda_ok(cudaMemset(st[form][k]->p, 0, 4), "memset");
-                        }
-                    }
-                    // the lanes form's one status word: lane 0's
-                    const auto status_of = [&](int32_t form, int32_t k) {
-                        return st[form][form == 1 ? 0 : k]->as<uint32_t>();
-                    };
-                    const auto gargs = [&](int32_t form, int32_t k) {
-                        const row_case & rc = rc_of(k);
-                        gate_up_args a = {w->p,
-                                          c.sh_gu.at(int32_t(g.fg)).d[card]->p,
-                                          c.sh_gu.at(int32_t(g.fu)).d[card]->p,
-                                          c.d_grids.p,
-                                          act_in(x[size_t(k)]->p, rc.rows, D),
-                                          ids[size_t(k)]->as<int32_t>(),
-                                          meta[form][k]->p,
-                                          act_out(glu[form][k]->p, glu_slots, n_ff_card),
-                                          gf[form][k]->as<float>(),
-                                          status_of(form, k)};
-                        a.cw = cw;
-                        a.map = map;
-                        if (hm == 1) {
-                            a.x = {nullptr, nullptr, rc.rows, D};
-                            a.hmix = hs[size_t(k)]->as<float>();
-                            a.hmix_peer_half = 1 - card;
-                            a.err = er[form][k]->as<uint32_t>();
-                        }
-                        return a;
-                    };
-                    gate_up_lanes_args la{};
-                    for (int32_t k = 0; k < lanes && ok; ++k) {
-                        ok = gate_up(g.f, g.fg, g.fu, max_rows, gargs(0, k), s);
-                        la.s[k] = gargs(1, k);
-                    }
-                    const bool gsup = ok && gate_up_lanes_supported(g.f, g.fg, g.fu, lanes, la);
-                    ok = ok && gate_up_lanes(g.f, g.fg, g.fu, lanes, la, s) &&
-                         cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "fmu2 lanes gate_up");
-                    std::string why;
-                    const auto note = [&](const std::string & m) { why += (why.empty() ? "" : "; ") + m; };
-                    const auto same_buf = [&](const dev_mem & a0, const dev_mem & a1, const std::string & name) {
-                        std::vector<uint8_t> v0(a0.n), v1(a1.n);
-                        if (!a0.get(v0.data(), a0.n) || !a1.get(v1.data(), a1.n)) {
-                            note(name + ": read back failed");
-                            return false;
-                        }
-                        const int64_t off = first_diff_at(v0, v1);
-                        if (off >= 0) {
-                            note(name + " first differs at byte " + std::to_string(off));
-                        }
-                        return off < 0;
-                    };
-                    bool same = ok && gsup;
-                    for (int32_t k = 0; k < lanes && ok; ++k) {
-                        const row_case & rc = rc_of(k);
-                        const std::string ln = "lane " + std::to_string(k) + " ";
-                        same = same_buf(*glu[0][k], *glu[1][k], ln + "GLU") && same;
-                        same = same_buf(*gf[0][k], *gf[1][k], ln + "F32 GLU") && same;
-                        same = same_buf(*er[0][k], *er[1][k], ln + "error word") && same;
-                        std::vector<bool> runs(size_t(rc.m.n_u), true);
-                        std::vector<uint16_t> want;
-                        const int32_t n_order = pass_order(rc, cw, runs, true, want);
-                        const std::vector<uint8_t> defined = meta_defined_bytes(rc, n_order < 0 ? 0 : n_order);
-                        std::vector<uint8_t> v[2];
-                        for (int32_t form = 0; form < 2; ++form) {
-                            v[form].resize(meta_bytes);
-                            std::vector<int32_t> mw(meta_bytes / 4);
-                            if (!meta[form][k]->get(v[form].data(), meta_bytes)) {
-                                same = false;
-                                note(ln + "meta read back failed");
-                                continue;
-                            }
-                            std::memcpy(mw.data(), v[form].data(), meta_bytes);
-                            if (n_order < 0 || !pass_region_matches(mw, rc, cw, runs, true)) {
-                                same = false;
-                                note(ln + (form == 0 ? "separate" : "lanes") + " meta differs from the host reference");
-                            }
-                        }
-                        for (size_t i = 0; i < defined.size(); ++i) {
-                            if (v[0][i] != v[1][i]) {
-                                if (defined[i] != 0) {
-                                    same = false;
-                                    note(ln + "meta's defined bytes differ at byte " + std::to_string(i));
-                                    break;
+                            ok = ok && x.back()->put(rc.xq.data(), rc.xq.size()) &&
+                                 ids.back()->put(rc.ids.data(), rc.ids.size() * 4) &&
+                                 wts.back()->put(rc.wts.data(), rc.wts.size() * 4) &&
+                                 sg.back()->put(rc.sg.data(), rc.sg.size() * 4) &&
+                                 hs.back()->put(hw.data(), hs.back()->n);
+                            for (int32_t form = 0; form < 2 && ok; ++form) {
+                                glu[form][k]  = std::make_unique<dev_mem>(glu_buf_bytes);
+                                gf[form][k]   = std::make_unique<dev_mem>(size_t(glu_slots) * n_ff_card * 4);
+                                meta[form][k] = std::make_unique<dev_mem>(meta_bytes);
+                                er[form][k]   = std::make_unique<dev_mem>(4);
+                                out[form][k]  = std::make_unique<dev_mem>(size_t(max_rows) * D * 4);
+                                st[form][k]   = std::make_unique<dev_mem>(4);
+                                for (const dev_mem * d : { glu[form][k].get(), gf[form][k].get(), meta[form][k].get(),
+                                                           out[form][k].get() }) {
+                                    ok = ok && cuda_ok(cudaMemset(d->p, 0xa5, d->n), "memset");
                                 }
-                                ++n_undef;
+                                ok = ok && cuda_ok(cudaMemset(er[form][k]->p, 0, 4), "memset") &&
+                                     cuda_ok(cudaMemset(st[form][k]->p, 0, 4), "memset");
                             }
                         }
-                    }
-                    ++n_gu;
-                    // down on each form's GLU and meta, every resident pair
-                    for (const dn_inst_t & d : rdn) {
-                        const dev_mem * wd = dev_packed(c, d.f, true, card);
-                        bool dok = ok && wd != nullptr;
-                        down_lanes_args da{};
-                        const auto dargs = [&](int32_t form, int32_t k) {
-                            down_args a = {wd->p,
-                                           c.sh_dn.at(int32_t(dense_of(d.fs))).d[card]->p,
-                                           c.d_grids.p,
-                                           act_in(glu[form][k]->p, glu_slots, n_ff_card),
-                                           ids[size_t(k)]->as<int32_t>(),
-                                           meta[form][k]->p,
-                                           wts[size_t(k)]->as<float>(),
-                                           sg[size_t(k)]->as<float>(),
-                                           out[form][k]->as<float>(),
-                                           status_of(form, k)};
+                        // the lanes form's one status word: lane 0's
+                        const auto status_of = [&](int32_t form, int32_t k) {
+                            return st[form][form == 1 ? 0 : k]->as<uint32_t>();
+                        };
+                        const auto gargs = [&](int32_t form, int32_t k) {
+                            const row_case & rc = rc_of(k);
+                            gate_up_args     a  = { w->p,
+                                                    c.sh_gu.at(int32_t(g.fg)).d[card]->p,
+                                                    c.sh_gu.at(int32_t(g.fu)).d[card]->p,
+                                                    c.d_grids.p,
+                                                    act_in(x[size_t(k)]->p, rc.rows, D),
+                                                    ids[size_t(k)]->as<int32_t>(),
+                                                    meta[form][k]->p,
+                                                    act_out(glu[form][k]->p, glu_slots, n_ff_card),
+                                                    gf[form][k]->as<float>(),
+                                                    status_of(form, k) };
+                            a.cw                = cw;
+                            a.map               = map;
+                            if (hm == 1) {
+                                a.x              = { nullptr, nullptr, rc.rows, D };
+                                a.hmix           = hs[size_t(k)]->as<float>();
+                                a.hmix_peer_half = 1 - card;
+                                a.err            = er[form][k]->as<uint32_t>();
+                            }
                             return a;
                         };
-                        for (int32_t k = 0; k < lanes && dok; ++k) {
-                            dok = cuda_ok(cudaMemset(out[0][k]->p, 0xa5, out[0][k]->n), "memset") &&
-                                  cuda_ok(cudaMemset(out[1][k]->p, 0x5a, out[1][k]->n), "memset") &&
-                                  down(d.f, d.fs, max_rows, dargs(0, k), s);
-                            da.s[k] = dargs(1, k);
+                        gate_up_lanes_args la{};
+                        for (int32_t k = 0; k < lanes && ok; ++k) {
+                            ok      = gate_up(g.f, g.fg, g.fu, rr, gargs(0, k), s);
+                            la.s[k] = gargs(1, k);
                         }
-                        const bool dsup = dok && down_lanes_supported(d.f, d.fs, lanes, da);
-                        dok = dok && down_lanes(d.f, d.fs, lanes, da, s) &&
-                              cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "fmu2 lanes down");
-                        bool dsame = dok && dsup;
-                        for (int32_t k = 0; k < lanes && dok; ++k) {
-                            dsame = same_buf(*out[0][k], *out[1][k],
-                                             "lane " + std::to_string(k) + " down " + fmt_name(d.f) + "+" +
-                                                 fmt_name(d.fs) + " out") &&
-                                    dsame;
+                        // FMS13: IQ3 below four rows has no lanes body: refused, and each lane's own gate_up runs
+                        const bool alone = is_iq3(f) && rr < 4;
+                        const bool sup   = ok && gate_up_lanes_supported(g.f, g.fg, g.fu, lanes, rr, la);
+                        const bool gsup  = alone ? !sup : sup;
+                        if (alone) {
+                            ++n_iq3_alone;
+                            for (int32_t k = 0; k < lanes && ok; ++k) {
+                                ok = gate_up(g.f, g.fg, g.fu, rr, la.s[k], s);
+                            }
+                        } else {
+                            ok = ok && gate_up_lanes(g.f, g.fg, g.fu, lanes, rr, la, s);
                         }
-                        ++n_dn;
-                        same = same && dsame;
-                        if (!dsup) {
-                            note(std::string("down ") + fmt_name(d.f) + "+" + fmt_name(d.fs) + " NOT SUPPORTED");
+                        ok = ok && cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "fmu2 lanes gate_up");
+                        std::string why;
+                        const auto  note = [&](const std::string & m) {
+                            why += (why.empty() ? "" : "; ") + m;
+                        };
+                        const auto same_buf = [&](const dev_mem & a0, const dev_mem & a1, const std::string & name) {
+                            std::vector<uint8_t> v0(a0.n), v1(a1.n);
+                            if (!a0.get(v0.data(), a0.n) || !a1.get(v1.data(), a1.n)) {
+                                note(name + ": read back failed");
+                                return false;
+                            }
+                            const int64_t off = first_diff_at(v0, v1);
+                            if (off >= 0) {
+                                note(name + " first differs at byte " + std::to_string(off));
+                            }
+                            return off < 0;
+                        };
+                        // FMS13: an output of [5][D] floats: rows < R bitwise, rows R .. 4 each still its fill
+                        const auto same_rows = [&](const dev_mem & a0, const dev_mem & a1, uint8_t f0, uint8_t f1,
+                                                   const std::string & name) {
+                            std::vector<uint8_t> v0(a0.n), v1(a1.n);
+                            if (!a0.get(v0.data(), a0.n) || !a1.get(v1.data(), a1.n)) {
+                                note(name + ": read back failed");
+                                return false;
+                            }
+                            const size_t cut  = size_t(rr) * D * 4;
+                            const bool   head = std::equal(v0.begin(), v0.begin() + ptrdiff_t(cut), v1.begin());
+                            const bool   tail =
+                                std::all_of(v0.begin() + ptrdiff_t(cut), v0.end(),
+                                            [&](uint8_t b) { return b == f0; }) &&
+                                std::all_of(v1.begin() + ptrdiff_t(cut), v1.end(), [&](uint8_t b) { return b == f1; });
+                            if (!head) {
+                                note(name + " rows < R differ");
+                            }
+                            if (!tail) {
+                                note(name + " rows R .. 4 touched");
+                            }
+                            return head && tail;
+                        };
+                        bool same = ok && gsup;
+                        for (int32_t k = 0; k < lanes && ok; ++k) {
+                            const row_case &  rc = rc_of(k);
+                            const std::string ln = "lane " + std::to_string(k) + " ";
+                            same                 = same_buf(*glu[0][k], *glu[1][k], ln + "GLU") && same;
+                            same                 = same_buf(*gf[0][k], *gf[1][k], ln + "F32 GLU") && same;
+                            same                 = same_buf(*er[0][k], *er[1][k], ln + "error word") && same;
+                            std::vector<bool>          runs(size_t(rc.m.n_u), true);
+                            std::vector<uint16_t>      want;
+                            const int32_t              n_order = pass_order(rc, cw, runs, true, want);
+                            const std::vector<uint8_t> defined = meta_defined_bytes(rc, n_order < 0 ? 0 : n_order);
+                            std::vector<uint8_t>       v[2];
+                            for (int32_t form = 0; form < 2; ++form) {
+                                v[form].resize(meta_bytes);
+                                std::vector<int32_t> mw(meta_bytes / 4);
+                                if (!meta[form][k]->get(v[form].data(), meta_bytes)) {
+                                    same = false;
+                                    note(ln + "meta read back failed");
+                                    continue;
+                                }
+                                std::memcpy(mw.data(), v[form].data(), meta_bytes);
+                                if (n_order < 0 || !pass_region_matches(mw, rc, cw, runs, true)) {
+                                    same = false;
+                                    note(ln + (form == 0 ? "separate" : "lanes") +
+                                         " meta differs from the host reference");
+                                }
+                            }
+                            for (size_t i = 0; i < defined.size(); ++i) {
+                                if (v[0][i] != v[1][i]) {
+                                    if (defined[i] != 0) {
+                                        same = false;
+                                        note(ln + "meta's defined bytes differ at byte " + std::to_string(i));
+                                        break;
+                                    }
+                                    ++n_undef;
+                                }
+                            }
                         }
-                    }
-                    uint32_t status_or = 0;
-                    for (int32_t form = 0; form < 2 && ok; ++form) {
-                        for (int32_t k = 0; k < lanes; ++k) {
-                            uint32_t v = 0;
-                            ok = st[form][k]->get(&v, 4) && ok;
-                            status_or |= v;
+                        ++n_gu;
+                        // down on each form's GLU and meta, every resident pair
+                        for (const dn_inst_t & d : rdn) {
+                            const dev_mem * wd  = dev_packed(c, d.f, true, card);
+                            bool            dok = ok && wd != nullptr;
+                            down_lanes_args da{};
+                            const auto      dargs = [&](int32_t form, int32_t k) {
+                                down_args a = { wd->p,
+                                                c.sh_dn.at(int32_t(dense_of(d.fs))).d[card]->p,
+                                                c.d_grids.p,
+                                                act_in(glu[form][k]->p, glu_slots, n_ff_card),
+                                                ids[size_t(k)]->as<int32_t>(),
+                                                meta[form][k]->p,
+                                                wts[size_t(k)]->as<float>(),
+                                                sg[size_t(k)]->as<float>(),
+                                                out[form][k]->as<float>(),
+                                                status_of(form, k) };
+                                return a;
+                            };
+                            for (int32_t k = 0; k < lanes && dok; ++k) {
+                                dok     = cuda_ok(cudaMemset(out[0][k]->p, 0xa5, out[0][k]->n), "memset") &&
+                                          cuda_ok(cudaMemset(out[1][k]->p, 0x5a, out[1][k]->n), "memset") &&
+                                          down(d.f, d.fs, rr, dargs(0, k), s);
+                                da.s[k] = dargs(1, k);
+                            }
+                            const bool dsup = dok && down_lanes_supported(d.f, d.fs, lanes, rr, da);
+                            dok             = dok && down_lanes(d.f, d.fs, lanes, rr, da, s) &&
+                                              cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "fmu2 lanes down");
+                            bool dsame      = dok && dsup;
+                            for (int32_t k = 0; k < lanes && dok; ++k) {
+                                dsame = same_rows(*out[0][k], *out[1][k], 0xa5, 0x5a,
+                                                  "lane " + std::to_string(k) + " down " + fmt_name(d.f) + "+" +
+                                                      fmt_name(d.fs) + " out") &&
+                                        dsame;
+                            }
+                            // FMS2 item 6: X-F sent by the launch, halves 0 and 1: joint row 5 k + b word q is the
+                            // canonical bits of lane k's out (b, h words_half + q); the rows past the lanes' stay the
+                            // sentinel, and each lane's out stays its own launch's. FMS2 item 7 (x16 1): the same send in
+                            // 16 bits, joint row r half q at r x16_row_halves + q the host's rounding of that value
+                            // (fn/xchg/x16_ref.h), every other half the sentinel, the error word err_x16_range exactly
+                            // when a value is beyond FP16's range
+                            constexpr int32_t hw = fn::xchg::words_half;
+                            constexpr int32_t pr = max_lanes * max_rows;
+                            dev_mem           peer(size_t(pr) * hw * 4);
+                            dev_mem           xerr(4);
+                            for (int32_t xh = 0; xh < 4 && dok; ++xh) {
+                                const int32_t h   = xh % 2;
+                                const bool    x16 = xh >= 2;
+                                dok = cuda_ok(cudaMemset(peer.p, 0xff, peer.n), "memset") &&
+                                      cuda_ok(cudaMemset(xerr.p, 0, 4), "memset") &&
+                                      down_lanes_send(d.f, d.fs, lanes, rr, da, peer.as<uint32_t>(), h,
+                                                      x16 ? xerr.as<uint32_t>() : nullptr, s) &&
+                                      cuda_ok(cudaStreamSynchronize(cudaStreamPerThread), "fmu2 lanes down send");
+                                std::vector<uint32_t> got(size_t(pr) * hw);
+                                uint32_t              got_err = 0;
+                                dok                  = dok && peer.get(got.data(), peer.n) && xerr.get(&got_err, 4);
+                                size_t      bad      = 0;
+                                bool        any_over = false;
+                                std::string first;  // the first differing 16-bit half
+                                const auto  half_at = [&](size_t i) {
+                                    return static_cast<uint16_t>(got[i / 2] >> (16 * (i % 2)));
+                                };
+                                for (int32_t k = 0; k < lanes && dok; ++k) {
+                                    std::vector<float> o(size_t(max_rows) * D);
+                                    dok = out[1][k]->get(o.data(), o.size() * 4);
+                                    for (int32_t b = 0; b < max_rows && dok; ++b) {
+                                        const size_t r = size_t(k * max_rows + b);
+                                        if (b >= rr) {  // FMS13: rows R .. 4 of the lane's stride stay the sentinel
+                                            for (int32_t q = 0; q < (x16 ? fn::xchg::x16_row_halves : hw); ++q) {
+                                                bad += x16 ? (half_at(r * fn::xchg::x16_row_halves + q) !=
+                                                                      fn::xchg::x16_sentinel ?
+                                                                  1 :
+                                                                  0) :
+                                                             (got[r * hw + q] != 0xffffffffu ? 1 : 0);
+                                            }
+                                            continue;
+                                        }
+                                        for (int32_t q = 0; q < hw; ++q) {
+                                            const float v = o[size_t(b) * D + size_t(h) * hw + q];
+                                            if (x16) {
+                                                const uint16_t want = fn::xchg::x16_ref(v, any_over);
+                                                n_x16_finite += (want & 0x7c00u) != 0x7c00u ? 1 : 0;
+                                                const uint16_t gh = half_at(r * fn::xchg::x16_row_halves + q);
+                                                if (gh != want && first.empty()) {
+                                                    char buf[160];
+                                                    snprintf(buf, sizeof(buf),
+                                                             " (first: lane %d row %d col %d value %a "
+                                                             "sent 0x%04x, the host's 0x%04x)",
+                                                             k, b, q, double(v), gh, want);
+                                                    first = buf;
+                                                }
+                                                bad += gh != want ? 1 : 0;
+                                                continue;
+                                            }
+                                            uint32_t want = 0;
+                                            std::memcpy(&want, &v, 4);
+                                            want = v != v ? fn::xchg::canonical_nan : want;
+                                            bad += got[r * hw + q] != want ? 1 : 0;
+                                        }
+                                    }
+                                }
+                                if (x16) {
+                                    for (size_t i = size_t(lanes) * max_rows * fn::xchg::x16_row_halves;
+                                         i < got.size() * 2; ++i) {
+                                        bad += half_at(i) != fn::xchg::x16_sentinel ? 1 : 0;
+                                    }
+                                    bad += got_err != (any_over ? fn::xchg::err_x16_range : 0u) ? 1 : 0;
+                                    n_x16_over += any_over ? 1 : 0;
+                                } else {
+                                    for (size_t i = size_t(lanes) * max_rows * hw; i < got.size(); ++i) {
+                                        bad += got[i] != 0xffffffffu ? 1 : 0;
+                                    }
+                                }
+                                for (int32_t k = 0; k < lanes && dok; ++k) {
+                                    dsame = same_rows(*out[0][k], *out[1][k], 0xa5, 0x5a,
+                                                      "lane " + std::to_string(k) + " down (X-F sent) out") &&
+                                            dsame;
+                                }
+                                if (bad != 0) {
+                                    dsame = false;
+                                    note(std::string("down ") + fmt_name(d.f) + "+" + fmt_name(d.fs) + " X-F half " +
+                                         std::to_string(h) + (x16 ? " (16-bit)" : "") + ": " + std::to_string(bad) +
+                                         " peer words differ" + first +
+                                         (x16 ? " flag " + std::to_string(got_err) : ""));
+                                }
+                                n_xf += dok && !x16 ? 1 : 0;
+                                n_xf16 += dok && x16 ? 1 : 0;
+                            }
+                            dsame = dsame && dok;
+                            ++n_dn;
+                            same = same && dsame;
+                            if (!dsup) {
+                                note(std::string("down ") + fmt_name(d.f) + "+" + fmt_name(d.fs) + " NOT SUPPORTED");
+                            }
                         }
-                    }
-                    if (!ok || !same || status_or != 0) {
-                        ++n_bad;
-                        fprintf(stderr, "ex-test: fmu2 lanes %s map %d lanes %d%s: %s%s%s%s\n",
-                                gu_name(g.f, g.fg, g.fu).c_str(), map, lanes, hm == 1 ? " (X-HMIX)" : "",
-                                !ok ? "FAILED TO RUN " : "", !gsup ? "NOT SUPPORTED " : "",
-                                status_or != 0 ? "status set " : (same ? "" : "DIFFERS"),
-                                why.empty() ? "" : (": " + why).c_str());
+                        uint32_t status_or = 0;
+                        for (int32_t form = 0; form < 2 && ok; ++form) {
+                            for (int32_t k = 0; k < lanes; ++k) {
+                                uint32_t v = 0;
+                                ok         = st[form][k]->get(&v, 4) && ok;
+                                status_or |= v;
+                            }
+                        }
+                        if (!ok || !same || status_or != 0) {
+                            ++n_bad;
+                            fprintf(stderr, "ex-test: fmu2 lanes R %d %s map %d lanes %d%s: %s%s%s%s\n", rr,
+                                    gu_name(g.f, g.fg, g.fu).c_str(), map, lanes, hm == 1 ? " (X-HMIX)" : "",
+                                    !ok ? "FAILED TO RUN " : "",
+                                    !gsup ? (alone ? "IQ3 LANES NOT REFUSED " : "NOT SUPPORTED ") : "",
+                                    status_or != 0 ? "status set " : (same ? "" : "DIFFERS"),
+                                    why.empty() ? "" : (": " + why).c_str());
+                        }
                     }
                 }
             }
         }
-    }
-    printf("ex-test: fmu2 gate_up_lanes + down_lanes against each lane's own launches at B 5: %d formats, %d gate_up "
-           "sets (lanes 2-4, map 3 and IQ2 map 2, x and X-HMIX), %d down sets (%zu resident pairs); GLU, F32 GLU, "
-           "error word and output bitwise, meta by its defined words (%d unspecified bytes differ, not compared): "
-           "%d differ\n",
-           n_formats, n_gu, n_dn, rdn.size(), n_undef, n_bad);
-    check(c, n_formats > 0 && n_gu > 0 && n_dn > 0 && n_bad == 0, "fmu2 lanes bitwise each lane's own launches");
+    }  // rr
+    printf(
+        "ex-test: fmu2 gate_up_lanes + down_lanes against each lane's own launches at B = R, R = 2 .. 5 (FMS13; "
+        "rows R .. 4 of every output and X-F row untouched; %d IQ3 sets at R <= 3 refused and run alone): %d "
+        "formats, %d gate_up sets (lanes 2-4, map 3 and IQ2 map 2, x and X-HMIX), %d down sets (%zu resident "
+        "pairs); GLU, F32 GLU, "
+        "error word and output bitwise, meta by its defined words (%d unspecified bytes differ, not compared), "
+        "X-F sent by the launch (FMS2 item 6) against the output's canonical bits, %d sends (halves 0 and 1), "
+        "and in 16 bits (item 7) against the host's rounding, %d sends (%d with a value beyond FP16, the flag "
+        "checked; %lld halves finite in FP16's range): %d differ\n",
+        n_iq3_alone, n_formats, n_gu, n_dn, rdn.size(), n_undef, n_xf, n_xf16, n_x16_over,
+        static_cast<long long>(n_x16_finite), n_bad);
+    check(c, n_formats > 0 && n_gu > 0 && n_dn > 0 && n_xf == 2 * n_dn && n_xf16 == 2 * n_dn && n_bad == 0,
+          "fmu2 lanes bitwise each lane's own launches");
 
     // refusals: nothing enqueued (the outputs keep their fill)
     const gu_inst_t g = gus.front();
-    dev_mem x(cases[0].xq.size()), ids(cases[0].ids.size() * 4), wts(cases[0].wts.size() * 4),
-        sg(cases[0].sg.size() * 4), tab(size_t(NE) * 8);
+    dev_mem         x(full.xq.size()), ids(full.ids.size() * 4), wts(full.wts.size() * 4), sg(full.sg.size() * 4),
+        tab(size_t(NE) * 8);
     std::unique_ptr<dev_mem> glu[max_lanes + 1], meta[max_lanes + 1], out[max_lanes + 1];
-    bool ok = x.put(cases[0].xq.data(), x.n) && ids.put(cases[0].ids.data(), ids.n) &&
-              wts.put(cases[0].wts.data(), wts.n) && sg.put(cases[0].sg.data(), sg.n) &&
-              cuda_ok(cudaMemset(tab.p, 0, tab.n), "memset");
+    bool ok = x.put(full.xq.data(), x.n) && ids.put(full.ids.data(), ids.n) && wts.put(full.wts.data(), wts.n) &&
+              sg.put(full.sg.data(), sg.n) && cuda_ok(cudaMemset(tab.p, 0, tab.n), "memset");
     for (int32_t k = 0; k <= max_lanes && ok; ++k) {
         glu[k] = std::make_unique<dev_mem>(glu_buf_bytes);
         meta[k] = std::make_unique<dev_mem>(meta_bytes);
@@ -4042,11 +4200,20 @@ void fmu2_lanes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vec
     struct refusal {
         const char * what;
         int32_t lanes;
-        int32_t kind; // 0 none, 1 shared GLU, 2 shared meta, 3 table, 4 Q8_0 down, 5 map 1
+        int32_t      kind;  // 0 none, 1 shared GLU, 2 shared meta, 3 table, 4 Q8_0 down, 5 map 1, 6 rows 1, 7 rows 6
     };
-    const refusal rs[] = {{"one lane", 1, 0},      {"five lanes", 5, 0},   {"a shared GLU", 2, 1},
-                          {"a shared meta", 2, 2}, {"a table (wt)", 2, 3}, {"a Q8_0 down", 2, 4},
-                          {"map 1", 2, 5}};
+
+    const refusal rs[] = {
+        { "one lane",      1, 0 },
+        { "five lanes",    5, 0 },
+        { "a shared GLU",  2, 1 },
+        { "a shared meta", 2, 2 },
+        { "a table (wt)",  2, 3 },
+        { "a Q8_0 down",   2, 4 },
+        { "map 1",         2, 5 },
+        { "rows 1",        2, 6 },
+        { "rows 6",        2, 7 }
+    };
     bool refused = ok && w != nullptr && wd != nullptr, untouched = true;
     for (const refusal & r : rs) {
         if (!refused) {
@@ -4073,9 +4240,11 @@ void fmu2_lanes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vec
         const fmt fd = r.kind == 4 ? fmt::q8_0 : dq.f, fsd = r.kind == 4 ? fmt::q8_0 : dq.fs;
         // map 1 refuses gate_up only, a Q8_0 down down only: the other side is not called
         const bool want_g = r.kind != 4, want_d = r.kind != 5;
-        const bool gs = want_g && (gate_up_lanes_supported(g.f, g.fg, g.fu, r.lanes, la) ||
-                                   gate_up_lanes(g.f, g.fg, g.fu, r.lanes, la, s));
-        const bool ds = want_d && (down_lanes_supported(fd, fsd, r.lanes, da) || down_lanes(fd, fsd, r.lanes, da, s));
+        const int32_t rows = r.kind == 6 ? 1 : r.kind == 7 ? max_rows + 1 : max_rows;  // FMS13: rows outside 2 .. 5
+        const bool    gs   = want_g && (gate_up_lanes_supported(g.f, g.fg, g.fu, r.lanes, rows, la) ||
+                                        gate_up_lanes(g.f, g.fg, g.fu, r.lanes, rows, la, s));
+        const bool    ds =
+            want_d && (down_lanes_supported(fd, fsd, r.lanes, rows, da) || down_lanes(fd, fsd, r.lanes, rows, da, s));
         if ((want_g && gs) || (want_d && ds)) {
             refused = false;
             fprintf(stderr, "ex-test: fmu2 lanes refusal %s: %s%s\n", r.what, want_g && gs ? "gate_up SUPPORTED " : "",
@@ -4090,9 +4259,11 @@ void fmu2_lanes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vec
                         std::all_of(v.begin(), v.end(), [](uint8_t b) { return b == 0xa5u; });
         }
     }
-    printf("ex-test: fmu2 lanes refusals (%zu: one and five lanes, a shared GLU or meta, a table, a Q8_0 down, map 1): "
-           "%s, outputs untouched: %s\n",
-           sizeof(rs) / sizeof(rs[0]), refused ? "all refused" : "NOT ALL REFUSED", untouched && ok ? "yes" : "NO");
+    printf(
+        "ex-test: fmu2 lanes refusals (%zu: one and five lanes, a shared GLU or meta, a table, a Q8_0 down, map 1, "
+        "rows 1 and 6): "
+        "%s, outputs untouched: %s\n",
+        sizeof(rs) / sizeof(rs[0]), refused ? "all refused" : "NOT ALL REFUSED", untouched && ok ? "yes" : "NO");
     check(c, ok && refused && untouched, "fmu2 lanes refusals");
 }
 
@@ -4372,7 +4543,7 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
         me10_pair(c, gus, master, Bs); // ME10: both shards' gate/up in one launch against two
     }
     if (!q2d && !q4 && std::find(Bs.begin(), Bs.end(), max_rows) != Bs.end()) {
-        fmu2_lanes(c, gus, dns, master); // FMU2 (build item 1): the joint round's lanes in one launch, each alone
+        fmu2_lanes(c, gus, dns, master);  // FMU2 (build item 1): the joint round's lanes in one launch, each alone
     }
     fmu2_rows_alone(c, gus, dns, master); // FMU2 (build item 2): the draft's instances, every row each row alone
     me2_policy(c);  // ME2: the cache's host policy

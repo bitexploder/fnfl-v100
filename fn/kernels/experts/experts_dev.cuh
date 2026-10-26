@@ -72,9 +72,9 @@ struct gu_layout {
 };
 
 __host__ __device__ constexpr gu_layout gu_layout_of(fmt f) {
-    return f == fmt::iq2_xxs   ? gu_layout{66, 4, false, false, 0, 2048}
-           : f == fmt::iq2_xs  ? gu_layout{74, 4, true, false, 2048, 4096}
-           : f == fmt::iq2_s   ? gu_layout{82, 5, false, false, 6144, 8192}
+    return f == fmt::iq2_xxs   ? gu_layout{66, 4, false, false, 17424, 1024} // FMS4 item 2: the selector tables
+           : f == fmt::iq2_xs  ? gu_layout{74, 4, true, false, 18448, 2048}
+           : f == fmt::iq2_s   ? gu_layout{82, 5, false, false, 20496, 4096}
            : f == fmt::iq3_xxs ? gu_layout{98, 6, false, false, 14336, 1024}
            : f == fmt::iq3_s   ? gu_layout{110, 6, true, true, 15360, 2048}
            : f == fmt::q8_0    ? gu_layout{8 * 34, 16, false, false, 0, 0}
@@ -95,7 +95,14 @@ __host__ __device__ constexpr gu_layout gu_layout_k(fmt f) {
 }
 
 constexpr int32_t kvalues_off = 17408;
-static_assert(kvalues_off + 16 == static_cast<int32_t>(grid_bytes), "grid buffer layout");
+static_assert(kvalues_off + 16 == gu_layout_of(fmt::iq2_xxs).grid_off &&
+                  gu_layout_of(fmt::iq2_xxs).grid_off + gu_layout_of(fmt::iq2_xxs).grid_len ==
+                      gu_layout_of(fmt::iq2_xs).grid_off &&
+                  gu_layout_of(fmt::iq2_xs).grid_off + gu_layout_of(fmt::iq2_xs).grid_len ==
+                      gu_layout_of(fmt::iq2_s).grid_off &&
+                  gu_layout_of(fmt::iq2_s).grid_off + gu_layout_of(fmt::iq2_s).grid_len ==
+                      static_cast<int32_t>(grid_bytes),
+              "grid buffer layout: the IQ2 selector tables after kvalues_iq4nl");
 
 __host__ __device__ constexpr int64_t tile_bytes(fmt f) {
     return int64_t(gu_threads) * gu_layout_k(f).block_bytes;
@@ -166,6 +173,43 @@ __device__ __forceinline__ uint32_t sign_lo(uint32_t s) {
 }
 __device__ __forceinline__ uint32_t sign_hi(uint32_t s) {
     return msb_mask((s & 0xf0u) * 0x01020408u);
+}
+
+// FMS4 item 2: PRMT with a run-time selector in the default mode. __byte_perm clears bit 3 of each selector nibble
+// first (one more LOP3 ... 0x7777 a call); the IQ2 selectors never set it, so the raw form is exact. prmt.b32 reads
+// only the selector's low 16 bits.
+__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
+    uint32_t r;
+    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(sel));
+    return r;
+}
+// FMS4 item 2: the eight sign bits of a 7-bit group (IQ2_XXS, IQ2_XS): the parity of the seven at bit 7 (ggml's
+// ksigns_iq2xs). s7 < 128, so nothing carries into bits 0..6; the bits above 7 are junk that iq2_signed drops. One
+// multiply-add: written in C++, the compiler knows the bits are disjoint and emits a shift and a LOP3 merge instead.
+__device__ __forceinline__ uint32_t sign8_of7(uint32_t s7) {
+    uint32_t r;
+    asm("mad.lo.u32 %0, %1, 128, %2;" : "=r"(r) : "r"(static_cast<uint32_t>(__popc(s7))), "r"(s7));
+    return r;
+}
+// FMS4 item 2: a | (b & M) as one LOP3. Written in C++, the selector's two merges are reassociated into three LOP3s
+// ((o & M2) | (e & M1), then | g32).
+template <uint32_t M> __device__ __forceinline__ uint32_t or_and(uint32_t a, uint32_t b) {
+    uint32_t r;
+    asm("lop3.b32 %0, %1, %2, %3, 0xf8;" : "=r"(r) : "r"(a), "r"(b), "n"(M));
+    return r;
+}
+// FMS4 item 2: an IQ2 grid entry's 8 signed bytes, weights 0..3 in lo and 4..7 in hi, from its selector entry g32
+// (nibble k: the level code of byte k) and its sign bits s8 (bit k: weight k negative; bits above 7 ignored). Sign k
+// goes to bit 2 of nibble k (even k by the first product, odd k by the second, each masked on its own: one mask over
+// their sum is wrong, spread2.py), so nibble k indexes the palette pos (8, 25, 43) or neg (-8, -25, -43). 0 of 360,448
+// (entry, sign) cases wrong over the three grids (fnfl/evidence/fms4-decode-recipes/final.py; grid-test's device form).
+// The merge order is the ticket's first, (g32 | e) | o.
+__device__ __forceinline__ void iq2_signed(uint32_t g32, uint32_t s8, uint32_t & lo, uint32_t & hi) {
+    constexpr uint32_t pos = 0x002b1908u, neg = 0x00d5e7f8u;
+    const uint32_t sel = or_and<0x40404040u>(or_and<0x04040404u>(g32, (s8 & 0x55u) * 0x00104104u),
+                                             (s8 & 0xaau) * 0x00820820u);
+    lo = prmt(pos, neg, sel);
+    hi = prmt(pos, neg, sel >> 16);
 }
 
 // The masks of a 7-bit sign group (IQ2_XXS, IQ2_XS, IQ3_XXS): ksigns_iq2xs without the table, the eighth sign being
@@ -258,11 +302,21 @@ bool gate_up_pair_iq2(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows,
 bool gate_up_pair_iq3(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a,
                       cudaStream_t st);
 
-// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B = 5, the IQ2 and IQ3 bodies
-// (experts_gu_lanes.cu); the caller checked the arguments
-bool gate_up_lanes_iq2(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
-                       cudaStream_t st);
-bool gate_up_lanes_iq3(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t lanes, const gate_up_lanes_args & a,
-                       cudaStream_t st);
+// FMU2 (build item 1): a joint round's lanes' gate/up in one launch (gate_up_lanes) at B = rows (FMS13: the round's
+// R; IQ2 2 .. 5, IQ3 4 .. 5), the IQ2 and IQ3 bodies (experts_gu_lanes.cu); the caller checked the arguments
+bool gate_up_lanes_iq2(fmt                        f,
+                       fn::dense::fmt             fg,
+                       fn::dense::fmt             fu,
+                       int32_t                    lanes,
+                       int32_t                    rows,
+                       const gate_up_lanes_args & a,
+                       cudaStream_t               st);
+bool gate_up_lanes_iq3(fmt                        f,
+                       fn::dense::fmt             fg,
+                       fn::dense::fmt             fu,
+                       int32_t                    lanes,
+                       int32_t                    rows,
+                       const gate_up_lanes_args & a,
+                       cudaStream_t               st);
 
 } // namespace fn::experts::detail

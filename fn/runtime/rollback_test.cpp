@@ -156,6 +156,9 @@ bool snapshot(rt::target & t, md::model & m, state_hash & s) {
         }
         const int64_t s0 = rd::version_slot(cur, 0);
         for (int32_t layer = 0; layer < 48; ++layer) {
+            if (!m.win.layer(layer)) {
+                continue;  // TTTS1: a split stage holds its window's layers
+            }
             const md::layer_state & st = p.s[layer];
             const uint64_t tag = uint64_t(c) << 8 | uint64_t(layer);
             if (p.w[layer].gdn) {
@@ -209,6 +212,9 @@ bool snapshot(rt::target & t, md::model & m, state_hash & s) {
                 }
                 s.h[6] = h;
             }
+        }
+        if (!m.win.ple()) {
+            continue;  // TTTS1: the back stage holds no PLE history
         }
         if (!get(f, p.ple_hist + s0 * fn::ple::hist_version_floats, size_t(fn::ple::hist_version_floats))) {
             return false;

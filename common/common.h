@@ -461,6 +461,13 @@ struct common_params_fnfl {
     std::vector<std::pair<std::string, std::string>> settings;
     int32_t              expert_reserve_mib = 768;
     std::string          kv_format;                // KV8: bf16 or q8; empty: the engine's default (bf16)
+    // TTTS1: the split across two boxes at layer K (0: one box), its follower's address and port, X-HELLO's commit
+    // and device-code digest
+    int32_t                                          split_layer = 0;
+    std::string                                      split_addr  = "10.25.0.2";
+    int32_t                                          split_port  = 13371;
+    std::string                                      split_commit;
+    std::string                                      split_digest;
 };
 
 struct common_params {

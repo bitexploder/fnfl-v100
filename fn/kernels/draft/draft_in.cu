@@ -30,9 +30,9 @@ __device__ __forceinline__ const float * hidden(const send_args & a, int32_t i) 
     return j < 0 ? a.carry_prev : a.carry + j * n_stream * half;
 }
 
-__global__ void __launch_bounds__(send_threads) send_kernel(const send_args a) {
+// FMS2 (build item 2): the send's block of row i, segment k (send_kernel's, and the joint catch-up's lanes launch)
+__device__ __forceinline__ void send_block(const send_args & a, int32_t i, int32_t k) {
     __shared__ float red[send_warps];
-    const int32_t i = static_cast<int32_t>(blockIdx.x) / n_seg, k = static_cast<int32_t>(blockIdx.x) % n_seg;
     const int32_t t = static_cast<int32_t>(threadIdx.x), lane = t % 32, warp = t / 32;
     const float * src = k == 0 ? a.emb + i * a.emb_stride : hidden(a, i) + (k - 1) * half;
     const float * g = k == 0 ? a.g_e : a.g_h + (k - 1) * half;
@@ -76,7 +76,13 @@ __global__ void __launch_bounds__(send_threads) send_kernel(const send_args a) {
     }
 }
 
-__global__ void __launch_bounds__(recv_threads) recv_kernel(const recv_args a) {
+__global__ void __launch_bounds__(send_threads) send_kernel(const send_args a) {
+    send_block(a, static_cast<int32_t>(blockIdx.x) / n_seg, static_cast<int32_t>(blockIdx.x) % n_seg);
+}
+
+// FMS2 (build item 2): the receive's block (recv_kernel's); L, the joint catch-up's lanes launch: the round's rows
+// *rows (the lane's descriptor's) instead of the grid's
+template <bool L> __device__ __forceinline__ void recv_block(const recv_args & a, const int32_t * rows) {
     __shared__ uint4 pv[row_u4]; // the peer's row as polled
     __shared__ float rs[n_seg];
     const int32_t i = static_cast<int32_t>(blockIdx.x);
@@ -92,7 +98,7 @@ __global__ void __launch_bounds__(recv_threads) recv_kernel(const recv_args a) {
     if (i == 0 && a.carry_prev != nullptr) {
         // the retained carry for the next round (draft.h): the round's last hidden row; the send kernel that read
         // the old one finished before this launch (stream order)
-        const int32_t j = *a.hsrc + static_cast<int32_t>(gridDim.x) - 1;
+        const int32_t j = *a.hsrc + (L ? *rows : static_cast<int32_t>(gridDim.x)) - 1;
         if (j >= 0) {
             for (int32_t u = t; u < n_stream * half / 4; u += recv_threads) {
                 reinterpret_cast<float4 *>(a.carry_prev)[u] =
@@ -125,6 +131,39 @@ __global__ void __launch_bounds__(recv_threads) recv_kernel(const recv_args a) {
     }
 }
 
+__global__ void __launch_bounds__(recv_threads) recv_kernel(const recv_args a) {
+    recv_block<false>(a, nullptr);
+}
+
+// FMS2 (build item 2, the joint catch-up): lanes 2 .. 4 in one launch, blockIdx.y the lane, each lane's rows read on
+// the device (its round descriptor's): the blocks of rows past them return at once
+struct send_lanes_args {
+    send_args a[fn::xchg::max_lanes];
+    const int32_t * rows[fn::xchg::max_lanes];
+};
+
+struct recv_lanes_args {
+    recv_args a[fn::xchg::max_lanes];
+    const int32_t * rows[fn::xchg::max_lanes];
+};
+
+__global__ void __launch_bounds__(send_threads) send_lanes_kernel(const __grid_constant__ send_lanes_args p) {
+    const int32_t u = static_cast<int32_t>(blockIdx.y);
+    const int32_t i = static_cast<int32_t>(blockIdx.x) / n_seg;
+    if (i >= *p.rows[u]) {
+        return;
+    }
+    send_block(p.a[u], i, static_cast<int32_t>(blockIdx.x) % n_seg);
+}
+
+__global__ void __launch_bounds__(recv_threads) recv_lanes_kernel(const __grid_constant__ recv_lanes_args p) {
+    const int32_t u = static_cast<int32_t>(blockIdx.y);
+    if (static_cast<int32_t>(blockIdx.x) >= *p.rows[u]) {
+        return;
+    }
+    recv_block<true>(p.a[u], p.rows[u]);
+}
+
 bool aligned(const void * p, uintptr_t n) {
     return p != nullptr && reinterpret_cast<uintptr_t>(p) % n == 0;
 }
@@ -150,6 +189,46 @@ bool draft_in_recv(int32_t rows, const recv_args & a, void * stream) {
         return false;
     }
     recv_kernel<<<rows, recv_threads, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool draft_in_send_lanes(int32_t lanes, const send_args * a, const int32_t * const * rows, void * stream) {
+    if (a == nullptr || rows == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    send_lanes_args p = {};
+    for (int32_t u = 0; u < lanes; ++u) {
+        const send_args & x = a[u];
+        if (rows[u] == nullptr || !aligned(x.emb, 16) || x.emb_stride % 4 != 0 || x.emb_stride < half ||
+            !aligned(x.g_e, 16) || !aligned(x.g_h, 16) || !aligned(x.peer, 16) || !aligned(x.own, 16) || x.chained ||
+            !aligned(x.carry, 16) || !aligned(x.carry_prev, 16) || x.hsrc == nullptr) {
+            return false;
+        }
+        p.a[u] = x;
+        p.rows[u] = rows[u];
+    }
+    send_lanes_kernel<<<dim3(max_rows * n_seg, static_cast<uint32_t>(lanes)), send_threads, 0,
+                        static_cast<cudaStream_t>(stream)>>>(p);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool draft_in_recv_lanes(int32_t lanes, const recv_args * a, const int32_t * const * rows, void * stream) {
+    if (a == nullptr || rows == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    recv_lanes_args p = {};
+    for (int32_t u = 0; u < lanes; ++u) {
+        const recv_args & x = a[u];
+        if (rows[u] == nullptr || !aligned(x.own, 16) || !aligned(x.slot, 16) || x.codes == nullptr ||
+            !aligned(x.scales, 8) || (x.f32 != nullptr && !aligned(x.f32, 4)) || x.err == nullptr ||
+            (x.card != 0 && x.card != 1) || !aligned(x.carry_prev, 16) || !aligned(x.carry, 16) || x.hsrc == nullptr) {
+            return false;
+        }
+        p.a[u] = x;
+        p.rows[u] = rows[u];
+    }
+    recv_lanes_kernel<<<dim3(max_rows, static_cast<uint32_t>(lanes)), recv_threads, 0,
+                        static_cast<cudaStream_t>(stream)>>>(p);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

@@ -13,6 +13,8 @@
 #include "fn/runtime/json_check.h"
 #include "fn/runtime/mx7_check.h"
 #include "fn/runtime/runtime.h"
+#include "fn/runtime/stage.h"
+#include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
 #include "fn/xchg/xchg.h"
@@ -23,8 +25,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdlib>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -1044,14 +1046,20 @@ bool fnfl_spec_request(rt::engine &                 e,
                        const std::vector<int32_t> & prompt,
                        int32_t                      n_reuse,
                        const rt::request_options &  o,
-                       fnfl_request_out &           out) {
+                       fnfl_request_out &           out,
+                       fn::runtime::stage::leader * L) {
     out              = fnfl_request_out();
     int32_t    n_pre = 0;
     const auto tp    = clk::now();
-    if (n_reuse < 0 || n_reuse >= static_cast<int32_t>(prompt.size()) || e.set_sampling(0, o) != rt::run_status::ok ||
-        e.truncate(0, n_reuse) != rt::run_status::ok ||
-        e.prefill(0, prompt.data() + n_reuse, static_cast<int32_t>(prompt.size()) - n_reuse, n_reuse, n_pre) !=
-            rt::run_status::ok) {
+    const int32_t n_new = static_cast<int32_t>(prompt.size()) - n_reuse;
+    if (n_reuse < 0 || n_reuse >= static_cast<int32_t>(prompt.size()) ||
+        (L != nullptr ? L->set_sampling(0, o) : e.set_sampling(0, o)) != rt::run_status::ok ||
+        (L != nullptr ? L->truncate(0, n_reuse) : e.truncate(0, n_reuse)) != rt::run_status::ok ||
+        (L != nullptr ? L->prefill(0, prompt.data() + n_reuse, n_new, n_reuse, n_pre) :
+                        e.prefill(0, prompt.data() + n_reuse, n_new, n_reuse, n_pre)) != rt::run_status::ok) {
+        if (L != nullptr && !L->error().empty()) {
+            fprintf(stderr, "spec run: the split: %s\n", L->error().c_str());
+        }
         return false;
     }
     out.pre_s                           = since(tp);
@@ -1061,7 +1069,19 @@ bool fnfl_spec_request(rt::engine &                 e,
     bool       end                      = false;
     const auto t0                       = clk::now();
     while (!end && static_cast<int32_t>(out.toks.size()) < o.max_tokens) {
-        if (e.step(0, buf, n, end) != rt::run_status::ok) {
+        if (L != nullptr) {
+            // TTTS1: one step of the slot on both boxes (a group of one)
+            const int32_t      slot = 0;
+            rt::joint_step_out r;
+            L->step_group(&slot, 1, &r);
+            if (r.st != rt::run_status::ok) {
+                fprintf(stderr, "spec run: the split's step: %s\n", r.why.c_str());
+                return false;
+            }
+            std::copy(r.out, r.out + r.n_out, buf);
+            n   = r.n_out;
+            end = r.end;
+        } else if (e.step(0, buf, n, end) != rt::run_status::ok) {
             return false;
         }
         out.toks.insert(out.toks.end(), buf, buf + n);
@@ -2118,13 +2138,28 @@ int fnfl_spec_run(const fnfl_target_args & a) {
             return x;
         };
     }
-    rt::engine e;
+    c.record_hash = a.split_role == 0;  // TTTS1: each step's decision hash (rounds.csv); the split's from the back
+    fnfl_split  sp;
     std::string err;
+    if (a.split_role != 0 && !fnfl_split_prepare(a, 1, sp, c, err)) {
+        fprintf(stderr, "spec run: %s\n", err.c_str());
+        return 1;
+    }
+    rt::engine e;
     if (!e.init(std::move(m), c, err)) {
         fprintf(stderr, "spec run: engine: %s\n", err.c_str());
         return 1;
     }
     printf("spec run: %s\n", e.settings().c_str());
+    if (a.split_role != 0) {
+        if (a.split_role != 1 || !fnfl_split_attach(a, e, cells, sp, err)) {
+            fprintf(stderr, "spec run: the split: %s\n", a.split_role != 1 ? "spec run is the leader" : err.c_str());
+            return 1;
+        }
+        printf("spec run: TTTS1 split at k %d: this box the front (layers 0 .. %d), the follower the back\n", a.split_k,
+               a.split_k - 1);
+    }
+    fn::runtime::stage::leader * const L         = sp.lead.get();
     // ME3: the graphs captured at init; none after (the end's line compares)
     const int32_t captures0 = e.test_target().captures();
     printf("spec run: ME3 executor: %s; %d graph captures at init\n",
@@ -2218,8 +2253,9 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         fclose(log);
         return 1;
     }
-    fprintf(rc, "setting,run,step,kind,n_before,d,a,n_out,cut,waits,to_draft_ms,to_verify_ms,to_catchup_ms,to_one_ms,"
-                "wall_ms\n");
+    fprintf(rc,
+            "setting,run,step,kind,n_before,d,a,n_out,cut,waits,to_draft_ms,to_verify_ms,to_catchup_ms,to_one_ms,"
+            "wall_ms,decision_hash\n");
     const auto ms = [](double s_) {
         char b[32] = "";
         if (s_ >= 0) {
@@ -2242,11 +2278,21 @@ int fnfl_spec_run(const fnfl_target_args & a) {
         for (size_t pg = 0; pg < per_arm; ++pg) {
             const size_t g = ai * per_arm + pg, p = pg / settings.size();
             const fnfl_target_args::run_setting & st = settings[pg % settings.size()];
+            // TTTS1 (--spec-d inside a setting): the setting's d, on both boxes with the split
+            const int32_t                         d_set = st.spec_d > 0 ? st.spec_d : a.spec_d;
+            if (d_set != e.config().spec_d) {
+                const bool sparse = dopt.attention == "sparse";
+                if ((L != nullptr ? L->set_draft(d_set, sparse) : e.set_draft(d_set, sparse)) != rt::run_status::ok) {
+                    fprintf(stderr, "spec run: set_draft(%d): %s\n", d_set,
+                            L != nullptr ? L->error().c_str() : e.error().c_str());
+                    return 1;
+                }
+            }
             char what[384];
             snprintf(what, sizeof(what),
-                     "setting %zu: T %.2f top-k %d top-p %.2f min-p %.2f seed %llu max_tokens %d; prompt %zu (%zu "
+                     "setting %zu: d %d T %.2f top-k %d top-p %.2f min-p %.2f seed %llu max_tokens %d; prompt %zu (%zu "
                      "tokens)",
-                     g, double(st.sampling.temp), st.sampling.top_k, double(st.sampling.top_p),
+                     g, e.config().spec_d, double(st.sampling.temp), st.sampling.top_k, double(st.sampling.top_p),
                      double(st.sampling.min_p), static_cast<unsigned long long>(st.sampling.seed), st.max_tokens, p,
                      prompts[p].size());
             printf("spec run: %s\n", what);
@@ -2280,7 +2326,7 @@ int fnfl_spec_run(const fnfl_target_args & a) {
                            a.append_close);
                 }
                 if (!me3_request_tokens(e, ids, append[p], req, n_reuse, closed ? a.append_close : -1) ||
-                    !fnfl_spec_request(e, req, n_reuse, o, ro)) {
+                    !fnfl_spec_request(e, req, n_reuse, o, ro, L)) {
                     fprintf(stderr, "spec run: %s\n", e.error().c_str());
                     return 1;
                 }
@@ -2366,13 +2412,13 @@ int fnfl_spec_run(const fnfl_target_args & a) {
                 write_tokens(a.out_dir + "/run-" + std::to_string(g) + "-" + std::to_string(r) + "-tokens.txt", toks);
                 int32_t k = 0;
                 for (const rt::step_info & x : e.last_steps()) {
-                    fprintf(rc, "%zu,%d,%d,%s,%lld,%d,%d,%d,%d,%d,%s,%s,%s,%s,%.4f\n", g, r, k++,
-                            x.kind == 0   ? "bootstrap"
-                            : x.kind == 1 ? "generate"
-                                          : "spec",
+                    fprintf(rc, "%zu,%d,%d,%s,%lld,%d,%d,%d,%d,%d,%s,%s,%s,%s,%.4f,%llu\n", g, r, k++,
+                            x.kind == 0 ? "bootstrap" :
+                            x.kind == 1 ? "generate" :
+                                          "spec",
                             static_cast<long long>(x.n_before), x.d, x.a, x.n_out, x.cut ? 1 : 0, x.waits,
                             ms(x.to_draft_s).c_str(), ms(x.to_verify_s).c_str(), ms(x.to_catchup_s).c_str(),
-                            ms(x.to_one_s).c_str(), x.wall_s * 1e3);
+                            ms(x.to_one_s).c_str(), x.wall_s * 1e3, static_cast<unsigned long long>(x.hash));
                 }
                 fflush(rc);
                 fflush(stdout);
@@ -2402,6 +2448,15 @@ int fnfl_spec_run(const fnfl_target_args & a) {
     printf("spec run: ME3 executor: %d graph captures at the end, %d after init (rebuilds)\n", captures1,
            captures1 - captures0);
     all = all && captures1 == captures0;
+    if (L != nullptr) {
+        const auto & ls = L->stats();
+        printf(
+            "spec run: TTTS1 split totals: %lld step groups, %lld members, %lld boundaries (%lld bytes), prompt "
+            "crossings %lld (%lld bytes); the leader's wait for the back %.3f s\n",
+            (long long) ls.groups, (long long) ls.members, (long long) ls.boundaries, (long long) ls.boundary_bytes,
+            (long long) sp.cross.count(), (long long) sp.cross.bytes(), ls.back_wait_s);
+        L->bye();
+    }
     fclose(log);
     printf("spec run: %s\n", all ? "PASS" : "FAILED");
     return all ? 0 : 1;

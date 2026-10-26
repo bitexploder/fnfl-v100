@@ -92,9 +92,13 @@ add_library(fnfl-runtime STATIC
     runtime/target.cpp
     runtime/target.h
     runtime/versions.cpp
-    runtime/versions.h)
+    runtime/versions.h
+    runtime/stage.cpp
+    runtime/stage.h
+    runtime/pipe.cpp
+    runtime/pipe.h)
 fnfl_target_flags(fnfl-runtime)
-target_link_libraries(fnfl-runtime PUBLIC fnfl-model fnfl-borrowed fnfl-quant fnfl-kernels-embed)
+target_link_libraries(fnfl-runtime PUBLIC fnfl-model fnfl-borrowed fnfl-quant fnfl-kernels-embed fnfl-link)
 
 # borrowed llama.cpp and ggml CPU code, behind plain interfaces: the GGUF reader only. No GPU code
 add_library(fnfl-borrowed STATIC
@@ -120,6 +124,18 @@ fnfl_target_flags(fnfl-xchg)
 target_compile_options(fnfl-xchg PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
 add_dependencies(fnfl-xchg fnfl-check-includes)
+
+# TTTS1: the box-to-box link of the split, over UCX's UCP (the operator's "reuse commms libraries"; Ubuntu's libucx-dev,
+# the dispatch's Setup). Host code only, no model constants
+find_package(PkgConfig REQUIRED)
+find_package(Threads REQUIRED)
+pkg_check_modules(UCX REQUIRED IMPORTED_TARGET ucx)
+add_library(fnfl-link STATIC
+    xchg/link.cpp
+    xchg/link.h)
+fnfl_target_flags(fnfl-link)
+target_link_libraries(fnfl-link PUBLIC PkgConfig::UCX Threads::Threads)
+add_dependencies(fnfl-link fnfl-check-includes)
 
 # FNFL's decode activation format and its quantize kernel (C2). Math flags are declared: no fast math; the divisions
 # are __fdiv_rn and the output is bitwise against the CPU reference (fn/quant/act_ref)
@@ -414,6 +430,8 @@ add_executable(fnfl-drive
     kernels/hc/hc_bench.h
     kernels/qsa/qsa_test.cpp
     kernels/qsa/qsa_test.h
+    kernels/qsa/qsaj_test.cpp
+    kernels/qsa/qsaj_test.h
     kernels/qsa/qsa_bench.cpp
     kernels/qsa/qsa_bench.h
     kernels/qsa/qa2_bench.cu
@@ -436,12 +454,15 @@ add_executable(fnfl-drive
     kernels/experts/experts_prompt_test.h
     kernels/experts/grids_test.cpp
     kernels/experts/grids_test.h
+    kernels/experts/grids_dev_test.cu
     kernels/gdn/gdn_bench.cu
     kernels/gdn/gdn_bench.h
     kernels/gdn/gdn_ref.cu
     kernels/gdn/gdn_ref.h
     kernels/gdn/gdn_test.cpp
     kernels/gdn/gdn_test.h
+    kernels/gdn/gdnj_test.cpp
+    kernels/gdn/gdnj_test.h
     kernels/ple/ple_bench.cpp
     kernels/ple/ple_bench.h
     kernels/ple/ple_test.cpp
@@ -488,10 +509,14 @@ add_executable(fnfl-drive
     kernels/samp/samp_ref.h
     kernels/samp/samp_test.cpp
     kernels/samp/samp_test.h
+    xchg/link_test.cpp
+    xchg/link_test.h
     xchg/xchg_test.cpp
     xchg/xchg_test.h
     xchg/xchg2_test.cpp
     xchg/xchg2_test.h
+    xchg/x16_test.cpp
+    xchg/x16_test.h
     runtime/layer_bench.cpp
     runtime/layer_test.cpp
     runtime/layer_test.h
@@ -508,11 +533,16 @@ add_executable(fnfl-drive
     runtime/mx7_check.cpp
     runtime/mx7_check.h
     runtime/spec_cmds.cpp
+    runtime/split_stage_test.cpp
+    runtime/split_stage_test.h
+    runtime/stage_cmds.cpp
+    runtime/stage_cmds.h
     runtime/split_test.cpp
     runtime/split_test.h
     runtime/state_test.cpp
     runtime/slots_gpu_test.cpp
     runtime/rollback_mu1_test.cpp
+    runtime/joint_kl.cpp
     runtime/state_test.h
     runtime/draft_cmds.cpp
     runtime/target_cmds.cpp
@@ -558,5 +588,5 @@ set_source_files_properties(kernels/draft/draft_bench.cu PROPERTIES COMPILE_OPTI
 target_link_libraries(fnfl-drive PRIVATE fnfl-glue fnfl-loader fnfl-runtime fnfl-borrowed fnfl-quant fnfl-kernels-act
     fnfl-kernels-gdn fnfl-kernels-hc fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts fnfl-kernels-dense
     fnfl-xchg fnfl-proto-xp1 fnfl-kernels-embed fnfl-kernels-ple fnfl-kernels-head fnfl-kernels-draft fnfl-kernels-samp
-    CUDA::cudart)
+    fnfl-link CUDA::cudart)
 add_dependencies(fnfl-drive fnfl-check-includes)

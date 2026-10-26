@@ -2,6 +2,7 @@
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/tc/tc_gemm.cuh"
 #include "fn/model/shapes.h"
+#include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
 
@@ -142,19 +143,22 @@ __device__ __forceinline__ uint16_t bf16_rn(float f) {
 
 // One warp a block: the mean of its 4 cells' raw keys, norm and rope at position 4b, as qsa_pool_rope_f32 computes it
 // (members summed in cell order, then scale * x + bias), stored as F32 in the tiled layout.
-__global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs a) {
+// FMS2 (build item 2): summary_update_kernel's warp; L, the joint catch-up's lanes launch: the new cells *rows (the
+// lane's descriptor's) instead of a.n_new
+template <bool L> __device__ __forceinline__ void update_warp(const update_kargs & a, const int32_t * rows) {
     const int lane = threadIdx.x & 31;
     const int i = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int32_t n_new = L && rows != nullptr ? *rows : a.n_new;
     int first = a.first, count = a.count, new_first = a.new_first;
     if (a.depth != nullptr) {
         new_first = *a.depth;
-        if (new_first < 0 || new_first > a.cap - a.n_new) {
+        if (new_first < 0 || new_first > a.cap - n_new) {
             return; // refused by the runtime before launch (FC-RD1); nothing is written
         }
         first = new_first / ratio;
-        count = (new_first + a.n_new) / ratio - first;
+        count = (new_first + n_new) / ratio - first;
     }
-    if (i >= count + a.n_new) {
+    if (i >= count + n_new) {
         return;
     }
     // ME6: the host-backed tier's window start (graph mode); the window holds every cell the launch touches
@@ -179,7 +183,7 @@ __global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs 
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
             // a cell this launch writes is taken from ik, never read back from the cache
-            const uint16_t h = n >= 0 && n < a.n_new ? bf16_rn(a.ik[n * head_dim + m * 32 + lane]) : k[m * 32 + lane];
+            const uint16_t h = n >= 0 && n < n_new ? bf16_rn(a.ik[n * head_dim + m * 32 + lane]) : k[m * 32 + lane];
             const float v = __uint_as_float(static_cast<uint32_t>(h) << 16);
             x[m] = r == 0 ? v : x[m] + v;
         }
@@ -196,6 +200,21 @@ __global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs 
         const int e = m * 32 + lane;
         tile[(e / 4) * (tile_blocks * 4) + e % 4] = x[m];
     }
+}
+
+__global__ void __launch_bounds__(128) summary_update_kernel(const update_kargs a) {
+    update_warp<false>(a, nullptr);
+}
+
+// FMS2 (build item 2, the joint catch-up): lanes 2 .. 4 in one launch, blockIdx.y the lane, each lane's new cells
+// *rows[u] (read on the device: its descriptor's rows); build item 3: rows[u] null, a[u].n_new
+struct update_lanes_kargs {
+    update_kargs a[fn::xchg::max_lanes];
+    const int32_t * rows[fn::xchg::max_lanes];
+};
+
+__global__ void __launch_bounds__(128) summary_update_lanes_kernel(const __grid_constant__ update_lanes_kargs p) {
+    update_warp<true>(p.a[blockIdx.y], p.rows[blockIdx.y]);
 }
 
 // ---- launch 1: score ----
@@ -245,8 +264,9 @@ __device__ __forceinline__ uint4 load_chunk(const uint4 * p, bool ok) {
 // tile's best two blocks a row (key, then the lower lane).
 // QA (SP2, the sparse draft): the query of row t sits at position depth + t + QA; the draft's one query is at its own
 // cell N with depth N - 1, so it sees the N / 4 whole blocks of the processed prefix. The target's launches are QA = 0.
-template <int B, int D, int QA = 0>
-__global__ void __launch_bounds__(score_threads<D>(), 1) score_kernel(const score_kargs a) {
+// FMS2 (build item 3, W3): the kernel's body, a's tiles over blockIdx.x; L false: score_kernel's, L true: a lane's of
+// score_lanes_kernel (its own instantiation, so the lone kernel's code is its own)
+template <int B, int D, int QA, bool L> __device__ __forceinline__ void score_body(const score_kargs & a) {
     static_assert(n_chunk % D == 0, "D must divide the chunks");
     constexpr int NV = B * n_idx_head;
     constexpr int LAG = B >= 3 && D == 4 ? 1 : 2;
@@ -373,6 +393,22 @@ __global__ void __launch_bounds__(score_threads<D>(), 1) score_kernel(const scor
         cur = nxt;
         cur_ok = next_ok;
     }
+}
+
+template <int B, int D, int QA = 0>
+__global__ void __launch_bounds__(score_threads<D>(), 1) score_kernel(const score_kargs a) {
+    score_body<B, D, QA, false>(a);
+}
+
+// FMS2 (build item 3, W3): the joint verify round's lanes in one launch, blockIdx.y the lane (target form, QA 0)
+struct score_lanes_kargs {
+    score_kargs a[fn::xchg::max_lanes];
+};
+
+template <int B, int D>
+__global__ void __launch_bounds__(score_threads<D>(), 1)
+score_lanes_kernel(const __grid_constant__ score_lanes_kargs p) {
+    score_body<B, D, 0, true>(p.a[blockIdx.y]);
 }
 
 // ---- launch 2: select ----
@@ -872,6 +908,25 @@ __global__ void __launch_bounds__(sel_threads, 1) select_kernel(const select_kar
     select_row(a, blockIdx.x, s);
 }
 
+// FMS2 (build item 3, W3): the joint verify round's lanes in one launch, blockIdx.y the lane: select_kernel's CTA
+struct select_lanes_kargs {
+    select_kargs a[fn::xchg::max_lanes];
+};
+
+__global__ void __launch_bounds__(sel_threads, 1) select_lanes_kernel(const __grid_constant__ select_lanes_kargs p) {
+    extern __shared__ uint4 dyn[];
+    sel_smem & s = *reinterpret_cast<sel_smem *>(dyn);
+    const select_kargs & a = p.a[blockIdx.y];
+    const int depth = *a.depth;
+    if (depth < 0 || depth > a.max_cells - a.rows) {
+        if (threadIdx.x == 0) {
+            *a.error = 4u;
+        }
+        return;
+    }
+    select_row(a, blockIdx.x, s);
+}
+
 // ---- test support ----
 
 __global__ void oracle_kernel(const int op, const float * x, const float * y, float * out, const int n) {
@@ -1002,6 +1057,31 @@ bool summary_update(const round_update_args & a, void * stream) {
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+bool summary_update_lanes(int32_t lanes, const round_update_args * a, const int32_t * const * rows, void * stream) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    update_lanes_kargs p = {};
+    for (int32_t u = 0; u < lanes; ++u) {
+        const round_update_args & x = a[u];
+        if ((rows != nullptr && rows[u] == nullptr) || x.keys == nullptr || x.k_norm == nullptr ||
+            x.summaries == nullptr || !aligned16(x.summaries) || x.ik == nullptr || x.depth == nullptr || x.rows < 1 ||
+            x.rows > max_rows || (rows != nullptr && x.rows != max_rows) || x.max_cells < x.rows ||
+            x.max_cells > max_cells || x.shift != nullptr) {
+            return false;
+        }
+        p.a[u] = {x.keys,   x.k_norm, x.summaries, 0,      0, 1.0f / static_cast<float>(ratio), 0.0f,    fn::rms_eps,
+                  head_dim, x.rope,   x.ik,        x.keys, 0, rows == nullptr ? x.rows : 0,     x.depth, x.max_cells,
+                  nullptr};
+        p.rows[u] = rows == nullptr ? nullptr : rows[u];
+    }
+    const int warps = 4;
+    const int n = (max_rows + ratio - 1) / ratio + max_rows; // summary_update's grid at its most rows
+    summary_update_lanes_kernel<<<dim3((n + warps - 1) / warps, static_cast<uint32_t>(lanes)), warps * 32, 0,
+                                  static_cast<cudaStream_t>(stream)>>>(p);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
 size_t workspace_bytes() {
     const size_t rb = static_cast<size_t>(max_rows) * max_blocks * 4;
     const size_t rt = static_cast<size_t>(max_rows) * max_tiles;
@@ -1116,6 +1196,127 @@ bool select(int32_t rows, const select_args & a, void * stream) {
         smem_done.fetch_or(1u << dev, std::memory_order_release);
     }
     select_kernel<<<rows, sel_threads, sizeof(sel_smem), st>>>(k);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+namespace {
+
+template <int B, int D>
+bool launch_score_lanes(const score_grid & g, int32_t lanes, const score_lanes_kargs & k, cudaStream_t st) {
+    score_lanes_kernel<B, D><<<dim3(g.ctas, lanes), g.warps * 32, 0, st>>>(k);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+// FMS13: the score launch at the round's rows B (2 .. max_rows) and depth D
+template <int B>
+bool launch_score_lanes_b(const score_grid & g, int32_t lanes, const score_lanes_kargs & k, cudaStream_t st) {
+    switch (g.depth) {
+        case 4:
+            return launch_score_lanes<B, 4>(g, lanes, k, st);
+        case 8:
+            return launch_score_lanes<B, 8>(g, lanes, k, st);
+        case 16:
+            return launch_score_lanes<B, 16>(g, lanes, k, st);
+        default:
+            return false;
+    }
+}
+
+bool select_args_ok(int32_t rows, const select_args & a) {
+    return rows >= 1 && rows <= max_rows && (a.q_ahead == 0 || (a.q_ahead == 1 && rows == 1)) &&
+           a.summaries != nullptr && a.q != nullptr && a.q_norm != nullptr && a.body != nullptr &&
+           a.offsets != nullptr && a.ws.keys != nullptr && a.depth != nullptr && a.max_cells >= rows &&
+           a.max_cells <= max_cells && aligned16(a.summaries) && aligned16(a.q) && aligned16(a.body) &&
+           aligned16(a.offsets);
+}
+
+} // namespace
+
+score_grid grid_lanes(int32_t rows, int32_t depth, int32_t lanes, int32_t test_depth) {
+    score_grid g = {};
+    const int32_t n_vis_max = (depth + rows) / ratio;
+    g.tiles = (n_vis_max + tile_blocks - 1) / tile_blocks;
+    // grid_of's choice over every lane's tiles: tiles a CTA when the lanes share the SMs
+    const int32_t tps = std::max((lanes * g.tiles + n_sm - 1) / n_sm, 1);
+    for (const int32_t d : {4, 8, 16}) {
+        g.depth = d;
+        g.tpc = std::min(tps, score_threads_of(d) / 32);
+        if (test_depth == 0 ? g.tpc * d * tile_blocks * 16 >= flight_bytes : d == test_depth) {
+            break;
+        }
+    }
+    g.warps = std::max(g.tpc, std::min(rows * n_idx_head, score_threads_of(g.depth) / 32));
+    // a lane's CTAs: its tiles' share of the SMs (one CTA an SM), at least one
+    g.ctas = std::max(1, std::min(std::max(n_sm / std::max(lanes, 1), 1), (g.tiles + g.tpc - 1) / g.tpc));
+    return g;
+}
+
+bool select_lanes(int32_t lanes, int32_t rows, const select_args * a, void * stream, int32_t test_depth) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || rows < 2 || rows > max_rows || stream == nullptr ||
+        (test_depth != 0 && test_depth != 4 && test_depth != 8 && test_depth != 16)) {
+        return false;
+    }
+    int32_t deepest = 0;
+    for (int32_t u = 0; u < lanes; ++u) {
+        if (!select_args_ok(rows, a[u]) || a[u].q_ahead != 0) {
+            return false;
+        }
+        deepest = std::max(deepest, a[u].max_cells - rows);
+    }
+    cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const score_grid   g  = grid_lanes(rows, deepest, lanes, test_depth);
+    score_lanes_kargs sk = {};
+    select_lanes_kargs k = {};
+    for (int32_t u = 0; u < lanes; ++u) {
+        const select_args & x = a[u];
+        sk.a[u] = {reinterpret_cast<const uint4 *>(x.summaries),
+                   x.q,
+                   x.q_norm,
+                   x.rope,
+                   fn::rms_eps,
+                   head_dim,
+                   x.depth,
+                   x.max_cells,
+                   g.tpc,
+                   x.ws.keys,
+                   x.ws.best1,
+                   x.ws.best2,
+                   x.ws.lanes,
+                   0u};
+        k.a[u]                = { x.ws.keys, x.ws.best1, x.ws.best2, x.ws.lanes,  x.ws.error, x.ws.stats,
+                                  x.body,    x.offsets,  x.depth,    x.max_cells, rows };
+    }
+    bool ok = false;
+    switch (rows) {
+        case 2:
+            ok = launch_score_lanes_b<2>(g, lanes, sk, st);
+            break;
+        case 3:
+            ok = launch_score_lanes_b<3>(g, lanes, sk, st);
+            break;
+        case 4:
+            ok = launch_score_lanes_b<4>(g, lanes, sk, st);
+            break;
+        default:
+            ok = launch_score_lanes_b<max_rows>(g, lanes, sk, st);
+            break;
+    }
+    if (!ok) {
+        return false;
+    }
+    static std::atomic<uint32_t> smem_done{0u}; // select()'s opt-in, for this kernel (once a device)
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 32) {
+        return false;
+    }
+    if ((smem_done.load(std::memory_order_acquire) >> dev & 1u) == 0u) {
+        if (cudaFuncSetAttribute(select_lanes_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(sizeof(sel_smem))) != cudaSuccess) {
+            return false;
+        }
+        smem_done.fetch_or(1u << dev, std::memory_order_release);
+    }
+    select_lanes_kernel<<<dim3(rows, lanes), sel_threads, sizeof(sel_smem), st>>>(k);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

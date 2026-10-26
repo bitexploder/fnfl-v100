@@ -539,6 +539,11 @@ private:
         lp.config.settings            = params_base.fnfl.settings; // ME3
         lp.config.expert_reserve_mib  = params_base.fnfl.expert_reserve_mib;
         lp.config.kv_format           = params_base.fnfl.kv_format; // KV8
+        lp.config.split_layer         = params_base.fnfl.split_layer;  // TTTS1
+        lp.config.split_addr          = params_base.fnfl.split_addr;
+        lp.config.split_port          = params_base.fnfl.split_port;
+        lp.config.split_commit        = params_base.fnfl.split_commit;
+        lp.config.split_digest        = params_base.fnfl.split_digest;
         SRV_INF("FNFL end-of-generation IDs: %s\n", eog_list.c_str());
 
         std::string err;
@@ -2001,6 +2006,41 @@ private:
             if (slot.state == SLOT_STATE_GENERATING) {
                 gen.push_back(&slot);
             }
+        }
+        // TTTS1: the split's two pipelined groups, one turn a call (each idle group begins, the older one ends); a
+        // slot whose group stays in flight has no result this iteration
+        if (fnfl_is_split(engine) && !gen.empty()) {
+            int32_t          ids[8] = {};
+            fnfl_step_result res[8];
+            fnfl_status      st[8] = {};
+            std::string      why[8];
+            bool             done[8] = {};
+            const int32_t    ng      = int32_t(std::min<size_t>(gen.size(), 8));
+            for (int32_t k = 0; k < ng; ++k) {
+                ids[k] = gen[k]->id;
+            }
+            const fnfl_status call = fnfl_step_pipe(engine, ids, ng, res, st, why, done);
+            for (int32_t k = 0; k < ng; ++k) {
+                server_slot & slot = *gen[k];
+                if (call == FNFL_OK && !done[k]) {
+                    continue;
+                }
+                try {
+                    metrics_on_step();
+                    if (call != FNFL_OK || st[k] != FNFL_OK) {
+                        engine_failed(slot, call != FNFL_OK ? call : st[k], call != FNFL_OK ? "step_pipe" : why[k]);
+                    } else {
+                        apply_step(slot, res[k]);
+                    }
+                    tu_stepped += (n > 0 ? "," : "") + std::to_string(slot.id);
+                    ++n;
+                } catch (const std::exception & e) {
+                    SLT_ERR(slot, "got exception: %s\n", e.what());
+                    send_error(slot, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
+                    slot.release();
+                }
+            }
+            gen.clear();
         }
         if (gen.size() >= 2 && gen.size() <= 4) {
             int32_t ids[4] = {};

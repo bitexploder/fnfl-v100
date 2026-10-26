@@ -107,12 +107,13 @@ __device__ __forceinline__ void put8(float * dst, const float (&y)[8], int32_t l
 
 // H (ME3, the host-backed KV's graphs): cell c at k_cache + (c - *shift) * 256 (v_cache alike), the window's start
 // read on the device; H false: the resident launch, shift unused
-template <bool H>
-__global__ void __launch_bounds__(prep_threads)
-    prepare_kernel(const prepare_args a, int32_t rows, const int64_t * shift) {
+// FMS2 (build item 2): prepare_kernel's block; L, the joint catch-up's lanes launch: block max_rows releases and the
+// rows are the descriptor's (*a.stride, read on the device), blocks past them idle
+template <bool H, bool L>
+__device__ __forceinline__ void prepare_block(const prepare_args & a, int32_t rows, const int64_t * shift) {
     const int32_t warp = static_cast<int32_t>(threadIdx.x) / 32, lane = static_cast<int32_t>(threadIdx.x) % 32;
     const int32_t t = static_cast<int32_t>(blockIdx.x);
-    if (t == rows) {
+    if (t == (L ? max_rows : rows)) {
         // the release (draft.h): this card's own X-HC and X-HMIX slot of the round, after their last readers
         // (stream order: the K/V product that read X-HMIX ran before this launch)
         for (int32_t u = static_cast<int32_t>(threadIdx.x); u < fn::xchg::hmix_slot_u4; u += prep_threads) {
@@ -124,6 +125,12 @@ __global__ void __launch_bounds__(prep_threads)
             }
         }
         return;
+    }
+    if constexpr (L) {
+        rows = *a.stride;
+        if (t >= rows) {
+            return;
+        }
     }
     const int32_t nb = *a.n_before, stride = *a.stride;
     const int64_t cell = static_cast<int64_t>(nb) + a.row0 + t;
@@ -156,6 +163,22 @@ __global__ void __launch_bounds__(prep_threads)
     const float4 vb = __ldg(reinterpret_cast<const float4 *>(a.kv_v + t * head_dim) + 2 * lane + 1);
     const float v[8] = {va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w};
     reinterpret_cast<uint4 *>(a.v_cache + at)[lane] = pack_f16(v, 1.0f);
+}
+
+template <bool H>
+__global__ void __launch_bounds__(prep_threads) prepare_kernel(const prepare_args a, int32_t rows,
+                                                               const int64_t * shift) {
+    prepare_block<H, false>(a, rows, shift);
+}
+
+// FMS2 (build item 2, the joint catch-up): lanes 2 .. 4 in one launch, blockIdx.y the lane; a lane's rows are its
+// descriptor's (*stride, read on the device), block max_rows its release, the blocks of rows past its rows idle
+struct prepare_lanes_args {
+    prepare_args a[fn::xchg::max_lanes];
+};
+
+__global__ void __launch_bounds__(prep_threads) prepare_lanes_kernel(const __grid_constant__ prepare_lanes_args p) {
+    prepare_block<false, true>(p.a[blockIdx.y], 0, nullptr);
 }
 
 // ---- attend ----
@@ -492,6 +515,27 @@ bool datc_prepare(int32_t rows, const prepare_args & a, void * stream, const int
     } else {
         prepare_kernel<false><<<blocks, prep_threads, 0, static_cast<cudaStream_t>(stream)>>>(a, rows, nullptr);
     }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool datc_prepare_lanes(int32_t lanes, const prepare_args * a, void * stream) {
+    if (a == nullptr || lanes < 2 || lanes > fn::xchg::max_lanes || stream == nullptr) {
+        return false;
+    }
+    prepare_lanes_args p = {};
+    for (int32_t u = 0; u < lanes; ++u) {
+        const prepare_args & x = a[u];
+        if (x.qfull != nullptr || x.row0 != 0 || x.max_cells < 1 || !aligned(x.kv_k, 16) || !aligned(x.kv_v, 16) ||
+            x.k_norm == nullptr || x.n_before == nullptr || x.pos == nullptr || x.stride == nullptr ||
+            !aligned(x.k_cache, 16) || !aligned(x.v_cache, 16) || x.err == nullptr ||
+            (x.k_f32 != nullptr && !aligned(x.k_f32, 16)) || !aligned(x.release_hc, 16) ||
+            !aligned(x.release_hmix, 16)) {
+            return false;
+        }
+        p.a[u] = x;
+    }
+    prepare_lanes_kernel<<<dim3(max_rows + 1, static_cast<uint32_t>(lanes)), prep_threads, 0,
+                           static_cast<cudaStream_t>(stream)>>>(p);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

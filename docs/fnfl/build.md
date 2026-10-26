@@ -15,6 +15,7 @@ The preset was written for, and is tested on, this toolchain:
 - **Ninja** (1.13.2 tested).
 - **Python 3**, for the include check that runs with every build.
 - **The OpenSSL development headers**, which are optional. Without them the server builds without HTTPS support, with a CMake warning.
+- **UCX** with its pkg-config file (`libucx-dev` on Ubuntu; 1.20 tested). New in 0.3: the link between two machines uses it, and CMake requires it even for a one-machine build.
 - **Linux on x86-64** (Ubuntu 26.04.1, kernel 7.0 tested).
 
 ## Configure and build

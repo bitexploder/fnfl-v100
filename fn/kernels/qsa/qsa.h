@@ -142,6 +142,12 @@ struct round_update_args {
     const int64_t * shift = nullptr;
 };
 bool summary_update(const round_update_args & a, void * stream);
+// FMS2 (build item 2, the joint catch-up): the round form of lanes 2 .. 4 in one launch, lane u on a[u] with *rows[u]
+// new cells (1 .. max_rows, read on the device: its descriptor's rows; a[u].rows must be max_rows, which sizes the
+// grid): lane u's warps are summary_update's at *rows[u], the same device code. Resident only (shift null). False,
+// with nothing enqueued, otherwise. FMS2 (build item 3, W3): rows null, every lane's new cells are its a[u].rows (the
+// joint verify round's R = d + 1, 1 .. max_rows; FMS13), on the grid of max_rows (warps past a lane's cells exit).
+bool summary_update_lanes(int32_t lanes, const round_update_args * a, const int32_t * const * rows, void * stream);
 
 // Scratch of select(), reused across layers and rounds; carve() lays it out in one allocation of workspace_bytes().
 struct workspace {
@@ -190,6 +196,20 @@ struct score_grid {
     int32_t depth; // 16-byte loads a lane in flight
 };
 score_grid grid_of(int32_t rows, int32_t depth);
+
+// FMS2 (build item 3, W3): select() of lanes 2 .. 4 of the joint verify round, each at rows (FMS13: the round's
+// R = d + 1, 2 .. max_rows, every lane alike) on its own
+// arguments a[u] (target form, q_ahead 0; its own workspace, body and offsets), in two launches for all lanes:
+//   score:  blockIdx.y the lane, grid_lanes' CTAs a lane. D and the tiles a CTA come from every lane's tiles together
+//           (grid_lanes), so a lane's D and grid may differ from its select() launch's; a block's key and a tile's
+//           best two depend on neither (each lane's chunks are summed in chunk order whatever D, and every tile's
+//           warp is the same arithmetic wherever it runs), so each lane's keys are its select()'s bitwise.
+//   select: blockIdx.y the lane, one CTA a row, select()'s.
+// test_depth: 0, grid_lanes' D; 4, 8 or 16 forces it (qsaj-test). False, with nothing enqueued, for an argument
+// outside select()'s contract in any lane, lanes outside 2 .. 4 or rows outside 2 .. max_rows.
+bool       select_lanes(int32_t lanes, int32_t rows, const select_args * a, void * stream, int32_t test_depth = 0);
+// the score grid of select_lanes at a depth (the deepest lane's max_cells - rows): tiles and ctas are a lane's
+score_grid grid_lanes(int32_t rows, int32_t depth, int32_t lanes, int32_t test_depth = 0);
 
 // ---- test support: the device's fast-math results for arguments the CPU reference computed ----
 // op 0: rsqrtf(x); 1: x / y as -use_fast_math divides; 2: __powf(x, y); 3: __cosf(x); 4: __sinf(x). out[i] = op(x[i], y[i]).

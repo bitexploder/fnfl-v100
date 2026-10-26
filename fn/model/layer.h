@@ -522,7 +522,10 @@ layer_input layer_output(const card_ctx & c);
 // only dirty slot and leaves it so: target: HC2's slot_of (the last sublayer slot 1); draft_step: G = 3 d sublayers,
 // slot(k) = {1, 2, 0}[(G - 1 - k) % 3] (from slot 0, ending on slot 1); catchup: its one sublayer on slot 2, released
 // by the K/V prepare (fn::draft::prepare_args::release_hc, release_hmix).
-enum class hc_rule : int32_t { target, draft_step, catchup };
+// TTTS1, stage: a split stage's target graph (any sublayer count G): the target rule when its second-to-last slot,
+// (G - 2) % 3, is not 1; otherwise (G a multiple of 3) the draft step's count from the end, {1, 2, 0}[(G - 1 - k) % 3],
+// which starts on slot 0 and ends on slot 1. Either way consecutive sublayers differ and the graph ends on slot 1.
+enum class hc_rule : int32_t { target, draft_step, catchup, stage };
 
 // Message use counters and the HC sublayer index: they pick the exchange slots and advance as a step runs.
 struct use_counters {
@@ -557,6 +560,17 @@ float * hmix_slot(const card_ctx & c, const use_counters & u);
 // DP2's launch in site's region; acquire: the first launch of a body, reading X-HMIX of sublayer u.sub (HC3)
 bool dense_run(card_ctx & c, fn::dense::product_args a, int32_t rows, dense_site site, bool acquire,
                const use_counters & u, const char * piece, std::string & err);
+// FMS2 (build item 2, the joint catch-up): HC sublayer u.sub, part 0 or 1, of lanes 2 .. 4 on one card at B = 5 in
+// one launch (Q8_0 weights: fn::hc::down2_q8_lanes, up2_q8_lanes), lane k on c[k] (its ring and buffers, the slots of
+// u's rule) with input in[k]; runs: the lanes' up2 run counters, lane k's at k * fn::hc::n_runs_card (zeroed once)
+bool hc_sublayer_lanes(card_ctx * const c[], int32_t lanes, const hc_module & h, int32_t set, const layer_input in[],
+                       const use_counters & u, int32_t part, uint32_t * runs, std::string & err);
+// FMS2 (build item 2): the joint product of lanes 2 .. 4 (fn::dense::product_joint at five rows a lane), acquiring
+// X-HMIX of sublayer u.sub on each lane's ring (c[k]: joint_rings' lane k, whose slots lie lane_floats apart; checked),
+// with the joint error word; the lanes' rows contiguous in a's outputs (lane k's at row 5 k); work: this launch's own
+// joint_work_bytes (after choose_splits), zeroed once
+bool dense_joint_run(card_ctx * const c[], int32_t lanes, fn::dense::product_args a, const fn::xchg::joint_rings & jr,
+                     void * work, const use_counters & u, const char * piece, std::string & err);
 // the destination-half exchange of ws.partial (set 0: X-A, 1: X-F) on slot `slot`: send, or receive into ws.out[set]
 bool half_exchange(card_ctx & c, int32_t set, int32_t rows, int32_t slot, bool send, std::string & err);
 // card_ctx::observe
@@ -587,17 +601,29 @@ step_status layer_card_step(card_ctx & c, const layer_weights & w, const layer_s
 // (ex.ids, ex.wts rows 5u ..); its state, descriptor depth and positions, committed slot and GDN selector stay its
 // slot's. A layer runs both HC sublayers as one launch for every lane, each lane on its own ring (fn::hc::sub_joint,
 // BF16 HC weights); the dense products once for every lane (fn::dense::product_joint: each weight tile decoded
-// once, each row's result bitwise the lone launch's); the slot pieces per lane (gdn_core, QSA's summary, select,
-// X-SELECT and attend, the experts); X-A and X-F once over every lane's rows on the joint slots. Every lane takes the
+// once, each row's result bitwise the lone launch's); the slot pieces in one launch for every lane, each lane on its
+// own arguments (FMS2 build item 3: gdn_core at grid.y = U, QSA's summary, score, select, X-SELECT's one send or
+// receive and attend, each lane with its own kernel workspaces, joint_lane_kernel_ws; the experts); X-A and X-F once
+// over every lane's rows on the joint slots. Every lane takes the
 // same pieces in the same order on both cards with the lone slot rules (one use_counters for all lanes), so each
 // lane's ring sees the lone sequence. Resident banks only (no expert service, no host-backed KV); for a graph capture
 // (one card's whole round on its stream), or eagerly in layer_pair_step's order (layer_joint_pair_step).
 struct joint_lanes {
     int32_t lanes = 0;
+    int32_t    rows = layer_max_rows;  // FMS13: R = d + 1, every lane's rows (2 .. 5); buffers keep the five-row stride
     card_ctx * lane[fn::xchg::max_lanes] = {};
     const fn::xchg::joint_rings * jr = nullptr;
     void * dense_work = nullptr; // joint_dense_work_bytes(), zeroed once, this card's
     dense_layouts dense_sites{}; // joint_dense_layouts (the target's six sites)
+    // FMS2 item 7: X-A and X-F in 16 bits (fn/xchg/xchg.h send_half_joint16's form), the producers' sends and
+    // send_half_joint16 / recv_add_joint16; false: F32 (I3: every lane bitwise its lone round)
+    bool                          x16       = false;
+    // FMS5: the router launch on the tensor cores (fn/kernels/dense/dense.h joint_args::router_tc; within its bound of
+    // FP64, not bitwise the lone launch); false: the joint product (every lane bitwise its lone round)
+    bool router_tc = false;
+    // FMS6: the quantized dense products at U = 3 and 4 in FP16 (fn/kernels/dense/dense.h joint_args::dense_f16;
+    // within its bound of FP64, not bitwise the lone launch); false: every lane bitwise its lone round
+    bool dense_f16 = false;
 };
 bool joint_dense_layouts(dense_layouts & out, std::string & err);
 size_t joint_dense_work_bytes();
@@ -609,6 +635,13 @@ size_t joint_route_bytes();
 void joint_route_carve(void * base, int32_t *& ids, float *& wts);
 // lane u's GLU slots and meta in the joint routing region (base: joint_route_bytes), into ex
 void joint_lane_ex(void * base, int32_t u, ex_bufs & ex);
+// FMS2 (build item 3, W3): every lane's own kernel workspaces on a card, so the lanes' QSA select, attend and
+// gdn_core each run in one launch: lane after lane, the QSA select scratch (fn::qsa::workspace_bytes), attend's
+// (fn::qsa::attn::workspace_bytes) and gdn_core's (fn::gdn::workspace_bytes). Zeroed once; every complete launch
+// leaves its counters as it found them, and the joint frame zeroes the region again after an error.
+size_t joint_kernel_ws_bytes();
+// lane u's workspaces in that region (base), into c.qsa_ws, c.attn_ws and c.gdn_ws
+void joint_lane_kernel_ws(void * base, int32_t u, card_ctx & c);
 step_status layer_joint_step(joint_lanes & j, const layer_weights & w, const layer_state * const st[],
                              const layer_input in[], use_counters & u, std::string & err);
 // Both cards' joint lanes (j[0] on card 0, j[1] on card 1, the same lanes) in layer_pair_step's phases, sends before

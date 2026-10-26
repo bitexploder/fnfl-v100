@@ -25,7 +25,16 @@
 // (Compute Sanitizer's run). FMU4 (D9): then four sampled slots' joint rounds (joint-san: one) against each slot's lone
 // run, tokens and ledgers.
 //
-// usage: fnfl-drive state-test mu1 [graph|eager|read|joint|joint-eager|joint-san] [DEV0] [DEV1] [--kv-format q8]
+// FMS2 (build item 2), state-test mu1 catchup: part B's engine on graphs, every slot read and five rows forced, the
+// draft layer's weights, the token embedding and each slot's draft regions seeded with bounded bytes; then joint
+// catch-ups at U = 2 .. 4 (rotated lanes, each membership twice at other random B_c, both draft forms), each lane's
+// draft round buffers, hidden carry, embedding rows, draft KV and draft index bitwise against its lone catch-up from
+// the same seeded state. catchup-eager the same eagerly. --nodes DIR: the joint catch-up graphs' node lists there
+// (and with joint, the joint verify graphs': FMS2 build item 3).
+//
+// usage: fnfl-drive state-test mu1 [graph|eager|read|joint|joint-eager|joint-san|catchup|catchup-eager] [DEV0] [DEV1]
+//        [--kv-format q8] [--nodes DIR] [--joint-x16 on|off]
+// --joint-x16 (FMS2 item 7): the engine's joint rounds' X-A and X-F in 16 bits (default off: I3 bitwise)
 //
 // MXMU1, state-test mu1-one [graph|eager|c0] DEV (zero weights, one card, the expert cache over its zero backing, the
 // host-backed KV; Config D's cache settings): part C0, no allocation: the refusals (three slots on one card, two
@@ -52,6 +61,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -493,14 +503,15 @@ void part_b_fmu1(rt::engine & e, const rt::request_options & ro, const std::vect
     e.release_slot(1);
 }
 
-// FMU2 (D1..D8): step_joint on the four-slot engine (resident TP, graphs, d = 4; zero weights, so every proposal is
-// accepted and the tokens say nothing of identity: rollback-test mu1 section 7 compares joint against lone on the real
-// weights). The plumbing: bootstraps alone, the joint round for two to four members in any lane order, the graph cache
-// (a hit, a capture, the least recently used out), a call mixing a member and a slot whose step is alone, a member's
-// injected round error (FC-RD2: that slot's step fails and its slot is lost; the others' steps are joint and whole; the
-// rings back at their sentinels for the next joint round), a duplicate slot refused, the frame's memory
+// FMU2 (D1..D8): step_joint on the four-slot engine (resident TP, graphs, d: FMS13's --spec-d, 4 by default; zero
+// weights, so every proposal is accepted and the tokens say nothing of identity: rollback-test mu1 section 7 compares
+// joint against lone on the real weights). The plumbing: bootstraps alone, the joint round for two to four members in
+// any lane order, the graph cache (a hit, a capture, the least recently used out), a call mixing a member and a slot
+// whose step is alone, a member's injected round error (FC-RD2: that slot's step fails and its slot is lost; the
+// others' steps are joint and whole; the rings back at their sentinels for the next joint round), a duplicate slot
+// refused, the frame's memory
 // eager (Compute Sanitizer's runs): the joint rounds enqueued in phases (no captures); first: D1 and D2's first round
-void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first) {
+void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first, const std::string & nodes, int32_t d) {
     for (int32_t s = 0; s < 4; ++s) {
         e.release_slot(s);
     }
@@ -510,6 +521,7 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
     if (jf == nullptr) {
         return;
     }
+    e.test_joint_frame()->test_graph_nodes(nodes); // FMS2 (build item 3): the joint verify graphs' node lists
     std::vector<int32_t> p(300);
     for (size_t i = 0; i < p.size(); ++i) {
         p[i] = int32_t(1000 + i % 977);
@@ -536,7 +548,7 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
         got.clear();
         for (size_t k = 0; k < slots.size(); ++k) {
             const int32_t is = res[k].st != rt::run_status::ok ? -1 : res[k].joint ? 1 : 0;
-            ok = ok && is == want[k] && (is != 1 || res[k].n_out == 5) && (is < 0 || res[k].n_out >= 1);
+            ok = ok && is == want[k] && (is != 1 || res[k].n_out == d + 1) && (is < 0 || res[k].n_out >= 1);
             const char * how = is == 1 ? " joint " : is == 0 ? " alone " : " failed ";
             got += (k > 0 ? ", " : "") + std::to_string(slots[k]) + how + std::to_string(res[k].n_out) +
                    (is < 0 ? " (" + res[k].why + ")" : "");
@@ -615,7 +627,7 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
     if (first) {
         const bool d2 =
             call({0, 1, 2, 3}, {1, 1, 1, 1}, got) && caps(1) && jf->rounds() == 1 && jf->draft_rounds() == 1;
-        put("D FMU2 four members in one joint round (five tokens each)", d2,
+        put("D FMU2 four members in one joint round (d + 1 tokens each)", d2,
             got + "; captures " + std::to_string(jf->captures()) + ", rounds " + std::to_string(jf->rounds()) +
                 ", joint drafts " + std::to_string(jf->draft_rounds()));
         for (int32_t s = 0; s < 4; ++s) {
@@ -627,7 +639,7 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
     // D2: four members, a capture; the same membership again, no capture
     const bool d2 = call({0, 1, 2, 3}, {1, 1, 1, 1}, got) && caps(1) && call({0, 1, 2, 3}, {1, 1, 1, 1}, got) &&
                     caps(1) && jf->rounds() == 2;
-    put("D FMU2 four members in one joint round (five tokens each); the membership's graphs reused", d2,
+    put("D FMU2 four members in one joint round (d + 1 tokens each); the membership's graphs reused", d2,
         got + "; captures " + std::to_string(jf->captures()) + ", rounds " + std::to_string(jf->rounds()));
     // D3: another lane order is another membership; two members; the least recently used pair out (cache 2)
     const bool d3 = call({2, 0, 3, 1}, {1, 1, 1, 1}, got) && caps(2) && call({3, 1}, {1, 1}, got) && caps(3) &&
@@ -671,6 +683,13 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
         jf->draft_rounds() == jf->rounds() && jf->draft_captures() == (eager ? 0 : jf->captures()),
         "joint drafts " + std::to_string(jf->draft_rounds()) + ", joint rounds " + std::to_string(jf->rounds()) +
             ", draft captures " + std::to_string(jf->draft_captures()));
+    // D7c (FMS2 build item 2): the joint steps' members caught up in joint catch-ups (each joint round's survivors
+    // two or more), their graphs a membership's (none eager)
+    put("D FMS2 the joint steps' catch-ups ran as joint catch-ups",
+        jf->catchup_rounds() > 0 && jf->catchup_rounds() <= jf->rounds() && (eager || jf->catchup_captures() > 0) &&
+            (!eager || jf->catchup_captures() == 0),
+        "joint catch-ups " + std::to_string(jf->catchup_rounds()) + ", joint rounds " + std::to_string(jf->rounds()) +
+            ", catch-up captures " + std::to_string(jf->catchup_captures()));
     sampled(3);
     // D8: the frame's memory (its startup bytes, the kept pairs' measured bytes, free memory after the last capture)
     char line[256];
@@ -696,7 +715,274 @@ void part_b_fmu2(rt::engine & e, rt::request_options ro, bool eager, bool first)
 
 // read_only (FMU1, the sanitizers' run): the engine, then the FMU1 read-job cases alone; joint_only (FMU2): the
 // engine on graphs at d = 4, then the joint step cases alone
-bool part_b(const fnfl_target_args & a, bool eager, bool read_only, bool joint_only = false, bool joint_one = false) {
+// ---- FMS2 (build item 2): state-test mu1 catchup [catchup-eager]: the joint catch-up against each member's lone ----
+
+// bounded bytes (0 .. 59): every F32, F16 and BF16 they form is finite and below 1, every int8 small and positive, so
+// seeded weights and state give finite, varied draft activations
+std::vector<uint8_t> bounded(uint64_t seed, size_t n) {
+    std::vector<uint8_t> v(n);
+    uint64_t z = seed * 0x9e3779b97f4a7c15ull + 7;
+    for (size_t i = 0; i < n; ++i) {
+        z ^= z << 13;
+        z ^= z >> 7;
+        z ^= z << 17;
+        v[i] = static_cast<uint8_t>((z >> 24) % 60);
+    }
+    return v;
+}
+
+// one per-slot region the catch-up reads or writes: a class part on a card (cmp: the bytes compared, from its start)
+struct cu_region {
+    uint8_t * p = nullptr;
+    int64_t bytes = 0;
+    int32_t card = 0;
+    std::string name;
+};
+
+// the slot's regions: the draft round's buffers, the hidden carry and embedding boundary, the draft KV and the draft
+// index's keys and summaries
+bool cu_regions(md::model & m, int32_t slot, std::vector<cu_region> & out) {
+    out.clear();
+    const md::slot_scope bind(m, slot);
+    struct want {
+        const char * cls;
+        const char * part; // null: every part
+    };
+    const want wants[] = {{"draft round (DR1)", nullptr},
+                          {"round and pass (TG1)", "hidden carry (FC-HEAD3, B <= 5)"},
+                          {"round and pass (TG1)", "embedding boundary (B <= 5)"},
+                          {"draft KV (F16)", nullptr},
+                          {"draft index (SP2)", "L48 keys"},
+                          {"draft index (SP2)", "L48 summaries"}};
+    for (const want & w : wants) {
+        const md::reserved_class * rc = m.state_class(w.cls);
+        if (rc == nullptr) {
+            return false;
+        }
+        for (int32_t card = 0; card < 2; ++card) {
+            for (int32_t p = 0; p < int32_t(rc->plan.parts.size()); ++p) {
+                if (w.part != nullptr && rc->plan.parts[size_t(p)].name != w.part) {
+                    continue;
+                }
+                const int64_t n = rc->live_bytes(p, card);
+                if (n > 0 && rc->part_ptr(p, card) != nullptr) {
+                    out.push_back(
+                        {rc->part_ptr(p, card), n, card, std::string(w.cls) + " / " + rc->plan.parts[size_t(p)].name});
+                }
+            }
+        }
+    }
+    return !out.empty();
+}
+
+// the draft layer's weights and the token embedding seeded with bounded bytes on both cards (the routed experts,
+// which the catch-up does not read, stay zero)
+bool cu_seed_weights(md::model & m, int64_t & bytes) {
+    bytes = 0;
+    std::vector<uint8_t> done[2] = {std::vector<uint8_t>(m.regions[0].size(), 0),
+                                    std::vector<uint8_t>(m.regions[1].size(), 0)};
+    for (int32_t t = 0; t < int32_t(m.region_of.size()); ++t) {
+        const std::string nm = md::tensors[t].name;
+        const bool draft = nm.rfind("blk.48.", 0) == 0 && nm.find("_exps") == std::string::npos;
+        if (!draft && nm != "token_embd.weight") {
+            continue;
+        }
+        const int32_t r = m.region_of[size_t(t)];
+        for (int32_t c = 0; c < 2 && r >= 0; ++c) {
+            const md::region_place & rp = m.regions[c][size_t(r)];
+            uint8_t * q = m.region_ptr(t, c);
+            if (q == nullptr || rp.alias || rp.cached || rp.bytes <= 0 || done[c][size_t(r)] != 0) {
+                continue; // a region once, on the cards that hold it
+            }
+            done[c][size_t(r)] = 1;
+            const std::vector<uint8_t> v = bounded(uint64_t(t) * 2 + uint64_t(c), size_t(rp.bytes));
+            if (!write_at(m.device[c], m.weights[c].data() + rp.offset, v)) {
+                return false;
+            }
+            bytes += rp.bytes;
+        }
+    }
+    return true;
+}
+
+void part_b_cuj(rt::engine & e, rt::request_options ro, bool eager, const std::string & nodes) {
+    for (int32_t s = 0; s < 4; ++s) {
+        e.release_slot(s);
+    }
+    rt::joint_frame * jf = e.test_joint_frame();
+    if (!put("E FMS2 the four-slot engine has a joint frame", jf != nullptr && jf->ready() && jf->eager() == eager,
+             e.settings())) {
+        return;
+    }
+    jf->test_graph_nodes(nodes);
+    md::model & m = e.test_model();
+    // each slot: a prompt of its own read, five more tokens forced (the target batch the catch-ups take from)
+    int64_t first[4] = {};
+    bool ok = true;
+    std::string err;
+    for (int32_t s = 0; s < 4 && ok; ++s) {
+        std::vector<int32_t> p(200 + 37 * s);
+        for (size_t i = 0; i < p.size(); ++i) {
+            p[i] = int32_t(1000 + (i * size_t(3 + 2 * s)) % 3989);
+        }
+        int32_t np = 0;
+        ok = e.set_sampling(s, ro) == rt::run_status::ok && e.truncate(s, 0) == rt::run_status::ok &&
+             e.read_begin(s, p.data(), int32_t(p.size()), 0, np) == 0;
+        rt::read_status st = rt::read_status::yielded;
+        while (ok && (st == rt::read_status::yielded || st == rt::read_status::chunk_done)) {
+            st = e.read_step(s, 48);
+        }
+        rt::target & t = e.test_target(s);
+        const int32_t more[5] = {4001 + s, 4103 + s, 4207 + s, 4311 + s, 4419 + s};
+        rt::round_result r;
+        ok = ok && st == rt::read_status::done && rt::extend_ledger(t, more, 5, err) && t.forced(5, r, err);
+        first[s] = t.draft_n();
+        ok = ok && first[s] == t.slot().n - 5;
+    }
+    int64_t wbytes = 0;
+    ok = put("E each slot read, five rows forced (the draft five behind)", ok, err.empty() ? e.error() : err);
+    const bool seeded = ok && cu_seed_weights(m, wbytes);
+    ok = ok && put("E the draft layer's weights and the token embedding seeded (bounded bytes)", seeded && wbytes > 0,
+                   std::to_string(wbytes / 1048576) + " MiB on the two cards");
+    if (!ok) {
+        return;
+    }
+    // the seeded state of a slot's regions (one pattern a slot and region, the same for the lone and the joint run)
+    std::vector<cu_region> reg[4];
+    std::vector<std::vector<uint8_t>> seed[4];
+    for (int32_t s = 0; s < 4 && ok; ++s) {
+        ok = cu_regions(m, s, reg[s]);
+        for (size_t i = 0; i < reg[s].size() && ok; ++i) {
+            seed[s].push_back(bounded(1000 + uint64_t(s) * 64 + i, size_t(reg[s][i].bytes)));
+        }
+    }
+    if (!put("E the slots' draft regions", ok)) {
+        return;
+    }
+    const auto plant = [&](int32_t s) {
+        bool w = cu(cudaDeviceSynchronize(), "sync");
+        for (size_t i = 0; i < reg[s].size() && w; ++i) {
+            w = write_at(m.device[reg[s][i].card], reg[s][i].p, seed[s][i]);
+        }
+        return w;
+    };
+    // a region's compared bytes: the embedding boundary's first B_c rows of hres ([5][4][1280] F32 first; the rows
+    // past B_c the joint form embeds and nothing reads), every other region whole
+    const auto take = [&](int32_t s, int32_t rows, std::vector<std::vector<uint8_t>> & out) {
+        out.assign(reg[s].size(), {});
+        bool w = cu(cudaSetDevice(m.device[0]), "device") && cu(cudaDeviceSynchronize(), "sync") &&
+                 cu(cudaSetDevice(m.device[1]), "device") && cu(cudaDeviceSynchronize(), "sync");
+        for (size_t i = 0; i < reg[s].size() && w; ++i) {
+            const bool emb = reg[s][i].name.find("embedding boundary") != std::string::npos;
+            const size_t n = emb ? size_t(rows) * 4 * 1280 * 4 : size_t(reg[s][i].bytes);
+            w = read_at(m.device[reg[s][i].card], reg[s][i].p, out[i], n);
+        }
+        return w;
+    };
+    uint64_t lcg = 12345;
+    const auto pick = [&]() {
+        lcg = lcg * 6364136223846793005ull + 1442695040888963407ull;
+        return int32_t((lcg >> 33) % 5) + 1;
+    };
+    struct cu_case {
+        std::vector<int32_t> slots;
+    };
+    const std::vector<cu_case> cases = {{{2, 0}}, {{1, 3, 0}}, {{3, 1, 0, 2}}, {{0, 1}}, {{2, 3, 1, 0}}};
+    int32_t n_case = 0, n_lane = 0, n_bad = 0;
+    int64_t changed = 0, nonfinite = 0, compared = 0;
+    std::string bad;
+    std::vector<int32_t> seen_rows(6, 0);
+    for (int32_t form = 0; form < 2 && ok; ++form) {
+        if (form == 1) {
+            ok = put("E the dense draft form set", e.set_draft(4, false) == rt::run_status::ok, e.error());
+        }
+        for (const cu_case & cc : cases) {
+            for (int32_t rep = 0; rep < 2 && ok; ++rep) { // twice: the cached graph at other B_c
+                const int32_t n = int32_t(cc.slots.size());
+                int32_t rows[4] = {};
+                rt::target * tt[4] = {};
+                std::vector<std::vector<uint8_t>> lone[4], joint[4];
+                for (int32_t k = 0; k < n; ++k) {
+                    rows[k] = pick();
+                    tt[k] = &e.test_target(cc.slots[size_t(k)]);
+                    seen_rows[size_t(rows[k])] += 1;
+                }
+                // lone: each member's catch-up from the seeded state
+                for (int32_t k = 0; k < n && ok; ++k) {
+                    const int32_t s = cc.slots[size_t(k)];
+                    rt::round_result r;
+                    ok = plant(s) && tt[k]->draft_catchup(rows[k], r, err) && take(s, rows[k], lone[k]) &&
+                         tt[k]->test_draft_rewind(first[s], err);
+                    for (size_t i = 0; i < reg[s].size() && ok; ++i) {
+                        for (size_t b = 0; b < lone[k][i].size(); ++b) {
+                            changed += lone[k][i][b] != seed[s][i][b] ? 1 : 0;
+                        }
+                        if (reg[s][i].name.find("eh_proj output") != std::string::npos) {
+                            const float * f = reinterpret_cast<const float *>(lone[k][i].data());
+                            for (int64_t q = 0; q < int64_t(rows[k]) * 4 * 1280; ++q) {
+                                nonfinite += std::isfinite(f[q]) ? 0 : 1;
+                            }
+                        }
+                    }
+                }
+                // joint: the members' catch-ups as one, from the same seeded state
+                for (int32_t k = 0; k < n && ok; ++k) {
+                    ok = plant(cc.slots[size_t(k)]);
+                }
+                rt::round_result rr[4];
+                bool rok[4] = {};
+                std::string why[4];
+                ok = ok && jf->catchup(tt, n, rows, rr, rok, why, err);
+                for (int32_t k = 0; k < n && ok; ++k) {
+                    const int32_t s = cc.slots[size_t(k)];
+                    ok = rok[k] && tt[k]->draft_n() == first[s] + rows[k] && take(s, rows[k], joint[k]) &&
+                         tt[k]->test_draft_rewind(first[s], err);
+                    if (!rok[k]) {
+                        err = why[k];
+                    }
+                    for (size_t i = 0; i < reg[s].size() && ok; ++i) {
+                        compared += int64_t(lone[k][i].size());
+                        if (lone[k][i] != joint[k][i]) {
+                            ++n_bad;
+                            bad += (bad.empty() ? "" : "; ") + std::string(form == 1 ? "dense" : "sparse") + " U " +
+                                   std::to_string(n) + " lane " + std::to_string(k) + " B_c " +
+                                   std::to_string(rows[k]) + " card " + std::to_string(reg[s][i].card) + " " +
+                                   reg[s][i].name;
+                        }
+                    }
+                    ++n_lane;
+                }
+                ++n_case;
+            }
+        }
+    }
+    put("E the joint catch-ups ran (both forms, U = 2 .. 4, rotated lanes, each membership twice)",
+        ok && n_case == 20 && jf->catchup_rounds() >= 20,
+        std::to_string(n_case) + " joint catch-ups, " + std::to_string(n_lane) + " lanes, " +
+            std::to_string(jf->catchup_captures()) + " captures" + (ok ? "" : ": " + err));
+    std::string seen;
+    for (int32_t b = 1; b <= 5; ++b) {
+        seen +=
+            (b > 1 ? ", " : "") + std::string("B_c ") + std::to_string(b) + " x" + std::to_string(seen_rows[size_t(b)]);
+    }
+    put("E every lane bitwise its lone catch-up (the draft round's buffers, the hidden carry, the embedding's B_c "
+        "rows, the draft KV and the draft index, both cards)",
+        ok && n_bad == 0 && compared > 0,
+        std::to_string(compared / 1048576) + " MiB compared; " + seen + (n_bad == 0 ? "" : "; differs: " + bad));
+    put("E the lone catch-ups wrote the seeded state (bytes changed), eh_proj's outputs finite",
+        changed > 0 && nonfinite == 0,
+        std::to_string(changed) + " bytes changed, " + std::to_string(nonfinite) + " non-finite eh_proj outputs");
+}
+
+bool part_b(const fnfl_target_args & a,
+            bool                     eager,
+            bool                     read_only,
+            bool                     joint_only   = false,
+            bool                     joint_one    = false,
+            bool                     catchup_only = false,
+            const std::string &      nodes        = std::string(),
+            bool                     x16          = false,
+            int32_t                  spec_d       = 4) {
     const int32_t cells = 65536;
     auto m = std::make_unique<md::model>();
     fnfl_target_args aa = a;
@@ -719,8 +1005,9 @@ bool part_b(const fnfl_target_args & a, bool eager, bool read_only, bool joint_o
     c.eog = {248046};
     c.timeout_s = joint_one ? 1800.0 : 30.0; // joint-san: a round under racecheck outlasts 30 s
     c.eager = eager;
-    if (joint_only) {
-        c.spec_d = 4; // the serving d
+    c.joint_x16 = x16;
+    if (joint_only || catchup_only) {
+        c.spec_d = spec_d;  // FMS13: the run's d (4 the serving d)
     }
     rt::engine e;
     std::string err;
@@ -788,7 +1075,11 @@ bool part_b(const fnfl_target_args & a, bool eager, bool read_only, bool joint_o
         return true;
     }
     if (joint_only) {
-        part_b_fmu2(e, ro, eager, joint_one);
+        part_b_fmu2(e, ro, eager, joint_one, nodes, spec_d);
+        return true;
+    }
+    if (catchup_only) {
+        part_b_cuj(e, ro, eager, nodes);
         return true;
     }
     bool ok = true;
@@ -1306,21 +1597,32 @@ int fnfl_state_test_mxmu1(const std::string & run, int32_t dev) {
     return g_fail == 0 ? 0 : 1;
 }
 
-int fnfl_state_test_mu1(const std::string & run, int32_t dev0, int32_t dev1, bool kv_q8) {
+int fnfl_state_test_mu1(const std::string & run,
+                        int32_t             dev0,
+                        int32_t             dev1,
+                        bool                kv_q8,
+                        const std::string & nodes,
+                        bool                x16,
+                        int32_t             spec_d) {
     g_fail = 0;
-    printf("state-test mu1: KV format %s\n", kv_q8 ? "q8 (KV8)" : "bf16");
+    printf("state-test mu1: KV format %s; joint X-A/X-F 16-bit %s; d %d\n", kv_q8 ? "q8 (KV8)" : "bf16",
+           x16 ? "on" : "off", spec_d);
     // read (FMU1): part B's engine and its FMU1 read-job cases alone, eagerly (Compute Sanitizer's run)
     const bool read_only = run == "read";
     // joint (FMU2): part B's engine on graphs at d = 4 and the joint step cases alone; joint-eager: eagerly (phased);
     // joint-san: eagerly, D1 and one four-member round (Compute Sanitizer's run)
     const bool joint_only = run == "joint" || run == "joint-eager" || run == "joint-san";
     const bool joint_eager = run == "joint-eager" || run == "joint-san";
-    if (!read_only && !joint_only) {
+    // catchup (FMS2): part B's engine on graphs and the joint catch-up against each lane's lone; catchup-eager:
+    // eagerly (phased); nodes: the joint catch-up graphs' node lists there
+    const bool catchup_only = run == "catchup" || run == "catchup-eager";
+    if (!read_only && !joint_only && !catchup_only) {
         part_a(dev0, dev1, kv_q8);
     }
     fnfl_target_args a;
     a.kv_q8 = kv_q8;
-    part_b(a, run == "eager" || read_only || joint_eager, read_only, joint_only, run == "joint-san");
+    part_b(a, run == "eager" || read_only || joint_eager || run == "catchup-eager", read_only, joint_only,
+           run == "joint-san", catchup_only, nodes, x16, spec_d);
     printf("state-test mu1: %s\n", g_fail == 0 ? "PASS" : "FAIL");
     return g_fail == 0 ? 0 : 1;
 }

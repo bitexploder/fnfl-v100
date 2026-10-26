@@ -257,7 +257,7 @@ bool target::init(model::model & m, const target_options & o, std::string & err)
     }
     if (o_.sample) {
         // SM1: the request's options (refused when FNFL does not honour them) on both cards
-        const int32_t cells = p_[0].s[3].n_cells;
+        const int32_t cells = this->cells();
         if (!o_.sampling.check(cells, err)) {
             return false;
         }
@@ -319,11 +319,11 @@ bool target::capture(std::string & err) {
         tier_->set_graph(true); // the graphs read the window's position on the device
     }
     // one graph per card per B, captured once, and the draft's step graphs; SV1: the other decision variant too
-    var_ = variant_of(o_);
+    var_ = stage_front() ? 0 : variant_of(o_);  // TTTS1: a front stage's graphs hold no decision: one variant
     if (!capture_variant(var_, err)) {
         return false;
     }
-    if (o.both_paths) {
+    if (o.both_paths && !stage_front()) {
         if (!o_.sample || o_.sampling.transform() || sp_path(o_.sampling) == fn::samp::path::full) {
             return fail(err, "both decision variants need the sampler on its greedy or top-k path, with no penalties "
                              "or bias (SV1)");
@@ -698,7 +698,7 @@ bool target::set_sampling(const fn::samp::options & o, std::string & err) {
     if (!o_.sample) {
         return fail(err, "set_sampling: the target runs without the sampler");
     }
-    const int32_t cells = p_[0].s[3].n_cells;
+    const int32_t cells = this->cells();
     if (!o.check(cells, err)) {
         return false;
     }
@@ -710,8 +710,9 @@ bool target::set_sampling(const fn::samp::options & o, std::string & err) {
         return fail(err, "speculation at T > 0 off the sampler's top-k path (top-k 0, or above 256) is refused: the "
                          "draft's full-path pick (q_shard) is not built (SP1); use top-k 1 .. 256");
     }
-    const int32_t v = sp_path(o) == fn::samp::path::greedy ? 0 : 1;
-    if (captured_ && var_key_[v] != static_cast<int32_t>(sp_path(o))) { // ME1: eager steps enqueue either path
+    // TTTS1: a front stage's graphs hold no decision, so its one variant serves every path
+    const int32_t v = stage_front() ? 0 : sp_path(o) == fn::samp::path::greedy ? 0 : 1;
+    if (captured_ && !stage_front() && var_key_[v] != static_cast<int32_t>(sp_path(o))) {  // ME1: eager: either path
         return fail(err, "set_sampling: this decision path's graphs were not captured (target_options::both_paths)");
     }
     const fn::samp::params prm = fn::samp::make_params(o, cells);
@@ -969,6 +970,10 @@ bool target::clear_slot(bool zero_state, std::string & err) {
             const model::reserved_class * rc = m_->state_class(cls);
             if (rc == nullptr && std::strcmp(cls, "target index keys (ME6)") == 0) {
                 continue; // ME6: the keys' host class exists with the host-backed tier only
+            }
+            if (rc == nullptr && !m_->win.head &&
+                (std::strcmp(cls, "draft KV (F16)") == 0 || std::strcmp(cls, "draft round (DR1)") == 0)) {
+                continue;  // TTTS1: the draft is the back's
             }
             if (rc == nullptr) {
                 return fail(err, std::string(cls) + ": not reserved");
@@ -1235,7 +1240,8 @@ bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, 
     const auto t0 = clock_t_::now();
     const uint64_t rd = next_round_;
     const int64_t n_before = l_.n;
-    const int32_t cells = p_[0].s[3].n_cells;
+    const int32_t  cells    = this->cells();
+    upload_e = upload_e && m_->win.ple();  // TTTS1: the PLE rows are the front's (a back stage gathers none)
     if (rows < 1 || rows > max_b || n_before + rows > cells) {
         return fail(err, "round refused before launch: B " + std::to_string(rows) + " at N " +
                              std::to_string(n_before) + " beyond " + std::to_string(cells) + " cells (FC-RD1)");
@@ -1420,9 +1426,14 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
                    int32_t test_k, int32_t test_fail, int32_t budget, const float * const * staged) {
     r = round_result();
     staged_round sr;
-    if (!round_stage(kind, rows, upload_e, timed, test_k, test_fail, budget, staged, *ple_use_, sr, err)) {
+    if (!round_stage(kind, rows, upload_e, timed, test_k, test_fail, budget, staged, *ple_use_, sr, err) ||
+        !round_launch(rows, timed, sr, err)) {
         return false;
     }
+    return round_collect(kind, rows, upload_e, timed, test_k, sr, r, err);
+}
+
+bool target::round_launch(int32_t rows, bool timed, staged_round & sr, std::string & err) {
     const uint64_t rd = sr.rd;
     const bool eager = eager_;
     if (eager) {
@@ -1483,7 +1494,7 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
     sr.t3 = clock_t_::now();
     next_round_ = rd + 1;
     ++*ple_use_;
-    return round_collect(kind, rows, upload_e, timed, test_k, sr, r, err);
+    return true;
 }
 
 bool target::forced(int32_t rows, round_result & r, std::string & err, bool upload_e, bool timed) {
@@ -1634,6 +1645,311 @@ bool target::joint_verify_end(int32_t d, const int32_t * prop, staged_round & sr
     return verify_accept(prop, r, err);
 }
 
+bool target::joint_forced_begin(int32_t rows, uint64_t ple_use, staged_round & sr, std::string & err) {
+    if (rows < 2 || rows > fn::round::max_rows) {
+        return fail(err, "joint forced: rows outside 2 .. 5");
+    }
+    if (!eager_ && !captured_) {
+        return fail(err, "joint forced: needs the graph executor's graphs when not eager");
+    }
+    if (rows > l_.u) {
+        return fail(err, "joint forced: B > U (FC-RD1)");
+    }
+    return round_stage(static_cast<int32_t>(fn::round::kind::forced), rows, true, false, 0, 0, 0, nullptr, ple_use, sr,
+                       err);
+}
+
+bool target::joint_forced_end(int32_t rows, staged_round & sr, round_result & r, std::string & err) {
+    r = round_result();
+    sr.t3 = clock_t_::now();
+    if (!round_collect(static_cast<int32_t>(fn::round::kind::forced), rows, true, false, 0, sr, r, err)) {
+        return false;
+    }
+    l_.n += rows;
+    l_.u -= rows;
+    l_.retained = true;
+    l_.retained_row = rows - 1;
+    slot_versions::settle(l_);
+    return check_ledger(err);
+}
+
+// ---- TTTS1: a split stage's rounds ----
+
+int32_t target::cells() const {
+    for (int32_t l = fn::full_attn_interval - 1; l < fn::n_layer; l += fn::full_attn_interval) {
+        if (m_->win.layer(l)) {
+            return p_[0].s[l].n_cells;  // the whole model: layer 3's, as before
+        }
+    }
+    return m_->n_cells;
+}
+
+bool target::front_begin(int32_t         kind,
+                         int32_t         rows,
+                         const int32_t * prop,
+                         int32_t         budget,
+                         front_round &   fr,
+                         std::string &   err) {
+    fr = front_round();
+    if (!stage_front() || (!eager_ && !captured_)) {
+        return fail(err, "front round: not a front stage, or the graph executor without its graphs");
+    }
+    const int32_t verify   = static_cast<int32_t>(fn::round::kind::verify);
+    const int32_t generate = static_cast<int32_t>(fn::round::kind::generate);
+    const int32_t forced   = static_cast<int32_t>(fn::round::kind::forced);
+    if (kind == forced) {
+        if (rows < 1 || rows > l_.u) {
+            return fail(err, "front forced round: B outside 1 .. U (FC-RD1)");
+        }
+    } else if (kind == generate) {
+        if (rows != 1 || l_.u != 1 || l_.pending < 0) {
+            return fail(err, "front generate round: no pending token");
+        }
+    } else if (kind == verify) {
+        const int32_t d = rows - 1;
+        if (l_.u != 1 || l_.pending < 0 || d < 1 || d > fn::samp::max_drafts || prop == nullptr || rows > budget) {
+            return fail(err, "front verify round: no pending token, d outside 1 .. 4, or B beyond the budget");
+        }
+        for (int32_t t = 0; t < d; ++t) {
+            l_.tok.push_back(prop[t]);
+            fr.prop[t] = prop[t];
+        }
+        verify_extra_ = d;  // the proposals are the round's inputs only
+        fr.d          = d;
+    } else {
+        return fail(err, "front round: kind " + std::to_string(kind) + " (forced, generate or verify)");
+    }
+    fr.kind = kind;
+    fr.rows = rows;
+    if (!round_stage(kind, rows, true, false, 0, 0, budget, nullptr, *ple_use_, fr.sr, err) ||
+        !round_launch(rows, false, fr.sr, err)) {
+        front_abandon(fr);
+        return false;
+    }
+    return true;
+}
+
+bool target::front_wait(front_round & fr, round_result & r, std::string & err) {
+    r = round_result();
+    if (!wait(fr.sr.rd, o_.timeout_s, err)) {
+        front_abandon(fr);
+        return false;
+    }
+    r.round    = fr.sr.rd;
+    r.kind     = fr.kind;
+    r.rows     = fr.rows;
+    r.n_before = static_cast<int32_t>(fr.sr.n_before);
+    r.t_done_s = std::chrono::duration<double>(clock_t_::now().time_since_epoch()).count();
+    for (int32_t c = 0; c < 2; ++c) {
+        const fn::round::done & dn = done_[c];
+        std::memcpy(r.err[c], dn.err, sizeof(dn.err));
+        r.t_begin[c] = dn.t_begin;
+        r.t_start[c] = dn.t_start;
+        r.t_end[c]   = dn.t_end;
+        r.cur[c]     = dn.cur;
+        r.gdn[c]     = dn.gdn;
+    }
+    for (int32_t c = 0; c < 2; ++c) {
+        for (int32_t i = 0; i < fn::round::max_err; ++i) {
+            if (r.err[c][i] != 0u) {
+                std::string e;
+                front_abandon(fr);
+                r.recovered = clear_errors(e) && v_.restore(l_, e) && check_ledger(e);
+                return fail(err, "front round " + std::to_string(fr.sr.rd) + ": card " + std::to_string(c) +
+                                     " error word " + std::to_string(i) + " = " + std::to_string(r.err[c][i]) +
+                                     (r.recovered ? " (recovered: nothing committed)" : " (not recovered: " + e + ")"));
+            }
+        }
+        // nothing is committed on a front stage's cards until the back's verdict (front_end)
+        if (r.cur[c] != l_.cur || r.gdn[c] != l_.gdn) {
+            front_abandon(fr);
+            return fail(err, "front round " + std::to_string(fr.sr.rd) + ": card " + std::to_string(c) +
+                                 "'s committed words " + std::to_string(r.cur[c]) + "/" + std::to_string(r.gdn[c]) +
+                                 " are not the ledger's " + std::to_string(l_.cur) + "/" + std::to_string(l_.gdn));
+        }
+    }
+    fr.waited = true;
+    return true;
+}
+
+bool target::front_end(const front_round & fr,
+                       int32_t             k,
+                       const int32_t *     out,
+                       int32_t             n_out,
+                       int32_t             cut_rows,
+                       int64_t             n_keep,
+                       std::string &       err) {
+    if (!fr.waited) {
+        return fail(err, "front_end: the round's completion was not seen (front_wait)");
+    }
+    const int32_t verify   = static_cast<int32_t>(fn::round::kind::verify);
+    const int32_t generate = static_cast<int32_t>(fn::round::kind::generate);
+    if (k != fn::round::commit_versions(fr.kind, fr.rows, fr.kind == verify ? n_out - 1 : 0, 0) ||
+        (fr.kind != static_cast<int32_t>(fn::round::kind::forced) && (out == nullptr || n_out < 1))) {
+        return fail(err, "front_end: the verdict's " + std::to_string(k) + " rows and " + std::to_string(n_out) +
+                             " tokens do not fit the round (kind " + std::to_string(fr.kind) + ", B " +
+                             std::to_string(fr.rows) + ")");
+    }
+    if (verify_extra_ > 0) {
+        l_.tok.resize(l_.tok.size() - size_t(verify_extra_));  // the proposals off, as verify does after its round
+        verify_extra_ = 0;
+    }
+    // the commit of k rows, as one box's commit node makes it: both cards in stream order, the ledger's mirror
+    uint32_t want[2] = { 0, 0 }, want_gdn[2] = { 0, 0 };
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+            !fn::round::advance(&p_[c].rstate->cur, &p_[c].rstate->gdn, k, false, st_[c])) {
+            return err.empty() ? fail(err, "front commit (round::advance)") : false;
+        }
+        want[c]     = static_cast<uint32_t>(fn::round::version_slot(l_.cur, k));
+        want_gdn[c] = k >= 1 ? fn::round::gdn_after_round(l_.gdn, k) : l_.gdn;
+    }
+    if (!v_.committed(l_, k, want, want_gdn, err)) {
+        return false;
+    }
+    if (fr.kind == verify) {
+        // as verify_accept: the a accepted proposals and the correction or bonus join the ledger
+        const int32_t a = n_out - 1;
+        for (int32_t t = 0; t < a; ++t) {
+            if (out[t] != fr.prop[t]) {
+                return fail(err, "front verify: accepted token " + std::to_string(t) + " is not the proposal");
+            }
+        }
+        l_.n += a + 1;
+        for (int32_t t = 0; t <= a; ++t) {
+            l_.tok.push_back(out[t]);
+        }
+        l_.pending = out[a];
+        l_.o += a + 1;
+        l_.retained = false;
+    } else if (fr.kind == generate) {
+        l_.n += 1;
+        l_.tok.push_back(out[0]);
+        l_.pending = out[0];
+        l_.o += 1;
+        l_.retained = false;
+    } else {
+        l_.n += fr.rows;
+        l_.u -= fr.rows;
+        l_.retained     = true;
+        l_.retained_row = fr.rows - 1;
+    }
+    slot_versions::settle(l_);
+    if (!check_ledger(err)) {
+        return false;
+    }
+    if (fr.kind != static_cast<int32_t>(fn::round::kind::forced)) {
+        ++l_.checks;
+        if (l_.u != 1) {
+            ++l_.failures;
+            return fail(err, "ledger: U != 1 after a front round");
+        }
+    }
+    // FC-DEC3's end-of-generation cut, as the back made it (runtime step_cut): the same primitive
+    return cut_rows < 0 || cut_rows == k || cut(cut_rows, n_keep, err);
+}
+
+bool target::joint_front_begin(int32_t         d,
+                               const int32_t * prop,
+                               int32_t         budget,
+                               uint64_t        ple_use,
+                               front_round &   fr,
+                               std::string &   err) {
+    fr = front_round();
+    if (!stage_front() || (!eager_ && !captured_)) {
+        return fail(err, "joint front verify: not a front stage, or the graph executor without its graphs");
+    }
+    if (l_.u != 1 || l_.pending < 0 || d < 1 || d > fn::samp::max_drafts || prop == nullptr || d + 1 > budget) {
+        return fail(err, "joint front verify: no pending token, d outside 1 .. 4, or B beyond the budget");
+    }
+    for (int32_t t = 0; t < d; ++t) {
+        l_.tok.push_back(prop[t]);
+        fr.prop[t] = prop[t];
+    }
+    verify_extra_ = d;
+    fr.kind       = static_cast<int32_t>(fn::round::kind::verify);
+    fr.rows       = d + 1;
+    fr.d          = d;
+    if (!round_stage(fr.kind, fr.rows, true, false, 0, 0, budget, nullptr, ple_use, fr.sr, err)) {
+        front_abandon(fr);
+        return false;
+    }
+    return true;
+}
+
+bool target::joint_front_forced_begin(int32_t rows, uint64_t ple_use, front_round & fr, std::string & err) {
+    fr = front_round();
+    if (!stage_front() || (!eager_ && !captured_)) {
+        return fail(err, "joint front forced: not a front stage, or the graph executor without its graphs");
+    }
+    if (rows < 2 || rows > fn::round::max_rows || rows > l_.u) {
+        return fail(err, "joint front forced: rows outside 2 .. 5, or B > U (FC-RD1)");
+    }
+    fr.kind = static_cast<int32_t>(fn::round::kind::forced);
+    fr.rows = rows;
+    if (!round_stage(fr.kind, rows, true, false, 0, 0, 0, nullptr, ple_use, fr.sr, err)) {
+        front_abandon(fr);
+        return false;
+    }
+    return true;
+}
+
+void target::front_abandon(front_round & fr) {
+    if (verify_extra_ > 0) {
+        l_.tok.resize(l_.tok.size() - size_t(verify_extra_));
+        verify_extra_ = 0;
+    }
+    fr.waited = false;
+}
+
+bool target::front_bootstrap(int32_t tok, std::string & err) {
+    if (!stage_front() || l_.u != 0 || tok < 0) {
+        return fail(err, "front bootstrap: not a front stage, the prompt not fully processed, or no token");
+    }
+    v_.begin_step(l_, false);
+    const uint32_t cur[2] = { l_.cur, l_.cur }, gdn[2] = { l_.gdn, l_.gdn };
+    if (!v_.committed(l_, 0, cur, gdn, err)) {  // the bootstrap commits no version (k = 0)
+        return false;
+    }
+    l_.tok.push_back(tok);
+    l_.pending = tok;
+    l_.u += 1;
+    l_.o += 1;
+    l_.retained = false;
+    if (!check_ledger(err)) {
+        return false;
+    }
+    ++l_.checks;
+    return l_.u == 1 ? true : fail(err, "ledger: U != 1 after the front bootstrap");
+}
+
+bool target::decision_hash(uint64_t & h, std::string & err, uint64_t round_bias) {
+    fn::samp::record rec = {};
+    if (!cuda_ok(cudaSetDevice(m_->device[0]), "cudaSetDevice", err) ||
+        !fn::samp::read_record(p_[0].samp, rec, st_[0])) {
+        return err.empty() ? fail(err, "decision record") : false;
+    }
+    h = rec.hash;
+    if (round_bias == 0) {
+        return true;
+    }
+    const int32_t n = std::clamp(rec.n, 0, int32_t(fn::samp::max_rows));
+    if (fn::samp::decision_hash(rec.round, n, rec.tok, rec.a) != rec.hash || rec.round < round_bias) {
+        return fail(err, "decision record: its hash is not its round's and tokens'");
+    }
+    h = fn::samp::decision_hash(rec.round - round_bias, n, rec.tok, rec.a);
+    return true;
+}
+
+bool target::front_prompt_handoff(std::string & err) {
+    if (!stage_front() || l_.u != 0 || l_.n < 1) {
+        return fail(err, "front prompt handoff: not a front stage, or the prompt not fully processed");
+    }
+    l_.retained     = true;
+    l_.retained_row = 0;
+    return check_ledger(err);
+}
+
 bool target::save_carry(std::string & err) {
     for (int32_t c = 0; c < 2; ++c) {
         cudaStream_t s = static_cast<cudaStream_t>(st_[c]);
@@ -1780,7 +2096,7 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
     }
     if (o_.sample && o_.sampling.penalties()) {
         // SM1: the penalty window from the prompt (the pinned server accepts the prompt into the sampler)
-        const int32_t cap = fn::samp::make_params(o_.sampling, p_[0].s[3].n_cells).cap;
+        const int32_t cap = fn::samp::make_params(o_.sampling, cells()).cap;
         for (int32_t c = 0; c < 2; ++c) {
             if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
                 !fn::samp::load_window(p_[c].samp, cap, l_.tok, st_[c])) {
@@ -1880,13 +2196,21 @@ bool target::draft_set_depth(int64_t depth, std::string & err) {
     return true;
 }
 
-bool target::draft_catchup(int32_t rows, round_result & r, std::string & err) {
+bool target::catchup_check(int32_t rows, std::string & err) const {
     const int64_t first = draft_n_;
     if (!o_.draft.on || first < 0 || rows < 1 || rows > fn::draft::max_rows || first < batch_start_ ||
         first + rows > l_.n) {
         return fail(err, "draft catch-up refused: rows " + std::to_string(rows) + " from " + std::to_string(first) +
                              " (batch start " + std::to_string(batch_start_) + ", N " + std::to_string(l_.n) +
                              "): the rows must be committed and the carry the last target batch's");
+    }
+    return true;
+}
+
+bool target::draft_catchup(int32_t rows, round_result & r, std::string & err) {
+    const int64_t first = draft_n_;
+    if (!catchup_check(rows, err)) {
+        return false;
     }
     if (carry_save_n_ < 0 && !save_carry(err)) {
         return false;
@@ -1902,6 +2226,38 @@ bool target::draft_catchup(int32_t rows, round_result & r, std::string & err) {
     }
     draft_n_ = first + rows;
     index_written(first, rows);
+    return true;
+}
+
+bool target::joint_catchup_begin(int32_t rows, staged_round & sr, std::string & err) {
+    const int64_t first = draft_n_;
+    if (!catchup_check(rows, err) || (carry_save_n_ < 0 && !save_carry(err))) {
+        return false;
+    }
+    return draft_stage(catchup_kind, rows, first, static_cast<int32_t>(first - batch_start_), sr, err);
+}
+
+bool target::joint_catchup_end(int32_t rows, const staged_round & sr, round_result & r, std::string & err) {
+    if (!draft_collect(catchup_kind, rows, sr, r, err)) {
+        std::string e2;
+        if (r.recovered && !restore_carry(e2)) { // SP1, as draft_catchup
+            err += "; " + e2;
+        }
+        return false;
+    }
+    draft_n_ = sr.n_before + rows;
+    index_written(sr.n_before, rows);
+    ++sub_.joint_catchups;
+    return true;
+}
+
+bool target::test_draft_rewind(int64_t n, std::string & err) {
+    if (n < batch_start_ || n > draft_n_) {
+        return fail(err, "test_draft_rewind: " + std::to_string(n) + " outside the batch start .. draft N");
+    }
+    draft_n_ = n;
+    index_n_ = std::min(index_n_, n);
+    carry_save_n_ = -1;
     return true;
 }
 

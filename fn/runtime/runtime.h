@@ -24,6 +24,7 @@
 #include "fn/runtime/prefill.h"
 #include "fn/runtime/target.h"
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -67,6 +68,8 @@ struct step_info {
     // catch-up; bootstrap and generate: their one round
     double to_draft_s = -1, to_verify_s = -1, to_catchup_s = -1, to_one_s = -1;
     bool joint = false; // FMU2: the verify round was a joint round's lane (step_joint)
+    // TTTS1 (engine_config::record_hash): the step's decision hash (the sampler record's, fn/kernels/samp/samp.h)
+    uint64_t hash  = 0;
 };
 
 // between a speculative step's draft step and its verify round (fnfl-drive spec's recorded rounds); r: the draft step's
@@ -91,6 +94,13 @@ bool step_propose(target & t, int32_t budget, int32_t d, std::chrono::steady_clo
                   std::string & err, const after_draft_fn * after_draft = nullptr);
 bool step_close(target & t, const std::vector<int32_t> & eog, const round_result & rv,
                 std::chrono::steady_clock::time_point t0, step_info & s, std::string & err);
+// step_close's halves (FMS2 build item 2: a joint catch-up's members take theirs in between): step_cut, the step's
+// tokens from rv and the end-of-generation cut (the catch-up's rows are then s.n_out); step_caught, the step closed
+// by its catch-up's result r
+bool step_cut(target & t, const std::vector<int32_t> & eog, const round_result & rv,
+              std::chrono::steady_clock::time_point t0, step_info & s, std::string & err);
+void step_caught(const std::vector<int32_t> & eog, const round_result & r, std::chrono::steady_clock::time_point t0,
+                 step_info & s);
 
 // the engine's settings, printed at startup (STANDARDS "Switches"); the test switches name SV1 and end when SV1 merges
 // with its checks recorded, unless the review keeps them as documented debug options
@@ -120,10 +130,29 @@ struct engine_config {
     // largest bulk chunk; the loan's startup check runs once the prefiller exists
     int32_t short_read = 0, prompt_chunk = 8192;
     // FMU2: the joint verify round for 2..4 generating slots on resident TP (step_joint; eager: phased, no graphs);
-    // joint_cache, the membership graph pairs kept (1 .. 8)
+    // joint_cache, the membership graph pairs kept (1 .. 8); joint_x16 (FMS2 item 7): the joint rounds' X-A and X-F in
+    // 16 bits (FP16, judged by joint-kl; off: every lane bitwise its lone round)
     bool joint = true;
     int32_t joint_cache = 2;
+    bool    joint_x16       = false;  // off: FMS2 load 1's joint-kl missed its top-1 line (335 vs the yardstick's 295)
+    // joint_router_tc (FMS5): the joint rounds' router launch on the tensor cores (fn::dense joint_args::router_tc:
+    // each logit within 2^-14 of FP64's sum |w x|, judged by joint-kl); off: the joint product, bitwise the lone round
+    bool joint_router_tc = true;
+    // joint_dense_f16 (FMS6): the joint rounds' quantized dense products at U = 3 and 4 in FP16 on the tensor cores
+    // (fn::dense joint_args::dense_f16: each output within 2^-8 of FP64's sum |w| |x|); off: bitwise the lone round
+    bool joint_dense_f16 = true;
+    // TTTS1: the split stage this engine is (fn/runtime/stage.h): 0 one box, 1 the front (layers 0 .. k - 1 of the
+    // model's window, no head, no draft), 2 the back (layers k .. 47, the head and the draft); stage_buf, each slot's
+    // boundary buffers on cards 0 and 1 (pinned host memory, model::stage_bytes(5) each): the front's send, the back's
+    // receive. A split engine serves up to max_split_slots slots
+    int32_t stage           = 0;
+    std::vector<std::array<uint8_t *, 2>> stage_buf;
+    // TTTS1 (fnfl-drive spec run's records): each step's decision hash read after it (one synchronous read a step;
+    // off in serving)
+    bool                                  record_hash = false;
 };
+
+constexpr int32_t max_split_slots = 8;  // TTTS1: the split's slots (one box: 4)
 
 // FMU2: one slot's step in step_joint
 struct joint_step_out {
@@ -180,8 +209,8 @@ struct read_info {
 struct pool_info {
     bool on = false;
     int32_t pages = 0, page_cells = 0, free_pages = 0;
-    int32_t mapped[4] = {0, 0, 0, 0}; // each slot's mapped pages
-    bool busy[4] = {false, false, false, false};
+    int32_t mapped[max_split_slots] = {};  // each slot's mapped pages (TTTS1: up to 8 on the split)
+    bool    busy[max_split_slots]   = {};
     int64_t capacity_cells = 0;
     int32_t reclaims = 0; // idle slots reclaimed since load
 };
@@ -230,6 +259,11 @@ class engine {
     // draft steps and catch-ups; every other slot's step runs alone. res[k] is slots[k]'s (step's outputs and status)
     void step_joint(const int32_t * slots, int32_t n, joint_step_out * res);
     run_status truncate(int32_t slot, int32_t n_keep);
+    // TTTS1: the split's truncate agreement. in_place: the slot's state matches its ledger (the cut kept it; false:
+    // the next prefill restores a checkpoint or re-prefills). to_restore: an in-place slot restores at the next
+    // prefill instead (its other box could not keep it), holding the same tokens
+    bool       in_place(int32_t slot) const;
+    void       to_restore(int32_t slot);
     // the tokens the slot's state holds (processed) and its pending token (-1: none)
     run_status history(int32_t slot, std::vector<int32_t> & tokens, int32_t & pending) const;
 
@@ -283,7 +317,46 @@ class engine {
     model::model & test_model() { return *m_; }
     // FMU2: the joint frame (nullptr when the engine has none) and whether a failed capture turned it off
     const joint_frame * test_joint() const { return joint_.get(); }
+    joint_frame * test_joint_frame() { return joint_.get(); } // FMS2: state-test mu1 catchup's joint catch-ups
     bool test_joint_off() const { return joint_off_; }
+    // FMS2 item 7 (TEST ONLY, fnfl-drive joint-kl): the engine shut down as its destructor does (slots, joint frame,
+    // prefiller, streams), the loaded model kept and returned (its state classes still reserved), so one load's state
+    // can be laid out again (fn::loader::release_state, reserve_state) under a new engine. The engine is then empty.
+    std::unique_ptr<model::model> test_take_model();
+
+    // ---- TTTS1: a split stage's engine (fn/runtime/stage.h) ----
+    // A stage's step runs its rounds between split_enter (the step's checks and cells, as step's; b its token budget)
+    // and split_leave (the step recorded as step records it, or its failure). split_budget: the slot's budget as
+    // step_enter computes it, with no side effect (the back's choice of a slot's next step). The joint frame (null
+    // when off) and the configuration for the stage's own step logic
+    run_status split_enter(int32_t slot, int32_t & b);
+    run_status split_leave(int32_t slot, bool ran, const step_info & s, int32_t * out, int32_t & n_out, bool & end);
+    int32_t    split_budget(int32_t slot) const;
+
+    bool split_valid(int32_t slot) const { return slot_ok(slot) && s_[size_t(slot)].valid; }
+
+    bool split_open(int32_t slot) const { return slot_ok(slot) && s_[size_t(slot)].open; }
+
+    int32_t split_steps(int32_t slot) const { return slot_ok(slot) ? int32_t(s_[size_t(slot)].steps.size()) : 0; }
+
+    joint_frame * split_joint() { return joint_off_ ? nullptr : joint_.get(); }
+
+    void split_joint_off() { joint_off_ = true; }
+
+    const engine_config & config() const { return c_; }
+
+    // the slot's last step's decision hash (record_hash; 0 without)
+    uint64_t split_last_hash(int32_t slot) const;
+
+    // the split back: rounds an early draft of the slot ran that its step then did not use (target::decision_hash)
+    void split_discard_rounds(int32_t slot, uint64_t n) {
+        if (slot_ok(slot)) {
+            s_[size_t(slot)].round_bias += n;
+        }
+    }
+
+    // TTTS1 (the follower's spec run records): slot's last finished request's steps
+    const std::vector<step_info> & last_steps_of(int32_t slot) const { return s_[size_t(slot)].last_steps; }
 
     // the reason of the last call that failed
     const std::string & error() const { return err_; }
@@ -307,6 +380,7 @@ class engine {
         bool unchecked = false;    // a decision ran since the last closing check
         int32_t n_gen = 0;         // the open request's tokens
         int32_t fail_step = 0;     // armed --fnfl-test-fail-step
+        uint64_t             round_bias = 0;  // TTTS1: the split back's discarded early draft rounds (decision hashes)
         std::vector<step_info> steps, last_steps;
         std::chrono::steady_clock::time_point t_first; // the open request's first step's start
         double t_span_s = 0;                           // from it to the last step's end
@@ -344,6 +418,7 @@ class engine {
                        int32_t n_tokens, double secs, bool ok, std::chrono::steady_clock::time_point entry);
 
     std::unique_ptr<model::model> m_;
+    void shutdown();                            // the destructor's teardown, the model kept
     std::unique_ptr<model::expert_service> ex_; // ME1 (destroyed after the targets and the prefiller)
     std::vector<slot_rt> s_;
     std::unique_ptr<prefiller> pf_;

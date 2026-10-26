@@ -296,14 +296,15 @@ size_t joint_products_work_bytes() {
     return fn::dense::joint_work_bytes(product_args_of(nullptr, nullptr));
 }
 
-bool products_joint(int32_t lanes, const step_args * const a[], uint8_t * work, void * stream) {
-    bool ok = a != nullptr && lanes >= 2 && lanes <= fn::dense::max_lanes &&
-              (joint_products_work_bytes() == 0 || al16(work));
+bool products_joint(int32_t lanes, int32_t rows, const step_args * const a[], uint8_t * work, void * stream) {
+    bool                  ok = a != nullptr && lanes >= 2 && lanes <= fn::dense::max_lanes && rows >= 2 &&
+                               rows <= fn::dense::lane_rows && (joint_products_work_bytes() == 0 || al16(work));
     fn::dense::joint_args j;
     j.lanes = lanes;
+    j.rows  = rows;
     for (int32_t u = 0; ok && u < lanes; ++u) {
-        ok = a[u] != nullptr && common_ok(fn::dense::lane_rows, *a[u], stream) && al16(a[u]->w.key) &&
-             al16(a[u]->w.value) && al16(a[u]->e) && a[u]->w.key == a[0]->w.key && a[u]->w.value == a[0]->w.value;
+        ok = a[u] != nullptr && common_ok(rows, *a[u], stream) && al16(a[u]->w.key) && al16(a[u]->w.value) &&
+             al16(a[u]->e) && a[u]->w.key == a[0]->w.key && a[u]->w.value == a[0]->w.value;
         if (ok) {
             const ws_view v = carve(a[u]->ws);
             j.x_f32[u] = a[u]->e;
@@ -312,8 +313,9 @@ bool products_joint(int32_t lanes, const step_args * const a[], uint8_t * work, 
         }
     }
     if (!ok) {
-        fprintf(stderr, "ple products_joint: rejected (lanes %d, or a lane's null, misaligned or other weights)\n",
-                lanes);
+        fprintf(stderr,
+                "ple products_joint: rejected (lanes %d, rows %d, or a lane's null, misaligned or other weights)\n",
+                lanes, rows);
         return false;
     }
     return fn::dense::product_joint(product_args_of(a[0], work), j, stream);

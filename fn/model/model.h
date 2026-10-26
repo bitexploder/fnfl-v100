@@ -83,6 +83,8 @@ struct region_place {
     // reads card 0's region (no device bytes of its own)
     bool cached = false;
     bool alias = false;
+    // TTTS1: a tensor outside this box's window (model::win): no device bytes, region_ptr null
+    bool    absent     = false;
 };
 
 class kv_pool;
@@ -106,6 +108,9 @@ struct tensor_source {
     const mapped_file * file = nullptr;
     uint64_t offset = 0;
     int64_t row_bytes = 0; // bytes of one GGUF row (ne0 elements)
+    // TTTS1 (split-test, fn/loader fill_weights_synth): the tensor's whole GGUF bytes in host memory, read in place of
+    // the mapping while set (no model data); null: the mapping
+    const uint8_t *     synth     = nullptr;
 };
 
 constexpr int64_t region_align = 256;
@@ -125,6 +130,10 @@ class model {
     // KV8 (--fnfl-kv-format q8): the target KV classes hold the 8-bit format (state_params::kv_q8), set by
     // reserve_state
     bool kv_q8 = false;
+    // TTTS1: the layers and extras this box holds (fn/model/state.h window; the loader's load_params::win), and the
+    // cells a slot of the reservation (reserve_state's state_params::n_cells)
+    window  win;
+    int32_t n_cells = 0;
 
     std::vector<std::unique_ptr<mapped_file>> files; // target shards, then the draft file
     std::vector<tensor_source> sources;              // per tensors[] entry

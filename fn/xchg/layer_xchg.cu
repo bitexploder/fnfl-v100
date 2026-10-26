@@ -69,6 +69,61 @@ __global__ void __launch_bounds__(128) recv_add_kernel(const float * __restrict_
     *reinterpret_cast<float4 *>(out + b * half_words + 4 * q) = o;
 }
 
+// FMS2 item 7: one thread 8 values of the B x 1280 payload, sent as one 16-byte group of FP16 halves (x16_bits)
+__global__ void __launch_bounds__(128) send_half16_kernel(const float * __restrict__ partial, int32_t peer_card,
+                                                          uint32_t * peer, uint32_t * err, int32_t n8) {
+    const int32_t u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= n8) {
+        return;
+    }
+    const int32_t b = u / (half_words / 8);
+    const int32_t q = u % (half_words / 8);
+    const float * src = partial + b * row_words + peer_card * half_words + 8 * q;
+    const float4 v0 = *reinterpret_cast<const float4 *>(src);
+    const float4 v1 = *reinterpret_cast<const float4 *>(src + 4);
+    const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    bool over = false;
+    uint32_t w[4];
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+        w[i] = uint32_t(x16_bits(v[2 * i], over)) | (uint32_t(x16_bits(v[2 * i + 1], over)) << 16);
+    }
+    *reinterpret_cast<uint4 *>(peer + (b * x16_row_halves + 8 * q) / 2) = make_uint4(w[0], w[1], w[2], w[3]);
+    if (over) {
+        atomicOr(err, err_x16_range);
+    }
+}
+
+// FMS2 item 7: one thread a 16-byte group (8 halves): poll16, reset, then out = own + the peer's value, in F32
+__global__ void __launch_bounds__(128) recv_add16_kernel(const float * __restrict__ partial, int32_t card,
+                                                         uint32_t * slot, float * __restrict__ out, uint32_t * err,
+                                                         uint32_t code, int32_t n8) {
+    const int32_t u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= n8) {
+        return;
+    }
+    const int32_t b = u / (half_words / 8);
+    const int32_t q = u % (half_words / 8);
+    uint4 * g = reinterpret_cast<uint4 *>(slot + (b * x16_row_halves + 8 * q) / 2);
+    uint4 v;
+    poll16(g, v, err, code);
+    reset4(g);
+    const uint32_t w[4] = {v.x, v.y, v.z, v.w};
+    const float * own = partial + b * row_words + card * half_words + 8 * q;
+    const float4 o0 = *reinterpret_cast<const float4 *>(own);
+    const float4 o1 = *reinterpret_cast<const float4 *>(own + 4);
+    const float a[8] = {o0.x, o0.y, o0.z, o0.w, o1.x, o1.y, o1.z, o1.w};
+    float r[8];
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+        r[2 * i] = a[2 * i] + __half2float(__ushort_as_half(static_cast<unsigned short>(w[i] & 0xffffu)));
+        r[2 * i + 1] = a[2 * i + 1] + __half2float(__ushort_as_half(static_cast<unsigned short>(w[i] >> 16)));
+    }
+    float * dst = out + b * half_words + 8 * q;
+    *reinterpret_cast<float4 *>(dst) = make_float4(r[0], r[1], r[2], r[3]);
+    *reinterpret_cast<float4 *>(dst + 4) = make_float4(r[4], r[5], r[6], r[7]);
+}
+
 // one warp a row, lane l word l (l < 24)
 __global__ void __launch_bounds__(32 * max_rows) send_route_kernel(const int32_t * __restrict__ ids_full,
                                                                    int32_t ids_stride, const float * __restrict__ wts,
@@ -122,8 +177,9 @@ __global__ void __launch_bounds__(32) recv_route_kernel(uint32_t * slot, int32_t
 // one thread a 16-byte word of the message: the header (u 0 and 1), then the body; the body's last group is read a word
 // at a time, so nothing past the body is read. The body's length is offsets[rows] (bytes), read on the device (TG1): the
 // grid covers the longest body of B rows and the threads past this body's message send nothing.
-__global__ void __launch_bounds__(128) send_select_kernel(int32_t rows, const int32_t * __restrict__ offsets,
-                                                          const uint32_t * __restrict__ body, uint32_t * peer) {
+// FMS2 (build item 3, W3): the kernel's body (send_select_kernel's, and a lane's of send_select_lanes_kernel)
+__device__ __forceinline__ void send_select_body(int32_t rows, const int32_t * __restrict__ offsets,
+                                                 const uint32_t * __restrict__ body, uint32_t * peer) {
     const int32_t u = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t total = offsets[rows];
     // an out-of-contract size is sent as it is in the header (the receiver reports it) with no body
@@ -154,15 +210,41 @@ __global__ void __launch_bounds__(128) send_select_kernel(int32_t rows, const in
     *reinterpret_cast<uint4 *>(peer + 4 * u) = make_uint4(x[0], x[1], x[2], x[3]);
 }
 
+__global__ void __launch_bounds__(128) send_select_kernel(int32_t rows, const int32_t * __restrict__ offsets,
+                                                          const uint32_t * __restrict__ body, uint32_t * peer) {
+    send_select_body(rows, offsets, body, peer);
+}
+
+// FMS2 (build item 3, W3): every lane's X-SELECT of the joint verify round in one launch each way, blockIdx.y the
+// lane (send) or blockIdx.x the lane (receive), each lane's message on its own lane ring's slot
+struct select_send_kargs {
+    const int32_t * offsets[max_lanes];
+    const uint32_t * body[max_lanes];
+    uint32_t * peer[max_lanes]; // the peer's slot of the lane's ring
+    int32_t rows;
+};
+
+struct select_recv_kargs {
+    uint32_t * slot[max_lanes]; // this card's slot of the lane's ring
+    int32_t * offsets[max_lanes];
+    uint32_t * body[max_lanes];
+    uint32_t * err[max_lanes]; // the lane ring's error word
+    int32_t rows;
+};
+
+__global__ void __launch_bounds__(128) send_select_lanes_kernel(const __grid_constant__ select_send_kargs p) {
+    const int32_t k = static_cast<int32_t>(blockIdx.y);
+    send_select_body(p.rows, p.offsets[k], p.body[k], p.peer[k]);
+}
+
 // One block, one thread a 16-byte word of the longest message of B rows. Thread 1 polls header group 1 first: its words
 // are offsets[min(t, rows)], t = 4 .. 7, so word 7 holds the body's total bytes (SP2: at B = 5 word 4 is row 4's
 // offset; at B <= 4 all four hold the total). It resets the group and shares the size; then each thread whose word is
 // in this message polls it, resets it and writes the offsets or body words. Threads past the message poll nothing
 // (their words were not written and stay the sentinel).
-__global__ void __launch_bounds__(select_recv_threads) recv_select_kernel(int32_t rows, uint32_t * slot,
-                                                                          int32_t * __restrict__ offsets,
-                                                                          uint32_t * __restrict__ body,
-                                                                          uint32_t * err) {
+// FMS2 (build item 3, W3): the kernel's body (recv_select_kernel's, and a lane's of recv_select_lanes_kernel)
+__device__ __forceinline__ void recv_select_body(int32_t rows, uint32_t * slot, int32_t * __restrict__ offsets,
+                                                 uint32_t * __restrict__ body, uint32_t * err) {
     __shared__ int32_t s_body_words;
     const int32_t u = threadIdx.x;
     uint4 v[1];
@@ -213,8 +295,76 @@ __global__ void __launch_bounds__(select_recv_threads) recv_select_kernel(int32_
     }
 }
 
+__global__ void __launch_bounds__(select_recv_threads) recv_select_kernel(int32_t rows, uint32_t * slot,
+                                                                          int32_t * __restrict__ offsets,
+                                                                          uint32_t * __restrict__ body,
+                                                                          uint32_t * err) {
+    recv_select_body(rows, slot, offsets, body, err);
+}
+
+__global__ void __launch_bounds__(select_recv_threads)
+recv_select_lanes_kernel(const __grid_constant__ select_recv_kargs p) {
+    const int32_t k = static_cast<int32_t>(blockIdx.x);
+    recv_select_body(p.rows, p.slot[k], p.offsets[k], p.body[k], p.err[k]);
+}
+
+// FMS13: the joint X-A / X-F of lanes of LR < max_rows rows. Thread u's packed row u / 320 = LR k + i is lane k's row
+// i, memory row max_rows k + i of the partial, the slot and out (every joint buffer keeps its five-row lane stride),
+// so rows LR .. 4 of each lane are neither sent, polled nor written. LR = max_rows takes the kernels above.
+template <int LR> __device__ __forceinline__ int32_t lane_row(int32_t b) {
+    return max_rows * (b / LR) + b % LR;
+}
+
+template <int LR>
+__global__ void __launch_bounds__(128) send_half_lanes_kernel(const float * __restrict__ partial,
+                                                              int32_t    peer_card,
+                                                              uint32_t * peer,
+                                                              int32_t    n4) {
+    const int32_t u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= n4) {
+        return;
+    }
+    const int32_t b = lane_row<LR>(u / (half_words / 4));
+    const int32_t q = u % (half_words / 4);
+    const float4  v = *reinterpret_cast<const float4 *>(partial + b * row_words + peer_card * half_words + 4 * q);
+    const uint4   w = make_uint4(canonical(v.x), canonical(v.y), canonical(v.z), canonical(v.w));
+    *reinterpret_cast<uint4 *>(peer + b * half_words + 4 * q) = w;
+}
+
+template <int LR>
+__global__ void __launch_bounds__(128) recv_add_lanes_kernel(const float * __restrict__ partial,
+                                                             int32_t    card,
+                                                             uint32_t * slot,
+                                                             float * __restrict__ out,
+                                                             uint32_t * err,
+                                                             uint32_t   code,
+                                                             int32_t    n4) {
+    const int32_t u = blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= n4) {
+        return;
+    }
+    const int32_t b    = lane_row<LR>(u / (half_words / 4));
+    const int32_t q    = u % (half_words / 4);
+    uint4 *       g    = reinterpret_cast<uint4 *>(slot + b * half_words) + q;
+    const uint4 * p[1] = { g };
+    uint4         v[1];
+    poll<1>(p, v, err, code);
+    reset4(g);
+    const float4 own = *reinterpret_cast<const float4 *>(partial + b * row_words + card * half_words + 4 * q);
+    float4       o;
+    o.x                                                       = own.x + __uint_as_float(v[0].x);
+    o.y                                                       = own.y + __uint_as_float(v[0].y);
+    o.z                                                       = own.z + __uint_as_float(v[0].z);
+    o.w                                                       = own.w + __uint_as_float(v[0].w);
+    *reinterpret_cast<float4 *>(out + b * half_words + 4 * q) = o;
+}
+
 bool rows_ok(int32_t rows) {
     return rows >= 1 && rows <= max_rows;
+}
+
+bool lanes_ok(int32_t lanes, int32_t lane_rows) {
+    return lanes >= 1 && lanes <= max_lanes && lane_rows >= 1 && lane_rows <= max_rows;
 }
 
 bool launched() {
@@ -254,13 +404,103 @@ bool recv_add(int32_t rows, int32_t card, const float * partial, float * slot, f
     return rows_ok(rows) && recv_add_rows(rows, card, partial, slot, out, err, code, stream);
 }
 
-bool send_half_joint(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, void * stream) {
-    return rows >= 1 && rows <= joint_rows && send_half_rows(rows, peer_card, partial, peer_slot, stream);
+bool send_half_joint16(int32_t rows, int32_t peer_card, const float * partial, float * peer_slot, uint32_t * err,
+                       void * stream) {
+    if (rows < 1 || rows > joint_rows || peer_card < 0 || peer_card > 1 || !al16(partial) || !al16(peer_slot) ||
+        err == nullptr || stream == nullptr) {
+        return false;
+    }
+    const int32_t n8 = rows * half_words / 8;
+    send_half16_kernel<<<(n8 + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        partial, peer_card, reinterpret_cast<uint32_t *>(peer_slot), err, n8); // FP16 halves handled as bits
+    return launched();
 }
 
-bool recv_add_joint(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
-                    uint32_t code, void * stream) {
-    return rows >= 1 && rows <= joint_rows && recv_add_rows(rows, card, partial, slot, out, err, code, stream);
+bool recv_add_joint16(int32_t rows, int32_t card, const float * partial, float * slot, float * out, uint32_t * err,
+                      uint32_t code, void * stream) {
+    if (rows < 1 || rows > joint_rows || card < 0 || card > 1 || !al16(partial) || !al16(slot) || !al16(out) ||
+        err == nullptr || stream == nullptr) {
+        return false;
+    }
+    const int32_t n8 = rows * half_words / 8;
+    recv_add16_kernel<<<(n8 + 127) / 128, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+        partial, card, reinterpret_cast<uint32_t *>(slot), out, err, code, n8); // FP16 halves handled as bits
+    return launched();
+}
+
+bool send_half_joint(int32_t       lanes,
+                     int32_t       lane_rows,
+                     int32_t       peer_card,
+                     const float * partial,
+                     float *       peer_slot,
+                     void *        stream) {
+    if (!lanes_ok(lanes, lane_rows)) {
+        return false;
+    }
+    if (lane_rows == max_rows) {  // contiguous rows: today's kernel
+        return send_half_rows(lanes * max_rows, peer_card, partial, peer_slot, stream);
+    }
+    if (peer_card < 0 || peer_card > 1 || !al16(partial) || !al16(peer_slot) || stream == nullptr) {
+        return false;
+    }
+    const int32_t      n4 = lanes * lane_rows * half_words / 4;
+    const dim3         grid((n4 + 127) / 128);
+    const cudaStream_t st   = static_cast<cudaStream_t>(stream);
+    uint32_t *         peer = reinterpret_cast<uint32_t *>(peer_slot);  // F32 payload words handled as bits
+    switch (lane_rows) {
+        case 1:
+            send_half_lanes_kernel<1><<<grid, 128, 0, st>>>(partial, peer_card, peer, n4);
+            break;
+        case 2:
+            send_half_lanes_kernel<2><<<grid, 128, 0, st>>>(partial, peer_card, peer, n4);
+            break;
+        case 3:
+            send_half_lanes_kernel<3><<<grid, 128, 0, st>>>(partial, peer_card, peer, n4);
+            break;
+        default:
+            send_half_lanes_kernel<4><<<grid, 128, 0, st>>>(partial, peer_card, peer, n4);
+            break;
+    }
+    return launched();
+}
+
+bool recv_add_joint(int32_t       lanes,
+                    int32_t       lane_rows,
+                    int32_t       card,
+                    const float * partial,
+                    float *       slot,
+                    float *       out,
+                    uint32_t *    err,
+                    uint32_t      code,
+                    void *        stream) {
+    if (!lanes_ok(lanes, lane_rows)) {
+        return false;
+    }
+    if (lane_rows == max_rows) {
+        return recv_add_rows(lanes * max_rows, card, partial, slot, out, err, code, stream);
+    }
+    if (card < 0 || card > 1 || !al16(partial) || !al16(slot) || !al16(out) || err == nullptr || stream == nullptr) {
+        return false;
+    }
+    const int32_t      n4 = lanes * lane_rows * half_words / 4;
+    const dim3         grid((n4 + 127) / 128);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    uint32_t *         s  = reinterpret_cast<uint32_t *>(slot);  // F32 payload words handled as bits
+    switch (lane_rows) {
+        case 1:
+            recv_add_lanes_kernel<1><<<grid, 128, 0, st>>>(partial, card, s, out, err, code, n4);
+            break;
+        case 2:
+            recv_add_lanes_kernel<2><<<grid, 128, 0, st>>>(partial, card, s, out, err, code, n4);
+            break;
+        case 3:
+            recv_add_lanes_kernel<3><<<grid, 128, 0, st>>>(partial, card, s, out, err, code, n4);
+            break;
+        default:
+            recv_add_lanes_kernel<4><<<grid, 128, 0, st>>>(partial, card, s, out, err, code, n4);
+            break;
+    }
+    return launched();
 }
 
 bool send_route(int32_t rows, const int32_t * ids_full, int32_t ids_stride, const float * wts, const float * sg,
@@ -301,6 +541,49 @@ bool recv_select(int32_t rows, float * slot, int32_t * offsets, uint32_t * body,
     const int32_t n4 = select_words(rows * select_row_words) / 4; // the longest message of B rows
     recv_select_kernel<<<1, (n4 + 31) / 32 * 32, 0, static_cast<cudaStream_t>(stream)>>>(
         rows, reinterpret_cast<uint32_t *>(slot), offsets, body, err); // words handled as bits
+    return launched();
+}
+
+bool send_select_lanes(int32_t lanes, int32_t rows, const int32_t * const * offsets, const uint32_t * const * body,
+                       float * const * peer_slot, void * stream) {
+    if (lanes < 2 || lanes > max_lanes || !rows_ok(rows) || offsets == nullptr || body == nullptr ||
+        peer_slot == nullptr || stream == nullptr) {
+        return false;
+    }
+    select_send_kargs p = {};
+    p.rows = rows;
+    for (int32_t k = 0; k < lanes; ++k) {
+        if (offsets[k] == nullptr || !al16(body[k]) || !al16(peer_slot[k])) {
+            return false;
+        }
+        p.offsets[k] = offsets[k];
+        p.body[k] = body[k];
+        p.peer[k] = reinterpret_cast<uint32_t *>(peer_slot[k]); // words handled as bits
+    }
+    const int32_t n4 = select_words(rows * select_row_words) / 4; // the longest message of B rows
+    send_select_lanes_kernel<<<dim3((n4 + 127) / 128, lanes), 128, 0, static_cast<cudaStream_t>(stream)>>>(p);
+    return launched();
+}
+
+bool recv_select_lanes(int32_t lanes, int32_t rows, float * const * slot, int32_t * const * offsets,
+                       uint32_t * const * body, uint32_t * const * err, void * stream) {
+    if (lanes < 2 || lanes > max_lanes || !rows_ok(rows) || slot == nullptr || offsets == nullptr || body == nullptr ||
+        err == nullptr || stream == nullptr) {
+        return false;
+    }
+    select_recv_kargs p = {};
+    p.rows = rows;
+    for (int32_t k = 0; k < lanes; ++k) {
+        if (!al16(slot[k]) || offsets[k] == nullptr || !al16(body[k]) || err[k] == nullptr) {
+            return false;
+        }
+        p.slot[k] = reinterpret_cast<uint32_t *>(slot[k]); // words handled as bits
+        p.offsets[k] = offsets[k];
+        p.body[k] = body[k];
+        p.err[k] = err[k];
+    }
+    const int32_t n4 = select_words(rows * select_row_words) / 4; // the longest message of B rows
+    recv_select_lanes_kernel<<<lanes, (n4 + 31) / 32 * 32, 0, static_cast<cudaStream_t>(stream)>>>(p);
     return launched();
 }
 
