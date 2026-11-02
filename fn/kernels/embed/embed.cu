@@ -1,7 +1,7 @@
+#include "fn/kernels/dense/iq3s.cuh"
 #include "fn/kernels/embed/embed.h"
 
-#include "fn/kernels/dense/iq3s.cuh"
-
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -85,6 +85,50 @@ embed_kernel(const uint8_t * __restrict__ table, const uint32_t * __restrict__ g
     }
 }
 
+// TTTS2: the Q8_0 table. Block b: row b; thread t: stream t / 20, features 64 (t % 20) .. +63 (two blocks)
+__global__ void __launch_bounds__(n_threads) embed_q8_kernel(const uint8_t * __restrict__ table,
+                                                             const int32_t * __restrict__ tok,
+                                                             float * __restrict__ hres,
+                                                             float * __restrict__ hpost,
+                                                             float * __restrict__ hx,
+                                                             uint32_t * err) {
+    const int32_t b  = blockIdx.x;
+    const int32_t t  = threadIdx.x;
+    const int32_t id = __ldg(tok + b);
+    if (id < 0 || id >= n_vocab) {
+        if (t == 0) {
+            atomicOr(err, err_token);
+        }
+        return;
+    }
+    const int32_t s   = t / (n_super * n_quarter);
+    const int32_t c   = t % (n_super * n_quarter);
+    float *       out = hres + (int64_t(b) * n_stream + s) * n_own + 64 * c;
+#pragma unroll
+    for (int32_t h = 0; h < 2; ++h) {
+        const uint8_t * blk = table + int64_t(id) * q8_row_bytes + (2 * c + h) * 34;
+        const float     d   = __half2float(__ushort_as_half(static_cast<unsigned short>(ld16(blk))));
+#pragma unroll
+        for (int32_t k = 0; k < 8; ++k) {
+            const uint32_t x = ld32u(blk + 2 + 4 * k);
+            float4         o;
+            o.x                                        = d * static_cast<float>(static_cast<int8_t>(x & 0xffu));
+            o.y                                        = d * static_cast<float>(static_cast<int8_t>((x >> 8) & 0xffu));
+            o.z                                        = d * static_cast<float>(static_cast<int8_t>((x >> 16) & 0xffu));
+            o.w                                        = d * static_cast<float>(static_cast<int8_t>(x >> 24));
+            reinterpret_cast<float4 *>(out)[8 * h + k] = o;
+        }
+    }
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int32_t k = 0; k < n_own / 4 / n_threads; ++k) {
+        reinterpret_cast<float4 *>(hx + int64_t(b) * n_own)[t + k * n_threads] = z;
+    }
+    if (t == 0) {
+        reinterpret_cast<float4 *>(hpost)[b] = z;
+    }
+}
+
 } // namespace
 
 bool check_tokens(const int32_t * tok, int32_t rows) {
@@ -102,10 +146,15 @@ bool check_tokens(const int32_t * tok, int32_t rows) {
 }
 
 bool embed(int32_t rows, const args & a, void * stream) {
-    if (rows < 1 || rows > max_rows || a.table == nullptr || !al16(a.grids) || a.tok == nullptr || !al16(a.hres) ||
-        !al16(a.hpost) || !al16(a.hx) || a.err == nullptr || stream == nullptr) {
+    if (rows < 1 || rows > max_rows || a.table == nullptr || (!a.q8 && !al16(a.grids)) || a.tok == nullptr ||
+        !al16(a.hres) || !al16(a.hpost) || !al16(a.hx) || a.err == nullptr || stream == nullptr) {
         fprintf(stderr, "embed: rejected (rows %d, or a null or misaligned pointer)\n", rows);
         return false;
+    }
+    if (a.q8) {
+        embed_q8_kernel<<<rows, n_threads, 0, static_cast<cudaStream_t>(stream)>>>(a.table, a.tok, a.hres, a.hpost,
+                                                                                   a.hx, a.err);
+        return cudaPeekAtLastError() == cudaSuccess;
     }
     embed_kernel<<<rows, n_threads, 0, static_cast<cudaStream_t>(stream)>>>(
         a.table, reinterpret_cast<const uint32_t *>(a.grids), a.tok, a.hres, a.hpost, a.hx, a.err);

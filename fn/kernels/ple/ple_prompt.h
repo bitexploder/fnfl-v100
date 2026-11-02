@@ -31,6 +31,7 @@ struct prompt_weights {
     const float *    norm_query[2] = { nullptr, nullptr };
     const float *    norm_conv[2]  = { nullptr, nullptr };
     const uint16_t * conv[2]       = { nullptr, nullptr };  // [5120][4] F16
+    bool             conv32        = false;                 // TTTS2: conv[] point at F32 [5120][4] (UD-Q4_K_XL)
 };
 
 struct prompt_args {

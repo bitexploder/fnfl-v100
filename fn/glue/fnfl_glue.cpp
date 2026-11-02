@@ -6,11 +6,16 @@
 #include "fn/loader/run_load.h"
 #include "fn/model/kv_pool.h"
 #include "fn/model/model.h"
+#include "fn/model/prompt.h"
 #include "fn/model/shapes.h"
 #include "fn/runtime/expert_cache.h"
+#include "fn/runtime/nvtx.h"
+#include "fn/runtime/ple_host.h"
 #include "fn/runtime/runtime.h"
 #include "fn/runtime/stage.h"
+#include "fn/vision/image.h"
 #include "fn/xchg/link.h"
+#include "fn/xchg/slow.h"
 
 #include <cuda_runtime_api.h>
 
@@ -24,7 +29,7 @@ static_assert(sizeof(fnfl_step_result::tokens) / sizeof(int32_t) == fn::runtime:
 namespace {
 
 // the draft subset when the server names none (DR1 Stage C's)
-constexpr const char * default_subset = "/home/jeremy/src/flashnext/work/DR1/stageC/subset/draft-subset.ids";
+constexpr const char * default_subset = "~/src/flashnext/work/DR1/stageC/subset/draft-subset.ids";
 
 } // namespace
 
@@ -43,21 +48,18 @@ struct fnfl_split_side {
             pipe->settle_all();
             lead.bye();
         }
-    }
-
-    // a call naming slot: its group in flight ends first, and a finished step not yet taken is dropped (the shell
-    // only names a slot between its requests or after its step's result)
-    void settle(int32_t slot) {
-        if (pipe != nullptr) {
-            pipe->settle(slot);
-            pipe->forget(slot);
-        }
+        // TTTSBS: the link stops before the members go (every operation ended, the ranges unmapped after the
+        // transport's quiescence): the crossing's and the slots' pinned buffers are freed with no operation on them
+        link.stop();
     }
 };
 
 struct fnfl_engine {
     fn::runtime::engine rt;
     std::unique_ptr<fnfl_split_side> split;
+    // APF1: the last paced read step's decision (fnfl_pace_last), and when it was taken (the books' clock)
+    fn::runtime::pace::decision      last_pace;
+    double                           last_pace_t = -1;
 };
 
 static fnfl_status to_status(fn::runtime::run_status s) {
@@ -411,6 +413,7 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
     // SP2's switch: dense (DA-TC) unless the server names sparse
     c.draft.attention = params.config.draft_attention.empty() ? "dense" : params.config.draft_attention;
     c.spec_d = params.config.spec_d;
+    c.small_read_rows = params.config.small_read_rows;  // MUP1
     c.draft.subset = params.config.draft_subset.empty() ? default_subset : params.config.draft_subset;
     c.eog = params.eog_ids;
     for (const int32_t id : params.config.test_eog) {
@@ -438,6 +441,8 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
     lp.kv_window = sv.kv_window; // ME3: --fnfl-kv-window
     lp.kv_q8 = kv_q8;            // KV8
     lp.pool_cells = pool_cells;
+    lp.mmproj       = params.config.mmproj;  // VIS1 Stage B
+    c.mmproj        = params.config.mmproj;
     auto e          = std::make_unique<fnfl_engine>();
     if (split_k != 0) {
         // TTTS1: this box the front: layers 0 .. k - 1 (with the embeddings; the head and the draft are the back's)
@@ -474,6 +479,15 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
     for (const std::string & line : fn::loader::ple_table_lines(lr)) {
         fprintf(stderr, "FNFL: %s\n", line.c_str());
     }
+    // STALL: a lazy table is read in behind the server, so a prompt's gather does not wait on the disk
+    fprintf(stderr, "FNFL: --fnfl-ple-warm %s\n", params.config.ple_warm ? "on (default)" : "off");
+    if (lp.ple_table == fn::runtime::ple_residency::lazy && params.config.ple_warm && m->ple_table != nullptr &&
+        m->ple_bytes > 0) {
+        auto warm = std::make_shared<fn::runtime::ple_warm>();
+        if (warm->start(m->ple_table, m->ple_bytes, true)) {
+            m->ple_warm = warm;
+        }
+    }
     fprintf(stderr, "FNFL: %s\n", fn::loader::draft_expert_line(*m).c_str()); // ME7
     fprintf(stderr, "FNFL: %s\n", fn::loader::router_f16_line(*m).c_str());   // FMS5
     if (!e->rt.init(std::move(m), c, err)) {
@@ -495,7 +509,7 @@ fnfl_engine * fnfl_load(const fnfl_load_params & params, fnfl_model_meta & meta,
         lk::set_text(lo.me.commit, sizeof lo.me.commit, params.config.split_commit);
         lk::set_text(lo.me.digest, sizeof lo.me.digest, params.config.split_digest);
         const std::string settings = st::hello_settings(split_k, params.n_parallel, c.n_ctx_slot, pool_cells, kv_q8,
-                                                        c.spec_d, c.draft.attention, c.eog);
+                                                        c.spec_d, c.draft.attention, c.eog, !c.mmproj.empty());
         lk::set_text(lo.me.model, sizeof lo.me.model,
                      st::hello_files(e->rt.test_model()) + "/" + st::hello_hash(settings));
         lo.me.split = split_k;
@@ -565,9 +579,9 @@ fnfl_status fnfl_set_sampling(fnfl_engine * engine, int32_t slot, const fnfl_sam
     o.sampling.request = 0;
     o.max_tokens = params.max_tokens;
     o.n_ctx = params.n_ctx;
+    o.ignore_eos = params.ignore_eos;
     if (engine->split != nullptr) {
-        engine->split->settle(slot);
-        const fnfl_status st = to_status(engine->split->lead.set_sampling(slot, o));
+        const fnfl_status st = to_status(engine->split->pipe->set_sampling(slot, o));
         if (st != FNFL_OK) {
             err = engine->split->lead.error();
         }
@@ -580,11 +594,92 @@ fnfl_status fnfl_set_sampling(fnfl_engine * engine, int32_t slot, const fnfl_sam
     return st;
 }
 
+struct fnfl_image {
+    std::shared_ptr<const fn::vision::prepared> p;
+};
+
+int32_t fnfl_image_token() {
+    return fn::runtime::image_token;
+}
+
+fnfl_image * fnfl_image_prepare(const uint8_t *           data,
+                                size_t                    n,
+                                const fnfl_image_limits & limits,
+                                fnfl_image_info &         info,
+                                std::string &             err) {
+    info = fnfl_image_info();
+    fn::vision::limits lim;
+    lim.max_bytes              = limits.max_bytes;
+    lim.max_decoded            = limits.max_decoded;
+    lim.max_side               = limits.max_side;
+    lim.max_images             = limits.max_images;
+    auto                     p = std::make_shared<fn::vision::prepared>();
+    const fn::vision::status s = fn::vision::prepare(data, n, lim, *p);
+    if (s != fn::vision::status::ok) {
+        err = fn::vision::status_text(s);
+        return nullptr;
+    }
+    info.nx        = p->nx;
+    info.ny        = p->ny;
+    info.width     = p->src.w;
+    info.height    = p->src.h;
+    info.resized_w = p->size.w;
+    info.resized_h = p->size.h;
+    auto * out     = new fnfl_image;
+    out->p         = std::move(p);
+    return out;
+}
+
+void fnfl_image_free(fnfl_image * image) {
+    delete image;
+}
+
+bool fnfl_vision(const fnfl_engine * engine) {
+    return engine != nullptr && !engine->rt.config().mmproj.empty();
+}
+
+namespace {
+
+// the read's images as the engine takes them (null: none)
+bool prompt_images(const fnfl_prompt_image * images, int32_t n_images, std::vector<fn::runtime::prompt_image> & out) {
+    out.clear();
+    if (n_images < 0 || (n_images > 0 && images == nullptr)) {
+        return false;
+    }
+    for (int32_t i = 0; i < n_images; ++i) {
+        if (images[i].image == nullptr) {
+            return false;
+        }
+        fn::runtime::prompt_image pi;
+        pi.span.cell = images[i].cell;
+        pi.img       = images[i].image->p;
+        out.push_back(std::move(pi));
+    }
+    return true;
+}
+
+}  // namespace
+
 fnfl_status fnfl_prefill(fnfl_engine * engine, int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse,
                          int32_t * n_processed, fnfl_progress progress, void * user) {
-    if (engine == nullptr) {
+    return fnfl_prefill_images(engine, slot, tokens, n_tokens, n_reuse, nullptr, 0, n_processed, progress, user);
+}
+
+fnfl_status fnfl_prefill_images(fnfl_engine *             engine,
+                                int32_t                   slot,
+                                const int32_t *           tokens,
+                                int32_t                   n_tokens,
+                                int32_t                   n_reuse,
+                                const fnfl_prompt_image * images,
+                                int32_t                   n_images,
+                                int32_t *                 n_processed,
+                                fnfl_progress             progress,
+                                void *                    user) {
+    std::vector<fn::runtime::prompt_image> im;
+    if (engine == nullptr || !prompt_images(images, n_images, im)) {
         return FNFL_BAD_REQUEST;
     }
+    const std::vector<fn::runtime::prompt_image> * imp = im.empty() ? nullptr : &im;
     int32_t n = 0;
     fn::runtime::prefill_progress on_chunk;
     if (progress != nullptr) {
@@ -593,10 +688,9 @@ fnfl_status fnfl_prefill(fnfl_engine * engine, int32_t slot, const int32_t * tok
         };
     }
     // TTTS1: the split reads the prompt on both boxes (no progress calls: its chunks cross to the follower)
-    const fnfl_status st =
-        engine->split != nullptr ?
-            (engine->split->settle(slot), to_status(engine->split->lead.prefill(slot, tokens, n_tokens, n_reuse, n))) :
-            to_status(engine->rt.prefill(slot, tokens, n_tokens, n_reuse, n, on_chunk));
+    const fnfl_status st = engine->split != nullptr ?
+                               to_status(engine->split->pipe->prefill(slot, tokens, n_tokens, n_reuse, n, imp)) :
+                               to_status(engine->rt.prefill(slot, tokens, n_tokens, n_reuse, n, on_chunk, imp));
     if (n_processed != nullptr) {
         *n_processed = n;
     }
@@ -610,9 +704,8 @@ fnfl_status fnfl_step(fnfl_engine * engine, int32_t slot, fnfl_step_result & res
     }
     if (engine->split != nullptr) {
         // one slot's step on the split: a group of one, synchronous
-        engine->split->settle(slot);
         fn::runtime::joint_step_out out;
-        engine->split->lead.step_group(&slot, 1, &out);
+        engine->split->pipe->step_one(slot, out);
         for (int32_t j = 0; j < out.n_out; ++j) {
             result.tokens[j] = out.out[j];
         }
@@ -629,15 +722,18 @@ fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t
         n < 1 || n > 4) {
         return FNFL_BAD_REQUEST;
     }
-    fn::runtime::joint_step_out out[4];
     if (engine->split != nullptr) {
+        // TTTS8: the split steps its writers through fnfl_step_pipe (and a lone one through fnfl_step); a joint call
+        // here would bypass the pipeline's finished steps, so it is refused, never run
         for (int32_t k = 0; k < n; ++k) {
-            engine->split->settle(slots[k]);
+            results[k] = fnfl_step_result();
+            status[k]  = FNFL_BAD_REQUEST;
+            errors[k]  = "fnfl_step_joint on the split: its writers step through fnfl_step_pipe";
         }
-        engine->split->lead.step_group(slots, n, out);
-    } else {
-        engine->rt.step_joint(slots, n, out);
+        return FNFL_BAD_REQUEST;
     }
+    fn::runtime::joint_step_out out[4];
+    engine->rt.step_joint(slots, n, out);
     for (int32_t k = 0; k < n; ++k) {
         results[k] = fnfl_step_result();
         for (int32_t j = 0; j < out[k].n_out; ++j) {
@@ -649,6 +745,14 @@ fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t
         errors[k]           = out[k].why;
     }
     return FNFL_OK;
+}
+
+void fnfl_range_push(const char * name) {
+    nvtxRangePushA(name);
+}
+
+void fnfl_range_pop() {
+    nvtxRangePop();
 }
 
 bool fnfl_is_split(const fnfl_engine * engine) {
@@ -666,6 +770,7 @@ fnfl_status fnfl_step_pipe(fnfl_engine *      engine,
         errors == nullptr || done == nullptr || n < 1 || n > fn::runtime::max_split_slots) {
         return FNFL_BAD_REQUEST;
     }
+    fn::runtime::nvtx_range     nr("fnfl.step_pipe");
     fn::runtime::joint_step_out out[fn::runtime::max_split_slots];
     bool                        fin[fn::runtime::max_split_slots] = {};
     engine->split->pipe->step(slots, n, out, fin);
@@ -693,8 +798,7 @@ fnfl_status fnfl_truncate(fnfl_engine * engine, int32_t slot, int32_t n_keep) {
         return FNFL_BAD_REQUEST;
     }
     if (engine->split != nullptr) {
-        engine->split->settle(slot);
-        return to_status(engine->split->lead.truncate(slot, n_keep));
+        return to_status(engine->split->pipe->truncate(slot, n_keep));
     }
     return to_status(engine->rt.truncate(slot, n_keep));
 }
@@ -727,30 +831,36 @@ void fnfl_release(fnfl_engine * engine) {
 
 int32_t fnfl_read_begin(fnfl_engine * engine, int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse,
                         int32_t * n_processed) {
-    if (engine == nullptr) {
+    return fnfl_read_begin_images(engine, slot, tokens, n_tokens, n_reuse, nullptr, 0, n_processed);
+}
+
+int32_t fnfl_read_begin_images(fnfl_engine *             engine,
+                               int32_t                   slot,
+                               const int32_t *           tokens,
+                               int32_t                   n_tokens,
+                               int32_t                   n_reuse,
+                               const fnfl_prompt_image * images,
+                               int32_t                   n_images,
+                               int32_t *                 n_processed) {
+    std::vector<fn::runtime::prompt_image> im;
+    if (engine == nullptr || !prompt_images(images, n_images, im)) {
         return -1;
     }
-    int32_t n = 0;
-    if (engine->split != nullptr) {
-        engine->split->settle(slot);
-    }
-    const int32_t r = engine->split != nullptr ? engine->split->lead.read_begin(slot, tokens, n_tokens, n_reuse, n) :
-                                                 engine->rt.read_begin(slot, tokens, n_tokens, n_reuse, n);
+    const std::vector<fn::runtime::prompt_image> * imp = im.empty() ? nullptr : &im;
+    int32_t                                        n   = 0;
+    const int32_t r = engine->split != nullptr ?
+                          engine->split->pipe->read_begin(slot, tokens, n_tokens, n_reuse, n, imp) :
+                          engine->rt.read_begin(slot, tokens, n_tokens, n_reuse, n, imp);
     if (n_processed != nullptr) {
         *n_processed = n;
     }
     return r;
 }
 
-fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_groups, fnfl_read_mode mode) {
-    if (engine == nullptr) {
-        return FNFL_READ_ERROR;
-    }
-    const fn::runtime::read_mode m = mode == FNFL_READ_LONE      ? fn::runtime::read_mode::lone
-                                     : mode == FNFL_READ_WRITERS ? fn::runtime::read_mode::writers
-                                                                 : fn::runtime::read_mode::shared;
-    switch (engine->split != nullptr ? engine->split->lead.read_step(slot, n_groups, m) :
-                                       engine->rt.read_step(slot, n_groups, m)) {
+namespace {
+
+fnfl_read_status status_of(fn::runtime::read_status st) {
+    switch (st) {
         case fn::runtime::read_status::yielded:
             return FNFL_READ_YIELDED;
         case fn::runtime::read_status::chunk_done:
@@ -759,10 +869,125 @@ fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_gr
             return FNFL_READ_DONE;
         case fn::runtime::read_status::cancelled:
             return FNFL_READ_CANCELLED;
+        case fn::runtime::read_status::front_done:
+            return FNFL_READ_FRONT_DONE;
         case fn::runtime::read_status::error:
         default:
             return FNFL_READ_ERROR;
     }
+}
+
+fnfl_read_status read_step_of(fnfl_engine *                    engine,
+                              int32_t                          slot,
+                              int32_t                          n_groups,
+                              fn::runtime::read_mode           m,
+                              const fn::runtime::read_budget * b) {
+    return status_of(engine->split != nullptr ? engine->split->lead.read_step(slot, n_groups, m, b) :
+                                                engine->rt.read_step(slot, n_groups, m, b));
+}
+
+}  // namespace
+
+fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_groups, fnfl_read_mode mode) {
+    if (engine == nullptr) {
+        return FNFL_READ_ERROR;
+    }
+    const fn::runtime::read_mode m = mode == FNFL_READ_LONE    ? fn::runtime::read_mode::lone :
+                                     mode == FNFL_READ_WRITERS ? fn::runtime::read_mode::writers :
+                                                                 fn::runtime::read_mode::shared;
+    return read_step_of(engine, slot, n_groups, m, nullptr);
+}
+
+bool fnfl_writer_pause_valid(int64_t pause_ms) {
+    return fn::runtime::pace::pause_valid(pause_ms);
+}
+
+bool fnfl_set_writer_pause(fnfl_engine * engine, int32_t pause_ms) {
+    if (engine == nullptr || !fn::runtime::pace::pause_valid(pause_ms)) {
+        return false;
+    }
+    engine->rt.pacer().set_pause(pause_ms);
+    if (engine->split != nullptr) {
+        engine->split->pipe->pace().set_pause(pause_ms);  // the follower takes it from the next command
+    }
+    return true;
+}
+
+void fnfl_set_prompt_graphs(bool on) {
+    fn::model::prompt_graphs(on);
+}
+
+bool fnfl_prompt_graphs() {
+    return fn::model::prompt_graphs_on();
+}
+
+int32_t fnfl_writer_pause(const fnfl_engine * engine) {
+    if (engine == nullptr) {
+        return fn::runtime::pace::pause_default_ms;
+    }
+    return engine->split != nullptr ? engine->split->pipe->pace().pause() : engine->rt.pacer().pause();
+}
+
+fnfl_read_status fnfl_read_step_paced(fnfl_engine * engine, int32_t slot) {
+    namespace pace = fn::runtime::pace;
+    if (engine == nullptr) {
+        return FNFL_READ_ERROR;
+    }
+    // the owner's book: the split's front (its pipeline), or resident TP's engine
+    pace::pacer &            p = engine->split != nullptr ? engine->split->pipe->pace() : engine->rt.pacer();
+    fn::runtime::read_budget b;
+    b.pace_before                = p.totals();
+    const double         now     = pace::clock_ms();
+    const pace::decision d       = p.decide(now);
+    b.budget_ms                  = d.budget_ms;
+    b.known                      = d.known;
+    b.pause_ms                   = p.pause();
+    b.paced                      = true;
+    b.pace_after                 = p.totals();
+    engine->last_pace            = d;
+    engine->last_pace_t          = now;
+    // the read work inserted here, by kind: a small read whole, the progress unit alone past the budget, or units
+    // under it
+    const bool             small = engine->rt.small_read(slot);
+    const fnfl_read_status st    = read_step_of(engine, slot, 1, fn::runtime::read_mode::writers, &b);
+    fn::runtime::read_info ri;
+    const bool             minimum = engine->rt.get_read_info(slot, ri) && ri.last_minimum;
+    p.read_ran(now, pace::clock_ms(),
+               small   ? pace::read_kind::small :
+               minimum ? pace::read_kind::minimum :
+                         pace::read_kind::budgeted);
+    return st;
+}
+
+bool fnfl_pace_last(const fnfl_engine * engine, fnfl_pace_report & out) {
+    out = fnfl_pace_report();
+    if (engine == nullptr || engine->last_pace_t < 0) {
+        return false;
+    }
+    const fn::runtime::pace::decision & d = engine->last_pace;
+    out.known                             = d.known;
+    out.budget_ms                         = d.budget_ms;
+    out.slack_ms                          = d.slack_ms;
+    out.pause_ms                          = d.pause_ms;
+    out.group                             = d.group;
+    out.phase                             = fn::runtime::pace::phase_name(d.ph);
+    out.projected                         = d.projected;
+    out.since_c_ms                        = d.c_ms >= 0 ? engine->last_pace_t - d.c_ms : -1.0;
+    out.f_ms                              = d.f_ms;
+    out.b_ms                              = d.b_ms;
+    out.why                               = d.why;
+    return true;
+}
+
+bool fnfl_read_ready(fnfl_engine * engine, int32_t slot) {
+    return engine == nullptr || engine->split == nullptr || engine->split->lead.read_ready(slot);
+}
+
+fnfl_read_status fnfl_read_poll(fnfl_engine * engine, int32_t slot) {
+    if (engine == nullptr || engine->split == nullptr) {
+        return FNFL_READ_ERROR;  // only the split's leader returns FRONT_DONE
+    }
+    return status_of(engine->split->lead.read_poll(slot));
 }
 
 void fnfl_read_cancel(fnfl_engine * engine, int32_t slot) {
@@ -799,6 +1024,45 @@ bool fnfl_read_info(const fnfl_engine * engine, int32_t slot, fnfl_read_report &
     info.service_ms = r.service_s * 1e3;
     info.longest_step_ms = r.longest_step_s * 1e3;
     info.last_group_ms = r.last_group_s < 0 ? -1.0 : r.last_group_s * 1e3;
+    // MUP2 piece 4: the units account here (the front on the split) and the back's
+    const auto units     = [](const fn::runtime::read_info & x, fnfl_read_units & u) {
+        u.units       = x.units_run;
+        u.steps       = x.unit_steps;
+        u.most        = x.most_units;
+        u.floor_units = x.floor_units;
+        u.piece_min   = x.piece_min;
+        u.piece_max   = x.piece_max;
+        u.gpu_ms      = x.unit_ms;
+        u.floor_ms    = x.floor_ms;
+        u.budget_ms      = x.budget_n > 0 ? x.budget_ms_sum / x.budget_n : -1.0;
+        u.service_ms  = x.service_s * 1e3;
+        u.below_floor = x.below_floor;
+        u.budget_misses = x.budget_misses;
+        // APF1: P, the zero and unknown budgets, and the box's pacing over the read
+        u.pause_ms       = x.pause_ms;
+        u.budget_zero    = x.budget_zero;
+        u.budget_unknown = x.budget_unknown;
+        u.pace_steps     = x.pace_ns.steps;
+        u.pace_known     = x.pace_ns.known;
+        u.pace_zero      = x.pace_ns.zero;
+        u.pace_unknown   = x.pace_ns.unknown;
+        u.completions    = x.pace_ns.completions;
+        u.gaps           = x.pace_ns.gaps;
+        u.over           = x.pace_ns.over;
+        u.over_none      = x.pace_ns.over_none;
+        u.over_budgeted  = x.pace_ns.over_budgeted;
+        u.over_minimum   = x.pace_ns.over_minimum;
+        u.over_small     = x.pace_ns.over_small;
+        u.over_idle      = x.pace_ns.over_idle;
+        u.longest_gap_ms = x.pace_ns.longest_ms;
+        u.over_ms        = x.pace_ns.over_ms_sum;
+    };
+    units(r, info.here);
+    if (engine->split != nullptr) {
+        fn::runtime::read_info b;
+        engine->split->lead.back_info(slot, b);
+        units(b, info.back);
+    }
     return true;
 }
 
@@ -825,10 +1089,16 @@ int32_t fnfl_lane_owner(const fnfl_engine * engine, int32_t lane) {
 
 fnfl_status fnfl_release_slot(fnfl_engine * engine, int32_t slot) {
     if (engine != nullptr && engine->split != nullptr) {
-        engine->split->settle(slot);
-        return to_status(engine->split->lead.release_slot(slot));
+        return to_status(engine->split->pipe->release_slot(slot));
     }
     return engine == nullptr ? FNFL_BAD_REQUEST : to_status(engine->rt.release_slot(slot));
+}
+
+fnfl_status fnfl_set_pos_offset(fnfl_engine * engine, int32_t slot, int32_t off) {
+    if (engine != nullptr && engine->split != nullptr) {
+        return to_status(engine->split->pipe->set_pos_offset(slot, off));
+    }
+    return engine == nullptr ? FNFL_BAD_REQUEST : to_status(engine->rt.set_pos_offset(slot, off));
 }
 
 int32_t fnfl_slot_held(const fnfl_engine * engine, int32_t slot) {
@@ -852,4 +1122,12 @@ bool fnfl_pool(const fnfl_engine * engine, fnfl_pool_report & out) {
         out.busy[i] = p.busy[i];
     }
     return true;
+}
+
+void fnfl_trace_sink(void (*sink)(const char * line)) {
+    fn::xchg::slow::set_sink(sink);
+}
+
+void fnfl_trace_writers(uint64_t mask) {
+    fn::xchg::slow::set_writers(mask);
 }

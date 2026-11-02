@@ -1,13 +1,18 @@
 #include "fn/xchg/link_test.h"
 
+#include "fn/xchg/life.h"
 #include "fn/xchg/link.h"
 
-#include <cuda_runtime_api.h>
+#if !defined(FNFL_LINK_TEST_HOST_ONLY)
+#    include <cuda_runtime_api.h>
+#endif
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -101,6 +106,7 @@ struct ack_msg {
 
 static_assert(sizeof(ack_msg) == ack_bytes, "an X-ACK of the test is 64 bytes");
 
+#if !defined(FNFL_LINK_TEST_HOST_ONLY)
 bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     if (e != cudaSuccess) {
         err = std::string(what) + ": " + cudaGetErrorString(e);
@@ -108,12 +114,19 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     }
     return true;
 }
+#endif
+
+// TTTSBS --host: plain host memory, page aligned, no card
+uint8_t * host_alloc(size_t n) {
+    return static_cast<uint8_t *>(std::aligned_alloc(4096, (n + 4095) / 4096 * 4096));
+}
 
 struct bufs {
     uint8_t * dec        = nullptr;  // [slot][card][5 rows] pinned
     uint8_t * prm        = nullptr;  // [piece][1024 rows] pinned
     uint8_t * small      = nullptr;  // [3][8][512] pinned: step, ctrl, ack
     uint8_t * check      = nullptr;  // a piece's read-back, pinned
+    uint8_t * chunk      = nullptr;  // the time case's prompt chunk, pinned (freed after the link stops)
     uint8_t * dev_dec[2] = { nullptr, nullptr };
     uint8_t * dev_prm[2] = { nullptr, nullptr };
 
@@ -132,6 +145,24 @@ bool alloc(bufs & b, const test_options & o, link & lk, std::string & err) {
     const size_t dec_n = size_t(n_slot) * 2 * lane_rows * dec_row;
     const size_t prm_n = size_t(n_piece) * piece_rows * prm_row;
     const size_t sm_n  = 3 * 8 * small_bytes;
+    if (o.host) {
+        b.dec   = host_alloc(dec_n);
+        b.prm   = host_alloc(prm_n);
+        b.small = host_alloc(sm_n);
+        b.check = host_alloc(size_t(piece_rows) * prm_row);
+        if (b.dec == nullptr || b.prm == nullptr || b.small == nullptr || b.check == nullptr) {
+            err = "host buffers";
+            return false;
+        }
+        life::own(b.dec, dec_n, "link-test decode buffers");
+        life::own(b.prm, prm_n, "link-test prompt buffers");
+        life::own(b.small, sm_n, "link-test small buffers");
+        return lk.map(b.dec, dec_n, err) && lk.map(b.prm, prm_n, err) && lk.map(b.small, sm_n, err);
+    }
+#if defined(FNFL_LINK_TEST_HOST_ONLY)
+    err = "this build has no cards: --host";
+    return false;
+#else
     if (!cuda_ok(cudaSetDevice(o.device[0]), "cudaSetDevice", err) ||
         !cuda_ok(cudaHostAlloc(reinterpret_cast<void **>(&b.dec), dec_n, cudaHostAllocPortable), "pinned", err) ||
         !cuda_ok(cudaHostAlloc(reinterpret_cast<void **>(&b.prm), prm_n, cudaHostAllocPortable), "pinned", err) ||
@@ -152,10 +183,43 @@ bool alloc(bufs & b, const test_options & o, link & lk, std::string & err) {
         }
     }
     return lk.map(b.dec, dec_n, err) && lk.map(b.prm, prm_n, err) && lk.map(b.small, sm_n, err);
+#endif
 }
 
-void release(bufs & b) {
-    for (uint8_t * p : { b.dec, b.prm, b.small, b.check }) {
+// the time case's chunk (TTTS7), allocated as the other buffers are
+bool chunk_alloc(bufs & b, const test_options & o, size_t n, std::string & err) {
+    if (o.host) {
+        b.chunk = host_alloc(n);
+        if (b.chunk == nullptr) {
+            err = "host chunk";
+            return false;
+        }
+        life::own(b.chunk, n, "link-test chunk");
+        return true;
+    }
+#if defined(FNFL_LINK_TEST_HOST_ONLY)
+    err = "this build has no cards: --host";
+    return false;
+#else
+    return cuda_ok(cudaHostAlloc(reinterpret_cast<void **>(&b.chunk), n, cudaHostAllocPortable), "pinned chunk", err);
+#endif
+}
+
+// after the link stopped (its operations ended, its ranges unmapped)
+void release(bufs & b, const test_options & o) {
+    if (o.host) {
+        for (uint8_t * p : { b.dec, b.prm, b.small, b.chunk }) {
+            if (p != nullptr) {
+                life::disown(p, "link-test buffers");
+            }
+        }
+        for (uint8_t * p : { b.dec, b.prm, b.small, b.check, b.chunk }) {
+            std::free(p);
+        }
+        return;
+    }
+#if !defined(FNFL_LINK_TEST_HOST_ONLY)
+    for (uint8_t * p : { b.dec, b.prm, b.small, b.check, b.chunk }) {
         if (p != nullptr) {
             cudaFreeHost(p);
         }
@@ -167,6 +231,7 @@ void release(bufs & b) {
             }
         }
     }
+#endif
 }
 
 // the far card's check: host buffer -> card -> read back, then the bytes against the pattern
@@ -178,12 +243,23 @@ int64_t card_check(const bufs &         b,
                    size_t               n,
                    uint64_t             seed,
                    std::string &        err) {
+    if (o.host) {
+        (void) b;
+        (void) card;
+        (void) dev;
+        return mismatches(src, n, seed);  // --host: the received bytes themselves
+    }
+#if defined(FNFL_LINK_TEST_HOST_ONLY)
+    err = "this build has no cards";
+    return -1;
+#else
     if (!cuda_ok(cudaSetDevice(o.device[card]), "cudaSetDevice", err) ||
         !cuda_ok(cudaMemcpy(dev, src, n, cudaMemcpyHostToDevice), "H2D", err) ||
         !cuda_ok(cudaMemcpy(b.check, dev, n, cudaMemcpyDeviceToHost), "D2H", err)) {
         return -1;
     }
     return mismatches(b.check, n, seed);
+#endif
 }
 
 struct runner {
@@ -193,19 +269,29 @@ struct runner {
     uint32_t             seq    = 1;
     int32_t              failed = 0;
     std::string          err;
+    int64_t              v0 = life::on ? life::get().violations : 0;  // TTTSBS: the ledger's count before the case
 
     bool on(const char * name) const {
         if (o.cases == "all") {
-            return true;
+            return std::string(name) != "time";  // TTTS7: the time case runs only when named
         }
         const std::string s = "," + o.cases + ",";
         return s.find("," + std::string(name) + ",") != std::string::npos;
     }
 
     void report(const char * name, bool ok, const std::string & what) {
+        int64_t v = 0;
+        if (life::on) {
+            v  = life::get().violations - v0;
+            v0 = life::get().violations;
+            ok = ok && v == 0;
+        }
         std::printf("link-test %s: %s: %s\n", o.leader ? "leader" : "follower", name, ok ? "PASS" : "FAIL");
         if (!what.empty()) {
             std::printf("  %s\n", what.c_str());
+        }
+        if (v > 0) {
+            std::printf("  %lld lifetime violations; last: %s\n", (long long) v, life::last().c_str());
         }
         std::fflush(stdout);
         failed += ok ? 0 : 1;
@@ -306,8 +392,9 @@ struct runner {
                 what = err;
             }
             report(name, ok && bad == 0 && refused == want_refused,
-                   std::to_string(msgs) + " messages compared on the cards, " + std::to_string(bad) +
-                       " mismatched words; refused " + std::to_string(refused) + (what.empty() ? "" : "; " + what));
+                   std::to_string(msgs) + " messages compared on the " + (o.host ? "host" : "cards") + ", " +
+                       std::to_string(bad) + " mismatched words; refused " + std::to_string(refused) +
+                       (what.empty() ? "" : "; " + what));
             return;
         }
         ack_msg    a;
@@ -542,6 +629,259 @@ struct runner {
         verdict("refuse", cid, ok, 0, 3, refused, 3);
     }
 
+    // ---- retire (TTTSBS): a receive whose wait timed out has ended before the wait returns ----
+    // The leader's receive of tag A times out with nothing sent; its buffer is then the leader's again (reused at
+    // once, the ledger checking). Only then does the follower send A and B: A must arrive unexpected (no receive
+    // left for it), the timed-out buffer keeps the leader's bytes, and A itself is intact when received afresh.
+    void retire() {
+        const uint32_t cid = 6;
+        const uint32_t s   = seq;
+        seq += 3;
+        const uint64_t   ta = make_tag(kind::test, 1, s, 0), tb = make_tag(kind::test, 1, s + 1, 0);
+        const uint64_t   go = make_tag(kind::test, 2, s + 2, 0);
+        constexpr size_t n  = 4096;
+        if (o.leader) {
+            uint8_t * buf = b.lane(0, 0);
+            fill(buf, n, seed_of(23, s, 0, 0, 0));
+            std::string   e;
+            const int32_t op = lk.recv(ta, buf, n, e);
+            const bool    w  = op >= 0 && lk.wait(op, e, 0.3);
+            life::reuse(buf, n, "link-test receive buffer (after its timed-out wait)");
+            const int32_t held  = lk.held();
+            const int32_t g     = lk.send(go, b.sm(1, 0), 8, err);
+            bool          ok    = !w && held == 0 && g >= 0 && lk.wait(g, err);
+            const int32_t rb    = ok ? lk.recv(tb, b.lane(1, 0), 64, err) : -1;
+            ok                  = ok && rb >= 0 && lk.wait(rb, err);
+            uint64_t      ut    = 0;
+            size_t        ub    = 0;
+            const bool    unexp = ok && lk.unexpected(ut, ub) && ut == ta && ub == n;
+            const bool    guard = mismatches(buf, n, seed_of(23, s, 0, 0, 0)) == 0;
+            const int32_t ra    = unexp ? lk.recv(ta, b.lane(2, 0), n, err) : -1;
+            const bool a_ok = ra >= 0 && lk.wait(ra, err) && mismatches(b.lane(2, 0), n, seed_of(29, s, 0, 0, 0)) == 0;
+            ok              = ok && unexp && guard && a_ok;
+            err = std::string("the timed-out wait ") + (w ? "succeeded" : "failed: " + e) + "; held after it " +
+                  std::to_string(held) + "; A " + (unexp ? "arrived unexpected" : "was not unexpected") +
+                  "; the buffer " + (guard ? "kept the leader's bytes" : "was written") + "; A received afresh " +
+                  (a_ok ? "intact" : "not intact") + (ok ? "" : "; " + err);
+            verdict("retire", cid, ok, 0, 0, 0, 0);
+            return;
+        }
+        const int32_t g  = lk.recv(go, b.sm(1, 0), 8, err);
+        bool          ok = g >= 0 && lk.wait(g, err);
+        fill(b.lane(0, 0), n, seed_of(29, s, 0, 0, 0));
+        fill(b.lane(1, 0), 64, seed_of(31, s, 0, 0, 0));
+        const int32_t sa = ok ? lk.send(ta, b.lane(0, 0), n, err) : -1;
+        const int32_t sb = ok ? lk.send(tb, b.lane(1, 0), 64, err) : -1;
+        ok               = ok && sa >= 0 && sb >= 0 && lk.wait(sa, err) && lk.wait(sb, err);
+        verdict("retire", cid, ok, 0, 2, 0, 0);
+    }
+
+    // ---- the end (TTTSBS): the follower stays until the leader holds every verdict ----
+    // A follower that stopped right after its last X-ACK could close the link before a slow leader (a sanitizer
+    // build) posted that acknowledgment's receive, and a post after the peer's loss is refused even when the bytes
+    // came. The follower's receive of one closing message is posted first; the leader sends it after its last
+    // verdict; then both stop
+    bool finish() {
+        const uint64_t t = make_tag(kind::test, 4, seq++, 0);
+        std::string    e;
+        int32_t        op = -1;
+        bool           ok = false;
+        if (o.leader) {
+            op = lk.send(t, b.sm(1, 0), 8, e);
+            ok = op >= 0 && lk.wait(op, e);
+        } else {
+            op = lk.recv(t, b.sm(1, 0), 8, e);
+            ok = op >= 0 && lk.wait(op, e, 3 * o.timeout_s + 4.0);
+        }
+        if (!ok) {
+            report("end", false, "the closing message: " + e);
+        }
+        return ok;
+    }
+
+    // ---- stop (TTTSBS; only when named, it ends the link): teardown with operations outstanding ----
+    // The leader leaves a receive nobody answers and a 40 MiB send nobody receives on its mapped buffers, then stops
+    // its link: the stop ends both (observed) before it unmaps (the ledger checks), within its bound. The follower's
+    // wait ends with the leader's loss.
+    bool stop() {
+        const uint32_t s = seq;
+        seq += 3;
+        const auto t0 = clk::now();
+        if (o.leader) {
+            std::string   e;
+            const int32_t r = lk.recv(make_tag(kind::test, 3, s, 0), b.lane(3, 0), 1024, e);
+            const int32_t w = lk.send(make_tag(kind::test, 3, s + 1, 0), b.piece(0), size_t(piece_rows) * prm_row, e);
+            lk.stop();
+            const double  t    = since(t0);
+            const int32_t held = lk.held();
+            const bool    ok   = r >= 0 && w >= 0 && held == 0 && t <= 3 * o.timeout_s + 4.0;
+            report("stop", ok,
+                   "a receive and a 40 MiB send outstanding; the stop ended them before unmapping; held after " +
+                       std::to_string(held) +
+                       (t <= 3 * o.timeout_s + 4.0 ? "; within its bound" : "; beyond its bound"));
+            return ok;
+        }
+        std::string   e;
+        const int32_t r  = lk.recv(make_tag(kind::test, 3, s + 2, 0), b.lane(3, 0), 1024, e);
+        const bool    w  = r >= 0 && lk.wait(r, e, 3 * o.timeout_s + 4.0);
+        const bool    ok = !w && (e.find("lost") != std::string::npos || e.find("no completion") != std::string::npos);
+        report("stop", ok, "the follower's wait ended with the leader's stop: " + e);
+        return ok;
+    }
+
+    // ---- time (TTTS7): a step group's hand-off at U = 2 and 4, and a prompt chunk's crossing ----
+    static std::string stats(std::vector<double> v, double scale, const char * unit) {
+        std::sort(v.begin(), v.end());
+        double sum = 0;
+        for (double x : v) {
+            sum += x;
+        }
+        const auto at = [&v](double q) {
+            return v[std::min(v.size() - 1, size_t(q * double(v.size() - 1) + 0.5))];
+        };
+        char line[256];
+        std::snprintf(line, sizeof line, "median %.1f %s, p10 %.1f, p90 %.1f, min %.1f, max %.1f, mean %.1f (n %zu)",
+                      at(0.5) * scale, unit, at(0.1) * scale, at(0.9) * scale, v.front() * scale, v.back() * scale,
+                      sum / double(v.size()) * scale, v.size());
+        return line;
+    }
+
+    void timing() {
+        const uint32_t cid  = 7;
+        bool           ok   = true;
+        int64_t        msgs = 0;
+        const int64_t  lane = o.row_bytes * o.time_rows;
+        if (o.time_rows < 1 || o.time_rows > lane_rows || o.row_bytes > int64_t(dec_row) ||
+            o.ctrl_bytes > int64_t(small_bytes) || o.step_bytes > int64_t(small_bytes) || o.head_bytes > 64 ||
+            o.chunk_bytes < 1 || o.piece_bytes < 1) {
+            err = "time: sizes outside the test's buffers";
+            verdict("time", cid, false, 0, 0, 0, 0);
+            return;
+        }
+        // the records: X-CTRL in sm(1, 0), X-STEP member k in sm(0, k), the chunk's head in sm(2, 7)
+        for (int32_t U : { 2, 4 }) {
+            std::vector<double> t;
+            for (int32_t i = 0; i < o.warm_rounds + o.rounds && ok; ++i) {
+                const uint32_t s = seq++;
+                const int32_t  g = i % 2;  // the two pipelined groups' slots: 0 .. 3 and 4 .. 7
+                int32_t        ops[2 * 4 + 4 + 1];
+                int32_t        n = 0;
+                if (o.leader) {
+                    const auto t0 = clk::now();
+                    for (int32_t k = 0; k < U; ++k) {
+                        ops[n++] = lk.recv(make_tag(kind::step, uint8_t(g), s, 0, uint8_t(g * 4 + k)), b.sm(0, k),
+                                           size_t(o.step_bytes), err);
+                    }
+                    ops[n++] = lk.send(make_tag(kind::ctrl, 0, s, 0), b.sm(1, 0), size_t(o.ctrl_bytes), err);
+                    for (int32_t k = 0; k < U; ++k) {
+                        for (int32_t c = 0; c < 2; ++c) {
+                            const int32_t slot = g * 4 + k;
+                            ops[n++] = lk.send(make_tag(kind::boundary, uint8_t(g), s, uint8_t(c), uint8_t(slot)),
+                                               b.lane(slot, c), size_t(lane), err);
+                        }
+                    }
+                    // the sends first (the leader's group end waits them first), then the answers
+                    for (int32_t q = U; q < n && ok; ++q) {
+                        ok = ops[q] >= 0 && lk.wait(ops[q], err);
+                    }
+                    for (int32_t q = 0; q < U && ok; ++q) {
+                        ok = ops[q] >= 0 && lk.wait(ops[q], err);
+                    }
+                    if (i >= o.warm_rounds) {
+                        t.push_back(since(t0));
+                    }
+                    continue;
+                }
+                const int32_t c0 = lk.recv(make_tag(kind::ctrl, 0, s, 0), b.sm(1, 0), size_t(o.ctrl_bytes), err);
+                ok               = c0 >= 0 && lk.wait(c0, err, 60.0);
+                for (int32_t k = 0; k < U && ok; ++k) {
+                    for (int32_t c = 0; c < 2; ++c) {
+                        const int32_t slot = g * 4 + k;
+                        ops[n++]           = lk.recv(make_tag(kind::boundary, uint8_t(g), s, uint8_t(c), uint8_t(slot)),
+                                                     b.lane(slot, c), size_t(lane), err);
+                    }
+                }
+                for (int32_t q = 0; q < n && ok; ++q) {
+                    ok = ops[q] >= 0 && lk.wait(ops[q], err);
+                }
+                n = 0;
+                for (int32_t k = 0; k < U && ok; ++k) {
+                    ops[n++] = lk.send(make_tag(kind::step, uint8_t(g), s, 0, uint8_t(g * 4 + k)), b.sm(0, k),
+                                       size_t(o.step_bytes), err);
+                }
+                for (int32_t q = 0; q < n && ok; ++q) {
+                    ok = ops[q] >= 0 && lk.wait(ops[q], err);
+                }
+                msgs += ok ? 1 + 2 * U : 0;
+            }
+            if (o.leader && ok) {
+                const int64_t bytes = o.ctrl_bytes + 2 * U * lane + U * o.step_bytes;
+                std::printf(
+                    "link-test leader: time: hand-off U %d, R %d: %lld bytes a round (X-CTRL %lld; %d "
+                    "X-BOUNDARY of %lld; %d X-STEP of %lld); round trip %s; untimed %d first\n",
+                    U, o.time_rows, (long long) bytes, (long long) o.ctrl_bytes, 2 * U, (long long) lane, U,
+                    (long long) o.step_bytes, stats(t, 1e6, "us").c_str(), o.warm_rounds);
+                std::fflush(stdout);
+            }
+        }
+        // a prompt chunk's crossing, through one pinned and mapped buffer of the chunk's bytes on each side
+        ok = ok && chunk_alloc(b, o, size_t(o.chunk_bytes), err) && lk.map(b.chunk, size_t(o.chunk_bytes), err);
+        uint8_t * const     chunk  = b.chunk;
+        const int32_t       pieces = int32_t((o.chunk_bytes + o.piece_bytes - 1) / o.piece_bytes);
+        std::vector<double> t;
+        for (int32_t i = 0; i < o.warm_chunks + o.chunks && ok; ++i) {
+            const uint32_t       s = seq++;
+            std::vector<int32_t> ops;
+            const uint64_t       th = make_tag(kind::prompt, 2, s, 0, 255);
+            const uint64_t       ta = make_tag(kind::ack, 10, s, 0);
+            if (o.leader) {
+                const auto    t0 = clk::now();
+                const int32_t a  = lk.recv(ta, b.sm(2, 6), 8, err);
+                const int32_t h  = lk.send(th, b.sm(2, 7), size_t(o.head_bytes), err);
+                ok               = a >= 0 && h >= 0 && lk.wait(h, err);
+                for (int32_t q = 0; q < pieces && ok; ++q) {
+                    const int64_t at = int64_t(q) * o.piece_bytes;
+                    ops.push_back(lk.send(make_tag(kind::prompt, 2, s, 0, uint8_t(q)), chunk + at,
+                                          size_t(std::min(o.piece_bytes, o.chunk_bytes - at)), err));
+                }
+                for (int32_t op : ops) {
+                    ok = ok && op >= 0 && lk.wait(op, err, 60.0);
+                }
+                ok = ok && lk.wait(a, err, 60.0);
+                if (i >= o.warm_chunks && ok) {
+                    t.push_back(since(t0));
+                }
+                continue;
+            }
+            const int32_t h = lk.recv(th, b.sm(2, 7), size_t(o.head_bytes), err);
+            ok              = h >= 0 && lk.wait(h, err, 60.0);
+            for (int32_t q = 0; q < pieces && ok; ++q) {
+                const int64_t at = int64_t(q) * o.piece_bytes;
+                ops.push_back(lk.recv(make_tag(kind::prompt, 2, s, 0, uint8_t(q)), chunk + at,
+                                      size_t(std::min(o.piece_bytes, o.chunk_bytes - at)), err));
+            }
+            for (int32_t op : ops) {
+                ok = ok && op >= 0 && lk.wait(op, err, 60.0);
+            }
+            const int32_t a = ok ? lk.send(ta, b.sm(2, 6), 8, err) : -1;
+            ok              = ok && a >= 0 && lk.wait(a, err);
+            msgs += ok ? 1 + pieces : 0;
+        }
+        if (o.leader && ok) {
+            std::vector<double> gbs;
+            for (double x : t) {
+                gbs.push_back(double(o.chunk_bytes) / x * 1e-9);
+            }
+            std::printf(
+                "link-test leader: time: prompt chunk: %lld bytes (a head of %lld, then %d pieces of at most "
+                "%lld), head to the follower's acknowledgment: %s; that is %s; untimed %d first\n",
+                (long long) o.chunk_bytes, (long long) o.head_bytes, pieces, (long long) o.piece_bytes,
+                stats(t, 1e3, "ms").c_str(), stats(gbs, 1.0, "GB/s").c_str(), o.warm_chunks);
+            std::fflush(stdout);
+        }
+        verdict("time", cid, ok, 0, msgs, 0, 0);
+    }
+
     // ---- kill: the follower ends itself mid-transfer; the leader's waits end within their bound ----
     void kill() {
         const uint32_t s    = seq++;
@@ -624,16 +964,19 @@ int run_test(const test_options & o) {
         std::printf("link-test: connect: FAIL\n  %s\n", err.c_str());
         return 1;
     }
-    const bool rc = lk.transport().find("rc_mlx5") != std::string::npos;
+    const bool rc = o.host || lk.transport().find("rc_mlx5") != std::string::npos;
     std::printf("link-test %s: connect: PASS (X-HELLO both ways)\nlink-test transport: %s\n",
                 o.leader ? "leader" : "follower", lk.transport().c_str());
     std::printf("link-test %s: transport line rc_mlx5: %s\n", o.leader ? "leader" : "follower",
-                rc ? "PASS" : "FAIL (not rc_mlx5)");
+                o.host ? "not required (--host)" :
+                rc     ? "PASS" :
+                         "FAIL (not rc_mlx5)");
     std::fflush(stdout);
     bufs b;
     if (!alloc(b, o, lk, err)) {
         std::printf("link-test: buffers: FAIL\n  %s\n", err.c_str());
-        release(b);
+        lk.stop();
+        release(b, o);
         return 1;
     }
     runner r{ o, lk, b, 1, 0, std::string() };
@@ -653,8 +996,19 @@ int run_test(const test_options & o) {
     if (r.on("refuse")) {
         r.refuse();
     }
-    if (r.on("kill")) {
+    if (r.on("retire")) {
+        r.retire();
+    }
+    if (r.on("time")) {
+        r.timing();
+    }
+    const bool named_stop = ("," + o.cases + ",").find(",stop,") != std::string::npos;
+    if (named_stop) {
+        r.stop();
+    } else if (r.on("kill")) {
         r.kill();
+    } else {
+        r.finish();  // the link stays up until the leader has every verdict
     }
     const counters t = lk.totals();
     std::printf("link-test %s: link totals: sent %llu messages / %llu bytes, received %llu messages / %llu bytes\n",
@@ -664,7 +1018,14 @@ int run_test(const test_options & o) {
                 r.failed);
     std::fflush(stdout);
     lk.stop();
-    release(b);
+    release(b, o);
+    if (life::on) {
+        const life::totals t = life::get();
+        std::printf("link-test %s: ledger: %lld uses, %lld ended, %lld violations; live users %lld, live owners %lld\n",
+                    o.leader ? "leader" : "follower", (long long) t.uses, (long long) t.dones, (long long) t.violations,
+                    (long long) t.live_users, (long long) t.live_owners);
+        r.failed += t.violations > 0 || t.live_users > 0 || t.live_owners > 0 ? 1 : 0;
+    }
     return r.failed == 0 ? 0 : 1;
 }
 

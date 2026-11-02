@@ -84,13 +84,13 @@ To stop the server, send it SIGTERM. Both cards should then return to 0 MiB.
   - `full` reads the whole table into RAM at startup and pins it there. That makes startup longer and needs about 27 GiB of free host memory.
   - Either way the results are the same; only timing differs.
 
-### Two machines (experimental, new in 0.3)
+### Two machines
 
-`--fnfl-split-layer K` (2 to 47; the default 0 is one machine) splits the model across two machines with two V100s each. This server runs layers 0 to K − 1. A second process, `fnfl-drive stage`, runs the rest, the output head and the draft on the other machine. Up to eight users run as two groups pipelined across the machines.
+`--fnfl-split-layer K` (2 to 47; the default 0 is one machine) splits the model across two machines with two V100s each. This server runs layers 0 to K - 1. A second process, `fnfl-drive stage`, runs the rest, the output head and the draft on the other machine. Up to eight users run as two groups pipelined across the machines.
 
-- `--fnfl-split-addr IP` and `--fnfl-split-port P` name the second process (default `10.25.0.2:13371`). The link uses UCX.
+- `--fnfl-split-addr IP` and `--fnfl-split-port P` name the second process (default `10.25.0.2:13371`).
 - `--fnfl-split-commit HEX` and `--fnfl-split-digest HEX` are build identities that both sides must agree on when they connect.
-- In 0.3 the second process loads the model from a fixed path on the development machine, so the split is not yet usable elsewhere. [`fn/tools/fnfl-serve.sh`](../../fn/tools/fnfl-serve.sh) `start --split` shows how it is launched there.
+- Since 0.4 the second process takes its model path, so the split runs on other machines too. [Two machines: the production launch](#two-machines-the-production-launch) has the launch, its defaults and the link's checks.
 
 ### Test switches
 
@@ -105,7 +105,7 @@ These exist for the engine's own checks and are not for serving.
 The server stops at load with a message for:
 
 - `--embedding` or `--rerank`
-- `--mmproj` (multimodal input)
+- `--mmproj` with any projector other than the model's own `mmproj-BF16.gguf`, or `--mmproj-url`
 - `--lora`
 
 ### Accepted but without effect
@@ -292,6 +292,88 @@ FNFL request: ended eog; steps 8098 (bootstrap 1, speculative 8097, generate 0);
   - The [engine description](engine.md#memory) lists the parts.
 - **The host** memory-maps the two model files, 75.8 GB. After the load, only the per-layer-embedding table (26.9 GiB) is still read. Its pages stay in the page cache while memory allows, or permanently with `--fnfl-ple-table full`. The server process itself uses well under 1 GiB of anonymous memory.
 
+## Two machines: the production launch
+
+The production configuration splits the model across two machines, each with two V100 32 GB cards, linked by an `mlx5` network adapter. The first machine runs `llama-server` with the model's first layers. The second runs the follower, `fnfl-drive stage`, with the remaining layers, the output head and the draft. Both machines run the same build. Requests go to the first machine's server as usual.
+
+[`fn/tools/fnfl-serve.sh`](../../fn/tools/fnfl-serve.sh) starts both from the first machine:
+
+```sh
+fn/tools/fnfl-serve.sh start --split
+```
+
+The script's model, draft, subset and lock paths are written for the development machines, so elsewhere it is a template.
+
+### Its defaults
+
+- **The file:** Unsloth's `UD-Q4_K_XL` quantization (four shards, `Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf`), the same path on both machines. The startup line `fnfl-serve: model <file>` names it. `MODEL` overrides it. A one-machine `start` still defaults to the IQ3_XXS file.
+- **The split:** layers 0 to 25 on the first machine, 26 to 47 on the second (`--split-layer K`).
+- **Slots:** 8 (`--slots N`, 1 to 8). The generating slots step in two pipelined groups, so each machine computes one group while the other machine computes the other.
+- **Proposals a step:** 2 (`--spec-d N`, 1 to 4), with sparse draft attention (`--draft-attention`).
+- **The KV pool:** 1,343,488 cells of 8-bit KV, shared by the slots. Each slot's conversation can reach 262,144 tokens. `CTX` sets another pool.
+- **The writers' pause:** 100 ms. While a prompt is read beside generating slots, each machine runs read units only before the latest start that keeps every group of generating users' next completed step within P ms of its last one. It is a best-effort target, not a bound: the smallest read unit, a small prompt read whole or a mispredicted unit can pass it, and the logs count each overrun with its reason. Set it at launch with `EXTRA_ARGS="--fnfl-writer-pause-ms P"` (an integer from 10 to 1000), or live with `POST /props` and `{"tu": {"writer_pause_ms": P}}`.
+- **Small prompts:** beside generating slots, a read of at most 512 new tokens runs in one step on each machine; the writers pause once for it (`--fnfl-small-read-rows N`, 0 turns it off).
+- **`/metrics`:** always on (`--metrics` is passed).
+
+The startup line `fnfl-serve: 8 slots, KV pool 1343488 cells, each slot's context 262144, ...` echoes the settings, and `start.txt` in `SERVE_DIR` records them.
+
+### The link
+
+The machines talk over UCX. The script uses RoCE when every check passes on both machines:
+
+- the UCX built with verbs is present under the script's UCX prefix;
+- the login may lock unlimited memory (`ulimit -l`);
+- `ucx_info -d` from that prefix lists `rc_mlx5` on `mlx5_0:1`;
+- port 1 of `mlx5_0` is `ACTIVE`.
+
+The checks run before either process loads, because the machines connect only after loading. When a check fails, the link runs over TCP: the script sets `UCX_TLS=tcp,self` itself, whatever the environment says, and prints one line naming the check:
+
+```
+fnfl-serve: RoCE not used (<the failed check>): the link over TCP, UCX_TLS=tcp,self
+```
+
+`--tcp` forces TCP. `--roce` forces RoCE and refuses to start when a check fails. Either way, the startup prints `fnfl-serve: transport RoCE: ...` or `fnfl-serve: transport TCP (...): ...`, and `start.txt` has a `transport:` line with the same choice and, for TCP, the check that failed.
+
+### Refused before loading
+
+`start --split` checks these on both machines before it takes a card, and refuses with one line naming the first that fails:
+
+- the two machines' builds agree: `llama-server --version` and `fnfl-drive --version` print `fnfl: commit <sha>`, with `-dirty` for a modified tree, and the commit and the compiled device code must match across the machines (the processes compare them again when they connect);
+- both machines booted with `iommu=pt`;
+- the follower's port has no socket other than `TIME_WAIT`;
+- every binary finds its UCX libraries, and for RoCE they are the prefix's.
+
+### Request limits
+
+- Up to 8 requests run at once; further requests wait for a free slot.
+- Each conversation can reach 262,144 tokens. A prompt longer than that is refused, and generation stops with the length reason at the end of the context.
+- Every per-request refusal of one machine applies ([Sampling per request](#sampling-per-request)).
+
+### Image input
+
+The server reads images when it starts with the model's vision projector, Unsloth's `mmproj-BF16.gguf` from the same repository as the model:
+
+```sh
+MMPROJ=/path/to/mmproj-BF16.gguf fn/tools/fnfl-serve.sh start --split
+```
+
+- Without `MMPROJ` the server is text only, and a request with an image is refused.
+- The script passes `--mmproj` to the server and `--image-planes` to the follower. The first machine encodes the images; the second needs no projector. The startup's `start.txt` has a `vision:` line.
+- The projector takes about 0.42 GiB on each of the first machine's cards. The default pool leaves room for it.
+- Images go in OpenAI-style chat requests to `/v1/chat/completions`, as `image_url` content parts whose URL is a base64 data URL (`data:image/png;base64,...` or `data:image/jpeg;base64,...`). The server fetches nothing: remote and file URLs are refused.
+- Each image is resized to at most 4,096 image tokens, about 4.2 megapixels, keeping its aspect ratio; a 1920 x 1080 screenshot is about 2,000 tokens. The image's tokens count towards the conversation's context like text.
+- Limits, each refused with status 400 and a message naming it:
+  - JPEG and PNG only (GIF, WebP, HEIC and other formats are refused);
+  - at most 20 MB encoded and 50 megapixels decoded an image, checked from the header before decoding, and no side over 46,000 pixels;
+  - at most 8 images a request.
+- A request body over the limit for eight full-size images is refused with 413.
+- `/completions` and token counting take text only.
+
+### Switches a user may set
+
+- `start` options: `--temp`, `--top-k`, `--top-p`, `--min-p` (the launch sampling), `--spec-d`, `--draft-attention`, `--slots`, `--split-layer`, `--tcp` or `--roce`.
+- Environment: `MODEL`, `MMPROJ` (image input), `CTX` (the pool), `PORT`, `SERVE_DIR`, and `EXTRA_ARGS` for more server arguments, such as `--fnfl-writer-pause-ms`, `--fnfl-small-read-rows` or `--api-key`. An API key applies to every client.
+
 ## The development launch script
 
 [`fn/tools/fnfl-serve.sh`](../../fn/tools/fnfl-serve.sh) starts, stops and reports on the server on the development machine. Its model, draft and subset paths and its GPU-lock directory are written into the script, so it is a template elsewhere.
@@ -302,7 +384,7 @@ FNFL request: ended eog; steps 8098 (bootstrap 1, speculative 8097, generate 0);
   3. Starts the server detached on all interfaces.
   4. Waits up to 600 s for `/health`.
 
-  It records the binary's SHA-256 and the settings in `start.txt`. Its defaults are the serving settings: the full 262,144-token context, `--fnfl-spec-d 2` and `--fnfl-draft-attention sparse`. It always passes both FNFL settings to the server. `--split` starts the [two-machine split](#two-machines-experimental-new-in-03) on the development machines.
+  It records the binary's SHA-256 and the settings in `start.txt`. Its defaults are the full 262,144-token context, `--fnfl-spec-d 2` and `--fnfl-draft-attention sparse`. It always passes both FNFL settings to the server. With `--split` it starts both machines ([Two machines](#two-machines-the-production-launch)).
 - **`fnfl-serve.sh stop`:** sends SIGTERM to the recorded PID only, waits for it to exit, then checks both cards are at 0 MiB and the locks are free.
 - **`fnfl-serve.sh status`:** the PID, `/health` and the locks.
 - **Environment:**

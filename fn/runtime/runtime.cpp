@@ -2,6 +2,7 @@
 
 #include "fn/model/kv_pool.h"
 #include "fn/model/model.h"
+#include "fn/runtime/nvtx.h"
 
 #include <cuda_runtime.h>
 
@@ -238,6 +239,7 @@ void engine::shutdown() {
         }
     }
     pf_.reset();
+    vs_.reset();     // VIS1 Stage B
     for (slot_rt & x : s_) {
         x.t.reset(); // each target synchronizes its streams and frees its graphs while the model is alive
     }
@@ -385,8 +387,33 @@ bool engine::init(std::unique_ptr<model::model> m, const engine_config & c, std:
     if (ex_ != nullptr && (!pf_->set_options(c_.short_read, c_.prompt_chunk, err) || !pf_->loan_check(err))) {
         return false;
     }
-    if (n > 1 && m_->pool != nullptr && !pf_->init_lane(*t0, err)) { // MXMU1: one card has no other-reader lane
+    // VIS1 Stage B: on the split's front with a projector the vision work class is the other-reader arena (the
+    // split reads in lane 0 only): no lane there
+    const model::reserved_class * vwork = m_->state_class("vision work (VIS1)");
+    const model::reserved_class * arena = m_->state_class("other-reader arena (MU1)");
+    const bool lent = vwork != nullptr && arena != nullptr && vwork->buf[0].data() == arena->buf[0].data();
+    if (n > 1 && m_->pool != nullptr && !lent && !pf_->init_lane(*t0, err)) {  // MXMU1: one card has no lane
         return false;
+    }
+    if (!c_.mmproj.empty() || c_.test_image_rows || c_.image_planes) {
+        // VIS1 Stage B: the box that embeds reads images (the projector, or the tests' synthetic rows); a split's
+        // back takes the front's planes
+        const bool embeds = !c_.mmproj.empty() || c_.test_image_rows;
+        if (embeds != m_->win.ple() || (embeds && c_.image_planes)) {
+            return fail(err, "engine: images on a box that does not embed, or planes only on one that does");
+        }
+        vs_           = std::make_unique<vision_service>();
+        const bool vi = !c_.mmproj.empty() ? vs_->init(*m_, c_.mmproj, err) :
+                        c_.test_image_rows ? vs_->init_synthetic(*m_, c_.test_image_rows, err) :
+                                             vs_->init_planes(*m_, err);
+        // one box drafts over the rows it supplies: the image token's row for the draft there (the front drafts none)
+        if (!vi || !vs_->token_row(*t0, embeds && t0->draft_on(), err)) {
+            return false;
+        }
+        if (vs_->lanes() < (m_->pool != nullptr && n > 1 && !lent ? 2 : 1)) {
+            return fail(err, "engine: the vision class has fewer read lanes than the prefiller");
+        }
+        pf_->set_images(vs_.get());
     }
     for (slot_rt & x : s_) {
         x.req = request_options();
@@ -435,25 +462,28 @@ std::string engine::settings() const {
                      double(ti.graph_bytes(1)) / 1048576.0);
             out += buf;
         }
-        snprintf(buf, sizeof(buf), "; read groups of %d layers; lanes: main %d rows, other-reader %d rows", read_group_,
-                 lane_rows(0), lane_rows(1));
+        snprintf(buf, sizeof(buf),
+                 "; read groups of %d layers; lanes: main %d rows, other-reader %d rows; small reads beside writers "
+                 "up to %d rows in one group (MUP1)",
+                 read_group_, lane_rows(0), lane_rows(1), c_.small_read_rows);
         out += buf;
         if (joint_ != nullptr) {
             if (joint_->eager()) {
                 snprintf(buf, sizeof(buf),
                          "; joint decode on (FMU2: frame %.1f / %.1f MiB on cards 0 / 1, eager; X-A/X-F 16-bit %s; "
-                         "router on the tensor cores %s (FMS5); dense FP16 at U 3, 4 %s (FMS6))",
+                         "router on the tensor cores %s (FMS5); dense FP16 at U 3, 4 %s (FMS6); dense Q8_0 instances "
+                         "%s (TTTS6))",
                          double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0,
                          joint_->x16() ? "on" : "off", joint_->router_tc() ? "on" : "off",
-                         joint_->dense_f16() ? "on" : "off");
+                         joint_->dense_f16() ? "on" : "off", joint_->q8() ? "on" : "off");
             } else {
                 snprintf(buf, sizeof(buf),
                          "; joint decode on (FMU2: frame %.1f / %.1f MiB on cards 0 / 1, %d graph "
                          "pairs kept; X-A/X-F 16-bit %s; router on the tensor cores %s (FMS5); dense FP16 at U 3, "
-                         "4 %s (FMS6))",
+                         "4 %s (FMS6); dense Q8_0 instances %s (TTTS6))",
                          double(joint_->bytes(0)) / 1048576.0, double(joint_->bytes(1)) / 1048576.0, c_.joint_cache,
                          joint_->x16() ? "on" : "off", joint_->router_tc() ? "on" : "off",
-                         joint_->dense_f16() ? "on" : "off");
+                         joint_->dense_f16() ? "on" : "off", joint_->q8() ? "on" : "off");
             }
         } else {
             snprintf(buf, sizeof(buf), "; joint decode off");
@@ -468,6 +498,11 @@ run_status engine::failed(run_status s, const std::string & what) {
     fprintf(stderr, "FNFL: %s\n", what.c_str());
     fflush(stderr);
     return s;
+}
+
+const std::vector<int32_t> & engine::eog(int32_t slot) const {
+    static const std::vector<int32_t> none;
+    return slot_ok(slot) && s_[size_t(slot)].req.ignore_eos ? none : c_.eog;
 }
 
 int32_t engine::budget(const slot_rt & x) const {
@@ -551,8 +586,8 @@ void engine::finish(slot_rt & x, const char * ended) {
                       : std::string();
     snprintf(buf, sizeof(buf),
              "FNFL request: ended %s; steps %d (bootstrap %d, speculative %d, generate %d); tokens %d; tokens a "
-             "speculative step %.3f; accepted drafts a speculative step %.3f; step wall ms median %.3f p90 %.3f (host "
-             "clock around each step, all steps); host waits a step: speculative %.2f, bootstrap and generate %.2f; "
+             "speculative step %.3f; accepted drafts a speculative step %.3f; step wall ms median %.3f p90 %.3f (%s); "
+             "host waits a step: speculative %.2f, bootstrap and generate %.2f; "
              "ms from a step's start to its waits, medians: draft step %.3f, verify %.3f, catch-up %.3f "
              "(speculative), the one round %.3f (bootstrap and generate); depth before a step %lld..%lld; "
              "end-of-generation cuts %d; decode span %.4f s (the bootstrap's start to the last step's end; steps' "
@@ -560,6 +595,9 @@ void engine::finish(slot_rt & x, const char * ended) {
              "predicted_per_second definition); closing check %s%s",
              s.ended.c_str(), s.steps, s.boot, s.spec, s.gen, s.tokens, s.spec ? double(s.spec_tokens) / s.spec : 0.0,
              s.spec ? double(s.accepted) / s.spec : 0.0, s.wall_median_ms, s.wall_p90_ms,
+             // PRD1 (TTTS1): a front stage's steps are the back's, from X-STEP: their wall is the back's own step
+             x.t->stage_front() ? "the split: the back's own step time, from X-STEP" :
+                                  "host clock around each step, all steps",
              s.spec ? double(s.waits_spec) / s.spec : 0.0,
              (s.boot + s.gen) ? double(s.waits_one) / (s.boot + s.gen) : 0.0, s.draft_median_ms, s.verify_median_ms,
              s.catchup_median_ms, s.one_median_ms, static_cast<long long>(s.n_before_min),
@@ -604,6 +642,7 @@ run_status engine::set_sampling(int32_t slot, const request_options & o) {
         return failed(run_status::bad_request, "slot " + std::to_string(slot) + ": FNFL serves " +
                                                    std::to_string(n_slots()) + " slot" + (n_slots() > 1 ? "s" : ""));
     }
+    pace_leave(slot);  // APF1: a request boundary: the slot is out of the writers
     slot_rt & x = s_[size_t(slot)];
     if (x.job.live) {
         return failed(run_status::bad_request, "set_sampling: slot " + std::to_string(slot) + "'s read is in progress");
@@ -661,12 +700,64 @@ void engine::prefill_lines(slot_rt & x, const char * how, int64_t from, int32_t 
     fflush(stderr);
 }
 
-run_status engine::prefill(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse,
-                           int32_t & n_processed, const prefill_progress & progress) {
+bool engine::read_images(slot_rt &                                              x,
+                         const int32_t *&                                       tokens,
+                         int32_t &                                              n_tokens,
+                         int32_t &                                              n_reuse,
+                         const std::vector<prompt_image> *                      images,
+                         std::vector<int32_t> &                                 cut,
+                         image_rows &                                           out,
+                         std::vector<std::shared_ptr<const vision::prepared>> & px,
+                         bool &                                                 vis) {
+    out.clear();
+    px.clear();
+    const image_rows & old = x.t->images();
+    const bool         img = images != nullptr && !images->empty();
+    vis                    = img || !old.empty();
+    if (!vis) {
+        return true;  // text: as before
+    }
+    const ledger &               l        = x.t->slot();
+    const std::vector<int32_t> & held_tok = x.valid ? l.tok : x.keep;
+    std::vector<int32_t>         all(held_tok.begin(), held_tok.begin() + n_reuse);
+    all.insert(all.end(), tokens, tokens + n_tokens);
+    const int64_t n = static_cast<int64_t>(all.size());
+    if (img) {
+        if (pf_ == nullptr || pf_->images() == nullptr) {
+            err_ = "images and no vision projector loaded";
+            return false;
+        }
+        std::vector<image_span> spans;
+        for (const prompt_image & pi : *images) {
+            spans.push_back(span_of(pi));
+            px.push_back(pi.img);
+        }
+        if (!out.set(all.data(), n, spans, err_) || !out.end_ok(n, err_)) {
+            return false;
+        }
+    }
+    const int64_t m = old.common(out, n_reuse);
+    if (m < n_reuse) {
+        cut.assign(all.begin() + m, all.end());
+        tokens   = cut.data();
+        n_tokens = static_cast<int32_t>(cut.size());
+        n_reuse  = static_cast<int32_t>(m);
+    }
+    return true;
+}
+
+run_status engine::prefill(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const prefill_progress &          progress,
+                           const std::vector<prompt_image> * images) {
     n_processed = 0;
+    pace_leave(slot);  // APF1: a request boundary: the slot is out of the writers
     if (n_slots() > 1) {
         // MU1: the slot's read job, every group in one step and every chunk in turn (nothing else runs meanwhile)
-        const int32_t r = read_begin(slot, tokens, n_tokens, n_reuse, n_processed);
+        const int32_t r = read_begin(slot, tokens, n_tokens, n_reuse, n_processed, images);
         if (r != 0) {
             return failed(run_status::bad_request, err_);
         }
@@ -707,6 +798,13 @@ run_status engine::prefill(int32_t slot, const int32_t * tokens, int32_t n_token
                                                    std::to_string(n_reuse) + " kept of " + std::to_string(held) +
                                                    " held, " + std::to_string(c_.n_ctx_slot) + " cells");
     }
+    std::vector<int32_t>                                 cut;
+    image_rows                                           nl;
+    std::vector<std::shared_ptr<const vision::prepared>> px;
+    bool                                                 vis = false;
+    if (!read_images(x, tokens, n_tokens, n_reuse, images, cut, nl, px, vis)) {
+        return failed(run_status::bad_request, "prefill: " + err_);
+    }
     // FC-PF1: nothing new: keep n_reuse - 1 tokens and process the last kept one again, so its logits exist
     int32_t one = 0;
     if (n_tokens == 0) {
@@ -722,22 +820,37 @@ run_status engine::prefill(int32_t slot, const int32_t * tokens, int32_t n_token
         t.stage_front() || (t.draft_n() >= t.batch_start() && t.draft_n() <= l.n && l.n - t.draft_n() <= 4);
     int64_t from = 0;
     const char * how = "a pure extension";
+    if (vis) {
+        t.set_images(nl, std::move(px));  // VIS1: the read's checkpoint keys, chunk positions and pixels
+    }
     if (x.valid && n_reuse == l.n && draft_ok && !t.invalid()) {
         from = l.n;
         x.pf_stats = pf_run_stats();
+        if (vis) {
+            t.set_pos_offset(nl.offset_at(from));
+        }
         ok = extend_ledger(t, tokens, n_tokens, err_) && pf_->run(t, &x.pf_stats, err_, progress);
     } else {
         std::vector<int32_t> all(held_tok.begin(), held_tok.begin() + n_reuse);
         all.insert(all.end(), tokens, tokens + n_tokens);
         x.pf_stats = pf_run_stats();
-        ok = pf_->begin(t, all, n_reuse, from, err_) && pf_->run(t, &x.pf_stats, err_, progress);
+        ok         = pf_->begin(t, all, n_reuse, from, err_);
+        if (ok && vis) {
+            t.set_pos_offset(nl.offset_at(from));
+        }
+        ok  = ok && pf_->run(t, &x.pf_stats, err_, progress);
         how = from > 0 ? "from a checkpoint" : "from token 0";
     }
+    if (ok && vis) {
+        t.set_pos_offset(nl.offset_at(static_cast<int64_t>(t.slot().tok.size())));  // decode's: off(N)
+    }
+    t.drop_pixels();                                                                // VIS1: the read has ended
     n_processed = static_cast<int32_t>(int64_t(n_reuse) + n_tokens - from);
     x.sub_ready = t.submitted();
     const int64_t stopped = ok ? -1 : x.pf_stats.stopped;
     prefill_lines(x, how, from, n_processed, n_reuse, n_tokens, since(t0), ok, entry);
     x.valid = ok;
+    x.ended = false;
     x.keep.clear();
     x.n_gen = 0;
     x.steps.clear();
@@ -746,6 +859,7 @@ run_status engine::prefill(int32_t slot, const int32_t * tokens, int32_t n_token
         // checkpoint at or below the kept prompt (the stopped run's handoff never happened, so there is no valid state)
         const ledger & lk = t.slot();
         x.keep.assign(lk.tok.begin(), lk.tok.begin() + std::min<int64_t>(stopped, int64_t(lk.tok.size())));
+        t.keep_images(static_cast<int64_t>(x.keep.size()));  // VIS1: an image the stop cut is read again
         n_processed = static_cast<int32_t>(x.keep.size());
         err_ = "prefill cancelled at " + std::to_string(stopped);
         return run_status::cancelled;
@@ -791,6 +905,7 @@ run_status engine::restore_ready(const ready_state & s) {
         return failed(run_status::error, what);
     }
     x.valid = true;
+    x.ended = false;
     x.keep.clear();
     x.n_gen = 0;
     x.steps.clear();
@@ -805,6 +920,12 @@ run_status engine::step_enter(int32_t slot, const int32_t * out, int32_t & b) {
     slot_rt & x = s_[size_t(slot)];
     if (!x.valid || x.job.live) {
         return failed(run_status::bad_request, "step: the slot holds no processed prompt (prefill first)");
+    }
+    if (x.ended) {
+        // PRD1 (TTTS8): the request finished at eog or its budget; a step now would bootstrap past its end (the lone,
+        // joint and split steps all enter here)
+        return failed(run_status::bad_request,
+                      "step: slot " + std::to_string(slot) + "'s request ended (eog or budget): read its next prompt");
     }
     if (pf_ != nullptr && pf_->loan_job() >= 0) {
         // MXMU1: a suspended cached chunk holds the prompt loan (only under test_partial_reads); a decode then would
@@ -849,14 +970,58 @@ run_status engine::step_enter(int32_t slot, const int32_t * out, int32_t & b) {
 run_status engine::step(int32_t slot, int32_t * out, int32_t & n_out, bool & end) {
     n_out = 0;
     end = false;
+    const double     t0 = pace::clock_ms();
     int32_t b = 0;
     const run_status rs = step_enter(slot, out, b);
     if (rs != run_status::ok) {
+        const bool left = true;
+        pace_steps(&slot, 1, t0, &left);
         return rs;
     }
     step_info s;
-    const bool ran = runtime::step(*s_[size_t(slot)].t, b, c_.spec_d, c_.eog, s, err_);
-    return step_leave(slot, ran, s, out, n_out, end);
+    const bool ran = runtime::step(*s_[size_t(slot)].t, b, c_.spec_d, eog(slot), s, err_);
+    const run_status st   = step_leave(slot, ran, s, out, n_out, end);
+    const bool       left = st != run_status::ok || end;
+    pace_steps(&slot, 1, t0, &left);
+    return st;
+}
+
+// APF1: resident TP's writer-pause book: a step of slots from t0 to now (left: the slot's generation ended or failed)
+void engine::pace_steps(const int32_t * slots, int32_t n, double t0, const bool * left) {
+    pace_.writer_step(slots, n, t0, pace::clock_ms());
+    for (int32_t k = 0; k < n; ++k) {
+        if (slots[k] >= 0 && slots[k] < pace::max_slots) {
+            pace_writers_ |= 1u << uint32_t(slots[k]);
+        }
+        if (left[k]) {
+            pace_leave(slots[k]);
+        }
+    }
+}
+
+void engine::pace_leave(int32_t slot) {
+    if (slot < 0 || slot >= pace::max_slots) {
+        return;
+    }
+    const uint32_t bit = 1u << uint32_t(slot);
+    const bool     was = (pace_writers_ & bit) != 0;
+    pace_writers_ &= ~bit;
+    pace_.slot_ended(slot);
+    if (was && pace_writers_ == 0) {
+        pace_.writers_left();
+    }
+}
+
+void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) {
+    const double t0 = pace::clock_ms();
+    step_joint_body(slots, n, res);
+    if (slots != nullptr && n >= 1 && n <= fn::xchg::max_lanes) {
+        bool left[fn::xchg::max_lanes] = {};
+        for (int32_t k = 0; k < n; ++k) {
+            left[k] = res[k].st != run_status::ok || res[k].end;
+        }
+        pace_steps(slots, n, t0, left);
+    }
 }
 
 run_status engine::step_leave(int32_t slot, bool ran, const step_info & s, int32_t * out, int32_t & n_out, bool & end) {
@@ -903,13 +1068,15 @@ run_status engine::step_leave(int32_t slot, bool ran, const step_info & s, int32
     }
     if (s.end) {
         finish(x, "eog");
+        x.ended = true;
     } else if (budget(x) < 1) {
         finish(x, "budget");
+        x.ended = true;
     }
     return run_status::ok;
 }
 
-void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) {
+void engine::step_joint_body(const int32_t * slots, int32_t n, joint_step_out * res) {
     for (int32_t k = 0; k < n; ++k) {
         res[k] = joint_step_out();
     }
@@ -1035,7 +1202,7 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
             s[k].joint = joint;
             bool cut = false;
             if (joint) {
-                cut = ok[i] && step_cut(t, c_.eog, rv[i], t0, s[k], err_);
+                cut = ok[i] && step_cut(t, eog(slots[k]), rv[i], t0, s[k], err_);
                 if (!ok[i]) {
                     err_ = why[i];
                 }
@@ -1043,7 +1210,7 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
                 err_ = "joint round: " + jerr;
             } else {
                 round_result r1;
-                cut = t.verify(d[i], prop[i], bud[i], r1, err_) && step_cut(t, c_.eog, r1, t0, s[k], err_);
+                cut = t.verify(d[i], prop[i], bud[i], r1, err_) && step_cut(t, eog(slots[k]), r1, t0, s[k], err_);
             }
             if (!cut) {
                 leave(k, false, s[k]);
@@ -1078,14 +1245,14 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
                 ran = ct[i]->draft_catchup(crows[i], cr[i], err_);
             }
             if (ran) {
-                step_caught(c_.eog, cr[i], t0, s[k]);
+                step_caught(eog(slots[k]), cr[i], t0, s[k]);
             }
             leave(k, ran, s[k]);
         }
     }
     for (int32_t k : alone) {
         step_info s;
-        const bool ran = runtime::step(*s_[size_t(slots[k])].t, b[k], c_.spec_d, c_.eog, s, err_);
+        const bool ran = runtime::step(*s_[size_t(slots[k])].t, b[k], c_.spec_d, eog(slots[k]), s, err_);
         leave(k, ran, s);
     }
 }
@@ -1093,6 +1260,7 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
 // ---- TTTS1: a split stage's steps ----
 
 run_status engine::split_enter(int32_t slot, int32_t & b) {
+    nvtx_range nr("split.enter");
     int32_t out[max_step_tokens] = {};
     return step_enter(slot, out, b);
 }
@@ -1103,6 +1271,7 @@ run_status engine::split_leave(int32_t           slot,
                                int32_t *         out,
                                int32_t &         n_out,
                                bool &            end) {
+    nvtx_range nr("split.leave");
     return step_leave(slot, ran, s, out, n_out, end);
 }
 
@@ -1127,6 +1296,7 @@ run_status engine::truncate(int32_t slot, int32_t n_keep) {
     if (!slot_ok(slot) || n_keep < 0) {
         return failed(run_status::bad_request, "truncate: slot " + std::to_string(slot));
     }
+    pace_leave(slot);  // APF1: a request boundary: the slot is out of the writers
     slot_rt & x = s_[size_t(slot)];
     if (x.job.live) {
         return failed(run_status::bad_request, "truncate: slot " + std::to_string(slot) + "'s read is in progress");
@@ -1135,6 +1305,7 @@ run_status engine::truncate(int32_t slot, int32_t n_keep) {
     if (!x.valid) {
         if (static_cast<size_t>(n_keep) < x.keep.size()) {
             x.keep.resize(static_cast<size_t>(n_keep));
+            x.t->keep_images(n_keep);  // VIS1: an image the cut cuts is read again
         }
         return run_status::ok;
     }
@@ -1149,7 +1320,11 @@ run_status engine::truncate(int32_t slot, int32_t n_keep) {
     }
     std::vector<int32_t> kept(l.tok.begin(), l.tok.begin() + n_keep);
     const step_record & last = t.versions().last();
-    if (last.valid && !last.prompt && n_keep >= last.n_before) {
+    // VIS1: a cut inside an image's rows is never made in place (no position there is cell + one offset): the
+    // restore below, the image dropped from the ledger and read again
+    const bool           in_image = t.images().cuts(n_keep);
+    t.keep_images(n_keep);
+    if (!in_image && last.valid && !last.prompt && n_keep >= last.n_before) {
         // within the last step: its version (SR1), then the draft catches up the kept rows (PB1: not within a bulk
         // prompt chunk, whose versions are half ends: the restore below)
         const int32_t j = static_cast<int32_t>(n_keep - last.n_before);
@@ -1224,6 +1399,37 @@ int32_t engine::lane_owner(int32_t lane) const {
     return pf_ != nullptr ? pf_->lane_owner(lane) : -1;
 }
 
+run_status engine::set_pos_offset(int32_t slot, int32_t off) {
+    if (!slot_ok(slot) || off < -max_pos_offset || off > max_pos_offset) {
+        return failed(run_status::bad_request,
+                      "set_pos_offset: slot " + std::to_string(slot) + ", offset " + std::to_string(off));
+    }
+    if (s_[size_t(slot)].job.live) {
+        return failed(run_status::bad_request,
+                      "set_pos_offset: slot " + std::to_string(slot) + "'s read is in progress");
+    }
+    s_[size_t(slot)].t->set_pos_offset(off);
+    return run_status::ok;
+}
+
+int32_t engine::pos_offset(int32_t slot) const {
+    return slot_ok(slot) ? s_[size_t(slot)].t->pos_offset() : 0;
+}
+
+bool engine::small_read(int32_t slot) const {
+    if (!slot_ok(slot) || !s_[size_t(slot)].job.live || c_.small_read_rows <= 0 || !resident_tp()) {
+        return false;
+    }
+    const pf_job & j = s_[size_t(slot)].job;
+    return j.to - j.from <= c_.small_read_rows;
+}
+
+void engine::test_piece_rows(int32_t r) {
+    if (pf_ != nullptr) {
+        pf_->test_piece_rows(r);
+    }
+}
+
 bool engine::set_read_group(int32_t layers) {
     if (layers < 1 || layers > fn::n_layer) {
         return false;
@@ -1263,6 +1469,7 @@ run_status engine::release_slot(int32_t slot) {
     if (!slot_ok(slot)) {
         return failed(run_status::bad_request, "release: slot " + std::to_string(slot));
     }
+    pace_leave(slot);  // APF1: a request boundary: the slot is out of the writers
     slot_rt & x = s_[size_t(slot)];
     if (x.job.live) {
         return failed(run_status::bad_request, "release: slot " + std::to_string(slot) + "'s read is in progress");
@@ -1329,8 +1536,12 @@ bool engine::ensure_cells(int32_t slot, int64_t cells, bool & capacity, std::str
     }
 }
 
-int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse,
-                           int32_t & n_processed) {
+int32_t engine::read_begin(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const std::vector<prompt_image> * images) {
     const auto entry = clk::now();
     n_processed = 0;
     if (n_slots() < 2 || !slot_ok(slot)) {
@@ -1342,6 +1553,7 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
         failed(run_status::bad_request, "read_begin: slot " + std::to_string(slot) + "'s read is in progress");
         return -1;
     }
+    pace_leave(slot);  // APF1: a request boundary: the slot is out of the writers
     target & t = *x.t;
     const ledger & l = t.slot();
     const std::vector<int32_t> & held_tok = x.valid ? l.tok : x.keep;
@@ -1358,6 +1570,14 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
                                             std::to_string(int64_t(n_reuse) + n_tokens) + " tokens exceed the " +
                                             std::to_string(c_.n_ctx_slot) + "-cell context");
         return 1;
+    }
+    std::vector<int32_t>                                 cut;
+    image_rows                                           nl;
+    std::vector<std::shared_ptr<const vision::prepared>> px;
+    bool                                                 vis = false;
+    if (!read_images(x, tokens, n_tokens, n_reuse, images, cut, nl, px, vis)) {
+        failed(run_status::bad_request, "read_begin: slot " + std::to_string(slot) + ": " + err_);
+        return -1;
     }
     // the pool's pages for the whole prompt and its next step, before anything changes on the slot (the rejection
     // leaves the slot's state intact); an idle slot is reclaimed when the pool is full
@@ -1387,13 +1607,22 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
     int64_t from = 0;
     bool ok = false;
     const char * how = "a pure extension";
+    if (vis) {
+        t.set_images(nl, std::move(px));  // VIS1: the read's checkpoint keys, chunk positions and pixels
+    }
     if (x.valid && n_reuse == l.n && draft_ok && !t.invalid()) {
         from = l.n;
+        if (vis) {
+            t.set_pos_offset(nl.offset_at(from));
+        }
         ok = extend_ledger(t, tokens, n_tokens, err_);
     } else {
         std::vector<int32_t> all(held_tok.begin(), held_tok.begin() + n_reuse);
         all.insert(all.end(), tokens, tokens + n_tokens);
         ok = pf_->begin(t, all, n_reuse, from, err_);
+        if (ok && vis) {
+            t.set_pos_offset(nl.offset_at(from));
+        }
         how = from > 0 ? "from a checkpoint" : "from token 0";
     }
     x.valid = false;
@@ -1401,6 +1630,7 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
     x.n_gen = 0;
     x.steps.clear();
     if (!ok) {
+        t.drop_pixels();
         pf_->drop_owner(slot);
         failed(run_status::error, "read_begin: " + err_);
         return -1;
@@ -1425,6 +1655,7 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
     }
     j = pf_job();
     j.live = true;
+    x.ended     = false;  // PRD1: the slot's next prompt
     j.id = next_job_++;
     j.slot = slot;
     j.tok = t.slot().tok;
@@ -1432,7 +1663,7 @@ int32_t engine::read_begin(int32_t slot, const int32_t * tokens, int32_t n_token
     j.to = static_cast<int64_t>(j.tok.size());
     j.committed = j.from;
     // MXMU1: the plan as the one-slot prefill makes it (MX3's cached split; ME3's short read with the expert service)
-    pf_->job_plan(j.from, j.to, ex_ != nullptr, j.plan, j.short_read);
+    pf_->job_plan(j.from, j.to, ex_ != nullptr, j.plan, j.short_read, t.images().any_image(j.from, j.to));
     j.stats = pf_run_stats();
     j.stats.from = j.from;
     j.stats.to = j.to;
@@ -1470,7 +1701,7 @@ bool engine::read_prefetch(int32_t now_slot, int32_t next_slot) {
     return true;
 }
 
-read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
+read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode, const read_budget * budget) {
     if (!slot_ok(slot) || !s_[size_t(slot)].job.live) {
         failed(run_status::bad_request, "read_step: slot " + std::to_string(slot) + " has no read");
         return read_status::error;
@@ -1480,10 +1711,33 @@ read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
     // MXMU1: with the expert service a step runs the whole chunk, so its loan, ring and lent hold are returned before
     // another slot's work (TEST: test_partial_reads steps groups, for the checks of a suspended cached chunk)
     const int32_t groups = ex_ != nullptr && !test_partial_ ? fn::n_layer : n_groups;
-    const pf_mode pm = mode == read_mode::lone      ? pf_mode::lone
-                       : mode == read_mode::writers ? pf_mode::writers
-                                                    : pf_mode::shared;
-    const pf_step st = pf_->job_step(*x.t, j, groups, read_group_, err_, pm);
+    // APF1: this box's budget, the owner's writer-pause decision (unknown: one unit)
+    pf_budget     pb;
+    if (budget != nullptr) {
+        pb.budget_ms = budget->floor ? -1.0 : budget->budget_ms;
+        pb.pause_ms  = budget->pause_ms;
+        pb.known     = budget->known;
+        pb.floor     = budget->floor;
+        pb.lagged    = budget->floor && budget->lagged;
+        if (budget->paced) {
+            if (!j.paced) {
+                j.pace0 = budget->pace_before;
+                j.paced = true;
+            }
+            j.pace1 = budget->pace_after;
+        }
+    }
+    // MUP1 piece 3, exactly (PRD1 item 7): a small read beside writers runs each chunk in the lone geometry (one
+    // group, end and finish in the step), whatever the budget or T; the writers pay one pause (MUP1's measured trade).
+    // The budget stays for every larger read
+    // (APF1: pace::geometry_of, the host-checked rule)
+    const bool           small = mode == read_mode::writers && small_read(slot);
+    const pace::geometry geo   = pace::geometry_of(mode == read_mode::lone, mode == read_mode::writers, small);
+    const pf_mode        pm    = geo == pace::geometry::whole ? pf_mode::lone :
+                                 geo == pace::geometry::units ? pf_mode::writers :
+                                                                pf_mode::shared;
+    j.small_whole           = j.small_whole || small;
+    const pf_step st        = pf_->job_step(*x.t, j, groups, read_group_, err_, pm, budget != nullptr ? &pb : nullptr);
     const auto end_lines = [&](bool ok, int64_t stopped) {
         x.pf_stats = j.stats;
         x.pf_stats.stopped = stopped;
@@ -1491,15 +1745,46 @@ read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
         x.pf_stats.ready_s = ok ? std::chrono::duration<double>(clk::now() - j.stats.t0).count() : -1;
         prefill_lines(x, x.job_how, j.from, static_cast<int32_t>(j.to - j.from), x.job_reuse, x.job_new,
                       std::chrono::duration<double>(clk::now() - j.stats.t0).count(), ok, x.job_entry);
+        // MUP2 piece 4: the units' account (writers mode): units, their steps and pieces, B (the mean over the steps
+        // with a known budget) and P, the steps whose budget was zero or unknown, the units' GPU time, the units run
+        // with no writer step pending (floor), the read's wall. APF1: this box's pacing over the read (the owner's
+        // decisions and the writers' completion gaps against P, with each overrun's reason)
+        const double wall_ms    = std::chrono::duration<double>(clk::now() - j.stats.t0).count() * 1e3;
+        char         units[400] = "";
+        if (j.units_run > 0) {
+            snprintf(units, sizeof(units),
+                     "; units %lld in %d steps (most %d), pieces %d..%d rows, B ms %.1f, P ms %d, budgets zero %d "
+                     "unknown %d, unit gpu ms %.1f, floor %d units %.1f ms, budget misses %d%s",
+                     static_cast<long long>(j.units_run), j.unit_steps, j.most_units, j.piece_min, j.piece_max,
+                     j.budget_n > 0 ? j.budget_ms_sum / j.budget_n : -1.0, j.pause_ms, j.budget_zero, j.budget_unknown,
+                     j.unit_ms, j.floor_units, j.floor_ms, j.budget_misses,
+                     j.below_floor ? ", pieces at the floor above B (1,024 rows)" : "");
+        }
+        const std::string paced     = j.paced ? "; pacing " + pace::pacer::summary(j.pace1 - j.pace0, j.pause_ms) : "";
+        // APF1 Part 4: the ladder's routes this box ran for the read (rungs, units replayed as graphs or run eagerly,
+        // dense products fused or converted, HC pieces fused or converted, expert gate/up grouped or per-task)
+        char              routes[512] = "";
+        if (j.rung_max > 0) {
+            snprintf(routes, sizeof routes, "; routes rungs %d..%d, %s", j.rung_min, j.rung_max,
+                     j.routes.text().c_str());
+        }
+        // PRD1 item 11: on the split's back, the chunks whose crossing was all received before the chunk took it
+        char             ahead[64] = "";
+        const pf_stage * stg       = pf_->stage();
+        const int64_t    n_ahead   = stg != nullptr ? stg->received_ahead(slot) : -1;
+        if (n_ahead >= 0) {
+            snprintf(ahead, sizeof ahead, ", chunks received ahead %lld", static_cast<long long>(n_ahead));
+        }
         fprintf(stderr,
                 "FNFL read job: slot %d, rows %lld (from %lld), chunks %d, groups %lld of %d layers, steps %d, service "
-                "ms %.1f, longest step ms %.1f, checkpoints %d, lane %s\n",
+                "ms %.1f, longest step ms %.1f, checkpoints %d, lane %s%s%s, wall ms %.1f%s%s%s\n",
                 slot, static_cast<long long>(j.to - j.from), static_cast<long long>(j.from), j.chunks_done,
                 static_cast<long long>(j.groups_done), j.layers, j.steps, j.service_s * 1e3, j.longest_step_s * 1e3,
                 j.checkpoints,
-                ok             ? "done"
-                : stopped >= 0 ? "cancelled"
-                               : "failed");
+                ok           ? "done" :
+                stopped >= 0 ? "cancelled" :
+                               "failed",
+                j.small_whole ? ", small" : "", ahead, wall_ms, units, paced.c_str(), routes);
         fflush(stderr);
     };
     switch (st) {
@@ -1508,6 +1793,10 @@ read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
         case pf_step::chunk_done:
             return read_status::chunk_done;
         case pf_step::done:
+            if (!x.t->images().empty()) {
+                x.t->set_pos_offset(x.t->images().offset_at(j.to));  // VIS1: decode's offset, off(N)
+            }
+            x.t->drop_pixels();
             x.sub_ready = x.t->submitted();
             end_lines(true, -1);
             j.live = false;
@@ -1519,6 +1808,8 @@ read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
             // checkpoint at or below the kept prompt (no handoff happened, so there is no valid state)
             const ledger & l = x.t->slot();
             x.keep.assign(l.tok.begin(), l.tok.begin() + std::min<int64_t>(j.committed, int64_t(l.tok.size())));
+            x.t->keep_images(static_cast<int64_t>(x.keep.size()));  // VIS1: an image the stop cut is read again
+            x.t->drop_pixels();
             end_lines(false, j.committed);
             j.live = false;
             x.valid = false;
@@ -1528,6 +1819,7 @@ read_status engine::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
         case pf_step::error:
         default: {
             const std::string what = "read: " + err_;
+            x.t->drop_pixels();
             end_lines(false, -1);
             j.live = false;
             x.valid = false;
@@ -1545,15 +1837,47 @@ void engine::test_abandon_read(int32_t slot) {
     }
     slot_rt & x = s_[size_t(slot)];
     pf_->job_abandon(*x.t, x.job);
+    x.t->drop_pixels();
     x.job.live = false;
     x.valid = false;
     x.keep.clear();
     pf_->drop_owner(slot);
 }
 
+bool engine::read_settle() {
+    if (pf_ == nullptr || !pf_->draining()) {
+        return true;
+    }
+    std::string e;
+    if (!pf_->units_settle(e)) {
+        failed(run_status::error, "read settle: " + e);
+        return false;
+    }
+    return true;
+}
+
+bool engine::read_draining() const {
+    return pf_ != nullptr && pf_->draining();
+}
+
+int32_t engine::read_in_flight() const {
+    return pf_ != nullptr ? pf_->units_in_flight() : 0;
+}
+
+int64_t engine::read_drained() const {
+    return pf_ != nullptr ? pf_->drain_launched() : 0;
+}
+
 void engine::read_cancel(int32_t slot) {
     if (slot_ok(slot) && s_[size_t(slot)].job.live) {
         s_[size_t(slot)].job.cancel = true;
+    }
+}
+
+void engine::read_cancel_after(int32_t slot, int64_t chunks) {
+    if (slot_ok(slot) && s_[size_t(slot)].job.live) {
+        s_[size_t(slot)].job.cancel    = true;
+        s_[size_t(slot)].job.cancel_at = chunks;
     }
 }
 
@@ -1585,6 +1909,23 @@ bool engine::get_read_info(int32_t slot, read_info & out) const {
     out.service_s = j.service_s;
     out.longest_step_s = j.longest_step_s;
     out.last_group_s = j.last_group_s;
+    out.units_run      = j.units_run;
+    out.unit_steps     = j.unit_steps;
+    out.most_units     = j.most_units;
+    out.floor_units    = j.floor_units;
+    out.budget_n       = j.budget_n;
+    out.piece_min      = j.piece_min;
+    out.piece_max      = j.piece_max;
+    out.unit_ms        = j.unit_ms;
+    out.floor_ms       = j.floor_ms;
+    out.budget_ms_sum  = j.budget_ms_sum;
+    out.pause_ms       = j.pause_ms;
+    out.budget_zero    = j.budget_zero;
+    out.budget_unknown = j.budget_unknown;
+    out.below_floor    = j.below_floor;
+    out.budget_misses  = j.budget_misses;
+    out.last_minimum   = j.last_minimum;
+    out.pace_ns        = j.paced ? j.pace1 - j.pace0 : pace::stats();
     return true;
 }
 

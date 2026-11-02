@@ -6,6 +6,7 @@
 #include "fn/proto/xp1/timing.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -39,11 +40,7 @@ double since(clk::time_point t0) {
 }
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "draft: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "draft", what);
 }
 
 bool read_ids(const std::string & path, std::vector<int32_t> & out) {

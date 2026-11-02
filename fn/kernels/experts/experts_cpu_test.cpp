@@ -1455,19 +1455,68 @@ bool me3_affinity() {
 
 } // namespace
 
-int fnfl_ex_cpu_test(const char * dir) {
+namespace {
+
+// TFC: the cases fnfl_ex_cpu_test runs by name, in this order for "all"; the first and the last need the synthetic
+// experts in dir
+const char * const ex_cpu_cases[] = { "formats",        "extents",      "mx7-f16",      "loan",      "short-read",
+                                      "refill-batches", "refill-state", "service-loop", "affinity",  "prompt-plan",
+                                      "slots",          "miss-split",   "admission",    "throughput" };
+
+// cases: "all" or a comma list of ex_cpu_cases; false (and the bad name on stderr) on anything else
+bool ex_cpu_select(const std::string & cases, std::map<std::string, bool> & on) {
+    for (const char * c : ex_cpu_cases) {
+        on[c] = cases == "all";
+    }
+    if (cases == "all") {
+        return true;
+    }
+    for (size_t p = 0; p <= cases.size();) {
+        const size_t      q    = std::min(cases.find(',', p), cases.size());
+        const std::string name = cases.substr(p, q - p);
+        if (on.count(name) == 0) {
+            fprintf(stderr, "ex-cpu-test: no case '%s'\n", name.c_str());
+            return false;
+        }
+        on[name] = true;
+        p        = q + 1;
+    }
+    return true;
+}
+
+}  // namespace
+
+const char * fnfl_ex_cpu_case_names() {
+    static const std::string names = [] {
+        std::string n;
+        for (const char * c : ex_cpu_cases) {
+            n += (n.empty() ? "" : ",") + std::string(c);
+        }
+        return n;
+    }();
+    return names.c_str();
+}
+
+int fnfl_ex_cpu_test(const char * dir, const char * cases) {
+    std::map<std::string, bool> on;
+    if (!ex_cpu_select(cases, on)) {
+        return 2;
+    }
     std::map<int32_t, fn::experts::synth> s;
     std::map<int32_t, bool> good;
     bool ok = true;
     const fmt gus[7] = {fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s, fmt::q4_k, fmt::q5_k};
     const fmt dns[4] = {fmt::q2_0, fmt::iq4_nl, fmt::q5_1, fmt::q8_0};
+    const bool synth  = on["formats"] || on["throughput"];
     for (const fmt f : gus) {
-        const bool r = cpu::gate_up_supported(f) && load(f, dir, s[int32_t(f)]) && round_trip_gu(s[int32_t(f)]);
+        const bool r     = !synth || (cpu::gate_up_supported(f) && load(f, dir, s[int32_t(f)]) &&
+                                      (!on["formats"] || round_trip_gu(s[int32_t(f)])));
         good[int32_t(f)] = r;
         ok = ok && r;
     }
     for (const fmt f : dns) {
-        const bool r = cpu::down_supported(f) && load(f, dir, s[int32_t(f)]) && round_trip_dn(s[int32_t(f)]);
+        const bool r     = !synth || (cpu::down_supported(f) && load(f, dir, s[int32_t(f)]) &&
+                                      (!on["formats"] || round_trip_dn(s[int32_t(f)])));
         good[int32_t(f)] = r;
         ok = ok && r;
     }
@@ -1477,76 +1526,111 @@ int fnfl_ex_cpu_test(const char * dir) {
     }
     cpu::pool pl;
     std::string err;
-    if (!pl.start(std::vector<int32_t>(5, -1), err)) {
-        printf("ex-cpu-test: %s\n", err.c_str());
-        return 1;
+    if (on["formats"]) {
+        if (!pl.start(std::vector<int32_t>(5, -1), err)) {
+            printf("ex-cpu-test: %s\n", err.c_str());
+            return 1;
+        }
+        // every gate/up format once, every down format at least once
+        const fmt pairs[7][2] = {
+            { fmt::iq2_xxs, fmt::q2_0   },
+            { fmt::iq2_xs,  fmt::iq4_nl },
+            { fmt::iq2_s,   fmt::q5_1   },
+            { fmt::iq3_xxs, fmt::q8_0   },
+            { fmt::iq3_s,   fmt::q2_0   },
+            { fmt::q4_k,    fmt::q5_1   },
+            { fmt::q5_k,    fmt::q8_0   }
+        };
+        for (const auto & p : pairs) {
+            const bool r        = fp64_pair(s[int32_t(p[0])], s[int32_t(p[1])], pl);
+            good[int32_t(p[0])] = good[int32_t(p[0])] && r;
+            good[int32_t(p[1])] = good[int32_t(p[1])] && r;
+            ok                  = ok && r;
+        }
+        for (const fmt f : gus) {
+            printf("ex-cpu-test: %s B=1..%d %s\n", fn::experts::fmt_name(f), R, good[int32_t(f)] ? "PASS" : "FAIL");
+        }
+        for (const fmt f : dns) {
+            printf("ex-cpu-test: %s B=1..%d %s\n", fn::experts::fmt_name(f), R, good[int32_t(f)] ? "PASS" : "FAIL");
+        }
+        // ME4: the native views against the reconstruction, the same pairs (every format)
+        for (const auto & p : pairs) {
+            ok = me4_native(s[int32_t(p[0])], s[int32_t(p[1])], pl) && ok;
+        }
     }
-    // every gate/up format once, every down format at least once
-    const fmt pairs[7][2] = {{fmt::iq2_xxs, fmt::q2_0}, {fmt::iq2_xs, fmt::iq4_nl}, {fmt::iq2_s, fmt::q5_1},
-                             {fmt::iq3_xxs, fmt::q8_0}, {fmt::iq3_s, fmt::q2_0},    {fmt::q4_k, fmt::q5_1},
-                             {fmt::q5_k, fmt::q8_0}};
-    for (const auto & p : pairs) {
-        const bool r = fp64_pair(s[int32_t(p[0])], s[int32_t(p[1])], pl);
-        good[int32_t(p[0])] = good[int32_t(p[0])] && r;
-        good[int32_t(p[1])] = good[int32_t(p[1])] && r;
-        ok = ok && r;
+    if (on["extents"]) {
+        ok = me4_extents() && ok;  // ME4: the extent rule
     }
-    for (const fmt f : gus) {
-        printf("ex-cpu-test: %s B=1..%d %s\n", fn::experts::fmt_name(f), R, good[int32_t(f)] ? "PASS" : "FAIL");
+    if (on["mx7-f16"]) {
+        ok = mx7_f16() && ok;  // MX7: the prompt CPU share's conversions
     }
-    for (const fmt f : dns) {
-        printf("ex-cpu-test: %s B=1..%d %s\n", fn::experts::fmt_name(f), R, good[int32_t(f)] ? "PASS" : "FAIL");
+    if (on["formats"]) {
+        // ME2b: the host drained with the workers (its own scratch, index workers): the tasks it claimed over the runs
+        const bool host = pl.host_tasks() > 0;
+        printf(
+            "ex-cpu-test: host drain: %lld tasks claimed by the host over the runs above (%d workers, 3 x (workers "
+            "+ host) tasks a phase) %s\n",
+            (long long) pl.host_tasks(), pl.workers(), host ? "PASS" : "FAIL");
+        ok = ok && host;
     }
-    // ME4: the native views against the reconstruction, the same pairs (every format), and the extent rule
-    for (const auto & p : pairs) {
-        ok = me4_native(s[int32_t(p[0])], s[int32_t(p[1])], pl) && ok;
-    }
-    ok = me4_extents() && ok;
-    ok = mx7_f16() && ok; // MX7: the prompt CPU share's conversions
-    // ME2b: the host drained with the workers (its own scratch, index workers): the tasks it claimed over the runs
-    const bool host = pl.host_tasks() > 0;
-    printf("ex-cpu-test: host drain: %lld tasks claimed by the host over the runs above (%d workers, 3 x (workers + "
-           "host) tasks a phase) %s\n",
-           (long long)pl.host_tasks(), pl.workers(), host ? "PASS" : "FAIL");
-    ok = ok && host;
+
     // ME3: the loan, short-read, refill-batch and helper-affinity arms
-    ok = me3_loan() && ok;
-    ok = me3_short_read() && ok;
-    ok = me3_refill_batches() && ok;
-    ok = me3_refill_state() && ok;
-    ok = me3_service_loop() && ok;
-    ok = me3_affinity() && ok;
-    // ME4: the prompt planner (chunks, paths, ring and loan, groups, the byte ring, the switch)
-    ok = fn::runtime::prompt_plan_test() && ok;
-    ok = fn::runtime::slots_cpu_test() && ok; // MU1
-    // ME5: the row-aware miss split
-    ok = fn::runtime::miss_split_test() && ok;
-    // ME9: the admission records
-    ok = fn::runtime::admission_test() && ok;
-    // the deployed classes' throughput, the pool pinned as the cache pins it (CPUs 1..5: each core's first)
-    pl.stop();
-    const std::vector<std::vector<int32_t>> cores = fn::runtime::physical_cores();
-    std::vector<int32_t> cpus;
-    for (size_t c = 1; c < cores.size() && cpus.size() < 5; ++c) {
-        cpus.push_back(cores[c][0]);
+    const struct {
+        const char * name;
+        bool (*fn)();
+    } host_cases[] = {
+        { "loan",           me3_loan                      },
+        { "short-read",     me3_short_read                },
+        { "refill-batches", me3_refill_batches            },
+        { "refill-state",   me3_refill_state              },
+        { "service-loop",   me3_service_loop              },
+        { "affinity",       me3_affinity                  },
+        { "prompt-plan",    fn::runtime::prompt_plan_test }, // ME4: the prompt planner
+        { "slots",          fn::runtime::slots_cpu_test   }, // MU1
+        { "miss-split",     fn::runtime::miss_split_test  }, // ME5: the row-aware miss split
+        { "admission",      fn::runtime::admission_test   }
+    };                                                     // ME9: the admission records
+
+    for (const auto & c : host_cases) {
+        if (on[c.name]) {
+            ok = c.fn() && ok;
+        }
     }
-    if (!pl.start(cpus, err)) {
-        printf("ex-cpu-test: %s\n", err.c_str());
-        return 1;
-    }
-    std::string masks;
-    for (int32_t i = 0; i < pl.workers(); ++i) {
-        char m[40];
-        snprintf(m, sizeof(m), "%s%d:0x%llx", i == 0 ? "" : " ", cpus[size_t(i)], (unsigned long long)pl.affinity(i));
-        masks += m;
-    }
-    printf("ex-cpu-test: throughput pool: %d workers, CPU:mask %s\n", pl.workers(), masks.c_str());
-    const fmt classes[10][2] = {{fmt::iq2_xs, fmt::iq4_nl},  {fmt::iq2_xxs, fmt::q2_0},  {fmt::iq2_xs, fmt::q2_0},
-                                {fmt::iq3_s, fmt::q2_0},     {fmt::iq2_s, fmt::q2_0},    {fmt::iq3_s, fmt::iq4_nl},
-                                {fmt::iq2_s, fmt::iq4_nl},   {fmt::iq2_xxs, fmt::iq4_nl}, {fmt::iq3_xxs, fmt::iq4_nl},
-                                {fmt::iq3_xxs, fmt::q2_0}};
-    for (const auto & c : classes) {
-        throughput(c[0], c[1], s[int32_t(c[0])], s[int32_t(c[1])], pl);
+    if (on["throughput"]) {
+        // the deployed classes' throughput, the pool pinned as the cache pins it (CPUs 1..5: each core's first)
+        pl.stop();
+        const std::vector<std::vector<int32_t>> cores = fn::runtime::physical_cores();
+        std::vector<int32_t>                    cpus;
+        for (size_t c = 1; c < cores.size() && cpus.size() < 5; ++c) {
+            cpus.push_back(cores[c][0]);
+        }
+        if (!pl.start(cpus, err)) {
+            printf("ex-cpu-test: %s\n", err.c_str());
+            return 1;
+        }
+        std::string masks;
+        for (int32_t i = 0; i < pl.workers(); ++i) {
+            char m[40];
+            snprintf(m, sizeof(m), "%s%d:0x%llx", i == 0 ? "" : " ", cpus[size_t(i)],
+                     (unsigned long long) pl.affinity(i));
+            masks += m;
+        }
+        printf("ex-cpu-test: throughput pool: %d workers, CPU:mask %s\n", pl.workers(), masks.c_str());
+        const fmt classes[10][2] = {
+            { fmt::iq2_xs,  fmt::iq4_nl },
+            { fmt::iq2_xxs, fmt::q2_0   },
+            { fmt::iq2_xs,  fmt::q2_0   },
+            { fmt::iq3_s,   fmt::q2_0   },
+            { fmt::iq2_s,   fmt::q2_0   },
+            { fmt::iq3_s,   fmt::iq4_nl },
+            { fmt::iq2_s,   fmt::iq4_nl },
+            { fmt::iq2_xxs, fmt::iq4_nl },
+            { fmt::iq3_xxs, fmt::iq4_nl },
+            { fmt::iq3_xxs, fmt::q2_0   }
+        };
+        for (const auto & c : classes) {
+            throughput(c[0], c[1], s[int32_t(c[0])], s[int32_t(c[1])], pl);
+        }
     }
     printf("ex-cpu-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;

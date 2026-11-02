@@ -3,12 +3,14 @@
 #include "fn/borrowed/gguf_tensors.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/hc/hc_prompt.h"
+#include "fn/kernels/tc/ladder.h"
 #include "fn/quant/formats.h"
 #include "fn/tools/prompt_test_util.h"
 #include "fn/xchg/prompt_xchg.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -786,10 +788,558 @@ bool fused_case(int32_t rows, verdict & v, const hcw & w) {
 
 }  // namespace
 
+// ---- TTTS3 item 7: TTTS2's hct_convert from the Q8_0 halves, on UD-Q4_K_XL's real HC tensors ---------------------
+
+// one HC module of the file: down Q8_0 [320][10240], inject F32 [4][10240], up Q8_0 [10240][320]
+struct hc_q8_module {
+    std::vector<uint8_t> down, up;  // GGUF rows: 320 of 10,880 bytes; 10,240 of 340
+    std::vector<float>   inject;    // [4][10240]
+    std::vector<float>   gamma;     // [4][2560] (hc_*_norm)
+};
+
+constexpr int64_t q8_down_row = int64_t(4) * D / 32 * 34, q8_up_row = NL / 32 * 34;
+
+float q8_value(const uint8_t * row, int64_t i) {
+    const uint8_t * b  = row + (i / 32) * 34;
+    uint16_t        dh = 0;
+    std::memcpy(&dh, b, 2);
+    return fn::quant::f16_to_f32(dh) * static_cast<float>(static_cast<int8_t>(b[2 + i % 32]));
+}
+
+// half h in hc.h's Q8_0 layouts: the mixed down (planar codes and scales of the 320 rows a stream, then the inject
+// rows BF16 [s][k][i]) and the Q8_0 up (rows f * 4 + s); false when an inject value is not exactly a BF16
+bool q8_halves(const hc_q8_module & m, int32_t h, std::vector<uint8_t> & down, std::vector<uint8_t> & up) {
+    down.assign(size_t(fn::hc::w_down_mix_bytes), 0);
+    up.assign(size_t(fn::hc::w_up_q8_bytes), 0);
+    constexpr int64_t nb = F / 32, n_codes = int64_t(4) * NL * F;
+    for (int32_t s = 0; s < 4; ++s) {
+        for (int32_t j = 0; j < NL; ++j) {
+            const int64_t   row = int64_t(s) * NL + j;
+            const uint8_t * src = m.down.data() + size_t(j) * q8_down_row + size_t(s * 2 * nb + h * nb) * 34;
+            for (int64_t b = 0; b < nb; ++b) {
+                std::memcpy(down.data() + row * F + b * 32, src + b * 34 + 2, 32);
+                std::memcpy(down.data() + n_codes + (row * nb + b) * 2, src + b * 34, 2);
+            }
+        }
+        for (int32_t k = 0; k < 4; ++k) {
+            for (int32_t i = 0; i < F; ++i) {
+                const float    x  = m.inject[size_t(k) * 4 * D + size_t(s) * D + size_t(h) * F + size_t(i)];
+                const uint16_t bf = fn::quant::f32_to_bf16(x);
+                if (fn::quant::bf16_to_f32(bf) != x) {
+                    return false;
+                }
+                std::memcpy(down.data() + fn::hc::w_down_head_q8_bytes + ((int64_t(s) * 4 + k) * F + i) * 2, &bf, 2);
+            }
+        }
+    }
+    constexpr int64_t ub = NL / 32, u_codes = int64_t(F) * 4 * NL;
+    for (int32_t f = 0; f < F; ++f) {
+        for (int32_t s = 0; s < 4; ++s) {
+            const int64_t   row = int64_t(f) * 4 + s;
+            const uint8_t * src = m.up.data() + size_t(int64_t(s) * D + int64_t(h) * F + f) * q8_up_row;
+            for (int64_t b = 0; b < ub; ++b) {
+                std::memcpy(up.data() + row * NL + b * 32, src + b * 34 + 2, 32);
+                std::memcpy(up.data() + u_codes + (row * ub + b) * 2, src + b * 34, 2);
+            }
+        }
+    }
+    return true;
+}
+
+// hct_convert's rule on the CPU (tc_gemm.cuh range_exp, pow2, pack2): a row's values, its largest magnitude m, e = 15
+// - frexp's exponent held in [-100, 100] (0 for m = 0), each value times 2^e rounded to FP16 (nearest even), 2^-e
+void convert_row(const std::vector<float> & v, uint16_t * out, float & scale) {
+    float m = 0.0f;
+    for (const float x : v) {
+        m = std::fmax(m, std::fabs(x));
+    }
+    int32_t x = 0;
+    (void) std::frexp(m, &x);
+    const int32_t e  = m > 0.0f ? std::max(-100, std::min(100, 15 - x)) : 0;
+    const float   sc = std::ldexp(1.0f, e);
+    for (size_t i = 0; i < v.size(); ++i) {
+        out[i] = fn::quant::f32_to_f16(v[i] * sc);
+    }
+    scale = std::ldexp(1.0f, -e);
+}
+
+// the expected hct_weights of a module: down rows (s, j) over the full width (j < 320 the Q8_0 values, else the
+// inject's), up rows b (feature 2 (b >> 3) + ((b >> 1) & 1), stream (b & 1) | ((b >> 2) & 1) << 1) over 320
+void convert_ref(const hc_q8_module &    m,
+                 std::vector<uint16_t> & down,
+                 std::vector<float> &    down_s,
+                 std::vector<uint16_t> & up,
+                 std::vector<float> &    up_s) {
+    down.assign(size_t(fn::hc::hct_down_elems), 0);
+    down_s.assign(size_t(4) * J, 0.0f);
+    up.assign(size_t(fn::hc::hct_up_elems), 0);
+    up_s.assign(size_t(4) * D, 0.0f);
+    parallel_for(4 * J, [&](int64_t row) {
+        const int32_t      s = static_cast<int32_t>(row / J), j = static_cast<int32_t>(row % J);
+        std::vector<float> v(D);
+        for (int32_t i = 0; i < D; ++i) {
+            v[size_t(i)] = j < NL ? q8_value(m.down.data() + size_t(j) * q8_down_row, int64_t(s) * D + i) :
+                                    m.inject[size_t(j - NL) * 4 * D + size_t(s) * D + size_t(i)];
+        }
+        convert_row(v, down.data() + row * D, down_s[size_t(row)]);
+    });
+    parallel_for(4 * D, [&](int64_t b) {
+        const int32_t      f = static_cast<int32_t>(2 * (b >> 3) + ((b >> 1) & 1));
+        const int32_t      s = static_cast<int32_t>((b & 1) | (((b >> 2) & 1) << 1));
+        std::vector<float> v(NL);
+        for (int32_t k = 0; k < NL; ++k) {
+            v[size_t(k)] = q8_value(m.up.data() + size_t(int64_t(s) * D + f) * q8_up_row, k);
+        }
+        convert_row(v, up.data() + b * NL, up_s[size_t(b)]);
+    });
+}
+
+// TTTS3 (hcp-test q8=GGUF): hct_convert with hcp_weights::q8 on layers 0, 25 and 47's attention and FFN modules: every
+// FP16 weight and row scale bitwise the CPU conversion of the file's values (Q8_0 d x q, the inject's BF16-exact F32),
+// a second launch bitwise the first
+bool q8_convert_cases(const std::string & model, verdict & v) {
+    std::vector<std::string> shards;
+    std::string              gerr;
+    if (!fnfl_gguf_shard_paths(model, shards, gerr)) {
+        v.put("q8 convert", false, gerr);
+        return false;
+    }
+    std::vector<fnfl_gguf_dir> dirs(shards.size());
+    for (size_t i = 0; i < shards.size(); ++i) {
+        if (!fnfl_gguf_read_dir(shards[i], dirs[i], gerr)) {
+            v.put("q8 convert", false, gerr);
+            return false;
+        }
+    }
+    const auto read_tensor = [&](const std::string & name, const char * type, uint64_t bytes, void * out) {
+        for (size_t i = 0; i < dirs.size(); ++i) {
+            for (const fnfl_gguf_tensor & t : dirs[i].tensors) {
+                if (t.name == name && t.type_name == type && t.bytes == bytes) {
+                    std::ifstream in(shards[i], std::ios::binary);
+                    in.seekg(static_cast<std::streamoff>(t.offset));
+                    in.read(static_cast<char *>(out), static_cast<std::streamsize>(bytes));
+                    return static_cast<bool>(in);
+                }
+            }
+        }
+        return false;
+    };
+    bool all = true;
+    for (const int32_t layer : { 0, 25, 47 }) {
+        for (const char * sub : { "attn", "ffn" }) {
+            const std::string pre  = "blk." + std::to_string(layer) + ".hc_" + sub;
+            const std::string name = "q8 convert layer " + std::to_string(layer) + " " + sub;
+            hc_q8_module      m;
+            m.down.resize(size_t(NL) * q8_down_row);
+            m.up.resize(size_t(4) * D * q8_up_row);
+            m.inject.resize(size_t(4) * 4 * D);
+            m.gamma.resize(size_t(4) * D);
+            if (!read_tensor(pre + "_down.weight", "q8_0", m.down.size(), m.down.data()) ||
+                !read_tensor(pre + "_norm.weight", "f32", m.gamma.size() * 4, m.gamma.data()) ||
+                !read_tensor(pre + "_up.weight", "q8_0", m.up.size(), m.up.data()) ||
+                !read_tensor(pre + "_inject.weight", "f32", m.inject.size() * 4, m.inject.data())) {
+                v.put(name, false, "the module's down, up or inject is missing, not Q8_0 / F32 or unreadable");
+                all = false;
+                continue;
+            }
+            std::vector<uint8_t> dn[2], up[2];
+            std::vector<float>   gm[2];
+            bool                 bf16_exact = true;
+            for (int32_t h = 0; h < 2; ++h) {
+                bf16_exact = q8_halves(m, h, dn[h], up[h]) && bf16_exact;
+                gm[h].resize(size_t(4) * F);
+                for (int32_t st = 0; st < 4; ++st) {
+                    std::memcpy(&gm[h][size_t(st) * F], &m.gamma[size_t(st) * D + size_t(h) * F], size_t(F) * 4);
+                }
+            }
+            std::vector<uint16_t> rd, ru, gd, gu, gd2, gu2;
+            std::vector<float>    rds, rus, gds, gus, gds2, gus2;
+            convert_ref(m, rd, rds, ru, rus);
+            dbuf ddn0(dn[0].size()), ddn1(dn[1].size()), dup0(up[0].size()), dup1(up[1].size()), dg0(gm[0].size() * 4),
+                dg1(gm[1].size() * 4), w16(static_cast<size_t>(fn::hc::hct_weight_bytes()));
+            fn::hc::hcp_weights a;
+            a.form                       = fn::hc::hcp_form::replicated;
+            a.down[0]                    = ddn0.as<uint16_t>();
+            a.down[1]                    = ddn1.as<uint16_t>();
+            a.up[0]                      = dup0.as<uint16_t>();
+            a.up[1]                      = dup1.as<uint16_t>();
+            a.gamma[0]                   = dg0.as<float>();
+            a.gamma[1]                   = dg1.as<float>();
+            a.q8                         = true;
+            const fn::hc::hct_weights hw = fn::hc::hct_carve(w16.as<uint8_t>());
+            const auto run = [&](std::vector<uint16_t> & od, std::vector<float> & ods, std::vector<uint16_t> & ou,
+                                 std::vector<float> & ous) {
+                od.resize(rd.size());
+                ods.resize(rds.size());
+                ou.resize(ru.size());
+                ous.resize(rus.size());
+                return w16.poison() && cuda_ok(cudaDeviceSynchronize(), "poison") &&
+                       fn::hc::hct_convert(a, hw, fn::ptest::test_stream()) &&
+                       cuda_ok(cudaDeviceSynchronize(), "hct_convert") &&
+                       cuda_ok(cudaMemcpy(od.data(), hw.down, od.size() * 2, cudaMemcpyDeviceToHost), "get") &&
+                       cuda_ok(cudaMemcpy(ods.data(), hw.down_s, ods.size() * 4, cudaMemcpyDeviceToHost), "get") &&
+                       cuda_ok(cudaMemcpy(ou.data(), hw.up, ou.size() * 2, cudaMemcpyDeviceToHost), "get") &&
+                       cuda_ok(cudaMemcpy(ous.data(), hw.up_s, ous.size() * 4, cudaMemcpyDeviceToHost), "get");
+            };
+            const bool ran = bf16_exact && ddn0.put(dn[0]) && ddn1.put(dn[1]) && dup0.put(up[0]) && dup1.put(up[1]) &&
+                             dg0.put(gm[0]) && dg1.put(gm[1]) && cuda_ok(cudaDeviceSynchronize(), "uploads") &&
+                             run(gd, gds, gu, gus) && run(gd2, gds2, gu2, gus2);
+            if (!ran) {
+                v.put(name, false, bf16_exact ? "launch failed" : "an inject value is not exactly a BF16");
+                all = false;
+                continue;
+            }
+            const auto differ = [](const auto & x, const auto & y) {
+                int64_t n = 0;
+                for (size_t i = 0; i < x.size(); ++i) {
+                    n += std::memcmp(&x[i], &y[i], sizeof(x[i])) != 0 ? 1 : 0;
+                }
+                return n;
+            };
+            const int64_t bd = differ(gd, rd), bds = differ(gds, rds), bu = differ(gu, ru), bus = differ(gus, rus);
+            const bool    same =
+                differ(gd, gd2) == 0 && differ(gds, gds2) == 0 && differ(gu, gu2) == 0 && differ(gus, gus2) == 0;
+            const bool ok = bd == 0 && bds == 0 && bu == 0 && bus == 0 && same;
+            v.put(name, ok,
+                  "down " + std::to_string(rd.size()) + " FP16 weights and " + std::to_string(rds.size()) +
+                      " row scales, up " + std::to_string(ru.size()) + " and " + std::to_string(rus.size()) +
+                      ", against the CPU conversion: " + std::to_string(bd + bds + bu + bus) + " differ; rerun " +
+                      (same ? "bitwise" : "DIFFERS"));
+            all = all && ok;
+        }
+    }
+    return all;
+}
+
+// ---- APF1 Part 4: the fused route against the converted route -------------------------------------------------------
+
+// a synthetic UD-Q4_K_XL module: Q8_0 blocks with random FP16 scales and codes in [-127, 127], BF16-exact injects
+void synth_q8_module(uint64_t seed, hc_q8_module & m) {
+    rng        g(seed);
+    const auto blocks = [&](std::vector<uint8_t> & out, int64_t bytes, double dmax) {
+        out.resize(size_t(bytes));
+        for (int64_t b = 0; b < bytes / 34; ++b) {
+            const uint16_t dh = fn::quant::f32_to_f16(static_cast<float>(g.uniform(0.1, 1.0) * dmax));
+            std::memcpy(&out[size_t(b * 34)], &dh, 2);
+            for (int32_t i = 0; i < 32; ++i) {
+                out[size_t(b * 34 + 2 + i)] =
+                    static_cast<uint8_t>(static_cast<int8_t>(static_cast<int32_t>(g.uniform(-127.0, 127.99))));
+            }
+        }
+    };
+    blocks(m.down, int64_t(NL) * q8_down_row, 0.07 / 127.0);
+    blocks(m.up, int64_t(4) * D * q8_up_row, 0.25 / 127.0);
+    m.inject.resize(size_t(4) * 4 * D);
+    for (float & x : m.inject) {
+        x = fn::quant::bf16_to_f32(fn::quant::f32_to_bf16(static_cast<float>(g.uniform(-0.07, 0.07))));
+    }
+    m.gamma.resize(size_t(4) * D);
+    for (float & x : m.gamma) {
+        x = static_cast<float>(g.uniform(0.5, 1.5));
+    }
+}
+
+// hct_scales then hct_mix_fused against hct_convert then hct_mix on the same halves and streams: the prepared scales
+// bitwise the converted ones, and mom (u, q, v), low, rinv, inject, mixed and its FP16 copy bitwise; the fused route
+// run twice (scratch reuse) bitwise; the error word clear. halves: BF16 [2] (q8 false) or the Q8_0 layouts (q8 true)
+bool g_san = false;  // hcp-test san: the ladder at two split counts a product
+
+// APF2: hct_mix_ladder on every tile and split count of each product (the other product on its retained tile), and
+// each product's first-ranked-looking pair (both on the same tile and split count): mixed and inject within the loose
+// bug-check tolerance (2e-2 a row) of the retained route's (fu) and, with w64 (the BF16 halves' FP64 model), of FP64;
+// a rerun bitwise; at one split count every tile of a product bitwise the others (the same K order); the FP16 copy
+// the F32 rounded; the error word clear
+bool ladder_route_sweep(const std::string &        name,
+                        const fn::hc::hcp_args &   a,
+                        const fn::hc::hct_weights & hp,
+                        dbuf &                     scr,
+                        dbuf &                     mixed,
+                        dbuf &                     inj,
+                        dbuf &                     m16,
+                        dbuf &                     err,
+                        const std::vector<float> & fu_mixed,
+                        const std::vector<float> & fu_inj,
+                        const hcw *                w64,
+                        const std::vector<float> & x,
+                        verdict &                  v) {
+    const int32_t rows = a.rows;
+    const int32_t max_s[2] = { std::min(fn::tc::lad_max_splits, fn::hc::hcl_down_k / 32),
+                               std::min(fn::tc::lad_max_splits, fn::hc::hcl_up_k / 32) };
+    int64_t       part = 0;
+    int32_t       cnt  = 0;
+    for (int32_t pr = 0; pr < 2; ++pr) {
+        for (int32_t t = 0; t < fn::tc::lad_n_tiles; ++t) {
+            const int32_t tc = fn::hc::hcl_tile_count(pr, rows, t);
+            cnt              = std::max(cnt, tc);
+            part = std::max(part, int64_t(tc) * max_s[pr] * fn::tc::lad_tiles[t].bm * fn::tc::lad_tiles[t].bn);
+        }
+    }
+    dbuf           wsp(size_t(std::max<int64_t>(part, 1)) * 4), wsc(size_t(std::max(cnt, 1)) * 4);
+    fn::tc::lad_ws ws;
+    ws.part        = wsp.as<float>();
+    ws.part_floats = part;
+    ws.count       = wsc.as<int32_t>();
+    ws.count_len   = cnt;
+    if (!cuda_ok(cudaMemset(wsc.p, 0, wsc.n), "the ladder's counters")) {
+        return false;
+    }
+    std::vector<double> rm, ri, rfm(fu_mixed.begin(), fu_mixed.end()), rfi(fu_inj.begin(), fu_inj.end());
+    if (w64 != nullptr) {
+        reference(*w64, x, rows, rm, ri);
+    }
+    const fn::hc::hct_combine none;
+    const auto run = [&](const fn::hc::hct_route & r, std::vector<float> & om, std::vector<float> & oi,
+                         std::vector<uint16_t> & o16, uint32_t & ew) {
+        std::vector<uint32_t> e;
+        const bool            ok = mixed.poison() && inj.poison() && m16.poison() && scr.poison() && err.zero() &&
+                        fn::hc::hct_mix_ladder(a, none, hp, scr.as<uint8_t>(), r, ws, fn::ptest::test_stream()) &&
+                        cuda_ok(cudaDeviceSynchronize(), "hct_mix_ladder") && mixed.get(om, size_t(rows) * D) &&
+                        inj.get(oi, size_t(rows) * 4) && m16.get(o16, size_t(rows) * D) && err.get(e, 1);
+        ew = ok ? e[0] : 1u;
+        return ok;
+    };
+    const auto rname = [](const fn::hc::hct_route & r) {
+        const auto one = [](int32_t t, int32_t s) {
+            return t < 0 ? std::string("retained") :
+                           "t" + std::to_string(fn::tc::lad_tiles[t].bm) + "x" +
+                               std::to_string(fn::tc::lad_tiles[t].bn) + " s" + std::to_string(s);
+        };
+        return "down " + one(r.down_tile, r.down_splits) + ", up " + one(r.up_tile, r.up_splits);
+    };
+    std::vector<fn::hc::hct_route> routes;
+    for (int32_t pr = 0; pr < 2; ++pr) {
+        for (int32_t sp = 1; sp <= max_s[pr]; ++sp) {
+            if (g_san && sp != 1 && sp != max_s[pr]) {
+                continue;
+            }
+            for (int32_t t = 0; t < fn::tc::lad_n_tiles; ++t) {
+                fn::hc::hct_route r;
+                (pr == 0 ? r.down_tile : r.up_tile)     = t;
+                (pr == 0 ? r.down_splits : r.up_splits) = sp;
+                routes.push_back(r);
+            }
+        }
+    }
+    for (int32_t t = 0; t < fn::tc::lad_n_tiles; ++t) {
+        routes.push_back({ t, max_s[0], t, max_s[1] });
+    }
+    bool                  bound_ok = true, rerun_ok = true, across = true, f16_ok = true, word_ok = true;
+    double                worst_r = 0.0, worst_f = 0.0;
+    std::string           worst_at, fails;
+    std::map<std::pair<int32_t, int32_t>, std::vector<float>> first;
+    for (const fn::hc::hct_route & r : routes) {
+        std::vector<float>    m1, i1, m2, i2;
+        std::vector<uint16_t> h1, h2;
+        uint32_t              e1 = 0, e2 = 0;
+        if (!run(r, m1, i1, h1, e1) || !run(r, m2, i2, h2, e2)) {
+            v.put(name + " ladder", false, "hct_mix_ladder launch failed at " + rname(r));
+            return false;
+        }
+        const double er = std::max(unit_error(m1.data(), rfm.data(), rows, D), unit_error(i1.data(), rfi.data(), rows, 4));
+        const double ef = w64 == nullptr ? 0.0 :
+                                           std::max(unit_error(m1.data(), rm.data(), rows, D),
+                                                    unit_error(i1.data(), ri.data(), rows, 4));
+        const bool b = er <= 2e-2 && ef <= 2e-2;
+        const bool rr = std::memcmp(m1.data(), m2.data(), m1.size() * 4) == 0 &&
+                        std::memcmp(i1.data(), i2.data(), i1.size() * 4) == 0 && h1 == h2;
+        bool f16 = true;
+        for (size_t i = 0; i < h1.size(); ++i) {
+            f16 = f16 && h1[i] == fn::quant::f32_to_f16(m1[i]);
+        }
+        if (er > worst_r) {
+            worst_r  = er;
+            worst_at = rname(r);
+        }
+        worst_f = std::max(worst_f, ef);
+        if (!b || !rr || !f16 || e1 != 0) {
+            fails += "; " + rname(r) + (b ? "" : " bound " + e3(std::max(er, ef))) + (rr ? "" : " rerun") +
+                     (f16 ? "" : " FP16") + (e1 == 0 ? "" : " word " + std::to_string(e1));
+        }
+        bound_ok = bound_ok && b;
+        rerun_ok = rerun_ok && rr;
+        f16_ok   = f16_ok && f16;
+        word_ok  = word_ok && e1 == 0;
+        // the same product at the same split count on another tile (the other product retained): bitwise
+        if ((r.up_tile < 0) != (r.down_tile < 0)) {
+            const std::pair<int32_t, int32_t> key = r.up_tile < 0 ? std::make_pair(0, r.down_splits) :
+                                                                    std::make_pair(1, r.up_splits);
+            const auto                        at  = first.find(key);
+            if (at == first.end()) {
+                first.emplace(key, m1);
+            } else {
+                across = across && std::memcmp(m1.data(), at->second.data(), m1.size() * 4) == 0;
+            }
+        }
+    }
+    const bool ok = bound_ok && rerun_ok && across && f16_ok && word_ok;
+    v.put(name + " ladder", ok,
+          std::to_string(routes.size()) + " routes: worst against the retained route " + e3(worst_r) + " (" +
+              worst_at + ")" + (w64 != nullptr ? ", against FP64 " + e3(worst_f) : std::string()) +
+              " (bound 2e-2 a row)" + (rerun_ok ? "; reruns bitwise" : "; RERUN DIFFERS") +
+              (across ? "; a product's tiles at one split count bitwise each other" : "; TILES DIFFER") +
+              (f16_ok ? "; FP16 copy bitwise" : "; FP16 COPY DIFFERS") + (word_ok ? "; error word clear" : "") +
+              (fails.empty() ? "" : fails));
+    return ok;
+}
+
+bool fused_route_case(const std::string & name,
+                      const std::vector<uint8_t> (&dn)[2],
+                      const std::vector<uint8_t> (&up)[2],
+                      const std::vector<float> (&gm)[2],
+                      bool        q8,
+                      int32_t     rows,
+                      verdict &   v,
+                      bool        ladder = false,
+                      const hcw * w64    = nullptr) {
+    std::vector<float> x;
+    make_x(rows, 0x9f0 + uint64_t(rows), x);
+    dbuf ddn0(dn[0].size()), ddn1(dn[1].size()), dup0(up[0].size()), dup1(up[1].size()), dg0(gm[0].size() * 4),
+        dg1(gm[1].size() * 4), dx(x.size() * 4), mom(size_t(rows) * fn::hc::hcp_mom * 4), low(size_t(rows) * NL * 4),
+        rinv(size_t(rows) * 16), inj(size_t(rows) * 16), mixed(size_t(rows) * D * 4), m16(size_t(rows) * D * 2),
+        err(256), w16(static_cast<size_t>(fn::hc::hct_weight_bytes())),
+        prep(static_cast<size_t>(fn::hc::hct_scale_bytes())), scr(static_cast<size_t>(fn::hc::hct_scratch_bytes(rows)));
+    if (!ddn0.put(dn[0]) || !ddn1.put(dn[1]) || !dup0.put(up[0]) || !dup1.put(up[1]) || !dg0.put(gm[0]) ||
+        !dg1.put(gm[1]) || !dx.put(x) || !err.zero() || !w16.poison() || !prep.poison()) {
+        return false;
+    }
+    fn::hc::hcp_args a;
+    a.w.form                     = fn::hc::hcp_form::replicated;
+    a.w.q8                       = q8;
+    a.w.down[0]                  = ddn0.as<uint16_t>();
+    a.w.down[1]                  = ddn1.as<uint16_t>();
+    a.w.up[0]                    = dup0.as<uint16_t>();
+    a.w.up[1]                    = dup1.as<uint16_t>();
+    a.w.gamma[0]                 = dg0.as<float>();
+    a.w.gamma[1]                 = dg1.as<float>();
+    a.rows                       = rows;
+    a.x                          = dx.as<float>();
+    a.mom                        = mom.as<float>();
+    a.low                        = low.as<float>();
+    a.rinv                       = rinv.as<float>();
+    a.inject                     = inj.as<float>();
+    a.mixed                      = mixed.as<float>();
+    a.ld_mixed                   = D;
+    a.mixed16                    = m16.as<uint16_t>();
+    a.ld_mixed16                 = D;
+    a.err                        = err.as<uint32_t>();
+    const fn::hc::hct_weights hw = fn::hc::hct_carve(w16.as<uint8_t>());
+    const fn::hc::hct_weights hp = fn::hc::hct_carve_scales(prep.as<uint8_t>());
+
+    struct outs {
+        std::vector<float>    mom, low, rinv, inj, mixed;
+        std::vector<uint16_t> m16;
+    };
+
+    const auto get = [&](outs & o) {
+        return cuda_ok(cudaDeviceSynchronize(), "hct") && mom.get(o.mom, size_t(rows) * fn::hc::hcp_mom) &&
+               low.get(o.low, size_t(rows) * NL) && rinv.get(o.rinv, size_t(rows) * 4) &&
+               inj.get(o.inj, size_t(rows) * 4) && mixed.get(o.mixed, size_t(rows) * D) &&
+               m16.get(o.m16, size_t(rows) * D);
+    };
+    const auto poison = [&]() {
+        return mom.poison() && low.poison() && rinv.poison() && inj.poison() && mixed.poison() && m16.poison() &&
+               scr.poison();
+    };
+    outs                      conv, fu1, fu2;
+    std::vector<float>        cds, cus, pds, pus;
+    std::vector<uint32_t>     ew;
+    const fn::hc::hct_combine none;
+    const bool ran = poison() && fn::hc::hct_convert(a.w, hw, fn::ptest::test_stream()) &&
+                     fn::hc::hct_mix(a, none, hw, scr.as<uint8_t>(), fn::ptest::test_stream()) && get(conv) &&
+                     poison() && fn::hc::hct_scales(a.w, hp, fn::ptest::test_stream()) &&
+                     fn::hc::hct_mix_fused(a, none, hp, scr.as<uint8_t>(), fn::ptest::test_stream()) && get(fu1) &&
+                     mom.poison() && mixed.poison() && m16.poison() &&
+                     fn::hc::hct_mix_fused(a, none, hp, scr.as<uint8_t>(), fn::ptest::test_stream()) && get(fu2) &&
+                     err.get(ew, 1);
+    if (!ran) {
+        v.put(name, false, "launch failed");
+        return false;
+    }
+    cds.resize(size_t(4) * J);
+    cus.resize(size_t(4) * D);
+    pds.resize(cds.size());
+    pus.resize(cus.size());
+    if (!cuda_ok(cudaMemcpy(cds.data(), hw.down_s, cds.size() * 4, cudaMemcpyDeviceToHost), "get") ||
+        !cuda_ok(cudaMemcpy(cus.data(), hw.up_s, cus.size() * 4, cudaMemcpyDeviceToHost), "get") ||
+        !cuda_ok(cudaMemcpy(pds.data(), hp.down_s, pds.size() * 4, cudaMemcpyDeviceToHost), "get") ||
+        !cuda_ok(cudaMemcpy(pus.data(), hp.up_s, pus.size() * 4, cudaMemcpyDeviceToHost), "get")) {
+        v.put(name, false, "readback failed");
+        return false;
+    }
+    const auto same = [](const auto & p, const auto & q) {
+        return p.size() == q.size() && std::memcmp(p.data(), q.data(), p.size() * sizeof(p[0])) == 0;
+    };
+    const auto all_same = [&](const outs & p, const outs & q) {
+        return same(p.mom, q.mom) && same(p.low, q.low) && same(p.rinv, q.rinv) && same(p.inj, q.inj) &&
+               same(p.mixed, q.mixed) && same(p.m16, q.m16);
+    };
+    const bool scales = same(cds, pds) && same(cus, pus);
+    const bool fused  = all_same(conv, fu1);
+    const bool rerun  = all_same(fu1, fu2);
+    const bool lad    = !ladder || ladder_route_sweep(name, a, hp, scr, mixed, inj, m16, err, fu1.mixed, fu1.inj,
+                                                      w64, x, v);
+    const bool ok     = scales && fused && rerun && ew[0] == 0 && lad;
+    v.put(name, ok,
+          std::string("prepared scales ") + (scales ? "bitwise" : "DIFFER") +
+              "; fused mom, low, rinv, inject, mixed, FP16 copy " + (fused ? "bitwise the converted route" : "DIFFER") +
+              "; fused rerun " + (rerun ? "bitwise" : "DIFFERS") + "; error word " + std::to_string(ew[0]) +
+              (rows <= fn::hc::hct_small_rows ? " (small tiles)" : ""));
+    return ok;
+}
+
+bool fused_route_cases(bool san, verdict & v, const hcw & w) {
+    std::vector<uint16_t> d16[2], u16[2];
+    std::vector<float>    gm[2];
+    halves(w, d16, u16, gm);
+    std::vector<uint8_t> dn[2], up[2];
+    for (int32_t h = 0; h < 2; ++h) {
+        dn[h].resize(d16[h].size() * 2);
+        std::memcpy(dn[h].data(), d16[h].data(), dn[h].size());
+        up[h].resize(u16[h].size() * 2);
+        std::memcpy(up[h].data(), u16[h].data(), up[h].size());
+    }
+    hc_q8_module m;
+    synth_q8_module(0x51f8, m);
+    std::vector<uint8_t> qd[2], qu[2];
+    std::vector<float>   qg[2];
+    for (int32_t h = 0; h < 2; ++h) {
+        if (!q8_halves(m, h, qd[h], qu[h])) {
+            v.put("fused route Q8_0 layout", false, "an inject value is not exactly a BF16");
+            return false;
+        }
+        qg[h].resize(size_t(4) * F);
+        for (int32_t st = 0; st < 4; ++st) {
+            std::memcpy(&qg[h][size_t(st) * F], &m.gamma[size_t(st) * D + size_t(h) * F], size_t(F) * 4);
+        }
+    }
+    bool all = true;
+    // APF2: the ladder at rows just below, at and above its tiles' rows (and a partial 128-row tile)
+    const std::vector<int32_t> lad =
+        san ? std::vector<int32_t>{ 3 } : std::vector<int32_t>{ 1, 7, 8, 9, 16, 17, 33, 64, 65, 128, 129, 257, 300 };
+    for (const int32_t r : san ? std::vector<int32_t>{ 3, 70 } :
+                                 std::vector<int32_t>{ 1, 7, 8, 9, 16, 17, 33, 63, 64, 65, 127, 128, 129, 257, 300, 513,
+                                                       2047, 2048, 2049 }) {
+        const bool l = std::find(lad.begin(), lad.end(), r) != lad.end();
+        all = fused_route_case("fused route BF16 " + std::to_string(r) + " rows", dn, up, gm, false, r, v, l, &w) &&
+              all;
+        all = fused_route_case("fused route Q8_0 " + std::to_string(r) + " rows", qd, qu, qg, true, r, v, l) && all;
+    }
+    return all;
+}
+
 int fnfl_hcp_test(int device, const char * mode) {
     const bool san = mode != nullptr && std::strcmp(mode, "san") == 0;
     verdict    v("hcp-test");
     if (!cuda_ok(cudaSetDevice(device), "device")) {
+        return 1;
+    }
+    if (mode != nullptr && std::strncmp(mode, "q8=", 3) == 0) {  // TTTS3 item 7: the Q8_0 conversion on real tensors
+        q8_convert_cases(std::string(mode + 3), v);
+        return v.finish();
+    }
+    g_san = san;
+    if (!fn::hc::hcl_attributes()) {
+        fprintf(stderr, "hcp-test: the ladder's shared memory opt-in\n");
         return 1;
     }
     hcw w;
@@ -822,6 +1372,16 @@ int fnfl_hcp_test(int device, const char * mode) {
     }
     for (const int32_t r : san ? std::vector<int32_t>{ 3 } : std::vector<int32_t>{ 1, 65, 1536 }) {
         fused_case(r, v, w);
+    }
+    fused_route_cases(san, v, w);
+    if (!san) {
+        for (const int32_t which : { 5, 6, 8, 10, 11, 12, 13, 14, 15, 16, 17 }) {
+            fn::hc::hcp_resources r{};
+            if (fn::hc::hcp_kernel_resources(which, r)) {
+                std::printf("hcp-test: kernel %d: %d registers, %d local bytes, %d static shared bytes\n", which,
+                            r.regs, r.local_bytes, r.shared_bytes);
+            }
+        }
     }
     if (mode != nullptr && std::strncmp(mode, "real=", 5) == 0) {
         real_cases(std::string(mode + 5), v);

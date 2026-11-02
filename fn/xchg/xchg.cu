@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 
@@ -44,7 +45,18 @@ struct device_scope {
 } // namespace
 
 bool enable_peer_access(int32_t dev0, int32_t dev1) {
+    // PRD1 (TTTSBS): the directed pairs this process enabled. Peer access is the driver's per-process state, so the
+    // record mirrors it; a repeat makes no CUDA call (cudaDeviceEnablePeerAccess's "already enabled" is an API error
+    // that compute-sanitizer memcheck reports). Devices 0 .. 7; others are enabled on every call, as before
+    static std::atomic<uint64_t> enabled{0};
     const int32_t dev[2] = {dev0, dev1};
+    const auto    bit    = [&](int32_t c) -> uint64_t {
+        return dev[c] >= 0 && dev[c] < 8 && dev[1 - c] >= 0 && dev[1 - c] < 8 ? uint64_t(1) << (dev[c] * 8 + dev[1 - c])
+                                                                                    : 0;
+    };
+    if (bit(0) != 0 && bit(1) != 0 && (enabled.load() & (bit(0) | bit(1))) == (bit(0) | bit(1))) {
+        return true;
+    }
     for (int32_t c = 0; c < 2; ++c) {
         int can = 0;
         if (!cuda_ok(cudaDeviceCanAccessPeer(&can, dev[c], dev[1 - c]), "cudaDeviceCanAccessPeer")) {
@@ -64,6 +76,7 @@ bool enable_peer_access(int32_t dev0, int32_t dev1) {
         } else if (!cuda_ok(e, "cudaDeviceEnablePeerAccess")) {
             return false;
         }
+        enabled.fetch_or(bit(c));
     }
     return true;
 }

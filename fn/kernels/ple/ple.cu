@@ -1,6 +1,5 @@
-#include "fn/kernels/ple/ple.h"
-
 #include "fn/kernels/dense/dense.h"
+#include "fn/kernels/ple/ple.h"
 #include "fn/kernels/round/version.h"
 #include "fn/xchg/xchg.cuh"
 #include "fn/xchg/xchg.h"
@@ -8,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 
@@ -42,13 +42,19 @@ bool al16(const void * p) {
     return p != nullptr && reinterpret_cast<uintptr_t>(p) % 16 == 0;
 }
 
-fn::dense::product_args product_args_of(const step_args * a, uint8_t * work) {
+// the products' matrix format for the key and value's (TTTS3)
+fn::dense::fmt dense_fmt(kv_fmt kv) {
+    return kv == kv_fmt::q8_0 ? fn::dense::fmt_q8_0f : kv == kv_fmt::f32 ? fn::dense::fmt::f32 : fn::dense::fmt::bf16;
+}
+
+fn::dense::product_args product_args_of(const step_args * a, uint8_t * work, kv_fmt kv) {
     fn::dense::product_args p;
     p.k = n_in;
     p.n_mats = 2;
-    p.mats[0].f = fn::dense::fmt::bf16;
+    const fn::dense::fmt f = dense_fmt(kv);
+    p.mats[0].f            = f;
     p.mats[0].m = n_channel;
-    p.mats[1].f = fn::dense::fmt::bf16;
+    p.mats[1].f            = f;
     p.mats[1].m = n_own;
     if (a != nullptr) {
         const ws_view v = carve(a->ws);
@@ -63,8 +69,11 @@ fn::dense::product_args product_args_of(const step_args * a, uint8_t * work) {
     return p;
 }
 
+// TTTS2, TTTS3: the largest of the formats' layouts
 size_t product_work_bytes() {
-    return fn::dense::work_bytes(product_args_of(nullptr, nullptr));
+    return std::max({ fn::dense::work_bytes(product_args_of(nullptr, nullptr, kv_fmt::bf16)),
+                      fn::dense::work_bytes(product_args_of(nullptr, nullptr, kv_fmt::f32)),
+                      fn::dense::work_bytes(product_args_of(nullptr, nullptr, kv_fmt::q8_0)) });
 }
 
 // ---- stats --------------------------------------------------------------------------------------------------------
@@ -183,13 +192,23 @@ __device__ __forceinline__ row_scalars scalars(const float * own, const float * 
 
 // thread: channel c = 1280 s + i. hres and h_out may be the same buffer (no __restrict__ on either). The block polls the peer's B rows (one lane a 16-byte word), shares them and its own
 // rows through shared memory, and computes the B x 4 scalars once.
-template <int B>
-__global__ void __launch_bounds__(update_threads)
-update_kernel(const float * __restrict__ value, const float * hres, const float * __restrict__ hpost,
-              const float * __restrict__ hx, const float * __restrict__ norm_conv, const uint16_t * __restrict__ conv,
-              const float * __restrict__ own_stats, float * slot, float * h_out, float * __restrict__ hist,
-              const uint32_t * cur_word, float * __restrict__ scal, uint32_t * err, int32_t card,
-              const uint64_t * use) {
+// TTTS2: T32, the taps F32 (conv32: one float4 a channel) instead of F16; every other operation the same
+template <int B, bool T32 = false>
+__global__ void __launch_bounds__(update_threads) update_kernel(const float * __restrict__ value,
+                                                                const float * hres,
+                                                                const float * __restrict__ hpost,
+                                                                const float * __restrict__ hx,
+                                                                const float * __restrict__ norm_conv,
+                                                                const uint16_t * __restrict__ conv,
+                                                                const float * __restrict__ own_stats,
+                                                                float * slot,
+                                                                float * h_out,
+                                                                float * __restrict__ hist,
+                                                                const uint32_t * cur_word,
+                                                                float * __restrict__ scal,
+                                                                uint32_t *       err,
+                                                                int32_t          card,
+                                                                const uint64_t * use) {
     if (use != nullptr) {
         slot += (*use % fn::xchg::n_slot) * slot_floats; // this card's slot of use u (TG1)
     }
@@ -201,11 +220,20 @@ update_kernel(const float * __restrict__ value, const float * hres, const float 
     const int32_t s = c / n_own, i = c % n_own;
 
     // independent of the exchange: the taps, the history and the norm, read before the poll
-    const uint2 wraw = __ldg(reinterpret_cast<const uint2 *>(conv) + c);
-    const float w0 = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x & 0xffffu)));
-    const float w1 = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x >> 16)));
-    const float w2 = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y & 0xffffu)));
-    const float w3 = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y >> 16)));
+    float w0, w1, w2, w3;
+    if constexpr (T32) {
+        const float4 wf = __ldg(reinterpret_cast<const float4 *>(conv) + c);
+        w0              = wf.x;
+        w1              = wf.y;
+        w2              = wf.z;
+        w3              = wf.w;
+    } else {
+        const uint2 wraw = __ldg(reinterpret_cast<const uint2 *>(conv) + c);
+        w0               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x & 0xffffu)));
+        w1               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x >> 16)));
+        w2               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y & 0xffffu)));
+        w3               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y >> 16)));
+    }
     const uint32_t cur = *cur_word; // the committed slot (SR1)
     const float * h0 = hist + fn::round::version_slot(cur, 0) * hist_version_floats + int64_t(c) * n_hist;
     float hv[n_hist];
@@ -288,12 +316,13 @@ bool products(int32_t rows, const step_args & a, void * stream) {
         fprintf(stderr, "ple products: rejected (rows %d, or a null or misaligned pointer)\n", rows);
         return false;
     }
-    const fn::dense::product_args p = product_args_of(&a, carve(a.ws).work);
+    const fn::dense::product_args p = product_args_of(&a, carve(a.ws).work, a.w.kv);
     return fn::dense::product(rows, p, stream);
 }
 
-size_t joint_products_work_bytes() {
-    return fn::dense::joint_work_bytes(product_args_of(nullptr, nullptr));
+size_t joint_products_work_bytes() {  // BF16 and (TTTS3) Q8_0
+    return std::max(fn::dense::joint_work_bytes(product_args_of(nullptr, nullptr, kv_fmt::bf16)),
+                    fn::dense::joint_work_bytes(product_args_of(nullptr, nullptr, kv_fmt::q8_0)));
 }
 
 bool products_joint(int32_t lanes, int32_t rows, const step_args * const a[], uint8_t * work, void * stream) {
@@ -304,7 +333,8 @@ bool products_joint(int32_t lanes, int32_t rows, const step_args * const a[], ui
     j.rows  = rows;
     for (int32_t u = 0; ok && u < lanes; ++u) {
         ok = a[u] != nullptr && common_ok(rows, *a[u], stream) && al16(a[u]->w.key) && al16(a[u]->w.value) &&
-             al16(a[u]->e) && a[u]->w.key == a[0]->w.key && a[u]->w.value == a[0]->w.value;
+             al16(a[u]->e) && a[u]->w.key == a[0]->w.key && a[u]->w.value == a[0]->w.value &&
+             a[u]->w.kv == a[0]->w.kv && a[u]->w.kv != kv_fmt::f32;
         if (ok) {
             const ws_view v = carve(a[u]->ws);
             j.x_f32[u] = a[u]->e;
@@ -318,7 +348,7 @@ bool products_joint(int32_t lanes, int32_t rows, const step_args * const a[], ui
                 lanes, rows);
         return false;
     }
-    return fn::dense::product_joint(product_args_of(a[0], work), j, stream);
+    return fn::dense::product_joint(product_args_of(a[0], work, a[0]->w.kv), j, stream);
 }
 
 bool stats(int32_t rows, const step_args & a, void * stream) {
@@ -337,18 +367,24 @@ bool stats(int32_t rows, const step_args & a, void * stream) {
 
 bool update(int32_t rows, const step_args & a, void * stream) {
     if (!common_ok(rows, a, stream) || !al16(a.hres) || !al16(a.hpost) || !al16(a.hx) || !al16(a.h_out) ||
-        !al16(a.hist) || a.cur == nullptr || !al16(a.w.norm_conv) || !al16(a.w.conv) || !al16(a.stats_slot) ||
-        a.err == nullptr ||
-        (a.card != 0 && a.card != 1)) {
+        !al16(a.hist) || a.cur == nullptr || !al16(a.w.norm_conv) ||
+        !al16(a.w.conv32 != nullptr ? (const void *) a.w.conv32 : a.w.conv) || !al16(a.stats_slot) ||
+        a.err == nullptr || (a.card != 0 && a.card != 1)) {
         fprintf(stderr, "ple update: rejected (rows %d, card %d, or a null or misaligned pointer)\n", rows, a.card);
         return false;
     }
     const ws_view v = carve(a.ws);
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
-#define FN_PLE_UPDATE(R)                                                                                               \
-    update_kernel<R><<<update_blocks, update_threads, 0, st>>>(v.value, a.hres, a.hpost, a.hx, a.w.norm_conv,          \
-                                                               a.w.conv, v.stats, a.stats_slot, a.h_out, a.hist,       \
-                                                               a.cur, v.scal, a.err, a.card, a.use)
+#define FN_PLE_UPDATE(R)                                                                                             \
+    if (a.w.conv32 != nullptr) {                                                                                     \
+        update_kernel<R, true><<<update_blocks, update_threads, 0, st>>>(                                            \
+            v.value, a.hres, a.hpost, a.hx, a.w.norm_conv, reinterpret_cast<const uint16_t *>(a.w.conv32), v.stats,  \
+            a.stats_slot, a.h_out, a.hist, a.cur, v.scal, a.err, a.card, a.use);                                     \
+    } else {                                                                                                         \
+        update_kernel<R><<<update_blocks, update_threads, 0, st>>>(v.value, a.hres, a.hpost, a.hx, a.w.norm_conv,    \
+                                                                   a.w.conv, v.stats, a.stats_slot, a.h_out, a.hist, \
+                                                                   a.cur, v.scal, a.err, a.card, a.use);             \
+    }
     switch (rows) {
         case 1:
             FN_PLE_UPDATE(1);

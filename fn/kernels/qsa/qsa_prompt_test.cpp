@@ -31,8 +31,19 @@ double angle(int32_t pos, int32_t i, float ts) {
     return theta;
 }
 
-// rms_norm(x) w then the IMROPE of a 256-wide row at pos (dims 0..63 in pairs (i, i + 32)), FP64
-void norm_rope_ref(const float * x, const float * w, int32_t pos, float ts, double * y) {
+// IMROPE's plane for rotation pair i (fn/kernels/qsa/imrope.cuh)
+int32_t imrope_plane_ref(int32_t i) {
+    return i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : i % 3 == 0 && i < 33 ? 0 : 3;
+}
+
+// rms_norm(x) w then the IMROPE of a 256-wide row at pos (dims 0..63 in pairs (i, i + 32)), FP64; plane (MUP1 piece
+// 5, optional): the row's four rope positions, pair i at plane[imrope_plane_ref(i)] (pos unused)
+void norm_rope_ref(const float *   x,
+                   const float *   w,
+                   int32_t         pos,
+                   float           ts,
+                   double *        y,
+                   const int32_t * plane = nullptr) {
     double ss = 0.0;
     for (int32_t e = 0; e < HD; ++e) {
         ss += double(x[e]) * x[e];
@@ -42,7 +53,8 @@ void norm_rope_ref(const float * x, const float * w, int32_t pos, float ts, doub
         y[e] = double(x[e]) * r * w[e];
     }
     for (int32_t i = 0; i < 32; ++i) {
-        const double th = angle(pos, i, ts), c = std::cos(th), s = std::sin(th);
+        const double th = angle(plane != nullptr ? plane[imrope_plane_ref(i)] : pos, i, ts), c = std::cos(th),
+                     s = std::sin(th);
         const double a = y[i], b = y[i + 32];
         y[i]      = a * c - b * s;
         y[i + 32] = a * s + b * c;
@@ -60,15 +72,22 @@ struct fixture {
 // (Amendment 2; the prompt scorer's FP16 products): a bug check. Each body's counts and tail equal the decode
 // select's, its blocks ascend strictly below the row's visibility, and at least 95% of them are the decode select's
 // (all of them for a row that takes every block, and with exact set, bitwise); a rerun is bitwise.
-bool select_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, const char * tag = "", bool exact = false) {
+// MUP1 piece 5: off, the slot's rotary offset (the prompt path's rope_off; the decode select's device word)
+bool select_case(fixture &    fx,
+                 int32_t      pos0,
+                 int32_t      n,
+                 verdict &    v,
+                 const char * tag   = "",
+                 bool         exact = false,
+                 int32_t      off   = 0) {
     rng                r(0x5e1 + uint64_t(pos0));
     std::vector<float> iq(size_t(n) * 4 * KD);
     for (float & f : iq) {
         f = static_cast<float>(r.normal());
     }
     dbuf diq(iq.size() * 4), ws(qsa::prompt_ws_bytes(fx.cells)), body(static_cast<size_t>(qsa::prompt_sel_bytes)),
-        dws(qsa::workspace_bytes()), dbody(size_t(qsa::max_row_words) * 4 * 4), doff(64), ddepth(256);
-    if (!diq.put(iq) || !body.poison() || !dws.zero()) {
+        dws(qsa::workspace_bytes()), dbody(size_t(qsa::max_row_words) * 4 * 4), doff(64), ddepth(256), drope(256);
+    if (!diq.put(iq) || !body.poison() || !dws.zero() || !drope.put(std::vector<int32_t>{ off })) {
         return false;
     }
     qsa::qsp_index_args a;
@@ -78,12 +97,13 @@ bool select_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, const char 
     a.rope      = qsa::model_rope();
     a.rows      = n;
     a.pos0      = pos0;
+    a.rope_off                 = off;
     a.max_cells = fx.cells;
     a.ws        = qsa::prompt_carve(ws.p, fx.cells);
     a.body      = body.as<uint32_t>();
     a.offsets   = reinterpret_cast<int32_t *>(a.body + qsa::prompt_body_words);
-    const std::string name =
-        std::string(tag) + "selection rows " + std::to_string(pos0) + " .. " + std::to_string(pos0 + n);
+    const std::string     name = std::string(tag) + "selection rows " + std::to_string(pos0) + " .. " +
+                                 std::to_string(pos0 + n) + (off != 0 ? " offset " + std::to_string(off) : "");
     std::vector<uint32_t> all;
     if (!qsa::qsp_select(a, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "qsp_select") ||
         !body.get(all, size_t(qsa::prompt_sel_bytes / 4))) {
@@ -111,6 +131,7 @@ bool select_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, const char 
         sa.ws        = qsa::carve(dws.p);
         sa.body      = dbody.as<uint32_t>();
         sa.offsets   = doff.as<int32_t>();
+        sa.rope_off  = off != 0 ? drope.as<int32_t>() : nullptr;
         std::vector<uint32_t> want;
         if (!ddepth.put(std::vector<int32_t>{ depth }) || !qsa::select(1, sa, fn::ptest::test_stream()) ||
             !cuda_ok(cudaDeviceSynchronize(), "select") || !dbody.get(want, size_t(qsa::row_words(depth)))) {
@@ -187,8 +208,17 @@ struct caches {
 // bitwise the CPU quantizer's), then attention of those rows over the prompt path's own selection against FP64 over
 // the decoded cache (PB3: a loose bug-check tolerance). vrows (optional): the rows' v (the quantizer's stress rows; the
 // write checked alone, the attention run for the dumps only)
-bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8, const float * vrows = nullptr,
-                    const char * tag = "") {
+// MUP1 piece 5: off, the slot's rotary offset (K, the selection's and the attention's queries at cell + off); planes
+// (optional): supplied rope planes [n][4] for K and the attention's queries (the selection stays on pos0 + t + off)
+bool kv_attend_case(fixture &                    fx,
+                    int32_t                      pos0,
+                    int32_t                      n,
+                    verdict &                    v,
+                    bool                         q8,
+                    const float *                vrows  = nullptr,
+                    const char *                 tag    = "",
+                    int32_t                      off    = 0,
+                    const std::vector<int32_t> * planes = nullptr) {
     rng                r(0xa77 + uint64_t(pos0));
     const int32_t      cells = pos0 + n;
     std::vector<float> kk(size_t(n) * HD), vv(size_t(n) * HD), kn(HD), qn(HD), qfull(size_t(n) * NH * QS);
@@ -237,7 +267,12 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     }
     dbuf dk(kk.size() * 4), dv(vv.size() * 4), dkn(size_t(HD) * 4), dqn(size_t(HD) * 4), dkc(size_t(fx.cells) * HD * 2),
         dvc(size_t(fx.cells) * HD * 2), dks(size_t(fx.cells) * SS * 2), dvs(size_t(fx.cells) * SS * 2),
-        dq(qfull.size() * 4), out(size_t(n) * NH * HD * 4), out16(size_t(n) * NH * HD * 2), err(256);
+        dq(qfull.size() * 4), out(size_t(n) * NH * HD * 4), out16(size_t(n) * NH * HD * 2), err(256),
+        dplanes(size_t(n) * 4 * 4);
+    if (planes != nullptr && !dplanes.put(*planes)) {
+        return false;
+    }
+    const int32_t * pl = planes != nullptr ? dplanes.as<int32_t>() : nullptr;
     const bool up = q8 ? dkc.put(h.k8) && dvc.put(h.v8) && dks.put(h.k) && dvs.put(h.v) : dkc.put(h.k) && dvc.put(h.v);
     if (!dk.put(kk) || !dv.put(vv) || !dkn.put(kn) || !dqn.put(qn) || !up || !dq.put(qfull) || !out.poison() ||
         !err.zero()) {
@@ -250,6 +285,8 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     ka.k_norm    = dkn.as<float>();
     ka.rows      = n;
     ka.pos0      = pos0;
+    ka.rope_off  = off;
+    ka.planes    = pl;
     ka.max_cells = fx.cells;
     ka.k_cache   = dkc.as<uint16_t>();
     ka.v_cache   = dvc.as<uint16_t>();
@@ -270,7 +307,8 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     int64_t kbad = 0, vbad = 0;
     for (int32_t t = 0; t < n; ++t) {
         double y[HD];
-        norm_rope_ref(kk.data() + size_t(t) * HD, kn.data(), pos0 + t, ts, y);
+        norm_rope_ref(kk.data() + size_t(t) * HD, kn.data(), pos0 + t + off, ts, y,
+                      planes != nullptr ? planes->data() + size_t(t) * 4 : nullptr);
         const int64_t cell = int64_t(pos0) + t;
         if (q8) {
             double ymax = 0.0;
@@ -297,11 +335,13 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
             vbad += g.v[at] == fn::quant::f32_to_bf16(vv[size_t(t) * HD + e]) ? 0 : 1;
         }
     }
-    v.put(std::string(tag) + "K/V write rows " + std::to_string(pos0) + " + " + std::to_string(n),
+    const std::string rope =
+        std::string(off != 0 ? " offset " + std::to_string(off) : "") + (planes != nullptr ? " supplied planes" : "");
+    v.put(std::string(tag) + "K/V write rows " + std::to_string(pos0) + " + " + std::to_string(n) + rope,
           kbad == 0 && vbad == 0,
           q8 ? std::to_string(kbad) + " K values beyond half a quantization step of FP64, " + std::to_string(vbad) +
-                   " V rows not the CPU quantizer's codes and scales (q8)"
-             : std::to_string(kbad) + " K values beyond one BF16 step of FP64, " + std::to_string(vbad) +
+                   " V rows not the CPU quantizer's codes and scales (q8)" :
+               std::to_string(kbad) + " K values beyond one BF16 step of FP64, " + std::to_string(vbad) +
                    " V values not bf16(v)");
     // the selection of the rows (the prompt path's own; checked against decode's above)
     std::vector<float> iq(size_t(n) * 4 * KD);
@@ -316,6 +356,7 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     ia.rope      = qsa::model_rope();
     ia.rows      = n;
     ia.pos0      = pos0;
+    ia.rope_off  = off;
     ia.max_cells = fx.cells;
     ia.ws        = qsa::prompt_carve(ws.p, fx.cells);
     ia.body      = body.as<uint32_t>();
@@ -331,6 +372,8 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     aa.v_scale = ka.v_scale;
     aa.rows      = n;
     aa.pos0      = pos0;
+    aa.rope_off  = off;
+    aa.planes    = pl;
     aa.max_cells = fx.cells;
     aa.out       = out.as<float>();
     aa.out16     = out16.as<uint16_t>();
@@ -350,7 +393,8 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     {
         std::vector<uint16_t> g16;
         const std::string d = std::string("qsp-") + (q8 ? "q8" : "bf16") + (vrows != nullptr ? "-stress" : "") + "-" +
-                              std::to_string(pos0) + "+" + std::to_string(n);
+                              std::to_string(pos0) + "+" + std::to_string(n) +
+                              (off != 0 ? "-off" + std::to_string(off) : "") + (planes != nullptr ? "-planes" : "");
         const bool dumped = out16.get(g16, size_t(n) * NH * HD) &&
                             fn::tools::test_dump(d + "-out", gout.data(), gout.size() * 4) &&
                             fn::tools::test_dump(d + "-out-rerun", gout2.data(), gout2.size() * 4) &&
@@ -372,7 +416,7 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     const int32_t *     offs = reinterpret_cast<const int32_t *>(bodies.data() + qsa::prompt_body_words);
     std::vector<double> ref(gout.size());
     parallel_for(n, [&](int64_t t) {
-        const int32_t pos = pos0 + static_cast<int32_t>(t);
+        const int32_t    pos = pos0 + static_cast<int32_t>(t) + off;
         const int32_t s = static_cast<int32_t>(t) / qsa::prompt_slab, rr = static_cast<int32_t>(t) % qsa::prompt_slab;
         const uint32_t * b =
             bodies.data() + int64_t(s) * qsa::prompt_slab_words + offs[s * (qsa::prompt_slab + 1) + rr] / 4;
@@ -387,7 +431,8 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
         }
         for (int32_t hh = 0; hh < NH; ++hh) {
             double q[HD];
-            norm_rope_ref(qfull.data() + (size_t(t) * NH + hh) * QS, qn.data(), pos, ts, q);
+            norm_rope_ref(qfull.data() + (size_t(t) * NH + hh) * QS, qn.data(), pos, ts, q,
+                          planes != nullptr ? planes->data() + size_t(t) * 4 : nullptr);
             std::vector<double> sc(sel.size());
             double              mx = -HUGE_VAL;
             for (size_t c = 0; c < sel.size(); ++c) {
@@ -418,7 +463,7 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
     // PB3 Amendment 2: a loose bug check (FP16 operands), the error printed on a failure only
     const bool loose = ea <= 2e-2;
     const bool ok = loose && same && ew[0] == 0;
-    v.put(std::string(tag) + "attention rows " + std::to_string(pos0) + " + " + std::to_string(n), ok,
+    v.put(std::string(tag) + "attention rows " + std::to_string(pos0) + " + " + std::to_string(n) + rope, ok,
           std::string("against FP64 ") + (loose ? "within" : "OUTSIDE") +
               " the loose bug-check tolerance (2e-2 a row and head)" + (loose ? "" : " [" + e3(ea) + "]") + "; rerun " +
               (same ? "bitwise" : "DIFFERS") + "; error word " + std::to_string(ew[0]));
@@ -427,6 +472,175 @@ bool kv_attend_case(fixture & fx, int32_t pos0, int32_t n, verdict & v, bool q8,
 }
 
 }  // namespace
+
+// VIS1 Stage B: the index with rope planes. Summaries of nb blocks from B0 with four planes that differ against FP64
+// (the mean of the 4 raw keys, rms_norm, k_norm, IMROPE pair by pair at the block's planes; within tol of the block's
+// largest value: the scorer's fast-math __sinf and __cosf), and with uniform planes (every plane 4b + off) bitwise the
+// offset path's. The prompt queries of n rows from pos0 with differing planes: the prepared FP16 queries (the
+// workspace's q16 times qs) against FP64 of the same norm and IMROPE; with uniform planes the selection bitwise the
+// offset path's.
+double index_rope_ref(const float * x, const float * w, const int32_t * plane, float ts, int32_t e) {
+    // one output column e of rms_norm(x) w with IMROPE (pairs (i, i + 32), i < 32), FP64
+    double ss = 0.0;
+    for (int32_t k = 0; k < KD; ++k) {
+        ss += double(x[k]) * x[k];
+    }
+    const double r = 1.0 / std::sqrt(ss / KD + double(fn::rms_eps));
+    const auto   y = [&](int32_t k) {
+        return double(x[k]) * r * w[k];
+    };
+    if (e >= 64) {
+        return y(e);
+    }
+    const int32_t i  = e % 32;
+    const double  th = double(plane[imrope_plane_ref(i)]) * std::pow(double(ts), double(i));
+    const double  a = y(i), b = y(i + 32);
+    return e < 32 ? a * std::cos(th) - b * std::sin(th) : a * std::sin(th) + b * std::cos(th);
+}
+
+bool planes_case(fixture & fx, verdict & v, bool san, const std::vector<float> & kn, const std::vector<float> & qn) {
+    const float          ts  = qsa::model_rope().theta_scale;
+    const double         tol = 4e-3;
+    const int32_t        B0 = 1101, nb = san ? 6 : 40;
+    std::vector<int32_t> bp(size_t(nb) * 4), bu(size_t(nb) * 4);
+    for (int32_t i = 0; i < nb; ++i) {
+        const int32_t p       = 600 + i / 5;  // a 5-wide image's blocks: t, h, w, e as image rows
+        bp[size_t(i) * 4 + 0] = p;
+        bp[size_t(i) * 4 + 1] = p + i % 3;
+        bp[size_t(i) * 4 + 2] = p + i % 5;
+        bp[size_t(i) * 4 + 3] = 0;
+        for (int32_t k = 0; k < 4; ++k) {
+            bu[size_t(i) * 4 + k] = 4 * (B0 + i) + 37;
+        }
+    }
+    dbuf dbp(bp.size() * 4), dbu(bu.size() * 4), s1(qsa::summary_bytes(fx.cells / 4)),
+        s2(qsa::summary_bytes(fx.cells / 4)), s3(qsa::summary_bytes(fx.cells / 4));
+    qsa::update_args ua;
+    ua.keys   = fx.dkeys.as<uint16_t>();
+    ua.k_norm = fx.dkn.as<float>();
+    ua.first  = B0;
+    ua.count  = nb;
+    ua.rope   = qsa::model_rope();
+    std::vector<float> g1, g2, g3;
+    bool               ok = dbp.put(bp) && dbu.put(bu) && s1.zero() && s2.zero() && s3.zero();
+    ua.summaries          = s1.as<float>();
+    ua.planes             = dbp.as<int32_t>();
+    ok                    = ok && qsa::summary_update(ua, fn::ptest::test_stream());
+    ua.summaries          = s2.as<float>();
+    ua.planes             = dbu.as<int32_t>();
+    ok                    = ok && qsa::summary_update(ua, fn::ptest::test_stream());
+    ua.summaries          = s3.as<float>();
+    ua.planes             = nullptr;
+    ua.rope_off           = 37;
+    ok = ok && qsa::summary_update(ua, fn::ptest::test_stream()) && cuda_ok(cudaDeviceSynchronize(), "summaries") &&
+         s1.get(g1, qsa::summary_bytes(fx.cells / 4) / 4) && s2.get(g2, qsa::summary_bytes(fx.cells / 4) / 4) &&
+         s3.get(g3, qsa::summary_bytes(fx.cells / 4) / 4);
+    if (!ok) {
+        v.put("index planes", false, "a launch or copy failed");
+        return false;
+    }
+    double worst = 0.0;
+    for (int32_t i = 0; i < nb; ++i) {
+        const int32_t b = B0 + i;
+        float         x[KD];
+        for (int32_t e = 0; e < KD; ++e) {
+            float sum = 0.0f;
+            for (int32_t r = 0; r < 4; ++r) {
+                sum += fn::quant::bf16_to_f32(fx.keys[(size_t(b) * 4 + size_t(r)) * KD + size_t(e)]);
+            }
+            x[e] = sum * 0.25f;
+        }
+        double err = 0.0, mx = 0.0;
+        for (int32_t e = 0; e < KD; ++e) {
+            const double want = index_rope_ref(x, kn.data(), &bp[size_t(i) * 4], ts, e);
+            const float  got  = g1[size_t(b / 32) * 4096 + size_t(e / 4) * 128 + size_t(b % 32) * 4 + size_t(e % 4)];
+            err               = std::max(err, std::fabs(double(got) - want));
+            mx                = std::max(mx, std::fabs(want));
+        }
+        worst = std::max(worst, mx > 0 ? err / mx : err);
+    }
+    char wv[32];
+    snprintf(wv, sizeof(wv), "%.2e", worst);
+    v.put("index summaries with planes (" + std::to_string(nb) + " blocks)", worst <= tol,
+          std::string("against FP64 pair by pair: worst ") + wv + " of the block's largest (tolerance 4e-3)");
+    v.put("index summaries with uniform planes", g2 == g3, g2 == g3 ? "bitwise the offset path's" : "DIFFER");
+
+    // the queries: n rows (one slab) from pos0, planes that differ; then uniform planes against the offset path
+    const int32_t        pos0 = 4404, n = san ? 9 : 70;
+    std::vector<int32_t> qp(size_t(n) * 4), qu(size_t(n) * 4);
+    for (int32_t t = 0; t < n; ++t) {
+        const int32_t p       = 640 + t / 7;
+        qp[size_t(t) * 4 + 0] = p;
+        qp[size_t(t) * 4 + 1] = p + (t / 7) % 4;
+        qp[size_t(t) * 4 + 2] = p + t % 7;
+        qp[size_t(t) * 4 + 3] = 0;
+        for (int32_t k = 0; k < 4; ++k) {
+            qu[size_t(t) * 4 + k] = pos0 + t + 211;
+        }
+    }
+    rng                r(0x91a);
+    std::vector<float> iq(size_t(n) * 4 * KD);
+    for (float & f : iq) {
+        f = static_cast<float>(r.normal());
+    }
+    dbuf diq(iq.size() * 4), dqp(qp.size() * 4), dqu(qu.size() * 4), ws(qsa::prompt_ws_bytes(fx.cells)),
+        b1(static_cast<size_t>(qsa::prompt_sel_bytes)), b2(static_cast<size_t>(qsa::prompt_sel_bytes));
+    qsa::qsp_index_args a;
+    a.summaries = fx.dsum.as<float>();
+    a.iq        = diq.as<float>();
+    a.q_norm    = fx.dqn.as<float>();
+    a.rope      = qsa::model_rope();
+    a.rows      = n;
+    a.pos0      = pos0;
+    a.max_cells = fx.cells;
+    a.ws        = qsa::prompt_carve(ws.p, fx.cells);
+    a.body      = b1.as<uint32_t>();
+    a.offsets   = reinterpret_cast<int32_t *>(a.body + qsa::prompt_body_words);
+    a.planes    = dqp.as<int32_t>();
+    std::vector<uint16_t> q16;
+    std::vector<float>    qs;
+    dbuf                  hq16(size_t(n) * 4 * KD * 2), hqs(size_t(n) * 4 * 4);
+    ok = diq.put(iq) && dqp.put(qp) && dqu.put(qu) && qsa::qsp_select(a, fn::ptest::test_stream()) &&
+         cuda_ok(cudaDeviceSynchronize(), "qsp_select planes") &&
+         cuda_ok(cudaMemcpy(hq16.p, a.ws.q16, size_t(n) * 4 * KD * 2, cudaMemcpyDeviceToDevice), "q16") &&
+         cuda_ok(cudaMemcpy(hqs.p, a.ws.qs, size_t(n) * 4 * 4, cudaMemcpyDeviceToDevice), "qs") &&
+         hq16.get(q16, size_t(n) * 4 * KD) && hqs.get(qs, size_t(n) * 4);
+    if (!ok) {
+        v.put("index queries with planes", false, "a launch or copy failed");
+        return false;
+    }
+    worst = 0.0;
+    for (int32_t q = 0; q < n * 4; ++q) {
+        const int32_t t   = q / 4;
+        double        err = 0.0, mx = 0.0;
+        for (int32_t e = 0; e < KD; ++e) {
+            const double want = index_rope_ref(&iq[size_t(q) * KD], qn.data(), &qp[size_t(t) * 4], ts, e);
+            const double got  = double(fn::quant::f16_value(q16[size_t(q) * KD + size_t(e)])) * qs[size_t(q)];
+            err               = std::max(err, std::fabs(got - want));
+            mx                = std::max(mx, std::fabs(want));
+        }
+        worst = std::max(worst, mx > 0 ? err / mx : err);
+    }
+    snprintf(wv, sizeof(wv), "%.2e", worst);
+    v.put("index queries with planes (" + std::to_string(n) + " rows)", worst <= tol,
+          std::string("prepared FP16 queries against FP64 pair by pair: worst ") + wv +
+              " of the query's largest (tolerance 4e-3)");
+    std::vector<uint32_t> w1, w2;
+    a.planes   = dqu.as<int32_t>();
+    ok         = b1.poison() && qsa::qsp_select(a, fn::ptest::test_stream());
+    a.body     = b2.as<uint32_t>();
+    a.offsets  = reinterpret_cast<int32_t *>(a.body + qsa::prompt_body_words);
+    a.planes   = nullptr;
+    a.rope_off = 211;
+    ok = ok && b2.poison() && qsa::qsp_select(a, fn::ptest::test_stream()) &&
+         cuda_ok(cudaDeviceSynchronize(), "qsp_select uniform") && b1.get(w1, size_t(qsa::prompt_sel_bytes / 4)) &&
+         b2.get(w2, size_t(qsa::prompt_sel_bytes / 4));
+    v.put("index selection with uniform planes", ok && w1 == w2,
+          !ok      ? "a launch or copy failed" :
+          w1 == w2 ? "bitwise the offset path's" :
+                     "DIFFERS");
+    return ok;
+}
 
 int fnfl_qsp_test(int device, const char * mode, bool q8) {
     const bool san = mode != nullptr && std::strcmp(mode, "san") == 0;
@@ -507,6 +721,27 @@ int fnfl_qsp_test(int device, const char * mode, bool q8) {
         kv_attend_case(fx, 9000, 130, v, q8);
         kv_attend_case(fx, 3000, n_stress, v, q8, stress.data(), "quantizer stress: ");
     }
+    // MUP1 piece 5: the rotary offset (rows read as cell + offset) and supplied planes (VIS1's rows: four planes
+    // that differ, against the FP64 reference pair by pair)
+    {
+        const int32_t        pos0 = 4100, n = san ? 8 : 70;
+        std::vector<int32_t> pl(size_t(n) * 4);
+        for (int32_t t = 0; t < n; ++t) {
+            const int32_t p       = 500 + t / 7;  // a 7-wide grid's rows after 500 text positions: t, h, w, e
+            pl[size_t(t) * 4 + 0] = p;
+            pl[size_t(t) * 4 + 1] = p + (t / 7) % 5;
+            pl[size_t(t) * 4 + 2] = p + t % 7;
+            pl[size_t(t) * 4 + 3] = p;
+        }
+        select_case(fx, 2040, san ? 12 : 130, v, "", false, 99991);
+        kv_attend_case(fx, pos0, n, v, q8, nullptr, "", 99991);
+        kv_attend_case(fx, pos0, n, v, q8, nullptr, "", -1000);
+        // negative rotary positions (a slot's cells below -offset): every row's position below zero
+        select_case(fx, 2040, san ? 12 : 130, v, "", false, -3000);
+        kv_attend_case(fx, pos0, n, v, q8, nullptr, "", -5000);
+        kv_attend_case(fx, pos0, n, v, q8, nullptr, "", 0, &pl);
+    }
+    planes_case(fx, v, san, kn, qn);  // VIS1 Stage B
     // deterministic ties and pathological inputs: cells 0 .. 4,095 rewritten, the summaries recomputed, the selection
     // against the decode select. Ties: every key the same value, so every block's summary and score tie. Pathological:
     // blocks in turn all zero, one-hot at 1e19 (its squares near F32's top), the smallest BF16 subnormal, and -0.0

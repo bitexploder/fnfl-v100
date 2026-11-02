@@ -1,6 +1,7 @@
 #include "fn/kernels/dense/iq3s.cuh"
 #include "fn/kernels/embed/embed.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -69,6 +70,42 @@ __global__ void __launch_bounds__(row_threads) embed_rows_kernel(const rows_args
     }
 }
 
+// TTTS2: the Q8_0 table; block b: row b, thread t: features 64 t .. 64 t + 63 (two blocks), each d * q
+__global__ void __launch_bounds__(row_threads) embed_rows_q8_kernel(const rows_args a) {
+    const int32_t b  = static_cast<int32_t>(blockIdx.x);
+    const int32_t t  = static_cast<int32_t>(threadIdx.x);
+    const int32_t id = __ldg(a.tok + b);
+    if (id < 0 || id >= n_vocab) {
+        if (t == 0) {
+            atomicOr(a.err, err_token);
+        }
+        return;
+    }
+    const int32_t c0 = 64 * t;
+    const int32_t cf = a.card * n_own + c0;
+#pragma unroll
+    for (int32_t h = 0; h < 2; ++h) {
+        const uint8_t * blk = a.table + int64_t(id) * q8_row_bytes + (2 * t + h) * 34;
+        const float     d   = __half2float(__ushort_as_half(static_cast<unsigned short>(ld16(blk))));
+#pragma unroll
+        for (int32_t k = 0; k < 8; ++k) {
+            const uint32_t x = ld32u(blk + 2 + 4 * k);
+            float4         o;
+            o.x             = d * static_cast<float>(static_cast<int8_t>(x & 0xffu));
+            o.y             = d * static_cast<float>(static_cast<int8_t>((x >> 8) & 0xffu));
+            o.z             = d * static_cast<float>(static_cast<int8_t>((x >> 16) & 0xffu));
+            o.w             = d * static_cast<float>(static_cast<int8_t>(x >> 24));
+            const int32_t j = 8 * h + k;
+            reinterpret_cast<float4 *>(a.own + int64_t(b) * n_own + c0)[j]   = o;
+            reinterpret_cast<float4 *>(a.full + int64_t(b) * n_full + cf)[j] = o;
+#pragma unroll
+            for (int32_t s = 0; s < n_stream; ++s) {
+                reinterpret_cast<float4 *>(a.streams + (int64_t(b) * n_stream + s) * n_full + cf)[j] = o;
+            }
+        }
+    }
+}
+
 // a thread a float4 of the peer's half
 __global__ void embed_join_kernel(const rows_args a, const float * peer) {
     const int64_t     i  = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -90,12 +127,30 @@ __global__ void embed_join_kernel(const rows_args a, const float * peer) {
     }
 }
 
+// VIS1: a thread a float4 of a supplied row's card half
+__global__ void embed_supply_kernel(const supply_args a) {
+    const int64_t     i  = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    constexpr int32_t q4 = n_own / 4;
+    if (i >= int64_t(a.n) * q4) {
+        return;
+    }
+    const int64_t r = i / q4, c4 = i % q4, b = a.row0 + r;
+    const float4  o  = __ldg(reinterpret_cast<const float4 *>(a.src + r * n_own) + c4);
+    const int64_t cf = int64_t(a.card) * n_own + 4 * c4;
+    *reinterpret_cast<float4 *>(a.own + b * n_own + 4 * c4) = o;
+    *reinterpret_cast<float4 *>(a.full + b * n_full + cf)   = o;
+#pragma unroll
+    for (int32_t s = 0; s < n_stream; ++s) {
+        *reinterpret_cast<float4 *>(a.streams + (b * n_stream + s) * n_full + cf) = o;
+    }
+}
+
 bool al16(const void * p) {
     return p != nullptr && reinterpret_cast<uintptr_t>(p) % 16 == 0;
 }
 
 bool rows_ok(const rows_args & a, void * stream) {
-    if (a.rows < 1 || a.rows > prompt_max_rows || a.table == nullptr || !al16(a.grids) || a.tok == nullptr ||
+    if (a.rows < 1 || a.rows > prompt_max_rows || a.table == nullptr || (!a.q8 && !al16(a.grids)) || a.tok == nullptr ||
         !al16(a.own) || !al16(a.full) || !al16(a.streams) || a.err == nullptr || (a.card != 0 && a.card != 1) ||
         stream == nullptr) {
         fprintf(stderr, "embed_rows: rejected (rows %d, card %d, or a null or misaligned pointer)\n", a.rows, a.card);
@@ -110,7 +165,23 @@ bool embed_rows(const rows_args & a, void * stream) {
     if (!rows_ok(a, stream)) {
         return false;
     }
+    if (a.q8) {
+        embed_rows_q8_kernel<<<a.rows, row_threads, 0, static_cast<cudaStream_t>(stream)>>>(a);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
     embed_rows_kernel<<<a.rows, row_threads, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool embed_supply(const supply_args & a, void * stream) {
+    if (a.n < 1 || a.row0 < 0 || a.rows > prompt_max_rows || int64_t(a.row0) + a.n > a.rows || !al16(a.src) ||
+        !al16(a.own) || !al16(a.full) || !al16(a.streams) || (a.card != 0 && a.card != 1) || stream == nullptr) {
+        fprintf(stderr, "embed_supply: rejected (rows %d .. %d of %d, card %d, or a null or misaligned pointer)\n",
+                a.row0, a.row0 + a.n, a.rows, a.card);
+        return false;
+    }
+    const int64_t n = int64_t(a.n) * (n_own / 4);
+    embed_supply_kernel<<<static_cast<uint32_t>((n + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 

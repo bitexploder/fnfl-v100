@@ -21,6 +21,7 @@
 #include "fn/model/pass.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -46,11 +47,7 @@ constexpr int64_t gdn_floats = int64_t(md::gdn_heads_card) * md::gdn_head_dim * 
 constexpr int64_t conv_floats = int64_t(md::gdn_conv_channels_card) * md::gdn_conv_history;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "rollback-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "rollback-test", what);
 }
 
 uint64_t mix(uint64_t z) {
@@ -387,7 +384,8 @@ bool fnfl_state_hashes(fn::runtime::target & t, fn::model::model & m, uint64_t h
 }
 
 int fnfl_rollback_test(const fnfl_target_args & a) {
-    if (a.mode == "mu1" || a.mode == "mu1-dry" || a.mode == "mu1-joint" || a.mode == "mu1-joint-eager") {
+    if (a.mode == "mu1" || a.mode == "mu1-dry" || a.mode == "mu1-joint" || a.mode == "mu1-joint-eager" ||
+        a.mode == "mu1-ladder") {
         return fnfl_rollback_mu1(a); // MU1 (rollback_mu1_test.cpp)
     }
     std::vector<int32_t> pool;

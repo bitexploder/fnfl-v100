@@ -115,11 +115,20 @@ __global__ void update_kernel(const prompt_args a) {
     }
     const int64_t b  = i / CH;
     const int32_t ch = static_cast<int32_t>(i % CH), s = ch / D, f = ch % D, h = f / n_own;
-    const uint2   wraw = __ldg(reinterpret_cast<const uint2 *>(a.w.conv[h]) + own_ch(s, f));
-    const float   w0   = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x & 0xffffu)));
-    const float   w1   = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x >> 16)));
-    const float   w2   = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y & 0xffffu)));
-    const float   w3   = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y >> 16)));
+    float         w0, w1, w2, w3;
+    if (a.w.conv32) {  // TTTS2
+        const float4 wf = __ldg(reinterpret_cast<const float4 *>(a.w.conv[h]) + own_ch(s, f));
+        w0              = wf.x;
+        w1              = wf.y;
+        w2              = wf.z;
+        w3              = wf.w;
+    } else {
+        const uint2 wraw = __ldg(reinterpret_cast<const uint2 *>(a.w.conv[h]) + own_ch(s, f));
+        w0               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x & 0xffffu)));
+        w1               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.x >> 16)));
+        w2               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y & 0xffffu)));
+        w3               = __half2float(__ushort_as_half(static_cast<unsigned short>(wraw.y >> 16)));
+    }
     float         acc  = x_at(a, b, ch, 9) * w0;
     acc                = fmaf(x_at(a, b, ch, 6), w1, acc);
     acc                = fmaf(x_at(a, b, ch, 3), w2, acc);

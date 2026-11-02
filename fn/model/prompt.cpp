@@ -1,9 +1,11 @@
 #include "fn/model/prompt.h"
 
+#include "fn/kernels/dense/dense_ladder.h"
 #include "fn/kernels/dense/dense_prompt.h"
 #include "fn/kernels/draft/draft_prompt.h"
 #include "fn/kernels/embed/embed.h"
 #include "fn/kernels/experts/experts.h"
+#include "fn/kernels/experts/experts_ladder.h"
 #include "fn/kernels/experts/experts_prompt.h"
 #include "fn/kernels/experts/experts_share.h"
 #include "fn/kernels/gdn/gdn_prompt.h"
@@ -15,15 +17,19 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/round/version.h"
+#include "fn/model/graph_rec.h"
 #include "fn/model/kv_tier.h"
+#include "fn/model/ladder.h"
 #include "fn/model/shapes.h"
 #include "fn/xchg/prompt_xchg.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -47,6 +53,24 @@ constexpr int64_t ple_key_bytes   = int64_t(4) * F * D * 2;
 constexpr int64_t ple_value_bytes = int64_t(F) * D * 2;
 constexpr int64_t ple_norm_bytes  = int64_t(4) * F * 4;
 constexpr int64_t ple_conv_bytes  = int64_t(4) * F * 4 * 2;
+
+// TTTS3: the key's 4 F rows and the value's F rows of D in their stored format (ple.h kv_row_bytes); the taps F16, or
+// F32 (TTTS2)
+constexpr int64_t ple_key_bytes_of(fn::ple::kv_fmt f) {
+    return int64_t(4) * F * fn::ple::kv_row_bytes(f);
+}
+
+constexpr int64_t ple_value_bytes_of(fn::ple::kv_fmt f) {
+    return int64_t(F) * fn::ple::kv_row_bytes(f);
+}
+
+constexpr int64_t ple_conv_bytes_of(bool conv32) {
+    return conv32 ? 2 * ple_conv_bytes : ple_conv_bytes;
+}
+
+static_assert(ple_key_bytes_of(fn::ple::kv_fmt::bf16) == ple_key_bytes &&
+                  ple_value_bytes_of(fn::ple::kv_fmt::bf16) == ple_value_bytes,
+              "the BF16 rows' replicas as before");
 constexpr int64_t ple_hist_card   = fn::ple::hist_version_floats;  // [5120][9]
 
 constexpr int64_t al(int64_t n) {
@@ -66,9 +90,43 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     return true;
 }
 
-// the slot sizes (header and payload); ME3: for a layout of rc chunk rows in halves of rh (prompt_path::layout)
-constexpr int64_t p_slot(int64_t rh) {
-    return 256 + rh * D * 2;
+// VIS1 Stage B: the draft's embeddings E [rows][2560] of half rows r0 .. r0 + n - 1 take the image token's row at
+// the chunk's supplied rows (embed_supply wrote the image's rows there for the target): the row once, then doubling
+// copies of the rows already written. Exact copies, in stream order before the draft reads E
+bool draft_image_rows(const prompt_chunk & c,
+                      int32_t              k,
+                      int32_t              r0,
+                      int32_t              n,
+                      float *              E,
+                      cudaStream_t         s,
+                      std::string &        err) {
+    if (c.draft_e[k] == nullptr) {
+        return fail(err, "prompt: supplied rows and no image-token row for the draft (vision_service::token_row)");
+    }
+    const size_t row = size_t(D) * 4;
+    for (int32_t i = 0; i < c.n_runs; ++i) {
+        const int32_t lo = std::max(c.runs[i].row0, r0), hi = std::min(c.runs[i].row0 + c.runs[i].n, r0 + n);
+        float * const dst = E + int64_t(lo) * D;
+        if (lo < hi && !cuda_ok(cudaMemcpyAsync(dst, c.draft_e[k], row, cudaMemcpyDeviceToDevice, s), "draft e", err)) {
+            return false;
+        }
+        for (int32_t done = 1; lo + done < hi;) {
+            const int32_t m = std::min(done, hi - lo - done);
+            if (!cuda_ok(cudaMemcpyAsync(dst + int64_t(done) * D, dst, row * size_t(m), cudaMemcpyDeviceToDevice, s),
+                         "draft e", err)) {
+                return false;
+            }
+            done += m;
+        }
+    }
+    return true;
+}
+
+// the slot sizes (header and payload); ME3: for a layout of rc chunk rows in halves of rh (prompt_path::layout).
+// MUP2: the P messages of a chunk's pieces lie in one region a card and direction, in row order, each its header then
+// its rows' FP16 payload: room for the most pieces' headers and both halves' rows (a partition refines the halves)
+constexpr int64_t p_region(int64_t rh) {
+    return int64_t(prompt_max_pieces) * fn::xchg::pmsg_payload_at + 2 * rh * D * 2;
 }
 constexpr int64_t emb_slot(int64_t rc) {
     return 256 + rc * F * 4;
@@ -95,6 +153,7 @@ int64_t family_bytes(int64_t H) {
     const int64_t ffn = al(int64_t(H) * NE * 4) + al(int64_t(H) * 8 * 4) + 2 * al(int64_t(H) * 4) +
                         al(int64_t(H) * NU * 4) * 2 + al(int64_t(513) * 4) + 2 * al(int64_t(H) * NU * 4) +
                         al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) + al(int64_t(513) * 4) +
+                        2 * al(int64_t(fn::experts::ep_max_ltasks) * 16) +  // APF2: the grouped task lists
                         al(int64_t(H) * NU * 320 * 2) + al(H * NU * D * 2) + al(H * D * 4) + 2 * al(H * 320 * 4) +
                         al(H * 320 * 2);
     const int64_t ple = al(H * 4 * D * 4) * 2 + al(H * D * 4) + al(H * 8 * 4);
@@ -111,9 +170,10 @@ int64_t family_bytes_single(int64_t rc, int64_t H, int32_t card) {
     const int64_t gdn_c1 = al(fn::gdn::prompt_wy_bytes(int32_t(H)));
     const int64_t qsa = al(H * QF * 4) + 2 * al(H * 256 * 4) + al(H * 512 * 4) + al(H * 128 * 4) +
                         al(static_cast<int64_t>(fn::qsa::prompt_ws_bytes(fn::qsa::max_cells))) + al(H * GV * 2);
-    const int64_t ffn_rt = al(int64_t(H) * NE * 4) + al(int64_t(H) * 8 * 4) + 2 * al(int64_t(H) * 4) +
-                           al(int64_t(H) * NU * 4) * 2 + al(int64_t(513) * 4) + 2 * al(int64_t(H) * NU * 4) +
-                           al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) + al(int64_t(513) * 4);
+    const int64_t ffn_rt  = al(int64_t(H) * NE * 4) + al(int64_t(H) * 8 * 4) + 2 * al(int64_t(H) * 4) +
+                            al(int64_t(H) * NU * 4) * 2 + al(int64_t(513) * 4) + 2 * al(int64_t(H) * NU * 4) +
+                            al(int64_t(fn::experts::ep_max_tasks) * 16) + al(int64_t(8) * 4) + al(int64_t(513) * 4) +
+                            2 * al(int64_t(fn::experts::ep_max_ltasks) * 16);
     const int64_t ffn_bdy = al(int64_t(H) * NU * 320 * 2) + al(H * NU * D * 2) + al(H * D * 4);
     const int64_t ffn_sh = 2 * al(H * 320 * 4) + al(H * 320 * 2);
     const int64_t ple_c0 = al(H * 4 * D * 4) + al(H * D * 4) + al(H * 8 * 4);
@@ -160,6 +220,13 @@ int64_t conv_bytes(bool single = false, int32_t card = 0) {
            std::max({gdn_end, qsa_end, ffn_end, draft_end}) * 2;
 }
 
+// APF2: the ladder's split-K workspace a card (fn/kernels/tc/ladder.h lad_ws): partials and one counter a tile; the
+// counters are zeroed at each chunk's start (the arena may be lent between chunks), each launch leaves them zero.
+// The selector's cost model takes these limits, so a table entry always fits
+constexpr int64_t lad_ws_floats = int64_t(6) << 20;  // 24 MiB
+constexpr int32_t lad_ws_counts = 65536;
+constexpr int64_t lad_ws_bytes  = al(lad_ws_floats * 4) + al(int64_t(lad_ws_counts) * 4);
+
 // a bump allocator over a region
 struct bump {
     uint8_t * p;
@@ -182,7 +249,7 @@ struct prompt_path::card_arena {
     float * inject = nullptr;
     float * mixed = nullptr; // [RH][2560]
     uint16_t * mixed16 = nullptr;
-    uint8_t *p_send[2] = {}, *p_recv[2] = {};
+    uint8_t *           p_send = nullptr, *p_recv = nullptr;  // MUP2: the P regions (p_msg)
     uint8_t *emb_send = nullptr, *emb_recv = nullptr;
     uint8_t *sel_send[2] = {}, *sel_recv[2] = {};
     uint8_t *           mom_send = nullptr, *mom_recv = nullptr;
@@ -196,6 +263,7 @@ struct prompt_path::card_arena {
     // PB3's conversion region: the current sublayer's FP16 HC coefficients and dense weights
     fn::hc::hct_weights hct;
     uint16_t *          w16 = nullptr;
+    fn::tc::lad_ws      lws;  // APF2: the ladder's split-K workspace
 
     // replicas: card 0's and card 1's halves (one of each pair is the resident region)
     struct hc_halves {
@@ -211,6 +279,12 @@ struct prompt_path::card_arena {
     float *                enorm       = nullptr;  // [2560] full
     float *                hnorm       = nullptr;  // [4][2560] full
     int32_t *              tok_host    = nullptr;  // pinned [2][RC]
+    // APF1 Part 4: the prepared data (in the replicas' class, built once by prepare): per layer the HC sublayers' row
+    // scales (hct_scales), and the BF16 products' column scales: GDN alpha | beta [48], the QSA index q | k [640]
+    // (the index owner's), the router | shared gate | 7 zeros [520]; the draft's index k [128]
+    std::vector<fn::hc::hct_weights> hc_prep_attn, hc_prep_ffn;
+    std::vector<float *>             ab_s, idx_s, rt_s;
+    float *                          dik_s = nullptr;
 };
 
 // one message link: card c sends its slot to card 1 - c's receive slot
@@ -227,17 +301,18 @@ struct prompt_path::link {
 
 namespace {
 
-enum link_id : int32_t { lk_p0, lk_p1, lk_emb, lk_sel0, lk_sel1, lk_mom, lk_dmix, n_links };
+// MUP2: a P link a piece (its events and generations; its slot's place is the chunk's, p_msg)
+enum link_id : int32_t { lk_emb, lk_sel0, lk_sel1, lk_mom, lk_dmix, lk_p0, n_links = lk_p0 + prompt_max_pieces };
 
 int64_t arena_bytes_a(int64_t rc, int64_t rh, bool single, int32_t card) {
     if (!single) {
         int64_t n = 0;
         n += al(rc * 4 * D * 4) + al(rc * D * 4) + al(rc * 4) + al(rc * 4 * 4);
         n += al(rh * D * 4) + al(rh * D * 2) + al(rh * D * 4);
-        n +=
-            4 * al(p_slot(rh)) + 2 * al(emb_slot(rc)) + 4 * al(sel_slot) + 2 * al(mom_slot(rh)) + 2 * al(dmix_slot(rh));
+        n += 2 * al(p_region(rh)) + 2 * al(emb_slot(rc)) + 4 * al(sel_slot) + 2 * al(mom_slot(rh)) +
+             2 * al(dmix_slot(rh));
         n += al(int64_t(4) * D * 4) + 2 * al(int64_t(4) * D * 9 * 4) + al(ple_hist_card * 4) + al(64);
-        n += al(family_bytes(rh)) + al(conv_bytes());
+        n += al(family_bytes(rh)) + al(conv_bytes()) + lad_ws_bytes;
         return n;
     }
     int64_t n = 0;
@@ -245,11 +320,11 @@ int64_t arena_bytes_a(int64_t rc, int64_t rh, bool single, int32_t card) {
         n += al(rc * 4 * D * 4) + al(rc * D * 4) + al(rc * 4) + al(rc * 4 * 4);
         n += al(rh * D * 2);
     }
-    n += 2 * al(p_slot(rh)) + 2 * al(sel_slot) + al(mom_slot(rh)) + al(dmix_slot(rh));
+    n += al(p_region(rh)) + 2 * al(sel_slot) + al(mom_slot(rh)) + al(dmix_slot(rh));
     if (card == 0) {
         n += al(int64_t(4) * D * 4) + 2 * al(int64_t(4) * D * 9 * 4);
     }
-    n += al(64) + al(family_bytes_single(rc, rh, card)) + al(conv_bytes(true, card));
+    n += al(64) + al(family_bytes_single(rc, rh, card)) + al(conv_bytes(true, card)) + lad_ws_bytes;
     return n;
 }
 
@@ -259,13 +334,417 @@ int64_t prompt_arena_bytes(int32_t chunk_rows, int32_t half_rows, bool single, i
     return arena_bytes_a(chunk_rows, half_rows, single, card);
 }
 
-int64_t prompt_replica_bytes(bool single) {
+namespace {
+
+// APF1 Part 4: the prepared data's bytes a card (prompt_path::prepare; card_arena's hc_prep_*, ab_s .. dik_s)
+constexpr int64_t prep_layer_bytes = al(int64_t(48) * 4) + al(int64_t(640) * 4) + al(int64_t(NE + 8) * 4);
+
+int64_t prep_bytes() {
+    return int64_t(2) * fn::n_layer * fn::hc::hct_scale_bytes() + int64_t(fn::n_layer) * prep_layer_bytes +
+           al(int64_t(128) * 4);
+}
+
+}  // namespace
+
+int64_t prompt_replica_bytes(bool single, fn::ple::kv_fmt ple_kv, bool ple_conv32) {
     const int64_t norms = al(int64_t(D) * 4) + al(int64_t(4) * D * 4);
     if (single) {
-        return norms;
+        return norms + prep_bytes();
     }
-    return int64_t(2) * fn::n_layer * al(hc_down_bytes + hc_up_bytes + hc_gamma_bytes) + al(ple_key_bytes) +
-           al(ple_value_bytes) + 3 * al(ple_norm_bytes) + al(ple_conv_bytes) + norms;
+    return int64_t(2) * fn::n_layer * al(hc_down_bytes + hc_up_bytes + hc_gamma_bytes) + al(ple_key_bytes_of(ple_kv)) +
+           al(ple_value_bytes_of(ple_kv)) + 3 * al(ple_norm_bytes) + al(ple_conv_bytes_of(ple_conv32)) + norms +
+           prep_bytes();
+}
+
+namespace {
+
+std::mutex                totals_mu;
+prompt_path::route_counts totals;
+uint32_t                  totals_rungs = 0;
+std::atomic<bool>         totals_on{ false };  // test-only collection (prompt_route_collect); off in serving
+
+constexpr int64_t prompt_path::route_counts::* count_fields[] = {
+    &prompt_path::route_counts::dense_ladder,  &prompt_path::route_counts::dense_retained,
+    &prompt_path::route_counts::dense_split,   &prompt_path::route_counts::hc_ladder,
+    &prompt_path::route_counts::hc_retained,   &prompt_path::route_counts::ex_grouped,
+    &prompt_path::route_counts::ex_per_task,   &prompt_path::route_counts::exd_grouped,
+    &prompt_path::route_counts::exd_per_task,  &prompt_path::route_counts::graph_units,
+    &prompt_path::route_counts::eager_units,   &prompt_path::route_counts::graph_captures,
+    &prompt_path::route_counts::graph_updated, &prompt_path::route_counts::qsa,
+    &prompt_path::route_counts::gdn,           &prompt_path::route_counts::ple,
+};
+
+// the totals less what a failed capture noted (now - before)
+void undo_totals(const prompt_path::route_counts & now, const prompt_path::route_counts & before) {
+    if (!totals_on.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::lock_guard<std::mutex> g(totals_mu);
+    for (const auto f : count_fields) {
+        totals.*f -= now.*f - before.*f;
+    }
+}
+
+}  // namespace
+
+void prompt_route_totals(prompt_path::route_counts & out, uint32_t & rungs, bool clear_fmts) {
+    const std::lock_guard<std::mutex> g(totals_mu);
+    out   = totals;
+    rungs = totals_rungs;
+    if (clear_fmts) {
+        totals.dense_fmts = 0;
+        totals.ex_fmts    = 0;
+    }
+}
+
+void prompt_route_collect(bool on) {
+    totals_on.store(on, std::memory_order_relaxed);
+}
+
+void prompt_path::note(int64_t route_counts::* f) {
+    ++(rcount_.*f);
+    if (!totals_on.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::lock_guard<std::mutex> g(totals_mu);
+    ++(totals.*f);
+}
+
+void prompt_path::note_fmt(uint32_t route_counts::* f, int32_t bit) {
+    rcount_.*f |= 1u << bit;
+    if (!totals_on.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const std::lock_guard<std::mutex> g(totals_mu);
+    totals.*f |= 1u << bit;
+}
+
+void prompt_path::route_counts::add_since(const route_counts & a, const route_counts & b) {
+    for (const auto f : count_fields) {
+        this->*f += a.*f - b.*f;
+    }
+    dense_fmts |= a.dense_fmts;
+    ex_fmts |= a.ex_fmts;
+}
+
+std::string prompt_path::route_counts::text() const {
+    const auto names = [](uint32_t bits, bool dense) {
+        std::string t;
+        for (int32_t i = 0; i < 32; ++i) {
+            if ((bits >> i & 1u) != 0) {
+                t += (t.empty() ? " (" : " ") +
+                     std::string(dense ? fn::dense::fmt_name(static_cast<fn::dense::fmt>(i)) :
+                                         fn::experts::fmt_name(static_cast<fn::experts::fmt>(i)));
+            }
+        }
+        return t.empty() ? t : t + ")";
+    };
+    const auto n = [](int64_t v) {
+        return std::to_string(v);
+    };
+    return "dense ladder " + n(dense_ladder) + names(dense_fmts, true) + " (split " + n(dense_split) + ") / retained " +
+           n(dense_retained) + ", hc ladder " + n(hc_ladder) + " / retained " + n(hc_retained) +
+           ", experts gate/up grouped " + n(ex_grouped) + " / per-task " + n(ex_per_task) + names(ex_fmts, false) +
+           ", down grouped " + n(exd_grouped) + " / per-task " + n(exd_per_task) + ", qsa " + n(qsa) + ", gdn " +
+           n(gdn) + ", ple " + n(ple) + " (retained), units graph " + n(graph_units) + " (captures " +
+           n(graph_captures) + ", updated " + n(graph_updated) + ") / eager " + n(eager_units);
+}
+
+bool prompt_path::test_skew_experts(bool on, std::string & err) {
+    if (on && skew_host_ == nullptr) {
+        void * h = nullptr;
+        if (!cuda_ok(cudaHostAlloc(&h, size_t(RC) * NU * 4, cudaHostAllocPortable), "skew rows", err)) {
+            return false;
+        }
+        skew_host_ = static_cast<int32_t *>(h);
+        for (int32_t r = 0; r < RC; ++r) {
+            for (int32_t q = 0; q < NU; ++q) {
+                skew_host_[int64_t(r) * NU + q] = q < 4 ? q : 4 + (37 * r + 61 * q) % 400;
+            }
+        }
+    }
+    skew_ = on;
+    return true;
+}
+
+namespace {
+
+std::atomic<bool> graphs_on{ true };  // APF2: the graph switch (the server's props)
+
+}  // namespace
+
+void prompt_graphs(bool on) {
+    graphs_on.store(on, std::memory_order_relaxed);
+}
+
+bool prompt_graphs_on() {
+    return graphs_on.load(std::memory_order_relaxed);
+}
+
+prompt_route prompt_route_for(int32_t rows, bool graph_ok, const prompt_route_force & force) {
+    prompt_route r;
+    r.rung = 64;
+    while (r.rung < rows && r.rung < prompt_chunk_rows) {
+        r.rung *= 2;
+    }
+    const bool dflt = prompt_graphs_on() && rows <= prompt_graph_rows;
+    r.graph         = (force.graph == 1 ? true : force.graph == 2 ? false : dflt) && graph_ok;
+    return r;
+}
+
+std::string prompt_route_name(const prompt_route & r) {
+    return "rung " + std::to_string(r.rung) + ", " + (r.graph ? "graph" : "eager");
+}
+
+// ---- APF2: the ladder's selection -----------------------------------------------------------------------------------
+namespace {
+
+// the weights' bytes a value (TurboMind's type_b) by the key's format name
+double lad_b_bytes(const std::string & f) {
+    static const std::pair<const char *, double> t[] = {
+        { "BF16",       2.0         },
+        { "Q8_0",       34.0 / 32   },
+        { "Q8_0/EX1",   34.0 / 32   },
+        { "Q4_K",       144.0 / 256 },
+        { "Q5_K",       176.0 / 256 },
+        { "Q6_K",       210.0 / 256 },
+        { "IQ4_XS",     136.0 / 256 },
+        { "IQ3_S",      110.0 / 256 },
+        { "IQ4_NL/EX1", 18.0 / 32   },
+        { "Q2_0/EX1",   10.0 / 32   },
+        { "Q5_1",       24.0 / 32   }
+    };
+    for (const auto & [n, b] : t) {
+        if (f == n) {
+            return b;
+        }
+    }
+    return 1.0;
+}
+
+}  // namespace
+
+fn::model::lad_key prompt_dense_key(int32_t f, int32_t lay, int32_t k, int32_t n) {
+    const auto df = static_cast<fn::dense::fmt>(f);
+    return { fn::model::lad_fam::dense,
+             std::string(fn::dense::fmt_name(df)) +
+                 (static_cast<fn::dense::pd_layout>(lay) == fn::dense::pd_layout::ex1_down ? "/EX1" : ""),
+             k, n };
+}
+
+fn::model::lad_key prompt_hc_key(bool up, bool q8) {
+    return { up ? fn::model::lad_fam::hc_up : fn::model::lad_fam::hc_down, q8 ? "Q8_0" : "BF16",
+             up ? fn::hc::hcl_up_k : fn::hc::hcl_down_k, up ? fn::hc::hcl_up_n : fn::hc::hcl_down_n };
+}
+
+fn::model::lad_key prompt_expert_key(bool down, int32_t f) {
+    return { down ? fn::model::lad_fam::ex_down : fn::model::lad_fam::ex_gate_up,
+             fn::experts::fmt_name(static_cast<fn::experts::fmt>(f)), down ? 320 : D, down ? D : 640 };
+}
+
+int32_t prompt_expert_rows(int32_t rows) {
+    return rows * NU / NE;
+}
+
+bool prompt_lad_model(const fn::model::lad_key & key, int32_t device, fn::model::lad_model & m) {
+    namespace fm = fn::model;
+    m            = {};
+    if (cudaDeviceGetAttribute(&m.sm_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
+        return false;
+    }
+    m.b_bytes = lad_b_bytes(key.fmt);
+    if (key.fam == fm::lad_fam::dense || key.fam == fm::lad_fam::hc_down || key.fam == fm::lad_fam::hc_up) {
+        m.ws_floats = lad_ws_floats;
+        m.ws_count  = lad_ws_counts;
+    }
+    m.num = key.fam == fm::lad_fam::hc_down                                       ? 4 :
+            key.fam == fm::lad_fam::ex_gate_up || key.fam == fm::lad_fam::ex_down ? NE :
+                                                                                    1;
+    for (int32_t t = 0; t < fm::lad_fam_tiles(key.fam); ++t) {
+        fn::tc::lad_resources r;
+        bool                  ok = false;
+        if (key.fam == fm::lad_fam::dense) {
+            fn::dense::pq_args q;
+            const bool         ex1 = key.fmt.size() > 4 && key.fmt.compare(key.fmt.size() - 4, 4, "/EX1") == 0;
+            const std::string  fn_ = ex1 ? key.fmt.substr(0, key.fmt.size() - 4) : key.fmt;
+            q.lay                  = ex1 ? fn::dense::pd_layout::ex1_down : fn::dense::pd_layout::dp2;
+            q.n_src                = fn_ == "BF16" ? 0 : 1;
+            for (int32_t f = 0; f < 32 && q.n_src > 0; ++f) {
+                if (fn_ == fn::dense::fmt_name(static_cast<fn::dense::fmt>(f))) {
+                    q.f = static_cast<fn::dense::fmt>(f);
+                }
+            }
+            fn::dense::pd_resources pr{};
+            ok            = fn::dense::pl_resources(q, t, pr);
+            r.ctas_per_sm = pr.ctas_per_sm;
+        } else if (key.fam == fm::lad_fam::hc_down || key.fam == fm::lad_fam::hc_up) {
+            ok = fn::hc::hcl_resources(key.fmt == "Q8_0", key.fam == fm::lad_fam::hc_up ? 1 : 0, t, r);
+        } else {
+            for (int32_t f = 0; f < 32; ++f) {
+                if (key.fmt == fn::experts::fmt_name(static_cast<fn::experts::fmt>(f))) {
+                    ok = fn::experts::el_resources(key.fam == fm::lad_fam::ex_down ? 1 : 0,
+                                                   static_cast<fn::experts::fmt>(f), t, r);
+                }
+            }
+        }
+        m.ctas[t] = ok ? r.ctas_per_sm : 0;
+    }
+    (void) cudaGetLastError();  // a format a family does not compile: no CTA (the filter's reason)
+    return true;
+}
+
+const fn::model::lad_model & prompt_path::lad_model_of(const fn::model::lad_key & key) {
+    for (const auto & [k, m] : lad_models_) {
+        if (k == key) {
+            return m;
+        }
+    }
+    fn::model::lad_model m;
+    (void) prompt_lad_model(key, m_ != nullptr ? m_->device[0] : 0, m);
+    lad_models_.emplace_back(key, m);
+    return lad_models_.back().second;
+}
+
+fn::model::lad_cfg prompt_path::lad_route(const fn::model::lad_key & key, int32_t rows, int32_t force) {
+    if (force == 2) {
+        return {};
+    }
+    if (force == 1) {
+        const fn::model::lad_ranking r =
+            fn::model::lad_rank(key.fam, std::max(1, rows), key.k, key.n, lad_model_of(key));
+        return r.ranked.empty() ? fn::model::lad_cfg{} : r.ranked.front().cfg;
+    }
+    // the table is the UD-Q4_K_XL file's (prompt-tune's calibration): another file (IQ3_XXS) runs the retained routes
+    // wherever its keys would match. The pick at the rung, the retained route where its split does not fit the
+    // workspace at these rows
+    return lad_on_ ? fn::model::lad_lookup(key, rows, lad_model_of(key)) : fn::model::lad_cfg{};
+}
+
+bool prompt_path::lad_retained_any(const fn::model::lad_key & key,
+                                   const prompt_chunk &       c,
+                                   int32_t                    force,
+                                   int32_t                    mul,
+                                   bool                       experts) {
+    for (int32_t j = 0; j < prompt_pieces(c); ++j) {
+        const int32_t rows = prompt_piece_rows(c, j) * mul;
+        if (lad_route(key, experts ? prompt_expert_rows(rows) : rows, force).retained()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+namespace {
+
+// TTTS2: an HC module's halves as the prompt path reads them: BF16, or hc.h's Q8_0 layouts (UD-Q4_K_XL)
+const uint16_t * hc_down_of(const hc_module & h) {
+    return h.q8_down != nullptr ? reinterpret_cast<const uint16_t *>(h.q8_down) : h.w_down;
+}
+
+const uint16_t * hc_up_of(const hc_module & h) {
+    return h.q8_up != nullptr ? reinterpret_cast<const uint16_t *>(h.q8_up) : h.w_up;
+}
+
+int64_t hc_down_bytes_of(const hc_module & h) {
+    return h.q8_down == nullptr ? hc_down_bytes : h.q8_mix ? fn::hc::w_down_mix_bytes : fn::hc::w_down_q8_bytes;
+}
+
+int64_t hc_up_bytes_of(const hc_module & h) {
+    return h.q8_up == nullptr ? hc_up_bytes : fn::hc::w_up_q8_bytes;
+}
+
+}  // namespace
+
+int32_t prompt_pieces(const prompt_chunk & c) {
+    return c.n_pieces > 0 ? c.n_pieces : c.half[1] > 0 ? 2 : 1;
+}
+
+int32_t prompt_piece_r0(const prompt_chunk & c, int32_t j) {
+    if (c.n_pieces <= 0) {
+        return j == 0 ? 0 : c.half[0];
+    }
+    int32_t r0 = 0;
+    for (int32_t i = 0; i < j; ++i) {
+        r0 += c.piece[i];
+    }
+    return r0;
+}
+
+int32_t prompt_piece_rows(const prompt_chunk & c, int32_t j) {
+    return c.n_pieces > 0 ? c.piece[j] : c.half[j];
+}
+
+bool prompt_set_pieces(prompt_chunk & c, int32_t rows, std::string & err, int32_t min_rows) {
+    c.n_pieces = 0;
+    if (rows == 0) {
+        return true;
+    }
+    if (rows < prompt_piece_grid || rows % prompt_piece_grid != 0 || min_rows < 0) {
+        return fail(err, "prompt: pieces of " + std::to_string(rows) + " rows (a positive multiple of 64), at least " +
+                             std::to_string(min_rows));
+    }
+    // each half in the fewest pieces of at most rows rows, evened out on the grid (no short tail piece paying the
+    // fixed cost for a few rows): k pieces of ceil(half / k) rounded up to 64, the last the rest. PRD1 item 12: with
+    // min_rows, no piece made by subdividing a half has fewer rows. At each k, from the fewest pieces of at most rows
+    // down to 2: the evened pieces when their last has min_rows; else k - 1 pieces of floor(half / k) rounded down to
+    // 64, when that has min_rows, and the last the larger rest; else one piece fewer. At k = 1 the half stays whole
+    int32_t n = 0;
+    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+        const int32_t g    = prompt_piece_grid;
+        const int32_t half = c.half[h];
+        const auto    even = [&](int32_t k) {
+            return ((half + k - 1) / k + g - 1) / g * g;
+        };
+        int32_t k    = (half + rows - 1) / rows;
+        int32_t e    = even(k);
+        bool    rest = false;  // k - 1 pieces of e and the rest (above e) last
+        for (; min_rows > 0 && k > 1; --k) {
+            e = even(k);
+            if (half - (k - 1) * e >= min_rows) {
+                break;
+            }
+            e = half / k / g * g;
+            if (e >= min_rows) {
+                rest = true;
+                break;
+            }
+        }
+        if (min_rows > 0 && k == 1) {
+            e = half;
+        }
+        for (int32_t left = half, i = 0; left > 0; ++i) {
+            if (n == prompt_max_pieces) {
+                c.n_pieces = 0;
+                return fail(err, "prompt: a chunk of " + std::to_string(c.rows) + " rows in pieces of " +
+                                     std::to_string(rows) + " rows: more than " + std::to_string(prompt_max_pieces) +
+                                     " pieces");
+            }
+            const int32_t p = rest && i == k - 1 ? left : std::min(left, e);
+            c.piece[n++]    = p;
+            left -= p;
+        }
+    }
+    c.n_pieces = n;
+    return true;
+}
+
+bool prompt_pieces_ok(const prompt_chunk & c) {
+    if (c.n_pieces == 0) {
+        return true;
+    }
+    if (c.n_pieces < 1 || c.n_pieces > prompt_max_pieces) {
+        return false;
+    }
+    int32_t r0          = 0;
+    bool    cut_at_half = c.half[1] == 0;
+    for (int32_t j = 0; j < c.n_pieces; ++j) {
+        if (c.piece[j] < 1 || (j + 1 < c.n_pieces && (r0 + c.piece[j]) % prompt_piece_grid != 0)) {
+            return false;
+        }
+        r0 += c.piece[j];
+        cut_at_half = cut_at_half || r0 == c.half[0];
+    }
+    return r0 == c.rows && cut_at_half;
 }
 
 const char * psite_name(psite s) {
@@ -280,9 +759,33 @@ const char * psite_name(psite s) {
 
 prompt_path::prompt_path() = default;
 
+// APF2: a unit's graph: its executable and its operations in capture order (empty ops: not replayable by update)
+// (the captured graph kept with it: the noted nodes are the graph's, which the executable's updates name)
+struct prompt_path::unit_graph_entry {
+    cudaGraph_t                     graph = nullptr;
+    cudaGraphExec_t                 exec  = nullptr;
+    std::vector<fn::model::grec_op> ops;
+    bool                            updatable = false;
+
+    ~unit_graph_entry() {
+        if (exec != nullptr) {
+            cudaGraphExecDestroy(exec);
+        }
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+    }
+};
+
 prompt_path::~prompt_path() {
+    ugraphs_.clear();
     for (int32_t c = 0; c < 2 && m_ != nullptr; ++c) {
         cudaSetDevice(m_->device[c]);
+        for (void * e : gj_[c]) {
+            if (e != nullptr) {
+                cudaEventDestroy(static_cast<cudaEvent_t>(e));
+            }
+        }
         if (copy_[c] != nullptr) {
             cudaStreamSynchronize(static_cast<cudaStream_t>(copy_[c]));
             cudaStreamDestroy(static_cast<cudaStream_t>(copy_[c]));
@@ -299,6 +802,9 @@ prompt_path::~prompt_path() {
         if (a.tok_host != nullptr) {
             cudaFreeHost(a.tok_host);
         }
+    }
+    if (skew_host_ != nullptr) {
+        cudaFreeHost(skew_host_);
     }
 }
 
@@ -329,11 +835,9 @@ bool prompt_path::carve(card_arena & a, int32_t rc, int32_t rh, bool single, int
             (void)b.take<float>(int64_t(rh) * D * 4);
         }
     }
-    for (int32_t h = 0; h < 2; ++h) {
-        a.p_send[h] = b.take<uint8_t>(p_slot(rh));
-        if (!single) {
-            a.p_recv[h] = b.take<uint8_t>(p_slot(rh));
-        }
+    a.p_send = b.take<uint8_t>(p_region(rh));
+    if (!single) {
+        a.p_recv = b.take<uint8_t>(p_region(rh));
     }
     if (!single) {
         a.emb_send = b.take<uint8_t>(emb_slot(rc));
@@ -377,6 +881,10 @@ bool prompt_path::carve(card_arena & a, int32_t rc, int32_t rh, bool single, int
         a.hct = {};
         a.w16 = reinterpret_cast<uint16_t *>(cv);
     }
+    a.lws.part        = b.take<float>(lad_ws_floats * 4);
+    a.lws.part_floats = lad_ws_floats;
+    a.lws.count       = b.take<int32_t>(int64_t(lad_ws_counts) * 4);
+    a.lws.count_len   = lad_ws_counts;
     if (b.off != prompt_arena_bytes(rc, rh, single, card) ||
         b.off > prompt_arena_bytes(rc_max_, rh_max_, single, card)) {
         return fail(err, "prompt: the arena's carve disagrees with its size");
@@ -400,8 +908,8 @@ void prompt_path::set_links() {
         for (int32_t c = 0; c < 2; ++c) {
             card_arena & a = a_[size_t(c)];
             const card_arena & p = a_[size_t(1 - c)];
+            a.p_recv             = p.p_send;
             for (int32_t h = 0; h < 2; ++h) {
-                a.p_recv[h] = p.p_send[h];
                 a.sel_recv[h] = p.sel_send[h];
             }
             a.emb_recv = p.emb_send;
@@ -410,11 +918,7 @@ void prompt_path::set_links() {
         }
     }
     for (int32_t c = 0; c < 2; ++c) {
-        card_arena & a = a_[size_t(c)];
-        links_[lk_p0].send[c] = a.p_send[0];
-        links_[lk_p0].recv[c]   = a.p_recv[0];
-        links_[lk_p1].send[c]   = a.p_send[1];
-        links_[lk_p1].recv[c]   = a.p_recv[1];
+        card_arena & a          = a_[size_t(c)];
         links_[lk_emb].send[c]  = a.emb_send;
         links_[lk_emb].recv[c]  = a.emb_recv;
         links_[lk_sel0].send[c] = a.sel_send[0];
@@ -468,6 +972,9 @@ bool prompt_path::loan_check(const std::vector<byte_span> & need, std::string & 
 bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2], std::string & err,
                        const char * arena_class, int32_t rc_max, int32_t rh_max) {
     m_ = &m;
+    // APF2: whether the measured table applies, once: dense_q8_of scans the tensor table 336 times, far too slow for
+    // every route lookup (about a second a read)
+    lad_on_ = dense_q8_of(m);
     a_.assign(2, card_arena());
     if (rc_max < 1 || rc_max > RC || rh_max < 1 || rh_max > RH) {
         return fail(err, "prompt: an arena layout outside 8,192 rows in halves of 4,096");
@@ -500,13 +1007,13 @@ bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2
             for (int32_t sub = 0; sub < 2; ++sub) {
                 card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
                 const hc_module &       own = sub == 0 ? p[c]->w[l].hc_attn : p[c]->w[l].hc_ffn;
-                hh.down[c]                  = own.w_down;
-                hh.up[c]                    = own.w_up;
+                hh.down[c]                  = hc_down_of(own);
+                hh.up[c]                    = hc_up_of(own);
                 hh.gamma[c]                 = own.gamma;
                 if (one) {
                     const hc_module & pw = sub == 0 ? p[1 - c]->w[l].hc_attn : p[1 - c]->w[l].hc_ffn;
-                    hh.down[1 - c]       = pw.w_down;
-                    hh.up[1 - c]         = pw.w_up;
+                    hh.down[1 - c]       = hc_down_of(pw);
+                    hh.up[1 - c]         = hc_up_of(pw);
                     hh.gamma[1 - c]      = pw.gamma;
                     continue;
                 }
@@ -521,7 +1028,7 @@ bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2
         a.ple_nk[c]        = p[c]->ple_w.norm_key;
         a.ple_nq[c]        = p[c]->ple_w.norm_query;
         a.ple_nc[c]        = p[c]->ple_w.norm_conv;
-        a.ple_conv[c]      = p[c]->ple_w.conv;
+        a.ple_conv[c]      = p[c]->ple_w.conv;  // TTTS2: F32 when ple_w.conv32 (the same pointer)
         if (one) {
             const fn::ple::weights & pw = p[1 - c]->ple_w;
             a.ple_key[1 - c]            = reinterpret_cast<const uint16_t *>(pw.key);
@@ -531,16 +1038,33 @@ bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2
             a.ple_nc[1 - c]             = pw.norm_conv;
             a.ple_conv[1 - c]           = pw.conv;
         } else {
-            a.ple_key[1 - c]   = r.take<const uint16_t>(ple_key_bytes);
-            a.ple_value[1 - c] = r.take<const uint16_t>(ple_value_bytes);
+            // TTTS3: the key and value in the file's format, TTTS2's F32 taps; the file's rule (as the reservation's,
+            // run_load file_state_params), since a box without PLE in its window leaves its ple_w unset
+            a.ple_key[1 - c]   = r.take<const uint16_t>(ple_key_bytes_of(ple_kv_of(m)));
+            a.ple_value[1 - c] = r.take<const uint16_t>(ple_value_bytes_of(ple_kv_of(m)));
             a.ple_nk[1 - c]    = r.take<const float>(ple_norm_bytes);
             a.ple_nq[1 - c]    = r.take<const float>(ple_norm_bytes);
             a.ple_nc[1 - c]    = r.take<const float>(ple_norm_bytes);
-            a.ple_conv[1 - c]  = r.take<const uint16_t>(ple_conv_bytes);
+            a.ple_conv[1 - c]  = r.take<const uint16_t>(ple_conv_bytes_of(ple_conv32_of(m)));
         }
         a.enorm = r.take<float>(int64_t(D) * 4);
         a.hnorm = r.take<float>(int64_t(4) * D * 4);
-        if (r.off > prompt_replica_bytes(one)) {
+        // APF1 Part 4: the prepared data's places (prep_bytes; filled by prepare)
+        a.hc_prep_attn.resize(fn::n_layer);
+        a.hc_prep_ffn.resize(fn::n_layer);
+        for (int32_t l = 0; l < fn::n_layer; ++l) {
+            a.hc_prep_attn[size_t(l)] = fn::hc::hct_carve_scales(r.take<uint8_t>(fn::hc::hct_scale_bytes()));
+            a.hc_prep_ffn[size_t(l)]  = fn::hc::hct_carve_scales(r.take<uint8_t>(fn::hc::hct_scale_bytes()));
+        }
+        for (int32_t l = 0; l < fn::n_layer; ++l) {
+            a.ab_s.push_back(r.take<float>(int64_t(48) * 4));
+            a.idx_s.push_back(r.take<float>(int64_t(640) * 4));
+            a.rt_s.push_back(r.take<float>(int64_t(NE + 8) * 4));
+        }
+        a.dik_s                    = r.take<float>(int64_t(128) * 4);
+        // TTTS3: against the part as reserved, not a size recomputed from the carve's own inputs
+        const reserved_class * rpc = m.state_class("HC and PLE replicas (PB1)");
+        if (r.off > rpc->plan.parts[0].bytes[c]) {
             return fail(err, "prompt: the replicas' carve exceeds their reservation");
         }
         void * th = nullptr;
@@ -576,7 +1100,82 @@ bool prompt_path::init(model & m, pass_card * const p[2], draft_card * const d[2
             }
         }
     }
-    return fill_replicas(err);
+    return fill_replicas(err) && prepare(err);
+}
+
+// APF1 Part 4: the ladder's prepared data, once at load: each HC sublayer's row scales (hct_scales, from both halves:
+// after fill_replicas) and the BF16 products' column scales (pd_bf16_scales), each bitwise the converted route's
+// scales; the window's layers only (TTTS1). Synchronous
+bool prompt_path::prepare(std::string & err) {
+    for (int32_t c = 0; c < 2; ++c) {
+        card_arena &      a = a_[size_t(c)];
+        const pass_card & p = *p_[c];
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err)) {
+            return false;
+        }
+        cudaStream_t s = static_cast<cudaStream_t>(p.c.stream);
+        // the kernels' shared memory opt-ins on this device now, so a unit's capture sets no attribute
+        if (!fn::dense::pq_tc_attributes() || !fn::experts::ep_prompt_attributes() ||
+            !fn::gdn::gdn_prompt_attributes() || !fn::dense::pl_attributes() || !fn::hc::hcl_attributes()) {
+            return fail(err, "prompt: a kernel's shared memory opt-in");
+        }
+        for (int32_t l = 0; l < fn::n_layer; ++l) {
+            if (!m_->win.layer(l)) {
+                continue;
+            }
+            const layer_weights & w = p.w[l];
+            for (int32_t sub = 0; sub < 2; ++sub) {
+                const card_arena::hc_halves & hh = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
+                fn::hc::hcp_weights           hw;
+                hw.form = fn::hc::hcp_form::replicated;
+                hw.q8   = (sub == 0 ? w.hc_attn : w.hc_ffn).q8_down != nullptr;
+                for (int32_t q = 0; q < 2; ++q) {
+                    hw.down[q]  = hh.down[q];
+                    hw.up[q]    = hh.up[q];
+                    hw.gamma[q] = hh.gamma[q];
+                }
+                if (!fn::hc::hct_scales(hw, sub == 0 ? a.hc_prep_attn[size_t(l)] : a.hc_prep_ffn[size_t(l)], s)) {
+                    return fail(err, "prompt: the HC prepared scales");
+                }
+            }
+            const bool gdn = l % fn::full_attn_interval != fn::full_attn_interval - 1;
+            float *    rt  = a.rt_s[size_t(l)];
+            if ((gdn && (!fn::dense::pd_bf16_scales(w.alpha, 24, D, a.ab_s[size_t(l)], s) ||
+                         !fn::dense::pd_bf16_scales(w.beta, 24, D, a.ab_s[size_t(l)] + 24, s))) ||
+                (!gdn && c == w.index_owner &&
+                 (!fn::dense::pd_bf16_scales(w.idx_q, 512, D, a.idx_s[size_t(l)], s) ||
+                  !fn::dense::pd_bf16_scales(w.idx_k, 128, D, a.idx_s[size_t(l)] + 512, s))) ||
+                !fn::dense::pd_bf16_scales(w.router, NE, D, rt, s) ||
+                !fn::dense::pd_bf16_scales(w.sh_gate_w, 1, D, rt + NE, s) ||
+                !cuda_ok(cudaMemsetAsync(rt + NE + 1, 0, size_t(7) * 4, s), "router pad", err)) {
+                return err.empty() ? fail(err, "prompt: the prepared column scales") : false;
+            }
+        }
+        if (d_[c] != nullptr && d_[c]->sparse && !fn::dense::pd_bf16_scales(d_[c]->iw.k_proj, 128, D, a.dik_s, s)) {
+            return fail(err, "prompt: the draft index's prepared scales");
+        }
+        if (!cuda_ok(cudaStreamSynchronize(s), "prepared data", err)) {
+            return false;
+        }
+    }
+    // APF2: the startup route report, once a process: each product's route at every rung and every candidate's
+    // reason (the table's medians and the cost model's filter and rank)
+    static std::atomic<bool> reported{ false };
+    if (!reported.exchange(true)) {
+        if (!cuda_ok(cudaSetDevice(m_->device[0]), "device", err)) {
+            return false;
+        }
+        std::string r = "ladder: the table holds " + std::to_string(fn::model::lad_table().size()) + " entries\n";
+        if (!lad_on_) {
+            r += "ladder: the table is UD-Q4_K_XL's; this file runs the retained routes at every rung\n";
+        } else {
+            for (const fn::model::lad_key & key : prompt_ladder_keys(*p_[0], d_[0], m_->win, 0)) {
+                r += fn::model::lad_report(key, lad_model_of(key));
+            }
+        }
+        fprintf(stderr, "%s", r.c_str());
+    }
+    return true;
 }
 
 bool prompt_path::fill_replicas(std::string & err) {
@@ -594,8 +1193,8 @@ bool prompt_path::fill_replicas(std::string & err) {
             for (int32_t sub = 0; sub < 2; ++sub) {
                 const card_arena::hc_halves & hh  = sub == 0 ? a.hc_attn[size_t(l)] : a.hc_ffn[size_t(l)];
                 const hc_module &             src = sub == 0 ? p_[pc]->w[l].hc_attn : p_[pc]->w[l].hc_ffn;
-                if (!peer(hh.down[pc], src.w_down, hc_down_bytes, "HC down replica") ||
-                    !peer(hh.up[pc], src.w_up, hc_up_bytes, "HC up replica") ||
+                if (!peer(hh.down[pc], hc_down_of(src), hc_down_bytes_of(src), "HC down replica") ||
+                    !peer(hh.up[pc], hc_up_of(src), hc_up_bytes_of(src), "HC up replica") ||
                     !peer(hh.gamma[pc], src.gamma, hc_gamma_bytes, "HC gamma replica")) {
                     return false;
                 }
@@ -603,12 +1202,12 @@ bool prompt_path::fill_replicas(std::string & err) {
         }
         const fn::ple::weights & pw = p_[pc]->ple_w;
         if (!m_->single && m_->win.ple() &&
-            (!peer(a.ple_key[pc], pw.key, ple_key_bytes, "PLE key replica") ||
-             !peer(a.ple_value[pc], pw.value, ple_value_bytes, "PLE value replica") ||
+            (!peer(a.ple_key[pc], pw.key, ple_key_bytes_of(pw.kv), "PLE key replica") ||
+             !peer(a.ple_value[pc], pw.value, ple_value_bytes_of(pw.kv), "PLE value replica") ||
              !peer(a.ple_nk[pc], pw.norm_key, ple_norm_bytes, "PLE norm replica") ||
              !peer(a.ple_nq[pc], pw.norm_query, ple_norm_bytes, "PLE norm replica") ||
              !peer(a.ple_nc[pc], pw.norm_conv, ple_norm_bytes, "PLE norm replica") ||
-             !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes, "PLE conv replica"))) {
+             !peer(a.ple_conv[pc], pw.conv, ple_conv_bytes_of(pw.conv32 != nullptr), "PLE conv replica"))) {
             return false;
         }
         if (d_[c] != nullptr) {
@@ -743,7 +1342,27 @@ namespace {
 
 // fn::experts::fmt to fn::dense::fmt for the shared down (EX1's layout)
 fn::dense::fmt dense_of(int32_t ef) {
-    return static_cast<fn::experts::fmt>(ef) == fn::experts::fmt::q2_0 ? fn::dense::fmt::q2_0 : fn::dense::fmt::iq4_nl;
+    const auto f = static_cast<fn::experts::fmt>(ef);
+    return f == fn::experts::fmt::q2_0 ? fn::dense::fmt::q2_0 :
+           f == fn::experts::fmt::q8_0 ? fn::dense::fmt::q8_0 :
+                                         fn::dense::fmt::iq4_nl;
+}
+
+// APF2: the ladder keys of a call site's packed matrices ws (the runs of one format, at most three each, as dprod)
+void dense_run_keys(std::initializer_list<const dense_weight *> ws,
+                    int32_t                                     kk,
+                    int32_t                                     lay,
+                    std::vector<fn::model::lad_key> &           out) {
+    const dense_weight * const * w  = ws.begin();
+    const int32_t                nw = static_cast<int32_t>(ws.size());
+    for (int32_t i = 0; i < nw;) {
+        const int32_t i0 = i;
+        int32_t       nn = 0;
+        for (int32_t m = 0; i < nw && m < 3 && w[i]->fmt == w[i0]->fmt; ++i, ++m) {
+            nn += static_cast<int32_t>(w[i]->n_out);
+        }
+        out.push_back(prompt_dense_key(w[i0]->fmt, lay, kk, nn));
+    }
 }
 
 fn::dense::pd_act act1(const uint16_t * x, int64_t ld) {
@@ -756,22 +1375,64 @@ fn::dense::pd_act act1(const uint16_t * x, int64_t ld) {
 
 }  // namespace
 
+uint8_t * prompt_path::p_msg(int32_t card, bool send, const prompt_chunk & c, int32_t j) const {
+    const card_arena & a = a_[size_t(card)];
+    return (send ? a.p_send : a.p_recv) + int64_t(j) * fn::xchg::pmsg_payload_at +
+           int64_t(prompt_piece_r0(c, j)) * D * 2;
+}
+
 bool prompt_path::chunk(const prompt_chunk & c, std::string & err) {
     return chunk_begin(c, err) && chunk_layers(c, 0, fn::n_layer, err) && chunk_end(c, err);
 }
 
 bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
     if (c.rows < 1 || c.rows > rc_ || c.half[0] < 1 || c.half[0] > rh_ || c.half[1] < 0 || c.half[1] > rh_ ||
-        c.half[0] + c.half[1] != c.rows || c.tok == nullptr ||
+        c.half[0] + c.half[1] != c.rows || c.tok == nullptr || !prompt_pieces_ok(c) ||
         (m_->win.ple() && (c.e[0] == nullptr || c.e[1] == nullptr))) {
         return fail(err, "prompt: a chunk outside the layout's " + std::to_string(rc_) + " rows in halves of at most " +
                              std::to_string(rh_));
+    }
+    if (c.n_runs < 0 || c.n_runs > c.rows ||
+        (c.n_runs > 0 && (c.runs == nullptr || c.embd[0] == nullptr || c.embd[1] == nullptr))) {
+        return fail(err, "prompt: " + std::to_string(c.n_runs) + " supplied runs for " + std::to_string(c.rows) +
+                             " rows, or a run without both cards' rows");
+    }
+    if ((c.planes[0] == nullptr) != (c.planes[1] == nullptr) || (c.planes[0] == nullptr) != (c.bplanes[0] == nullptr) ||
+        (c.bplanes[0] == nullptr) != (c.bplanes[1] == nullptr) || (c.n_runs > 0 && c.planes[0] == nullptr)) {
+        return fail(err, "prompt: rope planes and block planes come together on both cards (and with supplied rows)");
+    }
+    for (int32_t i = 0, end = 0; i < c.n_runs; ++i) {  // VIS1: ascending, disjoint, inside the chunk
+        const prompt_chunk::supply_run & u = c.runs[i];
+        if (u.n < 1 || u.row0 < end || int64_t(u.row0) + u.n > c.rows) {
+            return fail(err, "prompt: supplied run " + std::to_string(i) + " (rows " + std::to_string(u.row0) + " .. " +
+                                 std::to_string(int64_t(u.row0) + u.n) + ") outside the chunk's " +
+                                 std::to_string(c.rows) + " rows or overlapping the run before");
+        }
+        end = u.row0 + u.n;
+    }
+    // APF1 Part 4: the chunk's routes (the whole chunk's rows; prompt_route_for). Graphs on the two-card path without
+    // the expert service, the host-backed KV tier or the HC dump (whose host copies a capture cannot hold)
+    {
+        const bool no_xs = p_[0]->c.ex_service == nullptr && p_[1]->c.ex_service == nullptr;
+        const bool graph_ok =
+            !m_->single && no_xs && p_[0]->c.kv == nullptr && p_[1]->c.kv == nullptr && dump_.row_stride == 0;
+        route_ = prompt_route_for(c.rows, graph_ok, force_);
+        if (totals_on.load(std::memory_order_relaxed)) {
+            const std::lock_guard<std::mutex> g(totals_mu);
+            totals_rungs |= 1u << __builtin_ctz(static_cast<uint32_t>(route_.rung / 64));
+        }
     }
     // the tokens to both cards (a pinned slot a chunk parity: the slot two chunks back has been copied, the chunk
     // end's join having passed)
     for (int32_t k = 0; k < 2; ++k) {
         card_arena & a = a_[size_t(k)];
         if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err)) {
+            return false;
+        }
+        // APF2: the split counters zero (the arena may have been lent since the last chunk)
+        if (!cuda_ok(cudaMemsetAsync(a.lws.count, 0, size_t(a.lws.count_len) * 4,
+                                     static_cast<cudaStream_t>(p_[k]->c.stream)),
+                     "ladder counters", err)) {
             return false;
         }
         if (!m_->single || k == 0) {
@@ -817,15 +1478,31 @@ bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
             ea.full    = a.E;
             ea.streams = a.S;
             ea.err = a.err;
+            ea.q8      = p_[k]->embd_q8;  // TTTS2
             if (phase == 0) {
                 if (!m_->single && lk.any_copied[k] &&
                     !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lk.copied[k]), 0), "emb reuse", err)) {
                     return false;
                 }
-                if (!fn::embed::embed_rows(ea, s) ||
-                    (!m_->single &&
-                     (!fn::xchg::pstamp(a.emb_send, gen, c.rows, fn::xchg::pkind::emb, s) ||
-                      !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.prod[k]), s), "emb produced", err)))) {
+                // VIS1: supplied rows over the token rows, before the message is stamped (the peer joins them)
+                int64_t done = 0;
+                bool    sup  = fn::embed::embed_rows(ea, s);
+                for (int32_t i = 0; i < c.n_runs && sup; ++i) {
+                    fn::embed::supply_args sa;
+                    sa.src     = c.embd[k] + done * fn::embed::n_own;
+                    sa.row0    = c.runs[i].row0;
+                    sa.n       = c.runs[i].n;
+                    sa.rows    = c.rows;
+                    sa.card    = k;
+                    sa.own     = ea.own;
+                    sa.full    = ea.full;
+                    sa.streams = ea.streams;
+                    sup        = fn::embed::embed_supply(sa, s);
+                    done += c.runs[i].n;
+                }
+                if (!sup || (!m_->single && (!fn::xchg::pstamp(a.emb_send, gen, c.rows, fn::xchg::pkind::emb, s) ||
+                                             !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.prod[k]), s),
+                                                      "emb produced", err)))) {
                     return err.empty() ? fail(err, "prompt: embed") : false;
                 }
                 lk.g_prod[k] = gen;
@@ -866,15 +1543,13 @@ bool prompt_path::chunk_layers(const prompt_chunk & c, int32_t lo, int32_t hi, s
     if (lo < 0 || hi > fn::n_layer || lo > hi) {
         return fail(err, "prompt: layers " + std::to_string(lo) + " .. " + std::to_string(hi) + " outside 0 .. 48");
     }
-    const int32_t nh = c.half[1] > 0 ? 2 : 1;
-    // the layers, sublayer-major in halves
+    const int32_t np = prompt_pieces(c);
+    // the layers, sublayer-major in pieces (MUP2; the halves when the chunk names none)
     for (int32_t l = lo; l < hi; ++l) {
         for (int32_t sub = 0; sub < 2; ++sub) {
-            for (int32_t h = 0; h < nh; ++h) {
-                for (int32_t phase = 0; phase < 4; ++phase) {
-                    if (!layer_half(c, l, sub, h, phase, err)) {
-                        return false;
-                    }
+            for (int32_t j = 0; j < np; ++j) {
+                if (!chunk_piece(c, l, sub, j, err)) {
+                    return false;
                 }
             }
         }
@@ -882,15 +1557,249 @@ bool prompt_path::chunk_layers(const prompt_chunk & c, int32_t lo, int32_t hi, s
     return true;
 }
 
-bool prompt_path::chunk_end(const prompt_chunk & c, std::string & err) {
-    const int32_t nh = c.half[1] > 0 ? 2 : 1;
-    // the target's end: layer 47's FFN exchange into the final streams (phase 0 of a layer 48 attention sublayer);
-    // TTTS1: the window's last layer's (split-test's one-box windows end before 48)
-    for (int32_t h = 0; h < nh; ++h) {
-        if (!layer_half(c, m_->win.hi + 1, 0, h, 0, err)) {
+bool prompt_path::chunk_piece(const prompt_chunk & c, int32_t l, int32_t sub, int32_t j, std::string & err) {
+    if (l < 0 || l >= fn::n_layer || sub < 0 || sub > 1 || j < 0 || j >= prompt_pieces(c)) {
+        return fail(err, "prompt: a unit outside the chunk (layer " + std::to_string(l) + ", sublayer " +
+                             std::to_string(sub) + ", piece " + std::to_string(j) + ")");
+    }
+    if (route_.graph) {
+        return unit_graph(c, l, sub, j, err);
+    }
+    note(&route_counts::eager_units);
+    return unit_eager(c, l, sub, j, err);
+}
+
+// APF2: a unit graph's key: the unit (layer, sublayer, piece), its rows' rung, and for piece 0 (whose conversions
+// follow every piece's route) the chunk's pieces' rungs; the forced routes. Only the capture count depends on it: a
+// replay checks its operations against the graph's (graph_rec) and captures again on any difference
+uint64_t prompt_path::unit_key(const prompt_chunk & c, int32_t l, int32_t sub, int32_t j) const {
+    uint64_t   h   = 1469598103934665603ull;
+    const auto mix = [&](uint64_t v) {
+        h = (h ^ v) * 1099511628211ull;
+    };
+    mix(uint64_t(l));
+    mix(uint64_t(sub));
+    mix(uint64_t(j));
+    mix(static_cast<uint64_t>(fn::model::lad_rung_index(prompt_piece_rows(c, j))) + 1);
+    if (j == 0) {
+        for (int32_t i = 0; i < prompt_pieces(c); ++i) {
+            mix(uint64_t(fn::model::lad_rung_index(prompt_piece_rows(c, i)) + 1) << 8);
+        }
+    }
+    mix(uint64_t(force_.dense) | uint64_t(force_.hc) << 4 | uint64_t(force_.expert) << 8);
+    return h;
+}
+
+bool prompt_path::unit_eager(const prompt_chunk & c, int32_t l, int32_t sub, int32_t j, std::string & err) {
+    for (int32_t phase = 0; phase < 4; ++phase) {
+        if (!layer_half(c, l, sub, j, phase, err)) {
             return false;
         }
     }
+    return true;
+}
+
+// ---- APF1 Part 4: a unit as one CUDA graph --------------------------------------------------------------------------
+// The unit's launches (both cards' compute streams and copy streams) captured from card 0's compute stream and
+// replayed as one graph: the same kernels with the same arguments in the same stream order, so the same results.
+// Before the capture card 0's compute stream waits for the tails of the other three streams (the pre-join), so the
+// graph starts after everything enqueued before it and the unit's waits on events recorded earlier are already met
+// (ev_wait skips them under the capture; a capture cannot wait on work outside it). The capture forks the other
+// streams from card 0's and joins them back. After the replay the other streams wait for it, and the link events the
+// unit recorded are recorded again on their card's compute stream, so later units, the chunk's end, publication and
+// the other lane see them complete as before (later than the copy itself: never early). The executable is kept per
+// unit position and updated in place with the new arguments (cudaGraphExecUpdate), instantiated again when the
+// topology differs. A capture that fails (an operation capture refuses) restores the host state it advanced and
+// runs the unit eagerly.
+bool prompt_path::unit_graph(const prompt_chunk & c, int32_t l, int32_t sub, int32_t j, std::string & err) {
+    cudaStream_t st[2] = { static_cast<cudaStream_t>(p_[0]->c.stream), static_cast<cudaStream_t>(p_[1]->c.stream) };
+    cudaStream_t cp[2] = { static_cast<cudaStream_t>(copy_[0]), static_cast<cudaStream_t>(copy_[1]) };
+    const auto   ev    = [&](int32_t card, int32_t i) {
+        return static_cast<cudaEvent_t>(gj_[card][i]);
+    };
+    const auto dev = [&](int32_t card) {
+        return cuda_ok(cudaSetDevice(m_->device[card]), "device", err);
+    };
+    for (int32_t card = 0; card < 2; ++card) {
+        for (int32_t i = 0; i < 4; ++i) {
+            if (gj_[card][i] == nullptr) {
+                cudaEvent_t e = nullptr;
+                if (!dev(card) || !cuda_ok(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "graph event", err)) {
+                    return false;
+                }
+                gj_[card][i] = e;
+            }
+        }
+    }
+    // the pre-join: card 0's compute stream after the tails of card 1's compute and both copy streams
+    if (!dev(1) || !cuda_ok(cudaEventRecord(ev(1, 0), st[1]), "pre-join", err) ||
+        !cuda_ok(cudaEventRecord(ev(1, 1), cp[1]), "pre-join", err) || !dev(0) ||
+        !cuda_ok(cudaEventRecord(ev(0, 0), cp[0]), "pre-join", err) ||
+        !cuda_ok(cudaStreamWaitEvent(st[0], ev(0, 0), 0), "pre-join", err) ||
+        !cuda_ok(cudaStreamWaitEvent(st[0], ev(1, 0), 0), "pre-join", err) ||
+        !cuda_ok(cudaStreamWaitEvent(st[0], ev(1, 1), 0), "pre-join", err)) {
+        return false;
+    }
+    const std::vector<link>             links0 = links_;
+    const std::array<int64_t, n_psites> sites0 = sites_;
+    const route_counts                  rc0    = rcount_;
+    // the fork (events 1 of card 0 and the joins' events 2, 3 are recorded only inside the graph), the unit, the join
+    const auto                          body   = [&]() {
+        return cuda_ok(cudaEventRecord(ev(0, 1), st[0]), "fork", err) &&
+               cuda_ok(cudaStreamWaitEvent(cp[0], ev(0, 1), 0), "fork", err) && dev(1) &&
+               cuda_ok(cudaStreamWaitEvent(st[1], ev(0, 1), 0), "fork", err) &&
+               cuda_ok(cudaStreamWaitEvent(cp[1], ev(0, 1), 0), "fork", err) && unit_eager(c, l, sub, j, err) &&
+               dev(1) && cuda_ok(cudaEventRecord(ev(1, 2), st[1]), "join", err) &&
+               cuda_ok(cudaEventRecord(ev(1, 3), cp[1]), "join", err) && dev(0) &&
+               cuda_ok(cudaEventRecord(ev(0, 2), cp[0]), "join", err) &&
+               cuda_ok(cudaStreamWaitEvent(st[0], ev(1, 2), 0), "join", err) &&
+               cuda_ok(cudaStreamWaitEvent(st[0], ev(1, 3), 0), "join", err) &&
+               cuda_ok(cudaStreamWaitEvent(st[0], ev(0, 2), 0), "join", err);
+    };
+    const auto restore = [&]() {
+        links_ = links0;
+        sites_ = sites0;
+        undo_totals(rcount_, rc0);
+        rcount_ = rc0;
+        err.clear();
+    };
+    const uint64_t                    key = unit_key(c, l, sub, j);
+    std::shared_ptr<unit_graph_entry> ge;
+    if (const auto it = ugraphs_.find(key); it != ugraphs_.end()) {
+        ge = it->second;
+    }
+    cudaGraphExec_t x = nullptr;
+    // APF2: the unit's graph replayed: the host code runs with every operation's arguments going into the executable
+    // (graph_rec's update; no stream capture). A mismatch (another sequence of operations) captures again
+    if (ge != nullptr && ge->updatable) {
+        cap_rec_[0].clear();
+        cap_rec_[1].clear();
+        graph_rec rec;
+        rec.begin_update(&ge->ops, ge->exec);
+        capturing_       = true;
+        const bool ok    = body();
+        capturing_       = false;
+        const bool match = rec.end();
+        if (ok && match) {
+            x = ge->exec;
+            note(&route_counts::graph_updated);
+        } else {
+            restore();
+            ugraphs_.erase(key);
+            ge = nullptr;
+        }
+    }
+    if (x == nullptr) {
+        cap_rec_[0].clear();
+        cap_rec_[1].clear();
+        if (!dev(0) || !cuda_ok(cudaStreamBeginCapture(st[0], cudaStreamCaptureModeRelaxed), "capture", err)) {
+            return false;
+        }
+        auto      ne = std::make_shared<unit_graph_entry>();
+        graph_rec rec;
+        rec.begin_capture(&ne->ops);
+        capturing_           = true;
+        const bool ok        = body();
+        capturing_           = false;
+        ne->updatable        = rec.end();
+        cudaGraph_t       g  = nullptr;
+        const cudaError_t ce = (cudaSetDevice(m_->device[0]), cudaStreamEndCapture(st[0], &g));
+        if (!ok || ce != cudaSuccess || g == nullptr) {
+            // the unit was not run: the host state back, then eagerly (a failure there is the unit's own)
+            if (g != nullptr) {
+                cudaGraphDestroy(g);
+            }
+            (void) cudaGetLastError();
+            fprintf(stderr,
+                    "prompt: layer %d sublayer %d piece %d: graph capture failed (%s%s%s); the unit runs eagerly\n", l,
+                    sub, j, cudaGetErrorString(ce), ok ? "" : "; ", ok ? "" : err.c_str());
+            restore();
+            note(&route_counts::eager_units);
+            return unit_eager(c, l, sub, j, err);
+        }
+        ne->graph    = g;
+        size_t nodes = 0;
+        if (!cuda_ok(cudaGraphGetNodes(g, nullptr, &nodes), "graph nodes", err) ||
+            !cuda_ok(cudaGraphInstantiate(&ne->exec, g, 0), "graph instantiate", err)) {
+            return false;
+        }
+        graph_nodes_ += static_cast<int64_t>(nodes);
+        note(&route_counts::graph_captures);
+        x             = ne->exec;
+        ugraphs_[key] = ne;
+    }
+    if (!cuda_ok(cudaGraphLaunch(x, st[0]), "graph launch", err)) {
+        return false;
+    }
+    // after the replay: the other streams wait for it; the unit's link events recorded again on their card
+    if (!cuda_ok(cudaEventRecord(ev(0, 3), st[0]), "done", err) ||
+        !cuda_ok(cudaStreamWaitEvent(cp[0], ev(0, 3), 0), "done", err) || !dev(1) ||
+        !cuda_ok(cudaStreamWaitEvent(st[1], ev(0, 3), 0), "done", err) ||
+        !cuda_ok(cudaStreamWaitEvent(cp[1], ev(0, 3), 0), "done", err)) {
+        return false;
+    }
+    for (int32_t card = 0; card < 2; ++card) {
+        if (!dev(card)) {
+            return false;
+        }
+        for (void * e : cap_rec_[card]) {
+            if (!cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(e), st[card]), "link event", err)) {
+                return false;
+            }
+        }
+    }
+    note(&route_counts::graph_units);
+    return true;
+}
+
+bool prompt_path::ev_wait(void * stream, void * event, std::string & err, const char * what) {
+    if (capturing_) {
+        bool in = false;
+        for (const std::vector<void *> & v : cap_rec_) {
+            in = in || std::find(v.begin(), v.end(), event) != v.end();
+        }
+        if (!in) {
+            return true;  // recorded before the capture: the pre-join already waited for it
+        }
+    }
+    return cuda_ok(cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(event), 0), what,
+                   err);
+}
+
+bool prompt_path::ev_record(void * event, int32_t card, void * stream, std::string & err, const char * what) {
+    if (capturing_ && std::find(cap_rec_[card].begin(), cap_rec_[card].end(), event) == cap_rec_[card].end()) {
+        cap_rec_[card].push_back(event);
+    }
+    return cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream)), what, err);
+}
+
+bool prompt_path::peer_copy(void *        dst,
+                            int32_t       dst_card,
+                            const void *  src,
+                            int32_t       src_card,
+                            size_t        bytes,
+                            void *        stream,
+                            std::string & err) {
+    // a capture refuses cudaMemcpyPeerAsync; the same copy by its unified addresses (a peer copy node)
+    if (capturing_) {
+        return cuda_ok(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, static_cast<cudaStream_t>(stream)), "copy",
+                       err);
+    }
+    return cuda_ok(cudaMemcpyPeerAsync(dst, m_->device[dst_card], src, m_->device[src_card], bytes,
+                                       static_cast<cudaStream_t>(stream)),
+                   "copy", err);
+}
+
+bool prompt_path::chunk_end(const prompt_chunk & c, std::string & err) {
+    const int32_t nh = c.half[1] > 0 ? 2 : 1;
+    // the target's end: layer 47's FFN exchange into the final streams (phase 0 of a layer 48 attention sublayer),
+    // piece by piece (MUP2); TTTS1: the window's last layer's (split-test's one-box windows end before 48)
+    for (int32_t j = 0; j < prompt_pieces(c); ++j) {
+        if (!layer_half(c, m_->win.hi + 1, 0, j, 0, err)) {
+            return false;
+        }
+    }
+    // the draft's catch-up stays on the halves (a partition refines them)
     if (c.draft && d_[0] != nullptr) {
         for (int32_t h = 0; h < nh; ++h) {
             for (int32_t phase = 0; phase < 5; ++phase) {
@@ -903,26 +1812,87 @@ bool prompt_path::chunk_end(const prompt_chunk & c, std::string & err) {
     return true;
 }
 
-// One phase of sublayer sub of layer l for half h, both cards (card 0, then card 1):
+// One phase of sublayer sub of layer l for piece h (MUP2: the halves generalized; prompt_pieces), both cards (card 0,
+// then card 1):
 //   0: the previous sublayer's exchange of this half (receive, combine into S); at layer 1's attention, PLE; HC; the
 //      body's first part (products; on a QSA layer's index owner the index and selection, the SEL message produced)
 //   1: the SEL copy (QSA layers, the owner)
 //   2: the body's rest (QSA: the peer acquires SEL; K/V; attention; wo), the partial packed, the P message produced
 //   3: the P copy
 // l = 48 runs phase 0's receive and combine only (the target's end).
+std::vector<fn::model::lad_key> prompt_ladder_keys(const pass_card &  p,
+                                                   const draft_card * d,
+                                                   const window &     win,
+                                                   int32_t            card) {
+    std::vector<fn::model::lad_key> k;
+    const auto                      bf = [](int32_t kk, int32_t nn) {
+        return prompt_dense_key(static_cast<int32_t>(fn::dense::fmt::bf16), 0, kk, nn);
+    };
+    for (int32_t l = 0; l < fn::n_layer; ++l) {
+        if (!win.layer(l)) {
+            continue;
+        }
+        const layer_weights & w   = p.w[l];
+        const bool            gdn = l % fn::full_attn_interval != fn::full_attn_interval - 1;
+        k.push_back(prompt_hc_key(false, w.hc_attn.q8_down != nullptr));
+        k.push_back(prompt_hc_key(true, w.hc_attn.q8_down != nullptr));
+        if (gdn) {
+            dense_run_keys({ &w.qkv, &w.z }, D, 0, k);
+            k.push_back(bf(D, 48));
+            dense_run_keys({ &w.ssm_out }, GV, 0, k);
+        } else {
+            dense_run_keys({ &w.wq, &w.wk, &w.wv }, D, 0, k);
+            k.push_back(prompt_dense_key(w.wo.fmt, 0, GV, D));
+            if (card == w.index_owner) {
+                k.push_back(bf(D, 640));
+            }
+        }
+        k.push_back(prompt_hc_key(false, w.hc_ffn.q8_down != nullptr));
+        k.push_back(prompt_hc_key(true, w.hc_ffn.q8_down != nullptr));
+        k.push_back(bf(D, NE + 8));
+        dense_run_keys({ &w.sh_gate, &w.sh_up }, D, 0, k);
+        dense_weight sd;
+        sd.fmt   = static_cast<int32_t>(dense_of(w.ex_sh_down_fmt));
+        sd.n_out = D;
+        dense_run_keys({ &sd }, 320, static_cast<int32_t>(fn::dense::pd_layout::ex1_down), k);
+        if (fn::experts::el_takes_gate_up(static_cast<fn::experts::fmt>(w.ex_gu_fmt))) {
+            k.push_back(prompt_expert_key(false, w.ex_gu_fmt));
+        }
+        if (fn::experts::el_takes_down(static_cast<fn::experts::fmt>(w.ex_down_fmt))) {
+            k.push_back(prompt_expert_key(true, w.ex_down_fmt));
+        }
+    }
+    if (d != nullptr && win.layer(fn::n_layer)) {
+        k.push_back(prompt_dense_key(d->w.eh.fmt, 0, 2 * D, F));
+        k.push_back(prompt_dense_key(d->w.wk.fmt, 0, D, 256));
+        if (d->sparse) {
+            k.push_back(bf(D, 128));
+        }
+    }
+    std::vector<fn::model::lad_key> u;
+    for (const fn::model::lad_key & x : k) {
+        if (std::find(u.begin(), u.end(), x) == u.end()) {
+            u.push_back(x);
+        }
+    }
+    return u;
+}
+
 bool prompt_path::layer_half(const prompt_chunk & c,
                              int32_t              l,
                              int32_t              sub,
                              int32_t              h,
                              int32_t              phase,
                              std::string &        err) {
-    const int32_t  r0       = h == 0 ? 0 : c.half[0];
-    const int32_t  n        = c.half[h];
+    const int32_t  r0       = prompt_piece_r0(c, h);
+    const int32_t  n        = prompt_piece_rows(c, h);
     const int64_t  pos0     = c.start + r0;
     const bool     end      = l == m_->win.hi + 1;  // the window's end (TTTS1; the whole model: 48)
     const bool     gdn      = !end && l % fn::full_attn_interval != fn::full_attn_interval - 1;
-    link &         lp       = links_[h == 0 ? lk_p0 : lk_p1];
-    link &         ls       = links_[h == 0 ? lk_sel0 : lk_sel1];
+    link &         lp       = links_[lk_p0 + h];
+    // SEL: produced and consumed inside the piece's own sublayer, so two slots alternate (their reuse waits)
+    link &         ls       = links_[h % 2 == 0 ? lk_sel0 : lk_sel1];
+    const int32_t  sh       = h % 2;  // the SEL slot
     // the previous sublayer of this half: (l, sub - 1) or (l - 1, 1)
     const bool     first    = l == 0 && sub == 0;
     const uint64_t gen_prev = sub == 1 ? fn::xchg::pgen(c.seq, l, 0, h, fn::xchg::pkind::attn) :
@@ -950,21 +1920,17 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 return fail(err, "prompt: a message copied before its generation was produced");
             }
             if (!m_->single) {
-                cudaStream_t cs = static_cast<cudaStream_t>(copy_[k]);
+                cudaStream_t    cs  = static_cast<cudaStream_t>(copy_[k]);
+                uint8_t * const dst = phase == 1 ? lk.recv[1 - k] : p_msg(1 - k, false, c, h);
+                uint8_t * const src = phase == 1 ? lk.send[k] : p_msg(k, true, c, h);
                 if (!cuda_ok(cudaSetDevice(m_->device[k]), "device", err) ||
-                    !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.prod[k]), 0), "copy wait", err) ||
-                    (lk.any_freed[1 - k] &&
-                     !cuda_ok(cudaStreamWaitEvent(cs, static_cast<cudaEvent_t>(lk.freed[1 - k]), 0), "copy free",
-                              err)) ||
-                    !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k], m_->device[1 - k], lk.send[k], m_->device[k],
-                                                 size_t(phase == 1 ? sel_used : bytes), cs),
-                             "copy", err) ||
+                    !ev_wait(cs, lk.prod[k], err, "copy wait") ||
+                    (lk.any_freed[1 - k] && !ev_wait(cs, lk.freed[1 - k], err, "copy free")) ||
+                    !peer_copy(dst, 1 - k, src, k, size_t(phase == 1 ? sel_used : bytes), cs, err) ||
                     // SEL (PB3): the used slabs' bodies above, then their offsets (the payload's two regions)
                     (phase == 1 &&
-                     !cuda_ok(cudaMemcpyPeerAsync(lk.recv[1 - k] + sel_offs_at, m_->device[1 - k],
-                                                  lk.send[k] + sel_offs_at, m_->device[k], size_t(sel_offs_used), cs),
-                              "copy", err)) ||
-                    !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lk.copied[k]), cs), "copied", err)) {
+                     !peer_copy(dst + sel_offs_at, 1 - k, src + sel_offs_at, k, size_t(sel_offs_used), cs, err)) ||
+                    !ev_record(lk.copied[k], k, cs, err, "copied")) {
                     return false;
                 }
             }
@@ -1009,8 +1975,8 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             // freed after their reader
             const bool fold = !first && !end && !(l == 1 && sub == 0);
             fn::hc::hct_combine cb;
-            const auto freed = [&]() {
-                if (!m_->single && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.freed[k]), s), "freed", err)) {
+            const auto          freed = [&]() {
+                if (!m_->single && !ev_record(lp.freed[k], k, s, err, "freed")) {
                     return false;
                 }
                 lp.g_freed[k] = gen_prev;
@@ -1021,18 +1987,18 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 if (lp.g_copied[1 - k] != gen_prev) {
                     return fail(err, "prompt: a partial received before its generation was copied");
                 }
-                if (!m_->single &&
-                    !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[1 - k]), 0), "recv", err)) {
+                if (!m_->single && !ev_wait(s, lp.copied[1 - k], err, "recv")) {
                     return false;
                 }
                 if (fold) {
                     cb.card    = k;
-                    cb.own     = a.p_send[h];
-                    cb.peer    = a.p_recv[h];
+                    cb.own     = p_msg(k, true, c, h);
+                    cb.peer    = p_msg(k, false, c, h);
                     cb.gen     = gen_prev;
                     cb.inject  = inj;
                     cb.streams = S;
-                } else if (!fn::xchg::pcombine(n, k, a.p_send[h], a.p_recv[h], gen_prev, inj, S, a.err, s) ||
+                } else if (!fn::xchg::pcombine(n, k, p_msg(k, true, c, h), p_msg(k, false, c, h), gen_prev, inj, S,
+                                               a.err, s) ||
                            !freed()) {
                     return err.empty() ? fail(err, "prompt: combine") : false;
                 }
@@ -1064,6 +2030,8 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 kb.ldx                = D;
                 kb.out                = key;
                 kb.ld_out             = int64_t(4) * D;
+                kb.f32                = p.ple_w.kv == fn::ple::kv_fmt::f32;   // TTTS2
+                kb.q8                 = p.ple_w.kv == fn::ple::kv_fmt::q8_0;  // TTTS3
                 fn::dense::pb_args vb = kb;
                 vb.w_lo               = a.ple_value[0];
                 vb.w_hi               = a.ple_value[1];
@@ -1077,6 +2045,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     pa.w.norm_conv[hh]  = a.ple_nc[hh];
                     pa.w.conv[hh]       = a.ple_conv[hh];
                 }
+                pa.w.conv32 = p.ple_w.conv32 != nullptr;  // TTTS2
                 pa.rows     = n;
                 pa.key      = key;
                 pa.value    = value;
@@ -1087,7 +2056,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 pa.hist_out = a.ple_hist[1 - hist_cur_];
                 pa.state    = p.ple_hist;
                 pa.cur      = p.c.cur;
-                pa.v_out    = h + 1;
+                pa.v_out    = prompt_piece_v_out(h);
                 pa.card     = k;
                 if (!fn::dense::pd_bf16(kb, s) || !fn::dense::pd_bf16(vb, s) || !fn::ple::ple_prompt_stats(pa, s) ||
                     !fn::ple::ple_prompt_x(pa, s) || !fn::ple::ple_prompt_update(pa, s) ||
@@ -1104,6 +2073,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     }
                 }
                 count(psite::ple);
+                note(&route_counts::ple);
             }
             // 0c: HC
             if (!m_->single || k == 0) {
@@ -1111,6 +2081,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 bump b{sc};
                 fn::hc::hcp_args ha;
                 ha.w.form = fn::hc::hcp_form::replicated;
+                ha.w.q8   = (sub == 0 ? w.hc_attn : w.hc_ffn).q8_down != nullptr;  // TTTS2
                 for (int32_t q = 0; q < 2; ++q) {
                     ha.w.down[q]  = hh.down[q];
                     ha.w.up[q]    = hh.up[q];
@@ -1133,12 +2104,27 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 ha.ld_mixed16 = D;
                 ha.err        = a.err;
                 ha.card       = k;
-                // the coefficients to FP16 at the sublayer's first half (the second half reads them)
-                if ((h == 0 && !fn::hc::hct_convert(ha.w, a.hct, s)) ||
-                    !fn::hc::hct_mix(ha, cb, a.hct, b.take<uint8_t>(fn::hc::hct_scratch_bytes(n)), s) ||
+                // APF2: both products on the ladder's tiles (the table's or the force's routes at the piece's rows;
+                // split K in the card's workspace), else the retained route: the coefficients to FP16 at the
+                // sublayer's first piece when any piece of the chunk takes it (its other pieces read them)
+                uint8_t * const             hs = b.take<uint8_t>(fn::hc::hct_scratch_bytes(n));
+                const fn::hc::hct_weights & hp = sub == 0 ? a.hc_prep_attn[size_t(l)] : a.hc_prep_ffn[size_t(l)];
+                const fn::model::lad_key    kd = prompt_hc_key(false, ha.w.q8), ku = prompt_hc_key(true, ha.w.q8);
+                const fn::model::lad_cfg    cd = lad_route(kd, n, force_.hc), cu = lad_route(ku, n, force_.hc);
+                const bool                  hz = !cd.retained() && !cu.retained();
+                const bool hconv = h == 0 && (lad_retained_any(kd, c, force_.hc) || lad_retained_any(ku, c, force_.hc));
+                fn::hc::hct_route hr;
+                hr.down_tile   = cd.tile;
+                hr.down_splits = cd.splits;
+                hr.up_tile     = cu.tile;
+                hr.up_splits   = cu.splits;
+                if ((hconv && !fn::hc::hct_convert(ha.w, a.hct, s)) ||
+                    (hz ? !fn::hc::hct_mix_ladder(ha, cb, hp, hs, hr, a.lws, s) :
+                          !fn::hc::hct_mix(ha, cb, a.hct, hs, s)) ||
                     (fold && !freed())) {
                     return err.empty() ? fail(err, "prompt: HC") : false;
                 }
+                note(hz ? &route_counts::hc_ladder : &route_counts::hc_retained);
                 count(sub == 0 ? psite::hc_attn : psite::hc_ffn);
                 if (k == 0 && (!dump_hc(c, l, sub, h, err) || !dump_hc(c, l, sub + 2, h, err))) {
                     return false;
@@ -1146,29 +2132,45 @@ bool prompt_path::layer_half(const prompt_chunk & c,
             }
             // 0d: the body's first part. PB3: the sublayer's producer (GDN out, the experts' sum, QSA wo) writes the P
             // message's FP16 payload itself, so the send slot's previous message has been copied out before the body
-            if (!m_->single && lp.any_copied[k] &&
-                !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lp.copied[k]), 0), "slot reuse", err)) {
+            if (!m_->single && lp.any_copied[k] && !ev_wait(s, lp.copied[k], err, "slot reuse")) {
                 return false;
             }
-            uint16_t * const pay = reinterpret_cast<uint16_t *>(a.p_send[h] + fn::xchg::pmsg_payload_at);
+            uint16_t * const pay = reinterpret_cast<uint16_t *>(p_msg(k, true, c, h) + fn::xchg::pmsg_payload_at);
             const fn::dense::pd_act mx   = act1(a.mixed16, D);
-            // PB3: the sublayer's dense weights to FP16 in the conversion region at its first half (fused matrices
-            // contiguous), then tensor products with one output segment a matrix
-            const auto              to16 = [&](const dense_weight & dw, int64_t at) {
+            // PB3: the sublayer's dense weights to FP16 in the conversion region at its first piece (fused matrices
+            // contiguous), then tensor products with one output segment a matrix. APF2: each product's route from
+            // the ladder at the piece's rows (lad_route): a ladder tile decodes its weights in the tile loader
+            // (pl_tc), the retained route reads the conversion, made at piece 0 when any piece of the chunk takes it
+            const auto              to16 = [&](const dense_weight & dw, int64_t at, bool conv,
+                                               fn::dense::pd_layout lay = fn::dense::pd_layout::dp2) {
                 fn::dense::pd_args pa;
                 pa.f     = static_cast<fn::dense::fmt>(dw.fmt);
-                pa.lay   = fn::dense::pd_layout::dp2;
+                pa.lay   = lay;
                 pa.k     = static_cast<int32_t>(dw.k);
                 pa.n     = static_cast<int32_t>(dw.n_out);
                 pa.w     = dw.w;
                 pa.grids = p.c.dense_grids;
-                return h != 0 || fn::dense::pd_convert(pa, a.w16 + at, s);
+                return !conv || fn::dense::pd_convert(pa, a.w16 + at, s);
+            };
+            // whether the sublayer's piece 0 converts key's weights (some piece of the chunk takes the retained route)
+            const auto dconv = [&](const fn::model::lad_key & key, int32_t mul = 1) {
+                return h == 0 && lad_retained_any(key, c, force_.dense, mul);
+            };
+            // a ladder product: pl_tc on the route's tile and split count, noted
+            const auto ltc = [&](const fn::dense::pq_args & q, const fn::model::lad_cfg & cfg) {
+                note(&route_counts::dense_ladder);
+                if (cfg.splits > 1) {
+                    note(&route_counts::dense_split);
+                }
+                note_fmt(&route_counts::dense_fmts, static_cast<int32_t>(q.n_src == 0 ? fn::dense::fmt::bf16 : q.f));
+                return fn::dense::pl_tc(q, cfg.tile, cfg.splits, a.lws, s);
             };
             // segs: up to three output segments; cs: the BF16 conversions' column scales (at cs_at), or -1; o16: the
             // P payload instead of the one segment
             const auto tprod = [&](int64_t at, int32_t nn, int32_t kk, const fn::dense::pd_act & x,
                                    const fn::dense::pt_seg * segs, int32_t n_seg, int64_t cs_at,
-                                   uint16_t * o16 = nullptr, int64_t l16 = D, uint32_t e16 = fn::xchg::err_prange) {
+                                   uint16_t * o16 = nullptr, int64_t l16 = D, uint32_t e16 = fn::xchg::err_prange,
+                                   const float * row_scale = nullptr) {
                 fn::dense::pt_args t;
                 t.w = a.w16 + at;
                 t.n = nn;
@@ -1180,16 +2182,130 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     t.seg[i] = segs[i];
                 }
                 t.col_scale = cs_at < 0 ? nullptr : reinterpret_cast<const float *>(a.w16 + cs_at);
+                t.row_scale = row_scale;
                 t.out16 = o16;
                 t.ld16 = l16;
                 t.err = a.err;
                 t.err_bit = e16;
+                note(&route_counts::dense_retained);
                 return fn::dense::pd_tc(t, s);
             };
-            // BF16 rows of K = 2,560 to FP16 at at, their column scales at s_at (at the sublayer's first half)
-            const auto to16b = [&](const uint16_t * bw, int32_t rows_w, int64_t at, int64_t s_at) {
-                return h != 0 || fn::dense::pd_convert_bf16(bw, rows_w, D, a.w16 + at,
-                                                            reinterpret_cast<float *>(a.w16 + s_at), s);
+            // one product of packed matrices ws (columns one after another, K kk; converted at at). APF2: the runs
+            // of one format (at most three sources each, pl_tc's), each its own key and route; the product takes the
+            // ladder when every run's route is a ladder tile, else the retained route (one pd_tc over the conversion)
+            const auto dprod = [&](std::initializer_list<const dense_weight *> ws, int64_t at, int32_t kk,
+                                   const fn::dense::pd_act & x, const fn::dense::pt_seg * segs, int32_t n_seg,
+                                   uint16_t * o16 = nullptr, int64_t l16 = D, uint32_t e16 = fn::xchg::err_prange,
+                                   fn::dense::pd_layout lay       = fn::dense::pd_layout::dp2,
+                                   const float *        row_scale = nullptr) {
+                const dense_weight * const * w  = ws.begin();
+                const int32_t                nw = static_cast<int32_t>(ws.size());
+                int32_t ri[4] = {}, rcol[4] = {}, nr = 0;  // run r: sources ri[r] .., columns rcol[r] ..
+                for (int32_t i = 0, c0 = 0; i < nw && nr < 3; ++nr) {
+                    ri[nr]   = i;
+                    rcol[nr] = c0;
+                    for (int32_t m = 0; i < nw && m < 3 && w[i]->fmt == w[ri[nr]]->fmt; ++i, ++m) {
+                        c0 += static_cast<int32_t>(w[i]->n_out);
+                    }
+                    ri[nr + 1]   = i;
+                    rcol[nr + 1] = c0;
+                }
+                fn::model::lad_cfg cfg[3];
+                bool               ladder = true, conv = false;
+                for (int32_t r = 0; r < nr; ++r) {
+                    const fn::model::lad_key key =
+                        prompt_dense_key(w[ri[r]]->fmt, static_cast<int32_t>(lay), kk, rcol[r + 1] - rcol[r]);
+                    cfg[r] = lad_route(key, n, force_.dense);
+                    ladder = ladder && !cfg[r].retained();
+                    conv   = conv || dconv(key);
+                }
+                int32_t nn = 0;
+                for (const dense_weight * dw : ws) {
+                    if (!to16(*dw, at + int64_t(nn) * kk, conv, lay)) {
+                        return false;
+                    }
+                    nn += static_cast<int32_t>(dw->n_out);
+                }
+                if (!ladder) {
+                    return tprod(at, nn, kk, x, segs, n_seg, -1, o16, l16, e16, row_scale);
+                }
+                for (int32_t r = 0; r < nr; ++r) {
+                    fn::dense::pq_args q;
+                    q.f              = static_cast<fn::dense::fmt>(w[ri[r]]->fmt);
+                    q.lay            = lay;
+                    q.grids          = p.c.dense_grids;
+                    const int32_t c0 = rcol[r], c1 = rcol[r + 1];
+                    for (int32_t i = ri[r]; i < ri[r + 1]; ++i) {
+                        q.src[q.n_src++] = { w[i]->w, static_cast<int32_t>(w[i]->n_out) };
+                    }
+                    fn::dense::pt_args & t = q.t;
+                    t.n                    = c1 - c0;
+                    t.k                    = kk;
+                    t.rows                 = n;
+                    t.x                    = x;
+                    t.row_scale            = row_scale;
+                    t.err                  = a.err;
+                    t.err_bit              = e16;
+                    if (o16 != nullptr) {
+                        t.seg[0] = { nullptr, segs[0].ld, t.n };
+                        t.out16  = o16 + c0;
+                        t.ld16   = l16;
+                    } else {
+                        t.n_seg = 0;
+                        for (int32_t g = 0, g0 = 0; g < n_seg; g0 = segs[g].end, ++g) {
+                            const int32_t lo = std::max(g0, c0), hi = std::min(segs[g].end, c1);
+                            if (lo < hi) {
+                                t.seg[t.n_seg++] = { segs[g].out + int64_t(lo - g0), segs[g].ld, hi - c0 };
+                            }
+                        }
+                    }
+                    if (!ltc(q, cfg[r])) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            // BF16 rows of K = 2,560 to FP16 at at, their column scales at s_at (conv: at the sublayer's piece 0)
+            const auto to16b = [&](const uint16_t * bw, int32_t rows_w, int64_t at, int64_t s_at, bool conv) {
+                return !conv || fn::dense::pd_convert_bf16(bw, rows_w, D, a.w16 + at,
+                                                           reinterpret_cast<float *>(a.w16 + s_at), s);
+            };
+            const auto bkey = [&](int32_t nn) {
+                return prompt_dense_key(static_cast<int32_t>(fn::dense::fmt::bf16),
+                                        static_cast<int32_t>(fn::dense::pd_layout::dp2), D, nn);
+            };
+            // a BF16 product of rows b0 [n0] then b1 [n1] (nn columns, zero past n0 + n1): the retained route
+            // converted at at with scales at s_at, or a ladder tile from the prepared scales prep
+            const auto bprod = [&](const uint16_t * b0, int32_t n0, const uint16_t * b1, int32_t n1, int32_t nn,
+                                   int64_t at, int64_t s_at, const float * prep, const fn::dense::pd_act & x,
+                                   const fn::dense::pt_seg * segs, int32_t n_seg) {
+                const fn::model::lad_cfg cfg  = lad_route(bkey(nn), n, force_.dense);
+                const bool               conv = dconv(bkey(nn));
+                if (!to16b(b0, n0, at, s_at, conv) ||
+                    (b1 != nullptr && !to16b(b1, n1, at + int64_t(n0) * D, s_at + int64_t(2) * n0, conv))) {
+                    return false;
+                }
+                if (cfg.retained()) {
+                    return tprod(at, nn, D, x, segs, n_seg, s_at);
+                }
+                fn::dense::pq_args q;
+                q.b0                   = b0;
+                q.n0                   = n0;
+                q.b1                   = b1;
+                q.n1                   = n1;
+                q.b_scale              = prep;
+                fn::dense::pt_args & t = q.t;
+                t.n                    = nn;
+                t.k                    = D;
+                t.rows                 = n;
+                t.x                    = x;
+                t.n_seg                = n_seg;
+                for (int32_t i = 0; i < n_seg; ++i) {
+                    t.seg[i] = segs[i];
+                }
+                t.col_scale = prep;
+                t.err       = a.err;
+                return ltc(q, cfg);
             };
             if (sub == 0 && gdn) {
                 bump b{m_->single ? a_[0].scratch : sc};
@@ -1209,11 +2325,8 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 }
                 const fn::dense::pt_seg in[1] = {{nullptr, GC + GV, GC + GV}};
                 const fn::dense::pt_seg ab[2] = {{al, 24, 24}, {be, 24, 48}};
-                if (!to16(w.qkv, 0) || !to16(w.z, int64_t(GC) * D) || !to16(w.ssm_out, gdn_out_at) ||
-                    !to16b(w.alpha, 24, gdn_ab_at, gdn_ab_s_at) ||
-                    !to16b(w.beta, 24, gdn_ab_at + int64_t(24) * D, gdn_ab_s_at + 48) ||
-                    !tprod(0, GC + GV, D, mx, in, 1, -1, qz16, GC + GV, 1u) ||
-                    !tprod(gdn_ab_at, 48, D, mx, ab, 2, gdn_ab_s_at)) {
+                if (!dprod({ &w.qkv, &w.z }, 0, D, mx, in, 1, qz16, GC + GV, 1u) ||
+                    !bprod(w.alpha, 24, w.beta, 24, 48, gdn_ab_at, gdn_ab_s_at, a.ab_s[size_t(l)], mx, ab, 2)) {
                     return fail(err, "prompt: GDN input");
                 }
                 count(psite::gdn_input);
@@ -1227,11 +2340,11 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 ga.conv_w   = w.conv1d;
                 ga.hist     = st.conv;
                 ga.state    = st.gdn;
-                ga.rec      = st.rec;    // ME11: half 0 replays the selector's records
+                ga.rec       = st.rec;  // ME11: piece 0 replays the selector's records
                 ga.gsel     = p.c.gsel;
                 ga.cur      = p.c.cur;
-                ga.v_in     = h;
-                ga.v_out    = h + 1;
+                ga.v_in      = prompt_piece_v_in(h);  // MUP2: the halves' 0 -> 1 -> 2, then alternating
+                ga.v_out     = prompt_piece_v_out(h);
                 ga.alpha    = al;
                 ga.beta_raw = be;
                 ga.dt       = w.dt;
@@ -1248,9 +2361,10 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     !fn::gdn::gdn_prompt_recur(ga, s) || !fn::gdn::gdn_prompt_gate(ga, s)) {
                     return fail(err, "prompt: GDN core");
                 }
+                note(&route_counts::gdn);
                 count(psite::gdn_core);
                 const fn::dense::pt_seg po[1] = {{nullptr, D, D}};
-                if (!tprod(gdn_out_at, D, GV, act1(gated16, GV), po, 1, -1, pay)) {
+                if (!dprod({ &w.ssm_out }, gdn_out_at, GV, act1(gated16, GV), po, 1, pay)) {
                     return fail(err, "prompt: GDN out");
                 }
                 count(psite::gdn_out);
@@ -1267,20 +2381,18 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     return fail(err, "prompt: QSA weight shapes");
                 }
                 const fn::dense::pt_seg in[3] = {{qfull, QF, QF}, {kk, 256, QF + 256}, {vv, 256, QF + 512}};
-                if (!to16(w.wq, 0) || !to16(w.wk, int64_t(QF) * D) || !to16(w.wv, int64_t(QF + 256) * D) ||
-                    !to16(w.wo, qsa_out_at) || !tprod(0, QF + 512, D, mx, in, 3, -1)) {
+                if (!dprod({ &w.wq, &w.wk, &w.wv }, 0, D, mx, in, 3) ||
+                    !to16(w.wo, qsa_out_at, dconv(prompt_dense_key(w.wo.fmt, 0, GV, D)))) {
                     return fail(err, "prompt: QSA input");
                 }
                 const fn::dense::pt_seg ix[2] = {{iq, 512, 512}, {ik, 128, 640}};
-                if (k == w.index_owner && (!to16b(w.idx_q, 512, qsa_idx_at, qsa_idx_s_at) ||
-                                           !to16b(w.idx_k, 128, qsa_idx_at + int64_t(512) * D, qsa_idx_s_at + 1024) ||
-                                           !tprod(qsa_idx_at, 640, D, mx, ix, 2, qsa_idx_s_at))) {
+                if (k == w.index_owner &&
+                    !bprod(w.idx_q, 512, w.idx_k, 128, 640, qsa_idx_at, qsa_idx_s_at, a.idx_s[size_t(l)], mx, ix, 2)) {
                     return fail(err, "prompt: QSA index input");
                 }
                 count(psite::qsa_input);
                 if (k == w.index_owner) {
-                    if (!m_->single && ls.any_copied[k] &&
-                        !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ls.copied[k]), 0), "sel reuse", err)) {
+                    if (!m_->single && ls.any_copied[k] && !ev_wait(s, ls.copied[k], err, "sel reuse")) {
                         return false;
                     }
                     const int32_t        b0 = static_cast<int32_t>(pos0 / fn::qsa::ratio);
@@ -1302,6 +2414,9 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     ua.first     = b0;
                     ua.count     = b1 - b0;
                     ua.rope      = fn::qsa::model_rope();
+                    ua.rope_off  = c.rope_off;  // MUP1 piece 5
+                    // VIS1: each block at its first row's planes, each query at its row's
+                    ua.planes = c.bplanes[k] != nullptr ? c.bplanes[k] + 4 * (b0 - c.start / fn::qsa::ratio) : nullptr;
                     fn::qsa::qsp_index_args ia;
                     ia.summaries = st.idx_summaries;
                     ia.iq        = iq;
@@ -1309,18 +2424,19 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     ia.rope      = fn::qsa::model_rope();
                     ia.rows      = n;
                     ia.pos0      = static_cast<int32_t>(pos0);
+                    ia.rope_off  = c.rope_off;
+                    ia.planes    = c.planes[k] != nullptr ? c.planes[k] + 4 * (pos0 - c.start) : nullptr;
                     ia.max_cells = st.n_cells;
                     ia.ws        = fn::qsa::prompt_carve(wsb, st.n_cells);
                     ia.ws.error  = a.err + 1;
-                    ia.body      = reinterpret_cast<uint32_t *>(a.sel_send[h] + fn::xchg::pmsg_payload_at);
+                    ia.body      = reinterpret_cast<uint32_t *>(a.sel_send[sh] + fn::xchg::pmsg_payload_at);
                     ia.offsets   = reinterpret_cast<int32_t *>(ia.body + fn::qsa::prompt_body_words);
                     if (!fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, keys, st.n_cells, s) ||
                         (ua.count > 0 && !fn::qsa::summary_update(ua, s)) ||
                         (kt != nullptr && !kt->write_back_keys(k, st.kv_attn, pos0, n, s, err)) ||
                         !fn::qsa::qsp_select(ia, s) ||
-                        !fn::xchg::pstamp(a.sel_send[h], gen_sel, n, fn::xchg::pkind::sel, s) ||
-                        (!m_->single &&
-                         !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.prod[k]), s), "sel produced", err))) {
+                        !fn::xchg::pstamp(a.sel_send[sh], gen_sel, n, fn::xchg::pkind::sel, s) ||
+                        (!m_->single && !ev_record(ls.prod[k], k, s, err, "sel produced"))) {
                         return err.empty() ? fail(err, "prompt: QSA index") : false;
                     }
                     ls.g_prod[k] = gen_sel;
@@ -1342,6 +2458,9 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 rt.tasks = b0.take<int32_t>(int64_t(fn::experts::ep_max_tasks) * 16);
                 rt.counters = b0.take<int32_t>(int64_t(8) * 4);
                 int32_t * toff = b0.take<int32_t>(int64_t(513) * 4); // ME4: a ring layer's task offsets
+                fn::experts::ep_lists lists;  // APF2: the grouped task lists (gate/up's tile, down's)
+                int32_t * const       ltasks[2] = { b0.take<int32_t>(int64_t(fn::experts::ep_max_ltasks) * 16),
+                                                    b0.take<int32_t>(int64_t(fn::experts::ep_max_ltasks) * 16) };
                 bump b{sc, !m_->single || k == 0 ? b0.off : 0};
                 uint16_t * glu = b.take<uint16_t>(int64_t(n) * NU * 320 * 2);
                 uint16_t * part16 = b.take<uint16_t>(int64_t(n) * NU * D * 2); // PB3: the partials FP16
@@ -1356,15 +2475,18 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 if (!m_->single || k == 0) {
                     float * const rsc = reinterpret_cast<float *>(a.w16 + ffn_router_s_at);
                     const fn::dense::pt_seg rs[2] = {{logits, NE, NE}, {sgl, 8, NE + 8}};
-                    if ((h == 0 && (!cuda_ok(cudaMemsetAsync(a.w16 + ffn_router_at + int64_t(NE + 1) * D, 0,
-                                                             size_t(7) * D * 2, s),
-                                             "gate pad", err) ||
-                                    !cuda_ok(cudaMemsetAsync(rsc + NE + 1, 0, size_t(7) * 4, s), "gate pad", err))) ||
-                        !to16b(w.router, NE, ffn_router_at, ffn_router_s_at) ||
-                        !to16b(w.sh_gate_w, 1, ffn_router_at + int64_t(NE) * D, ffn_router_s_at + 2 * NE) ||
-                        !tprod(ffn_router_at, NE + 8, D, mx, rs, 2, ffn_router_s_at) ||
-                        !fn::dense::pd_route(n, logits, sgl, ids, wts, sg, s, 8)) {
-                        return fail(err, "prompt: router");
+                    if ((dconv(prompt_dense_key(static_cast<int32_t>(fn::dense::fmt::bf16), 0, D, NE + 8)) &&
+                         (!cuda_ok(
+                              cudaMemsetAsync(a.w16 + ffn_router_at + int64_t(NE + 1) * D, 0, size_t(7) * D * 2, s),
+                              "gate pad", err) ||
+                          !cuda_ok(cudaMemsetAsync(rsc + NE + 1, 0, size_t(7) * 4, s), "gate pad", err))) ||
+                        !bprod(w.router, NE, w.sh_gate_w, 1, NE + 8, ffn_router_at, ffn_router_s_at, a.rt_s[size_t(l)],
+                               mx, rs, 2) ||
+                        !fn::dense::pd_route(n, logits, sgl, ids, wts, sg, s, 8) ||
+                        (skew_ && !cuda_ok(cudaMemcpyAsync(ids, skew_host_ + int64_t(r0) * NU, size_t(n) * NU * 4,
+                                                           cudaMemcpyHostToDevice, s),
+                                           "skewed routes", err))) {
+                        return err.empty() ? fail(err, "prompt: router") : false;
                     }
                     count(psite::ffn_router);
                 }
@@ -1391,7 +2513,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 bool ring = false; // ME4: the layer's experts come through the service's ring, group by group
                 if (xs != nullptr) {
                     void * const streams[2] = { p_[0]->c.stream, p_[1]->c.stream };
-                    const int32_t * const rid = c.half[1] == 0 ? ids : nullptr;
+                    const int32_t * const rid        = prompt_pieces(c) == 1 ? ids : nullptr;
                     if (h == 0 && k == 0 && !xs->prompt_layer(l, n, rid, c.more, streams, err)) {
                         return err.empty() ? fail(err, "prompt: expert staging") : false;
                     }
@@ -1418,10 +2540,37 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 // offsets run once, on card 0
                 const uint8_t * const skip = ring ? xs->prompt_share_skip(l) : nullptr;
                 const bool own = !m_->single || k == 0;
-                if ((own && !fn::experts::ep_group(n, fn::experts::ep_task_rows(gf), ids, rt, a.err + 2, s)) ||
+                // APF2: gate/up and down each grouped on the ladder's route at the piece's routed rows an expert
+                // (resident Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down; the expert service's layers keep per-task), over
+                // ep_group's list for the route's tile
+                const int32_t            er   = prompt_expert_rows(n);
+                const fn::model::lad_cfg gcf =
+                    xs == nullptr && fn::experts::el_takes_gate_up(gf) ?
+                        lad_route(prompt_expert_key(false, static_cast<int32_t>(gf)), er, force_.expert) :
+                        fn::model::lad_cfg{};
+                const fn::model::lad_cfg dcf =
+                    xs == nullptr && fn::experts::el_takes_down(df) ?
+                        lad_route(prompt_expert_key(true, static_cast<int32_t>(df)), er, force_.expert) :
+                        fn::model::lad_cfg{};
+                if (!gcf.retained()) {
+                    lists.tasks[0] = ltasks[0];
+                    lists.rows[0]  = fn::experts::el_rows(gcf.tile);
+                }
+                if (!dcf.retained()) {
+                    lists.tasks[1] = ltasks[1];
+                    lists.rows[1]  = fn::experts::el_rows(dcf.tile);
+                }
+                if (!ring) {
+                    note(!gcf.retained() ? &route_counts::ex_grouped : &route_counts::ex_per_task);
+                    note(!dcf.retained() ? &route_counts::exd_grouped : &route_counts::exd_per_task);
+                    note_fmt(&route_counts::ex_fmts, static_cast<int32_t>(gf));
+                }
+                if ((own && !fn::experts::ep_group(n, fn::experts::ep_task_rows(gf), ids, rt, a.err + 2, s, lists)) ||
                     (own && skip != nullptr && !fn::experts::es_drop(rt, skip, s)) ||
-                    (ring ? (own && !fn::experts::ep_task_offsets(rt, toff, s))
-                          : !fn::experts::ep_gate_up(gf, n, gu, s))) {
+                    (ring ? (own && !fn::experts::ep_task_offsets(rt, toff, s)) :
+                            !(gcf.retained() ? fn::experts::ep_gate_up(gf, n, gu, s) :
+                                               fn::experts::ep_gate_up_ladder(gf, gcf.tile, n, gu, ltasks[0],
+                                                                              rt.counters + 2, s)))) {
                     return fail(err, "prompt: experts gate/up");
                 }
                 // the shared expert: gate and up (DP2's packing), the GLU, its down (EX1's) scaled by sg
@@ -1429,28 +2578,22 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     return fail(err, "prompt: shared expert shapes");
                 }
                 const fn::dense::pt_seg gu2[2] = {{sh_g, 320, 320}, {sh_u, 320, 640}};
-                if (!to16(w.sh_gate, 0) || !to16(w.sh_up, int64_t(320) * D) || !tprod(0, 640, D, mx, gu2, 2, -1) ||
+                if (!dprod({ &w.sh_gate, &w.sh_up }, 0, D, mx, gu2, 2) ||
                     !fn::dense::pd_glu(n, 320, sh_g, sh_u, 320, sh_glu, 320, s)) {
                     return fail(err, "prompt: shared expert");
                 }
                 {
                     // the shared down (EX1's layout), scaled by sg after the sum
-                    fn::dense::pd_args pa;
-                    pa.f     = dense_of(w.ex_sh_down_fmt);
-                    pa.lay   = fn::dense::pd_layout::ex1_down;
-                    pa.k     = 320;
-                    pa.n     = D;
-                    pa.w     = w.ex_sh_down;
-                    pa.grids = p.c.dense_grids;
-                    fn::dense::pt_args t;
-                    t.w         = a.w16 + ffn_down_at;
-                    t.n         = D;
-                    t.k         = 320;
-                    t.rows      = n;
-                    t.x         = act1(sh_glu, 320);
-                    t.seg[0]    = { shared, D, D };
-                    t.row_scale = sg;
-                    if ((h == 0 && !fn::dense::pd_convert(pa, a.w16 + ffn_down_at, s)) || !fn::dense::pd_tc(t, s)) {
+                    dense_weight sd;
+                    sd.w                          = w.ex_sh_down;
+                    sd.fmt                        = static_cast<int32_t>(dense_of(w.ex_sh_down_fmt));
+                    sd.k                          = 320;
+                    sd.n_out                      = D;
+                    const fn::dense::pt_seg so[1] = {
+                        { shared, D, D }
+                    };
+                    if (!dprod({ &sd }, ffn_down_at, 320, act1(sh_glu, 320), so, 1, nullptr, D, fn::xchg::err_prange,
+                               fn::dense::pd_layout::ex1_down, sg)) {
                         return fail(err, "prompt: shared down");
                     }
                 }
@@ -1468,7 +2611,10 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 if (ring) {
                     rcard[k] = { true, gf, df, gu, dn, sa, toff };
                 } else {
-                    if (!fn::experts::ep_down(df, n, dn, s) || !fn::experts::ep_sum(n, sa, s)) {
+                    if (!(dcf.retained() ?
+                              fn::experts::ep_down(df, n, dn, s) :
+                              fn::experts::ep_down_ladder(df, dcf.tile, n, dn, ltasks[1], rt.counters + 3, s)) ||
+                        !fn::experts::ep_sum(n, sa, s)) {
                         return fail(err, "prompt: experts down");
                     }
                     count(psite::ffn_experts);
@@ -1491,7 +2637,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 (void) b.take<uint8_t>(static_cast<int64_t>(fn::qsa::prompt_ws_bytes(fn::qsa::max_cells)));
                 uint16_t *      att16 = b.take<uint16_t>(int64_t(n) * GV * 2);
                 const bool      owner = k == w.index_owner;
-                const uint8_t * sel   = owner ? a.sel_send[h] : a.sel_recv[h];
+                const uint8_t * sel   = owner ? a.sel_send[sh] : a.sel_recv[sh];
                 // ME1 (the host-backed KV, kv_tier.h): the layer's history below the chunk staged into the card's
                 // arenas before the first half, which then serve as its whole cache; each half's new cells go back
                 uint16_t *      kc = st.k_cache;
@@ -1511,6 +2657,8 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 ka.k_norm = w.k_norm;
                 ka.rows = n;
                 ka.pos0 = static_cast<int32_t>(pos0);
+                ka.rope_off  = c.rope_off;  // MUP1 piece 5
+                ka.planes    = c.planes[k] != nullptr ? c.planes[k] + 4 * (pos0 - c.start) : nullptr;
                 ka.max_cells = st.n_cells;
                 ka.k_cache = kc;
                 ka.v_cache = vc;
@@ -1526,8 +2674,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                     if (ls.g_copied[1 - k] != gen_sel) {
                         return fail(err, "prompt: a selection received before its generation was copied");
                     }
-                    if ((!m_->single && !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ls.copied[1 - k]), 0),
-                                                 "sel recv", err)) ||
+                    if ((!m_->single && !ev_wait(s, ls.copied[1 - k], err, "sel recv")) ||
                         !fn::xchg::pcheck(sel, gen_sel, a.err, s)) {
                         return err.empty() ? fail(err, "prompt: sel check") : false;
                     }
@@ -1544,22 +2691,24 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 aa.v_scale = st.v_scale;
                 aa.rows      = n;
                 aa.pos0      = static_cast<int32_t>(pos0);
+                aa.rope_off  = ka.rope_off;
+                aa.planes    = ka.planes;
                 aa.max_cells = st.n_cells;
                 aa.out16     = att16;
                 aa.err       = a.err;
                 if (!fn::qsa::qsp_attend(aa, s)) {
                     return fail(err, "prompt: QSA attention");
                 }
+                note(&route_counts::qsa);
                 if (!owner) {
-                    if (!m_->single &&
-                        !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ls.freed[k]), s), "sel freed", err)) {
+                    if (!m_->single && !ev_record(ls.freed[k], k, s, err, "sel freed")) {
                         return false;
                     }
                     ls.g_freed[k] = gen_sel;
                     ls.any_freed[k] = true;
                 }
                 count(psite::qsa_attend);
-                // wo: converted at phase 0 of the sublayer's first half
+                // wo: the ladder's route at the piece's rows, else the conversion phase 0 made (APF2)
                 fn::dense::pt_args t;
                 t.w      = a.w16 + qsa_out_at;
                 t.n      = D;
@@ -1567,18 +2716,37 @@ bool prompt_path::layer_half(const prompt_chunk & c,
                 t.rows   = n;
                 t.x      = act1(att16, GV);
                 t.seg[0] = {nullptr, D, D};
-                t.out16 = reinterpret_cast<uint16_t *>(a.p_send[h] + fn::xchg::pmsg_payload_at);
+                t.out16   = reinterpret_cast<uint16_t *>(p_msg(k, true, c, h) + fn::xchg::pmsg_payload_at);
                 t.ld16 = D;
                 t.err = a.err;
                 t.err_bit = fn::xchg::err_prange;
-                if (!fn::dense::pd_tc(t, s)) {
+                const fn::model::lad_cfg wcfg = lad_route(prompt_dense_key(w.wo.fmt, 0, GV, D), n, force_.dense);
+                bool                     wo_ok = false;
+                if (!wcfg.retained()) {
+                    fn::dense::pq_args q;
+                    q.f      = static_cast<fn::dense::fmt>(w.wo.fmt);
+                    q.src[0] = { w.wo.w, D };
+                    q.n_src  = 1;
+                    q.grids  = p.c.dense_grids;
+                    q.t      = t;
+                    q.t.w    = nullptr;
+                    note(&route_counts::dense_ladder);
+                    if (wcfg.splits > 1) {
+                        note(&route_counts::dense_split);
+                    }
+                    wo_ok = fn::dense::pl_tc(q, wcfg.tile, wcfg.splits, a.lws, s);
+                } else {
+                    note(&route_counts::dense_retained);
+                    wo_ok = fn::dense::pd_tc(t, s);
+                }
+                if (!wo_ok) {
                     return fail(err, "prompt: QSA out");
                 }
                 count(psite::qsa_out);
             }
             // the payload written by the sublayer's producer (phase 0 waited for the slot's previous copy)
-            if (!fn::xchg::pseal(n, a.p_send[h], gen, s) ||
-                (!m_->single && !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lp.prod[k]), s), "produced", err))) {
+            if (!fn::xchg::pseal(n, p_msg(k, true, c, h), gen, s) ||
+                (!m_->single && !ev_record(lp.prod[k], k, s, err, "produced"))) {
                 return err.empty() ? fail(err, "prompt: pack") : false;
             }
             lp.g_prod[k] = gen;
@@ -1639,7 +2807,7 @@ bool prompt_path::layer_half(const prompt_chunk & c,
         }
     }
     if (phase == 0 && l == 1 && sub == 0) {
-        hist_cur_ ^= 1;  // the next half's PLE reads this half's history
+        hist_cur_ ^= 1;  // the next piece's PLE reads this piece's history
     }
     return true;
 }
@@ -1694,7 +2862,10 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             return false;
         }
         bump             b{ a.scratch };
-        const auto to16d = [&](const dense_weight & dw, int64_t at) {
+        const auto       to16d = [&](const dense_weight & dw, int64_t at, bool conv) {
+            if (!conv) {
+                return true;
+            }
             fn::dense::pd_args pa;
             pa.f = static_cast<fn::dense::fmt>(dw.fmt);
             pa.lay = fn::dense::pd_layout::dp2;
@@ -1703,6 +2874,45 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             pa.w = dw.w;
             pa.grids = p.c.dense_grids;
             return fn::dense::pd_convert(pa, a.w16 + at, s);
+        };
+        // APF2: pt's key (dw's format, or the draft index's BF16 rows with dw null), and its route at pt's rows: pd_tc
+        // over the conversion (pt.w), or pl_tc from dw itself (a packed matrix) or the BF16 rows and their prepared
+        // scales
+        const auto dkey = [&](const dense_weight * dw, int32_t kk, int32_t nn) {
+            return prompt_dense_key(dw != nullptr ? dw->fmt : static_cast<int32_t>(fn::dense::fmt::bf16), 0, kk, nn);
+        };
+        const auto dtc = [&](const fn::dense::pt_args & pt, const dense_weight * dw) {
+            const fn::model::lad_cfg cfg = lad_route(dkey(dw, pt.k, pt.n), pt.rows, force_.dense);
+            if (cfg.retained()) {
+                note(&route_counts::dense_retained);
+                return fn::dense::pd_tc(pt, s);
+            }
+            fn::dense::pq_args q;
+            if (dw != nullptr) {
+                q.f      = static_cast<fn::dense::fmt>(dw->fmt);
+                q.src[0] = { dw->w, static_cast<int32_t>(dw->n_out) };
+                q.n_src  = 1;
+                q.grids  = p.c.dense_grids;
+            } else {
+                q.b0      = d.iw.k_proj;
+                q.n0      = 128;
+                q.b_scale = a.dik_s;
+            }
+            q.t   = pt;
+            q.t.w = nullptr;
+            if (dw == nullptr) {
+                q.t.col_scale = a.dik_s;
+            }
+            note(&route_counts::dense_ladder);
+            if (cfg.splits > 1) {
+                note(&route_counts::dense_split);
+            }
+            return fn::dense::pl_tc(q, cfg.tile, cfg.splits, a.lws, s);
+        };
+        // whether piece 0 converts the product of key (some piece of the chunk takes the retained route; mul: the
+        // product's rows a piece row)
+        const auto dcv = [&](const fn::model::lad_key & key, int32_t mul) {
+            return h == 0 && lad_retained_any(key, c, force_.dense, mul);
         };
         uint16_t *       e16     = b.take<uint16_t>(int64_t(n) * D * 2);
         uint16_t *       h16     = b.take<uint16_t>(int64_t(n) * 4 * D * 2);
@@ -1731,6 +2941,10 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
         ha.ld_mixed    = F;
         ha.err         = a.err;
         if (phase == 0) {
+            // VIS1: one device's two logical cards share E (set_links)
+            if (c.n_runs > 0 && (k == 0 || a.E != a_[0].E) && !draft_image_rows(c, k, r0, n, a.E, s, err)) {
+                return false;
+            }
             fn::draft::norm_args na;
             na.rows   = n;
             na.emb    = a.E + int64_t(r0) * D;
@@ -1761,8 +2975,11 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             pt.x.k_split = D;
             pt.seg[0] = {eh, F, F};
             pt.n_seg = 1;
-            bool cv = h != 0 || (to16d(d.w.eh, 0) && to16d(d.w.wk, draft_wk_at) && to16d(d.w.wv, draft_wv_at));
-            if (h == 0 && d.sparse) {
+            // APF2: each conversion where some piece takes the retained route
+            bool cv      = to16d(d.w.eh, 0, dcv(dkey(&d.w.eh, 2 * D, F), 4)) &&
+                           to16d(d.w.wk, draft_wk_at, dcv(dkey(&d.w.wk, D, 256), 1)) &&
+                           to16d(d.w.wv, draft_wv_at, dcv(dkey(&d.w.wv, D, 256), 1));
+            if (d.sparse && dcv(dkey(nullptr, D, 128), 1)) {
                 // SP2 (sparse): the index k's FP16 copy and its column scales too
                 cv = cv && fn::dense::pd_convert_bf16(d.iw.k_proj, 128, D, a.w16 + draft_ik_at,
                                                       reinterpret_cast<float *>(a.w16 + draft_ik_s_at), s);
@@ -1777,7 +2994,7 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                                                      "test hidden rows", err))) {
                 return err.empty() ? fail(err, "prompt: test hidden rows beyond the given rows") : false;
             }
-            if (!cv || !fn::draft::dcp_norm(na, s) || !fn::dense::pd_tc(pt, s) || !fn::hc::hcp_down(ha, s) ||
+            if (!cv || !fn::draft::dcp_norm(na, s) || !dtc(pt, &d.w.eh) || !fn::hc::hcp_down(ha, s) ||
                 !fn::xchg::pstamp(a.mom_send, gmom, n, fn::xchg::pkind::mom, s) ||
                 (!m_->single &&
                  !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(lm.prod[k]), s), "mom produced", err))) {
@@ -1823,7 +3040,7 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             if (ld.g_copied[1 - k] != gmix) {
                 return fail(err, "prompt: the draft's mixed half received before it was copied");
             }
-            const auto q8 = [&](int64_t at, float * out) { // wk or wv, converted at phase 0 of the first half
+            const auto q8 = [&](int64_t at, float * out, const dense_weight & dw) {  // wk or wv (phase 0's conversion)
                 fn::dense::pt_args pt;
                 pt.w = a.w16 + at;
                 pt.n = 256;
@@ -1832,7 +3049,7 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                 pt.x = act1(mixed16, D);
                 pt.seg[0] = {out, 256, 256};
                 pt.n_seg = 1;
-                return fn::dense::pd_tc(pt, s);
+                return dtc(pt, &dw);
             };
             fn::draft::kvp_args kp;
             kp.rows        = n;
@@ -1844,6 +3061,8 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
             kp.k_cache = d.k_cache;
             kp.v_cache = d.v_cache;
             kp.theta_scale = fn::qsa::attn::rope_theta_scale();
+            kp.rope_off    = c.rope_off;  // MUP1 piece 5
+            kp.planes      = c.planes[k] != nullptr ? c.planes[k] + 4 * (pos0 - c.start) : nullptr;
             if ((!m_->single &&
                  !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(ld.copied[1 - k]), 0), "dmix recv", err)) ||
                 !fn::xchg::pcheck(a.dmix_recv, gmix, a.err, s) ||
@@ -1852,7 +3071,7 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                                       a.err, s) ||
                 (!m_->single &&
                  !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(ld.freed[k]), s), "dmix freed", err)) ||
-                !q8(draft_wk_at, kk) || !q8(draft_wv_at, vv) || !fn::draft::dcp_prepare(kp, s)) {
+                !q8(draft_wk_at, kk, d.w.wk) || !q8(draft_wv_at, vv, d.w.wv) || !fn::draft::dcp_prepare(kp, s)) {
                 return err.empty() ? fail(err, "prompt: draft K/V") : false;
             }
             if (test_m_[k] != nullptr &&
@@ -1891,8 +3110,9 @@ bool prompt_path::draft_half(const prompt_chunk & c, int32_t h, int32_t phase, s
                 ua.first     = b0;
                 ua.count     = b1 - b0;
                 ua.rope      = fn::qsa::model_rope();
-                if (!fn::dense::pd_tc(pt, s) ||
-                    !fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, keys, d.max_cells, s) ||
+                ua.rope_off  = c.rope_off;  // MUP1 piece 5
+                ua.planes    = c.bplanes[k] != nullptr ? c.bplanes[k] + 4 * (b0 - c.start / fn::qsa::ratio) : nullptr;
+                if (!dtc(pt, nullptr) || !fn::qsa::qsp_keys(n, static_cast<int32_t>(pos0), ik, keys, d.max_cells, s) ||
                     (ua.count > 0 && !fn::qsa::summary_update(ua, s)) ||
                     (kt != nullptr && !kt->write_back_keys(k, kv_tier::draft_attn, pos0, n, s, err))) {
                     return err.empty() ? fail(err, "prompt: draft index") : false;
@@ -1936,13 +3156,14 @@ bool prompt_path::check_errors(std::string & err) {
 
 namespace {
 
-// the crossing's layout for half h of c: S (card 0's), inject of card 0 and 1, the FFN message of card 0 and 1
+// the crossing's layout for piece h of c (MUP2; the halves when it names none): S (card 0's), inject of card 0 and 1,
+// the FFN message of card 0 and 1
 struct crossing_half {
     int64_t s = 0, inj[2] = { 0, 0 }, p[2] = { 0, 0 }, end = 0;
 };
 
 crossing_half crossing_at(const prompt_chunk & c, int32_t h, int64_t base) {
-    const int64_t n = c.half[h];
+    const int64_t n = prompt_piece_rows(c, h);
     crossing_half x;
     x.s      = base;
     x.inj[0] = x.s + n * 4 * D * 4;
@@ -1957,7 +3178,7 @@ crossing_half crossing_at(const prompt_chunk & c, int32_t h, int64_t base) {
 
 int64_t prompt_path::crossing_bytes(const prompt_chunk & c) {
     int64_t off = 0;
-    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+    for (int32_t h = 0; h < prompt_pieces(c); ++h) {
         off = crossing_at(c, h, off).end;
     }
     return off;
@@ -1967,13 +3188,16 @@ bool prompt_path::crossing_out(const prompt_chunk & c, int32_t k, uint8_t * dst,
     if (m_->single || k < 1 || k >= fn::n_layer || dst == nullptr) {
         return fail(err, "prompt crossing out: two cards, k in 1 .. 47 and a buffer");
     }
+    if (!prompt_pieces_ok(c)) {
+        return fail(err, "prompt crossing out: the chunk's pieces");
+    }
     int64_t off = 0;
-    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+    for (int32_t h = 0; h < prompt_pieces(c); ++h) {
         const crossing_half x = crossing_at(c, h, off);
         off                   = x.end;
-        const int32_t  r0     = h == 0 ? 0 : c.half[0];
-        const int64_t  n      = c.half[h];
-        link &         lp     = links_[h == 0 ? lk_p0 : lk_p1];
+        const int32_t  r0     = prompt_piece_r0(c, h);
+        const int64_t  n      = prompt_piece_rows(c, h);
+        link &         lp     = links_[lk_p0 + h];
         const uint64_t gen    = fn::xchg::pgen(c.seq, k - 1, 1, h, fn::xchg::pkind::ffn);
         for (int32_t kk = 0; kk < 2; ++kk) {
             card_arena & a = a_[size_t(kk)];
@@ -1989,7 +3213,7 @@ bool prompt_path::crossing_out(const prompt_chunk & c, int32_t k, uint8_t * dst,
                 !cuda_ok(cudaMemcpyAsync(dst + x.inj[kk], a.inject + int64_t(r0) * 4, size_t(n) * 4 * 4,
                                          cudaMemcpyDeviceToHost, s),
                          "crossing inject", err) ||
-                !cuda_ok(cudaMemcpyAsync(dst + x.p[kk], a.p_send[h], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
+                !cuda_ok(cudaMemcpyAsync(dst + x.p[kk], p_msg(kk, true, c, h), size_t(fn::xchg::pmsg_bytes(n * D * 2)),
                                          cudaMemcpyDeviceToHost, s),
                          "crossing partial", err) ||
                 // the consumer's release of the receive slot (layer k's phase 0 on one box)
@@ -2008,13 +3232,16 @@ bool prompt_path::crossing_in(const prompt_chunk & c, int32_t k, const uint8_t *
     if (m_->single || k < 1 || k >= fn::n_layer || src == nullptr) {
         return fail(err, "prompt crossing in: two cards, k in 1 .. 47 and a buffer");
     }
+    if (!prompt_pieces_ok(c)) {
+        return fail(err, "prompt crossing in: the chunk's pieces");
+    }
     int64_t off = 0;
-    for (int32_t h = 0; h < 2 && c.half[h] > 0; ++h) {
+    for (int32_t h = 0; h < prompt_pieces(c); ++h) {
         const crossing_half x = crossing_at(c, h, off);
         off                   = x.end;
-        const int32_t  r0     = h == 0 ? 0 : c.half[0];
-        const int64_t  n      = c.half[h];
-        link &         lp     = links_[h == 0 ? lk_p0 : lk_p1];
+        const int32_t  r0     = prompt_piece_r0(c, h);
+        const int64_t  n      = prompt_piece_rows(c, h);
+        link &         lp     = links_[lk_p0 + h];
         const uint64_t gen    = fn::xchg::pgen(c.seq, k - 1, 1, h, fn::xchg::pkind::ffn);
         for (int32_t kk = 0; kk < 2; ++kk) {
             card_arena & a = a_[size_t(kk)];
@@ -2026,11 +3253,11 @@ bool prompt_path::crossing_in(const prompt_chunk & c, int32_t k, const uint8_t *
                 !cuda_ok(cudaMemcpyAsync(a.inject + int64_t(r0) * 4, src + x.inj[kk], size_t(n) * 4 * 4,
                                          cudaMemcpyHostToDevice, s),
                          "crossing inject", err) ||
-                !cuda_ok(cudaMemcpyAsync(a.p_send[h], src + x.p[kk], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
+                !cuda_ok(cudaMemcpyAsync(p_msg(kk, true, c, h), src + x.p[kk], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
                                          cudaMemcpyHostToDevice, s),
                          "crossing partial", err) ||
-                !cuda_ok(cudaMemcpyAsync(a.p_recv[h], src + x.p[1 - kk], size_t(fn::xchg::pmsg_bytes(n * D * 2)),
-                                         cudaMemcpyHostToDevice, s),
+                !cuda_ok(cudaMemcpyAsync(p_msg(kk, false, c, h), src + x.p[1 - kk],
+                                         size_t(fn::xchg::pmsg_bytes(n * D * 2)), cudaMemcpyHostToDevice, s),
                          "crossing peer partial", err) ||
                 // the exchange's copy stands done: card kk's message is in the peer's receive slot (the bookkeeping
                 // layer k's phase 0 checks; its data is ordered on each card's own stream above)
@@ -2093,8 +3320,8 @@ bool prompt_path::dump_hc(const prompt_chunk & c, int32_t layer, int32_t which, 
     // which 0/1: the attention/FFN call's input streams and low-rank coefficients (after mid); 2/3: its mixed output
     card_arena &  a  = a_[0];
     cudaStream_t  s  = static_cast<cudaStream_t>(p_[0]->c.stream);
-    const int32_t r0 = h == 0 ? 0 : c.half[0];
-    const int32_t n  = c.half[h];
+    const int32_t r0 = prompt_piece_r0(c, h);
+    const int32_t n  = prompt_piece_rows(c, h);
     const int32_t m  = (n + dump_.row_stride - 1) / dump_.row_stride;
     bump          b{ a.scratch };
     (void) b.take<float>(int64_t(n) * fn::hc::hcp_mom * 4);

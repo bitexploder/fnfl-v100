@@ -77,10 +77,13 @@ struct logits_args {
     int32_t n;          // vocabulary rows on this card
     float * logits;     // [B][n] out
     void * work;        // logits_work_bytes(n) bytes, or null when that is 0
+    // TTTS2: w holds Q8_0 rows (UD-Q4_K_XL's output.weight; dense::product's Q8_0 numerics and the same bound),
+    // dense::pack'ed; false: Q5_K
+    bool            q8 = false;
 };
 
-// bytes of the product's work buffer for n rows (0 when the product is unsplit, as at n = 124,160)
-size_t logits_work_bytes(int32_t n);
+// bytes of the product's work buffer for n rows (0 when the product is unsplit, as at n = 124,160); q8 as logits_args
+size_t logits_work_bytes(int32_t n, bool q8 = false);
 
 struct reduce_args {
     const float * logits; // [B][n]
@@ -118,8 +121,14 @@ size_t greedy_work_bytes();
 // rows. pack_draft_head: output.weight's rows ids[0 .. m - 1] (vocab: the GGUF rows, row_bytes apart; m % 8 == 0)
 // packed for logits; false on a bad input.
 bool draft_ids(const int32_t * subset, int32_t n, int32_t card, int32_t * ids);
-int64_t draft_head_bytes(int32_t m);
-bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * ids, int32_t m, uint8_t * dst);
+// TTTS2: q8, the rows are Q8_0 (UD-Q4_K_XL's output.weight) instead of Q5_K.
+int64_t draft_head_bytes(int32_t m, bool q8 = false);
+bool    pack_draft_head(const uint8_t * vocab,
+                        size_t          row_bytes,
+                        const int32_t * ids,
+                        int32_t         m,
+                        uint8_t *       dst,
+                        bool            q8 = false);
 
 // Enqueue on stream (a cudaStream_t). False, with nothing enqueued, for a row count, size or pointer the contract
 // rejects; false after a failed launch submission (the CUDA error is left for the caller).

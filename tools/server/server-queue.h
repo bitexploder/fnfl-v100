@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -49,6 +50,10 @@ private:
 
 public:
     ~server_queue() { worker_stop(); }
+
+    // SSF1: a slot is processing (the update callback sets it each turn): the loop's 1 s task wait timing out then is
+    // a slow-wait trace line
+    std::atomic<bool> slots_processing{ false };
 
     // Add a new task to the end of the queue
     int post(server_task && task, bool front = false);
@@ -183,8 +188,8 @@ public:
     // This function blocks the thread until there is a response for one of the id_tasks
     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);
 
-    // same as recv(), but have timeout in seconds
-    // if timeout is reached, nullptr is returned
+    // one wait of at most timeout seconds for a result of id_tasks; nullptr when it ends without one (the timeout,
+    // or a wake for another task: PRD1 item 14, so a caller polls its stop condition on every wake)
     server_task_result_ptr recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout);
 
     // single-task version of recv()

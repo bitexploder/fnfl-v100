@@ -121,15 +121,31 @@ __device__ __forceinline__ uint4 load_a(const a_operand & a, int32_t rows, int32
 
 }  // namespace detail
 
+// The B operand's 16-byte chunk (column col, K k .. k + 7) from FP16 [n][ldb], zero past n: gemm_cta's loader. APF1
+// Part 4: gemm_cta_b takes another loader of the same signature (the HC fused route forms the FP16 values from the
+// quantized halves there)
+struct b_plain {
+    const problem & p;
+
+    __device__ __forceinline__ uint4 operator()(int32_t col, int32_t k) const {
+        return col < p.n ? __ldg(reinterpret_cast<const uint4 *>(p.b + int64_t(col) * p.ldb + k)) :
+                           make_uint4(0u, 0u, 0u, 0u);
+    }
+};
+
 // The C element i (0..7) of a lane in its quadpair's 8 x 8 tile: row (i & 2) | (lane & 16 ? 4 : 0) | (lane & 1),
 // column (i & 1) | ((lane >> 1) & 1) << 1 | (i >> 2) << 2. The epilogue receives, per row, the four columns
 // c0, c0 + 1, c0 + 4, c0 + 5 that the lane holds.
 //
 // Epi: __device__ void operator()(int32_t row, int32_t col0, const float (&v)[4]) const, called only for row < rows;
 // it masks the columns itself (col0 + {0, 1, 4, 5} against n).
-template <int32_t BN, int32_t MI, int32_t NI = 2, typename Epi>
-__device__ __forceinline__ void gemm_cta(const problem & p, int32_t row0, int32_t col0, uint8_t * smem,
-                                         const Epi & epi) {
+template <int32_t BN, int32_t MI, int32_t NI = 2, typename Epi, typename BL>
+__device__ __forceinline__ void gemm_cta_b(const problem & p,
+                                           int32_t         row0,
+                                           int32_t         col0,
+                                           uint8_t *       smem,
+                                           const Epi &     epi,
+                                           const BL &      bl) {
     static_assert(BN == 64 || BN == 128, "BN 64 or 128");
     static_assert(MI == 2 || MI == 4, "2 or 4 m-tiles a warp");
     static_assert(NI == 2 || (NI == 4 && BN == 128), "2 n-tiles a warp, or 4 at BN 128");
@@ -188,9 +204,7 @@ __device__ __forceinline__ void gemm_cta(const problem & p, int32_t row0, int32_
         for (int32_t i = 0; i < B_ITER; ++i) {
             const int32_t ci  = tid + i * T;
             const int32_t col = ci >> 2, c = ci & 3;
-            sb[i] = col0 + col < p.n ?
-                        __ldg(reinterpret_cast<const uint4 *>(p.b + int64_t(col0 + col) * p.ldb + k0 + 8 * c)) :
-                        make_uint4(0u, 0u, 0u, 0u);
+            sb[i] = bl(col0 + col, k0 + 8 * c);
         }
     };
     const auto store = [&](int32_t buf) {
@@ -270,6 +284,15 @@ __device__ __forceinline__ void gemm_cta(const problem & p, int32_t row0, int32_
             }
         }
     }
+}
+
+template <int32_t BN, int32_t MI, int32_t NI = 2, typename Epi>
+__device__ __forceinline__ void gemm_cta(const problem & p,
+                                         int32_t         row0,
+                                         int32_t         col0,
+                                         uint8_t *       smem,
+                                         const Epi &     epi) {
+    gemm_cta_b<BN, MI, NI>(p, row0, col0, smem, epi, b_plain{ p });
 }
 
 }  // namespace fn::tc

@@ -1,4 +1,5 @@
 #include "fn/kernels/qsa/qsa.h"
+#include "fn/kernels/qsa/imrope.cuh"
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/tc/tc_gemm.cuh"
 #include "fn/model/shapes.h"
@@ -133,6 +134,9 @@ struct update_kargs {
     const int32_t * depth; // the round form: first, count, new_first and n_new from the device depth (n_new = rows)
     int32_t cap;           // the round form: the key cache's cells
     const int64_t * shift; // ME6, the round form: optional device word w; cell c at keys + (c - *w) * head_dim
+    const int32_t * off;   // MUP1: the round form's rotary offset (device word; null: off0)
+    int32_t off0;          // MUP1: the cache form's rotary offset
+    const int32_t * planes; // VIS1: the cache form's blocks' first rows' planes [count][4] (null: cell + offset)
 };
 
 // round to nearest even (finite keys), as the cache stores them
@@ -192,7 +196,11 @@ template <bool L> __device__ __forceinline__ void update_warp(const update_kargs
     for (int m = 0; m < 4; ++m) {
         x[m] = a.scale * x[m] + a.bias;
     }
-    norm_rope(x, a.k_norm, a.eps, a.ncols, b * ratio, a.rope, lane);
+    const int32_t off = a.off != nullptr ? *a.off : a.off0; // MUP1: rotary position = cell + the slot's offset
+    // VIS1: with planes, the block's first row's plane for this lane's rotation pair (IMROPE's sector rule); text
+    // planes are all the cell plus the offset, the same integer
+    const int32_t pos = a.planes != nullptr ? __ldg(a.planes + 4 * i + imrope_plane(lane)) : b * ratio + off;
+    norm_rope(x, a.k_norm, a.eps, a.ncols, pos, a.rope, lane);
     float * tile =
         a.summaries + static_cast<int64_t>(b / tile_blocks) * (n_chunk * tile_blocks * 4) + (b % tile_blocks) * 4;
 #pragma unroll
@@ -234,6 +242,7 @@ struct score_kargs {
     uint32_t * best2;
     uint16_t * lanes;
     uint32_t mz; // an opaque zero (order_after)
+    const int32_t * off; // MUP1: the rotary offset (device word; null: 0)
 };
 
 // acc += the 4 summary elements s times the query elements a, in element order
@@ -277,6 +286,7 @@ template <int B, int D, int QA, bool L> __device__ __forceinline__ void score_bo
     const int W = blockDim.x >> 5;
     const int G = gridDim.x * a.tpc;
     const int depth = *a.depth;
+    const int rope_off = a.off != nullptr ? *a.off : 0; // MUP1: the queries' rotary positions are cell + offset
     const int n_vis_max = (depth + B) / ratio; // blocks loaded: 0 .. n_vis_max - 1
     if (depth < 0 || depth > a.max_cells - B || n_vis_max <= top_blocks) {
         return; // no row selects (launch 2 takes every visible block), or a refused depth (launch 2 flags it)
@@ -309,7 +319,7 @@ template <int B, int D, int QA, bool L> __device__ __forceinline__ void score_bo
         for (int m = 0; m < 4; ++m) {
             x[m] = v == warp ? x0[m] : a.q[v * head_dim + m * 32 + lane];
         }
-        norm_rope(x, a.q_norm, a.eps, a.ncols, depth + v / n_idx_head + QA, a.rope, lane);
+        norm_rope(x, a.q_norm, a.eps, a.ncols, depth + v / n_idx_head + QA + rope_off, a.rope, lane);
         float * row = reinterpret_cast<float *>(qs[v]);
 #pragma unroll
         for (int m = 0; m < 4; ++m) {
@@ -1032,9 +1042,10 @@ bool summary_update(const update_args & a, void * stream) {
         a.count < 1 || a.first + a.count > max_blocks || !aligned16(a.summaries)) {
         return false;
     }
-    const update_kargs k = {a.keys,  a.k_norm, a.summaries, a.first, a.count, 1.0f / static_cast<float>(ratio),
-                            0.0f,    fn::rms_eps, head_dim, a.rope,  nullptr, nullptr,
-                            0,       0,           nullptr,  0,           nullptr};
+    const update_kargs k = {a.keys,  a.k_norm,    a.summaries, a.first, a.count,  1.0f / static_cast<float>(ratio),
+                            0.0f,    fn::rms_eps, head_dim,    a.rope,  nullptr,  nullptr,
+                            0,       0,           nullptr,     0,       nullptr,  nullptr,
+                            a.rope_off, a.planes};
     const int warps = 4;
     summary_update_kernel<<<(a.count + warps - 1) / warps, warps * 32, 0, static_cast<cudaStream_t>(stream)>>>(k);
     return cudaPeekAtLastError() == cudaSuccess;
@@ -1046,9 +1057,10 @@ bool summary_update(const round_update_args & a, void * stream) {
         a.max_cells < a.rows || a.max_cells > max_cells) {
         return false;
     }
-    const update_kargs k = {a.keys, a.k_norm,    a.summaries, 0,      0,       1.0f / static_cast<float>(ratio),
-                            0.0f,   fn::rms_eps, head_dim,    a.rope, a.ik,    a.keys,
-                            0,      a.rows,      a.depth,     a.max_cells, a.shift};
+    const update_kargs k = {a.keys, a.k_norm,    a.summaries, 0,      0,           1.0f / static_cast<float>(ratio),
+                            0.0f,   fn::rms_eps, head_dim,    a.rope, a.ik,        a.keys,
+                            0,      a.rows,      a.depth,     a.max_cells, a.shift, a.rope_off,
+                            0,      nullptr};
     // the most warps any depth needs: the blocks rows cells can complete (one for rows <= 4, SP2: two at 5) pooled and
     // rows cells written
     const int warps = 4;
@@ -1072,7 +1084,7 @@ bool summary_update_lanes(int32_t lanes, const round_update_args * a, const int3
         }
         p.a[u] = {x.keys,   x.k_norm, x.summaries, 0,      0, 1.0f / static_cast<float>(ratio), 0.0f,    fn::rms_eps,
                   head_dim, x.rope,   x.ik,        x.keys, 0, rows == nullptr ? x.rows : 0,     x.depth, x.max_cells,
-                  nullptr};
+                  nullptr,  x.rope_off, 0, nullptr};
         p.rows[u] = rows == nullptr ? nullptr : rows[u];
     }
     const int warps = 4;
@@ -1155,7 +1167,8 @@ bool select(int32_t rows, const select_args & a, void * stream) {
                             a.ws.best1,
                             a.ws.best2,
                             a.ws.lanes,
-                            0u};
+                            0u,
+                            a.rope_off};
     bool ok = false;
     switch (rows) {
         case 1:
@@ -1282,7 +1295,8 @@ bool select_lanes(int32_t lanes, int32_t rows, const select_args * a, void * str
                    x.ws.best1,
                    x.ws.best2,
                    x.ws.lanes,
-                   0u};
+                   0u,
+                   x.rope_off};
         k.a[u]                = { x.ws.keys, x.ws.best1, x.ws.best2, x.ws.lanes,  x.ws.error, x.ws.stats,
                                   x.body,    x.offsets,  x.depth,    x.max_cells, rows };
     }
@@ -1355,16 +1369,19 @@ __global__ void __launch_bounds__(128) prompt_keys_kernel(int32_t       rows,
     }
 }
 
-// a warp a query vector v = 4 row + head, at position pos0 + row (score_kernel's query preparation), then (PB3) its
+// a warp a query vector v = 4 row + head, at rotary position rope0 + row (MUP1: the row's cell plus the slot's
+// offset; score_kernel's query preparation; VIS1: the row's planes [rows][4] when set, IMROPE's plane a pair), then
+// (PB3) its
 // FP16 copy for the tensor scorer: scaled by the power of two that brings its largest magnitude into [2^14, 2^15)
 // (fn::tc::range_exp), rounded once; qs[v] the scale's inverse
 __global__ void __launch_bounds__(256) prompt_queries_kernel(int32_t       rows,
-                                                             int32_t       pos0,
+                                                             int32_t       rope0,
                                                              const float * iq,
                                                              const float * q_norm,
                                                              rope_params   rope,
                                                              uint16_t *    q16,
-                                                             float *       qs) {
+                                                             float *       qs,
+                                                             const int32_t * planes) {
     const int lane = threadIdx.x & 31;
     const int v    = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (v >= rows * n_idx_head) {
@@ -1375,7 +1392,7 @@ __global__ void __launch_bounds__(256) prompt_queries_kernel(int32_t       rows,
     for (int m = 0; m < 4; ++m) {
         x[m] = iq[int64_t(v) * head_dim + m * 32 + lane];
     }
-    norm_rope(x, q_norm, fn::rms_eps, head_dim, pos0 + v / n_idx_head, rope, lane);
+    norm_rope(x, q_norm, fn::rms_eps, head_dim, prompt_rope_pos(planes, rope0, v / n_idx_head, lane), rope, lane);
     const int32_t e = fn::tc::range_exp(
         fn::tc::warp_max(fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3])))));
     const float sc = fn::tc::pow2(e);
@@ -1632,7 +1649,8 @@ bool qsp_select(const qsp_index_args & a, void * stream) {
         const int32_t r0 = s * prompt_slab, n = std::min(prompt_slab, a.rows - r0), pos = a.pos0 + r0;
         const int32_t tiles = ((pos + n) / ratio + tile_blocks - 1) / tile_blocks;
         prompt_queries_kernel<<<(n * n_idx_head + 7) / 8, 256, 0, st>>>(
-            n, pos, a.iq + int64_t(r0) * n_idx_head * head_dim, a.q_norm, a.rope, a.ws.q16, a.ws.qs);
+            n, pos + a.rope_off, a.iq + int64_t(r0) * n_idx_head * head_dim, a.q_norm, a.rope, a.ws.q16, a.ws.qs,
+            a.planes != nullptr ? a.planes + int64_t(r0) * 4 : nullptr);
         if ((pos + n) / ratio > top_blocks && tiles > 0) {
             const dim3 grid((n + sc_rows - 1) / sc_rows, (tiles + sc_tpc - 1) / sc_tpc);
             prompt_score_tc_kernel<<<grid, 256, 0, st>>>(n, pos, tiles, reinterpret_cast<const uint4 *>(a.summaries),

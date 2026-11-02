@@ -40,6 +40,11 @@ struct fnfl_split_plan_args {
     int32_t     cal_k = 27, cal_slots = 8, cal_slot_cells = 16384, cal_pool_cells = 131072;
     bool        cal_q8        = true;
     double      free_front[2] = { -1, -1 }, free_back[2] = { -1, -1 };
+    // MUP2 piece 5: with both boxes' calibrations, the largest pool (q8, a multiple of the 16,384-cell page) that leaves
+    // floor_mib free a card, after reserve_front_gib a front card (VIS1's encoder on the front box) and reserve_back_gib a back
+    // card
+    double      floor_mib = 384, reserve_front_gib = 0, reserve_back_gib = 0;
+    bool        images = false;  // VIS1 Stage B (--images): the front reads images (--mmproj)
 };
 
 int fnfl_split_plan(const fnfl_split_plan_args & a);

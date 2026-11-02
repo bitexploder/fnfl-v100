@@ -107,6 +107,8 @@ struct server_slot {
     int32_t tu_n_processed = 0;
     int64_t tu_t_start     = 0;
     bool    tu_cancel      = false;
+    // PRD1 item 9 (the split): the front's read ended, its back halves are out; out of the reader order, polled
+    bool    tu_finishing      = false;
 
     server_slot_stats stats;
 
@@ -362,6 +364,10 @@ private:
         // the launch's -b. A turn is one FNFL chunk (PF1's partition, the read's numerics), and a reader served out of
         // turn runs its chunk in the other-reader lane in slices, so TU6's n_ubatch cap has no counterpart
         int32_t fast_limit = 4096;
+        // APF1: the writers' pause target P beside a read (--fnfl-writer-pause-ms, POST /props tu.writer_pause_ms):
+        // each box's read units run before the latest start that keeps every writer group's next completed step
+        // within P of its last one (fn/runtime/pace.h; best effort)
+        int32_t writer_pause_ms = 100;
     } tu_policy;
 
     bool tu_engaged = false;
@@ -395,6 +401,7 @@ private:
         double  last_group_ms    = -1.0; // the chunk's last measured group (-1 at its start)
         int32_t steps            = 0;
         int64_t groups_at_start  = 0;
+        int64_t units_at_start   = 0;  // PRD1 item 13: this box's units run when the turn began (the TU job line)
         int32_t chunk            = 0, rows = 0, lane = -1;
     } tu_job[2];
 
@@ -455,8 +462,9 @@ private:
         std::string what;
         if (params.embedding) {
             what = "embeddings and reranking (--embedding, --rerank)";
-        } else if (!params.mmproj.path.empty() || !params.mmproj.url.empty()) {
-            what = "multimodal input (--mmproj)";
+        } else if (!params.mmproj.url.empty()) {
+            // VIS1 Stage B: --mmproj PATH is FNFL's projector (the engine refuses any other at load)
+            what = "a downloaded projector (--mmproj-url; give --mmproj PATH)";
         } else if (!params.lora_adapters.empty()) {
             what = "LoRA adapters (--lora)";
         }
@@ -522,7 +530,9 @@ private:
         }
         lp.config.draft_subset   = params_base.fnfl.draft_subset;
         lp.config.ple_table      = params_base.fnfl.ple_table;
+        lp.config.ple_warm       = params_base.fnfl.ple_warm;
         lp.config.spec_d         = params_base.fnfl.spec_d;
+        lp.config.small_read_rows     = params_base.fnfl.small_read_rows;  // MUP1
         lp.config.draft_attention = params_base.fnfl.draft_attention;
         lp.config.check_state    = params_base.fnfl.check_state;
         lp.config.test_eog       = params_base.fnfl.test_eog;
@@ -544,6 +554,7 @@ private:
         lp.config.split_port          = params_base.fnfl.split_port;
         lp.config.split_commit        = params_base.fnfl.split_commit;
         lp.config.split_digest        = params_base.fnfl.split_digest;
+        lp.config.mmproj              = params_base.mmproj.path;  // VIS1 Stage B
         SRV_INF("FNFL end-of-generation IDs: %s\n", eog_list.c_str());
 
         std::string err;
@@ -600,6 +611,11 @@ private:
 
         // (MU1) two-user scheduling: engaged with more than one slot; the engine's group is the policy's
         tu_engaged = params_base.n_parallel > 1;
+        tu_policy.writer_pause_ms = params_base.fnfl.writer_pause_ms;  // APF1
+        if (!fnfl_set_writer_pause(engine, tu_policy.writer_pause_ms)) {
+            SRV_ERR("FNFL refused the writer pause of %d ms (10 .. 1000)\n", tu_policy.writer_pause_ms);
+            return false;
+        }
         if (tu_engaged && !fnfl_set_read_group(engine, tu_policy.group)) {
             SRV_ERR("FNFL refused the read group of %d layers\n", tu_policy.group);
             return false;
@@ -611,12 +627,15 @@ private:
                     tu_resident ? "resident TP, the path chosen from the active slots (lone writer, lone reader, "
                                   "writers beside a reader, readers)"
                                 : "MU1's turn-taking (not resident TP)");
-            SRV_INF("two-user scheduling (MU1, TU6's port): engaged, %d slots, slice %d ms, group %d layers, short "
-                    "reads up to %d uncached tokens (TU6's n_batch), a turn one chunk (main lane %d rows), "
-                    "other-reader lane %d rows; KV pool %lld cells in pages of %d, each slot's context %d\n",
-                    params_base.n_parallel, tu_policy.slice_ms, tu_policy.group, tu_policy.fast_limit,
-                    fnfl_lane_rows(engine, 0), fnfl_lane_rows(engine, 1), (long long) model_meta.pool_cells,
-                    model_meta.pool_page_cells, n_ctx_slot());
+            SRV_INF(
+                "two-user scheduling (MU1, TU6's port): engaged, %d slots, slice %d ms, group %d layers, short "
+                "reads up to %d uncached tokens (TU6's n_batch), a turn one chunk (main lane %d rows), "
+                "other-reader lane %d rows; KV pool %lld cells in pages of %d, each slot's context %d; writer "
+                "pause %d ms (APF1: beside writers each box's read units run before the latest start that keeps "
+                "every writer group's next step within P of its last)\n",
+                params_base.n_parallel, tu_policy.slice_ms, tu_policy.group, tu_policy.fast_limit,
+                fnfl_lane_rows(engine, 0), fnfl_lane_rows(engine, 1), (long long) model_meta.pool_cells,
+                model_meta.pool_page_cells, n_ctx_slot(), tu_policy.writer_pause_ms);
         }
 
         {
@@ -670,6 +689,8 @@ private:
         queue_tasks.on_update_slots([this]() {
             update_slots();
         });
+        // SSF1: the engine's slow-wait trace lines go to this log (its timestamps, as stall_scan.py reads them)
+        fnfl_trace_sink([](const char * line) { LOG_WRN("%s\n", line); });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
         });
@@ -728,7 +749,8 @@ private:
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
-                /* force_pure_content    */ params_base.force_pure_content_parser
+                /* force_pure_content    */ params_base.force_pure_content_parser,
+                /* allow_image           */ fnfl_vision(engine)  // VIS1 Stage B
             };
 
             {
@@ -760,8 +782,10 @@ private:
     }
 
     server_slot * get_slot_by_id(int id_slot) {
-        // note: allow id_slot to be out of bounds (wrap around)
-        id_slot = id_slot % slots.size();
+        // SSF1: no wrap; both client paths validate first, and this guard keeps an invalid ID from naming a slot
+        if (!slot_id_valid(id_slot, static_cast<int32_t>(slots.size()), false)) {
+            return nullptr;
+        }
 
         for (server_slot & slot : slots) {
             if (slot.id == id_slot) {
@@ -871,9 +895,6 @@ private:
         if (s.penalty_present != 0.0f) {
             v.push_back("presence_penalty");
         }
-        if (s.ignore_eos) {
-            v.push_back("ignore_eos");
-        }
         const size_t n_eog_bias = s.ignore_eos ? params_base.sampling.logit_bias_eog.size() : 0;
         if (s.logit_bias.size() > n_eog_bias) {
             v.push_back("logit_bias");
@@ -971,6 +992,7 @@ private:
         slot.tu_prefix         = slot.task->params.cache_prompt ? (int32_t) slot.prompt.tokens.get_common_prefix(slot.task->tokens) : 0;
         slot.tu_last_read_seq  = 0;
         slot.tu_cancel         = false;
+        slot.tu_finishing      = false;
 
         SLT_INF(slot, "%s", "processing task\n");
         return true;
@@ -1048,7 +1070,8 @@ private:
     void record_answer(server_slot & slot) {
         const size_t start = (size_t) slot.task->n_tokens();
         const size_t end   = slot.prompt.tokens.size();
-        if (slot.sampled == LLAMA_TOKEN_NULL || !llama_vocab_is_eog(vocab, slot.sampled) || start >= end) {
+        if (slot.sampled == LLAMA_TOKEN_NULL || !llama_vocab_is_eog(vocab, slot.sampled) || start >= end ||
+            slot.task->params.sampling.ignore_eos) {
             return;
         }
         server_answers_keep_first(slot.answers, start);
@@ -1178,7 +1201,8 @@ private:
             }
         }
 
-        if (llama_vocab_is_eog(vocab, result.tok)) {
+        // VBENCH: with ignore_eos the engine returns end-of-generation tokens and goes on (vLLM's ignore_eos)
+        if (!slot.task->params.sampling.ignore_eos && llama_vocab_is_eog(vocab, result.tok)) {
             slot.stop           = STOP_TYPE_EOS;
             slot.has_next_token = false;
 
@@ -1437,9 +1461,12 @@ private:
                             tu_policy.group = g;
                         }
                     }
+                    if (set.writer_pause_ms > 0 && fnfl_set_writer_pause(engine, set.writer_pause_ms)) {
+                        tu_policy.writer_pause_ms = set.writer_pause_ms;  // APF1: the next read-step decision's
+                    }
                     tu_version++;
-                    LOG_WRN("TU policy: version %d, slice %d ms, group %d layers (POST /props)\n", tu_version,
-                            tu_policy.slice_ms, tu_policy.group);
+                    LOG_WRN("TU policy: version %d, slice %d ms, group %d layers, writer pause %d ms (POST /props)\n",
+                            tu_version, tu_policy.slice_ms, tu_policy.group, tu_policy.writer_pause_ms);
                     tu_publish();
 
                     auto res = std::make_unique<server_task_result_tu_policy>();
@@ -1548,6 +1575,15 @@ private:
     }
 
     // an engine call failed: the request gets the engine's reason, and the slot is released
+    // VIS1 Stage B: the slot's prompt's images as the engine takes them (all of them, in absolute cells)
+    static std::vector<fnfl_prompt_image> prompt_images(const server_slot & slot) {
+        std::vector<fnfl_prompt_image> out;
+        for (const auto & im : slot.task->images) {
+            out.push_back({ im.first, im.second.get() });
+        }
+        return out;
+    }
+
     void engine_failed(server_slot & slot, fnfl_status status) { engine_failed(slot, status, fnfl_last_error(engine)); }
 
     // (FMU2) a slot's failure with its own reason (a joint step's)
@@ -1602,6 +1638,7 @@ private:
             fs.min_p       = sp.min_p;
             fs.max_tokens  = slot.n_predict_max;
             fs.n_ctx       = slot.n_ctx;
+            fs.ignore_eos  = sp.ignore_eos;
             std::string err;
             if (fnfl_set_sampling(engine, slot.id, fs, err) != FNFL_OK) {
                 send_error(slot, "FNFL: " + err, ERROR_TYPE_INVALID_REQUEST);
@@ -1654,7 +1691,9 @@ private:
         prefill_watch watch = { this, &slot };
         // BG1: tasks that only read the server's state (/slots, /metrics) are answered during the prefill; the rest wait
         queue_tasks.yield_to_queue([&]() {
-            st = fnfl_prefill(engine, slot.id, all.data() + n_past, n_new, n_past, &n_processed, &on_prefill_chunk, &watch);
+            const std::vector<fnfl_prompt_image> im = prompt_images(slot);  // VIS1 Stage B
+            st = fnfl_prefill_images(engine, slot.id, all.data() + n_past, n_new, n_past, im.data(), int32_t(im.size()),
+                                     &n_processed, &on_prefill_chunk, &watch);
         });
         if (st == FNFL_CANCELLED) {
             // the client left during the prefill: the slot keeps the prompt's tokens the engine kept (n_processed)
@@ -1717,6 +1756,7 @@ private:
 
     // a step's tokens into the slot: the state check, each token's processing and the request's end
     void apply_step(server_slot & slot, const fnfl_step_result & r) {
+        fnfl_range_scope nvtx_apply("server.apply_step"); // TTTS7
         if (r.n_tokens < 1) {
             engine_failed(slot, FNFL_ERROR);
             return;
@@ -1782,21 +1822,22 @@ private:
         const bool pool = engine != nullptr && fnfl_pool(engine, pr);
         std::lock_guard<std::mutex> lock(tu_props_mutex);
         tu_props = {
-            {"enabled", tu_engaged},
-            {"presence", tu_resident},
-            {"slice_ms", tu_policy.slice_ms},
-            {"group", tu_policy.group},
-            {"fast_limit", tu_policy.fast_limit},
-            {"version", tu_version},
-            {"slots", params_base.n_parallel},
-            {"n_ctx_slot", n_ctx_slot()},
-            {"kv_pool",
+            { "enabled",         tu_engaged                },
+            { "presence",        tu_resident               },
+            { "slice_ms",        tu_policy.slice_ms        },
+            { "group",           tu_policy.group           },
+            { "fast_limit",      tu_policy.fast_limit      },
+            { "writer_pause_ms", tu_policy.writer_pause_ms },
+            { "version",         tu_version                },
+            { "slots",           params_base.n_parallel    },
+            { "n_ctx_slot",      n_ctx_slot()              },
+            { "kv_pool",
              json{
-                 {"on", pool && pr.on},
-                 {"cells", pool ? pr.capacity_cells : 0},
-                 {"page_cells", pool ? pr.page_cells : 0},
-                 {"pages", pool ? pr.pages : 0},
-             }},
+                  { "on", pool && pr.on },
+                  { "cells", pool ? pr.capacity_cells : 0 },
+                  { "page_cells", pool ? pr.page_cells : 0 },
+                  { "pages", pool ? pr.pages : 0 },
+              }                                            },
         };
     }
 
@@ -1850,9 +1891,12 @@ private:
                 r.id_task   = slot.task->id;
                 r.live      = tu_job[0].active && tu_job[0].slot == &slot;
                 r.begun = slot.state == SLOT_STATE_PROCESSING_PROMPT;
+                r.finishing = slot.tu_finishing;
                 readers.push_back(r);
             }
         }
+        // PRD1 item 9: a finishing slot is not a reader here (tu_follow and tu_prefetch see the same list)
+        tu_drop_finishing(readers);
         tu_readers = readers;
         if (readers.empty()) {
             tu_pick_prev = nullptr;
@@ -1932,6 +1976,7 @@ private:
             fs.min_p       = sp.min_p;
             fs.max_tokens  = slot.n_predict_max;
             fs.n_ctx       = slot.n_ctx;
+            fs.ignore_eos  = sp.ignore_eos;
             std::string err;
             if (fnfl_set_sampling(engine, slot.id, fs, err) != FNFL_OK) {
                 send_error(slot, "FNFL: " + err, ERROR_TYPE_INVALID_REQUEST);
@@ -1975,7 +2020,9 @@ private:
             }
         }
         int32_t n_processed = n_new;
-        const int32_t r = fnfl_read_begin(engine, slot.id, all.data() + n_past, n_new, n_past, &n_processed);
+        const std::vector<fnfl_prompt_image> im          = prompt_images(slot);  // VIS1 Stage B
+        const int32_t r = fnfl_read_begin_images(engine, slot.id, all.data() + n_past, n_new, n_past, im.data(),
+                                                 int32_t(im.size()), &n_processed);
         if (r == 1) {
             send_error(slot, "FNFL: " + fnfl_last_error(engine) + " (the KV pool or the context cannot hold the request)",
                        ERROR_TYPE_EXCEED_CONTEXT_SIZE);
@@ -2100,6 +2147,7 @@ private:
         fnfl_read_report r;
         fnfl_read_info(engine, slot.id, r);
         j.groups_at_start = r.groups_done;
+        j.units_at_start      = r.here.units;
         j.chunk           = r.chunk;
         j.rows            = r.next_rows;
         slot.tu_last_read_seq = ++tu_read_seq;
@@ -2112,8 +2160,8 @@ private:
         tu_job_t & j = tu_job[k];
         server_slot & slot = *j.slot;
         const bool peer = tu_peer(&slot);
-        // FMU1: the presence rule (resident TP): writers beside a reader one step a slice of main's group in 1-layer
-        // groups (FMU2's reader rule); MU1's shared slices otherwise. FMU2's correction: a lone reader runs main's
+        // FMU1: the presence rule (resident TP): writers beside a reader one step a slice, its units under the read
+        // budget (FMU2's reader rule, MUP2); MU1's shared slices otherwise. FMU2's correction: a lone reader runs main's
         // geometry, one step a call, so an arrival waits one step, not the chunk (FMU1's lone chunk was one step)
         const tu_mode mode = tu_resident ? tu_slot_mode(slot) : tu_mode::shared;
         const fnfl_read_mode rmode = mode == tu_mode::writers ? FNFL_READ_WRITERS : FNFL_READ_SHARED;
@@ -2123,10 +2171,9 @@ private:
         int64_t n_groups_run = 0;
         fnfl_read_status ret = FNFL_READ_YIELDED;
         while (true) {
-            // FMU2's reader rule: beside writers, one step a slice
-            const int32_t n_groups = mode == tu_mode::writers
-                                         ? (n_run > 0 ? 0 : tu_writers_groups(budget, j.last_group_ms, tu_policy.group))
-                                         : tu_next_groups(budget, t_slice, j.last_group_ms, n_run);
+            // FMU2's reader rule: beside writers, one step a slice (its units under the budget, MUP2)
+            const int32_t n_groups = mode == tu_mode::writers ? (n_run > 0 ? 0 : 1) :
+                                                                tu_next_groups(budget, t_slice, j.last_group_ms, n_run);
             if (n_groups < 1) {
                 break;
             }
@@ -2137,8 +2184,13 @@ private:
             }
             j.n_rounds_pending = 0;
             const int64_t t0 = ggml_time_us();
-            queue_tasks.yield_to_queue([&]() { ret = fnfl_read_step(engine, slot.id, n_groups, rmode); });
-            const double dt = (ggml_time_us() - t0) / 1000.0;
+            // APF1: beside writers one step of units under this box's writer-pause deadline (the follower budgets the
+            // back by its own deadline under the same P)
+            queue_tasks.yield_to_queue([&]() {
+                ret = mode == tu_mode::writers ? fnfl_read_step_paced(engine, slot.id) :
+                                                 fnfl_read_step(engine, slot.id, n_groups, rmode);
+            });
+            const double     dt = (ggml_time_us() - t0) / 1000.0;
             fnfl_read_report after;
             fnfl_read_info(engine, slot.id, after);
             const int64_t ran = std::max<int64_t>(0, after.groups_done - before.groups_done);
@@ -2174,7 +2226,17 @@ private:
                 } break;
             case FNFL_READ_DONE:
                 tu_turn_end(k, "read");
-                tu_finish(slot);
+                // PRD1 item 14: a cancel the client asked for during the read is honoured at its end too
+                if (tu_read_end(tu_read_out::done, slot.tu_cancel) == tu_end::generate) {
+                    tu_finish(slot);
+                } else {
+                    tu_cancelled(slot);
+                }
+                break;
+            case FNFL_READ_FRONT_DONE:
+                // PRD1 item 9: the front is free: the job ends and the next reader starts; the slot is polled
+                tu_turn_end(k, "front done");
+                slot.tu_finishing = true;
                 break;
             case FNFL_READ_CANCELLED:
                 {
@@ -2199,7 +2261,10 @@ private:
                 continue;
             }
             n_writers += slot.state == SLOT_STATE_GENERATING ? 1 : 0;
-            n_readers += slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT ? 1 : 0;
+            n_readers +=
+                (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT) && !slot.tu_finishing ?
+                    1 :
+                    0;
         }
         return tu_presence(n_writers, n_readers);
     }
@@ -2216,22 +2281,69 @@ private:
         }
     }
 
-    // the turn's line (the job's identity, chunk, groups, peer rounds, service and longest slice), and the job's end
+    // MUP2 piece 4: a box's units account (writers mode) for the TU lines: units in steps (most a step), piece rows,
+    // the mean known budget B and P, the budgets zero and unknown, the engine's service, the units run with no writer
+    // step pending. APF1: the box's pacing over the read: the writers' completion gaps (longest, over P with each
+    // overrun's reason, their excess over P), separate from the client's streamed-token gaps
+    static std::string tu_units_str(const char * box, const fnfl_read_units & u) {
+        if (u.units <= 0) {
+            return "";
+        }
+        char b[720];
+        snprintf(b, sizeof b,
+                 "; %s units %lld in %d steps (%.1f a step, most %d), pieces %d..%d rows, B ms %.1f, P ms %d, "
+                 "budgets zero %d unknown %d, service ms %.1f, floor %d units %.1f ms, budget misses %d%s; %s pacing: "
+                 "decisions %lld (known %lld, zero %lld, unknown %lld), writer completions %lld, gaps %lld, longest "
+                 "gap ms %.1f, over P %lld (no read here %lld, budgeted %lld, minimum unit %lld, small read %lld, idle "
+                 "drain %lld), excess ms %.1f",
+                 box, (long long) u.units, u.steps, u.steps > 0 ? double(u.units) / u.steps : 0.0, u.most, u.piece_min,
+                 u.piece_max, u.budget_ms, u.pause_ms, u.budget_zero, u.budget_unknown, u.service_ms, u.floor_units,
+                 u.floor_ms, u.budget_misses, u.below_floor ? ", pieces at the floor above B" : "", box,
+                 (long long) u.pace_steps, (long long) u.pace_known, (long long) u.pace_zero,
+                 (long long) u.pace_unknown, (long long) u.completions, (long long) u.gaps, u.longest_gap_ms,
+                 (long long) u.over, (long long) u.over_none, (long long) u.over_budgeted, (long long) u.over_minimum,
+                 (long long) u.over_small, (long long) u.over_idle, u.over_ms);
+        return b;
+    }
+
+    // the turn's line (the job's identity, chunk, groups or units, peer rounds, service and longest slice), and the
+    // job's end. PRD1 item 13: a turn that ran units (writers mode, MUP2) names them as units, this box's
     void tu_turn_end(int k, const char * how) {
         tu_job_t & j = tu_job[k];
         fnfl_read_report r;
         fnfl_read_info(engine, j.slot->id, r);
-        LOG_WRN("TU job: slot %d, task %d, %s: chunk %d (%d rows), lane %d, groups %lld of %d layers, peer rounds %d, "
-                "steps %d, service ms %.1f, longest slice ms %.1f (slice %d ms); read %d of %d tokens committed\n",
-                j.slot->id, j.slot->task ? j.slot->task->id : -1, how, j.chunk, j.rows, j.lane,
-                (long long) (r.groups_done - j.groups_at_start), r.layers, j.peer_rounds, j.steps, j.service_ms,
-                j.longest_slice_ms, tu_policy.slice_ms, r.committed, r.total);
+        char          work[64];
+        const int64_t units = r.here.units - j.units_at_start;
+        if (units > 0) {
+            snprintf(work, sizeof work, "units %lld", (long long) units);
+        } else {
+            snprintf(work, sizeof work, "groups %lld of %d layers", (long long) (r.groups_done - j.groups_at_start),
+                     r.layers);
+        }
+        LOG_WRN(
+            "TU job: slot %d, task %d, %s: chunk %d (%d rows), lane %d, %s, peer rounds %d, "
+            "steps %d, service ms %.1f, longest slice ms %.1f (slice %d ms); read %d of %d tokens committed%s%s\n",
+            j.slot->id, j.slot->task ? j.slot->task->id : -1, how, j.chunk, j.rows, j.lane, work, j.peer_rounds,
+            j.steps, j.service_ms, j.longest_slice_ms, tu_policy.slice_ms, r.committed, r.total,
+            tu_units_str("front", r.here).c_str(), tu_units_str("back", r.back).c_str());
         j.active = false;
         j.slot   = nullptr;
     }
 
     // the read is done: start_prompt's second half (the slot's tokens, stats, the last progress event), then generating
     void tu_finish(server_slot & slot) {
+        {
+            // MUP2 piece 4: the read's line: its wall time, the engine's service (FNFL read job, not the TU turns' sum)
+            // and each box's units account
+            fnfl_read_report r;
+            fnfl_read_info(engine, slot.id, r);
+            LOG_WRN(
+                "TU read: slot %d, task %d, %d tokens (from %d), wall ms %.1f, engine service ms %.1f, writer pause "
+                "%d ms%s%s\n",
+                slot.id, slot.task ? slot.task->id : -1, r.total - r.from, r.from,
+                (ggml_time_us() - slot.tu_t_start) / 1000.0, r.service_ms, tu_policy.writer_pause_ms,
+                tu_units_str("front", r.here).c_str(), tu_units_str("back", r.back).c_str());
+        }
         const llama_tokens & all = slot.task->tokens.get_tokens();
         int32_t n_new = slot.tu_n_new;
         if (slot.tu_n_processed != n_new) {
@@ -2304,13 +2416,56 @@ private:
             return;
         }
         const tu_job_t & j = tu_job[k];
-        LOG_INF("TU iteration %lld: t_us=%" PRId64 " writers stepped [%s]; then job %d (slot %d, %s)\n",
+        // APF1: this box's last read-step decision: P, the budget (known or unknown, and why), the constraining group,
+        // its phase, and its inputs (C as the time since it, F and B; -1 unknown); a projected input is marked
+        char             pace[256] = "";
+        fnfl_pace_report pr;
+        if (fnfl_pace_last(engine, pr)) {
+            snprintf(
+                pace, sizeof pace,
+                "; the last read step's pace: P %d ms, budget %s %.1f ms (slack %.1f), group %d %s%s, since C %.1f ms, "
+                "F %.1f, B %.1f%s%s",
+                pr.pause_ms, pr.known ? "known" : "unknown", pr.budget_ms, pr.slack_ms, pr.group, pr.phase,
+                pr.projected ? " (projected)" : "", pr.since_c_ms, pr.f_ms, pr.b_ms, pr.known ? "" : ": ", pr.why);
+        }
+        LOG_INF("TU iteration %lld: t_us=%" PRId64 " writers stepped [%s]; then job %d (slot %d, %s)%s\n",
                 (long long) ++tu_iter, ggml_time_us(), tu_stepped.c_str(), k, j.slot ? j.slot->id : -1,
-                j.active ? "slice" : "turn ended");
+                j.active ? "slice" : "turn ended", pace);
+    }
+
+    // PRD1 item 9: each finishing slot whose back halves have all answered ends now (no wait): generating, or
+    // released at a cancel the client asked for meanwhile, or failed. Its TU read line is written at that end
+    void tu_poll_finishing() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT || !slot.tu_finishing || !fnfl_read_ready(engine, slot.id)) {
+                continue;
+            }
+            const fnfl_read_status st = fnfl_read_poll(engine, slot.id);
+            if (st == FNFL_READ_FRONT_DONE) {
+                continue;
+            }
+            slot.tu_finishing     = false;
+            const tu_read_out out = st == FNFL_READ_DONE      ? tu_read_out::done :
+                                    st == FNFL_READ_CANCELLED ? tu_read_out::cancelled :
+                                                                tu_read_out::failed;
+            switch (tu_read_end(out, slot.tu_cancel)) {
+                case tu_end::generate:
+                    tu_finish(slot);
+                    break;
+                case tu_end::release:
+                    tu_cancelled(slot);  // PRD1 item 14: no generated token; the slot keeps the prompt it read
+                    break;
+                case tu_end::fail:
+                    SLT_ERR(slot, "%s", "two-user scheduling: the read's back half failed\n");
+                    engine_failed(slot, FNFL_ERROR);
+                    break;
+            }
+        }
     }
 
     void tu_update() {
-        // FMU1 (resident TP): who has model work this iteration
+        tu_timed(tp_cancel, [&]() { tu_poll_finishing(); });
+        // FMU1 (resident TP): who has model work this iteration (PRD1 item 9: a finishing slot has none on the front)
         int32_t n_writers = 0, n_reading = 0, n_started = 0;
         server_slot * writer = nullptr;
         for (auto & slot : slots) {
@@ -2318,14 +2473,15 @@ private:
                 ++n_writers;
                 writer = &slot;
             }
-            n_reading += slot.state == SLOT_STATE_PROCESSING_PROMPT ? 1 : 0;
+            n_reading += slot.state == SLOT_STATE_PROCESSING_PROMPT && !slot.tu_finishing ? 1 : 0;
             n_started += slot.state == SLOT_STATE_STARTED ? 1 : 0;
         }
         if (tu_resident && tu_lone_writer(n_writers, n_reading + n_started, tu_job[0].active || tu_job[1].active)) {
             // a lone writer: the one-slot loop's body (I2)
             try {
                 metrics_on_step();
-                step_slot(*writer);
+                tu_timed(tp_writers, [&]() { step_slot(*writer); });
+                tu_stepped = std::to_string(writer->id);
             } catch (const std::exception & e) {
                 SLT_ERR(*writer, "got exception: %s\n", e.what());
                 send_error(*writer, std::string("got exception: ") + e.what(), ERROR_TYPE_SERVER);
@@ -2343,59 +2499,126 @@ private:
                     break;
                 }
                 ++n_admitted;
-                tu_admit(slot);
+                tu_timed(tp_admit, [&]() { tu_admit(slot); });
             }
         }
         // a cancelled read with no chunk in progress stops now (BG1: no chunk started for it)
         for (auto & slot : slots) {
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.tu_cancel &&
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT && slot.tu_cancel && !slot.tu_finishing &&
                 !(tu_job[0].active && tu_job[0].slot == &slot) && !(tu_job[1].active && tu_job[1].slot == &slot)) {
                 fnfl_read_report r;
                 if (fnfl_read_info(engine, slot.id, r) && !r.in_chunk) {
-                    const fnfl_read_status st = fnfl_read_step(engine, slot.id, 1);
+                    fnfl_read_status st = FNFL_READ_ERROR;
+                    tu_timed(tp_cancel, [&]() { st = fnfl_read_step(engine, slot.id, 1); });
                     if (st == FNFL_READ_CANCELLED) {
                         tu_cancelled(slot);
+                    } else if (st == FNFL_READ_FRONT_DONE) {
+                        slot.tu_finishing =
+                            true;  // PRD1 items 9 and 14: the back's halves out: tu_poll_finishing ends it
                     } else if (st == FNFL_READ_ERROR) {
                         engine_failed(slot, FNFL_ERROR);
                     }
                 }
             }
         }
-        tu_order();
+        tu_timed(tp_order, [&]() { tu_order(); });
         if (tu_resident) {
-            tu_prefetch();
+            tu_timed(tp_prefetch, [&]() { tu_prefetch(); });
             if (busy && n_admitted > 0 && n_writers > 0) {
-                tu_decode();
+                tu_timed(tp_writers, [&]() { tu_decode(); });
                 return;
             }
         }
         if (tu_job[1].active) {
-            tu_decode();
+            tu_timed(tp_writers, [&]() { tu_decode(); });
             tu_iter_line(1);
-            tu_slice(1);
+            tu_timed(tp_slice, [&]() { tu_slice(1); });
             return;
         }
         if (tu_job[0].active) {
-            tu_decode();
+            tu_timed(tp_writers, [&]() { tu_decode(); });
             if (!tu_job[0].active) {
                 return;
             }
             if (tu_pick != nullptr && tu_pick != tu_job[0].slot && tu_other_fits(*tu_pick)) {
                 tu_iter_line(0);
-                tu_start(*tu_pick, 1);
+                tu_timed(tp_slice, [&]() { tu_start(*tu_pick, 1); });
                 return;
             }
             tu_iter_line(0);
-            tu_slice(0);
+            tu_timed(tp_slice, [&]() { tu_slice(0); });
             return;
         }
-        tu_decode();
+        tu_timed(tp_writers, [&]() { tu_decode(); });
         if (tu_pick != nullptr && tu_pick->state == SLOT_STATE_PROCESSING_PROMPT) {
-            tu_start(*tu_pick, 0);
+            tu_timed(tp_slice, [&]() { tu_start(*tu_pick, 0); });
         }
     }
 
+    // SSF1: a turn's parts for the slow-turn line (seconds), reset each turn
+    enum { tp_admit, tp_cancel, tp_order, tp_prefetch, tp_writers, tp_slice, tp_n };
+
+    double  tu_part[tp_n]    = {};
+    int64_t t_turn_end_us    = 0;  // the previous turn's end
+    bool    turn_had_writers = false;
+
+    template <class F> void tu_timed(int part, F && f) {
+        const int64_t t0 = ggml_time_us();
+        f();
+        tu_part[part] += (ggml_time_us() - t0) / 1e6;
+    }
+
+    // one turn of the server loop, with the slow-wait trace's gate (the generating slots) and its slow-turn line: a
+    // turn plus the queue's time before it of slow::threshold_s (0.5 s) or more while writers generate
     void update_slots() {
+        const int64_t t0      = ggml_time_us();
+        uint64_t      writers = 0;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.id >= 0 && slot.id < 64) {
+                writers |= uint64_t(1) << slot.id;
+            }
+        }
+        fnfl_trace_writers(writers);
+        for (double & p : tu_part) {
+            p = 0.0;
+        }
+        tu_stepped.clear();
+        update_slots_turn();
+        const int64_t t1          = ggml_time_us();
+        const double  queue_s     = t_turn_end_us > 0 ? (t0 - t_turn_end_us) / 1e6 : 0.0;
+        const double  turn_s      = (t1 - t0) / 1e6;
+        // a writer held up: generating before and after the turn (the last writer's own end beside a read is not one)
+        uint64_t      writers_end = 0;
+        for (const auto & slot : slots) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.id >= 0 && slot.id < 64) {
+                writers_end |= uint64_t(1) << slot.id;
+            }
+        }
+        if (turn_had_writers && (writers & writers_end) != 0 && queue_s + turn_s >= 0.5) {
+            double parts = 0.0;
+            for (const double p : tu_part) {
+                parts += p;
+            }
+            const tu_job_t & j0 = tu_job[0];
+            const tu_job_t & j1 = tu_job[1];
+            LOG_WRN(
+                "FNFL slow: leader turn %.3f s, queue before it %.3f s: admissions %.3f s, read cancels %.3f s, "
+                "order %.3f s, prefetch %.3f s, writers %.3f s [%s], read slice %.3f s (jobs: slot %d, slot %d), "
+                "other %.3f s; t_us=%" PRId64 "\n",
+                turn_s, queue_s, tu_part[tp_admit], tu_part[tp_cancel], tu_part[tp_order], tu_part[tp_prefetch],
+                tu_part[tp_writers], tu_stepped.c_str(), tu_part[tp_slice], j0.slot ? j0.slot->id : -1,
+                j1.slot ? j1.slot->id : -1, turn_s - parts, t1);
+        }
+        t_turn_end_us    = t1;
+        turn_had_writers = writers_end != 0;
+        // the loop's task wait follows this turn
+        queue_tasks.slots_processing.store(
+            std::any_of(slots.begin(), slots.end(), [](const server_slot & s) { return s.is_processing(); }),
+            std::memory_order_relaxed);
+    }
+
+    void update_slots_turn() {
+        fnfl_range_scope nvtx_turn("server.update_slots"); // TTTS7: the shell's turn in an nsys capture
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2573,11 +2796,11 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // server_routes
 //
 
-std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
-            const server_http_req & req,
-            server_task_type type,
-            const json & data,
-            task_response_type res_type) {
+std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(const server_http_req & req,
+                                                                             server_task_type        type,
+                                                                             const json &            data,
+                                                                             task_response_type      res_type,
+                                                                             std::vector<raw_buffer> files) {
     GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
 
     auto res = create_response();
@@ -2608,8 +2831,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // process prompt
         std::vector<server_tokens> inputs;
-
-        inputs = tokenize_input_prompts(ctx_server.vocab, prompt, true, true);
+        // VIS1 Stage B: the chat's images prepared by the engine (decode, resize, cut; the request limits), then the
+        // prompt tokenized as the reference engine does, each image a run of image tokens
+        std::vector<std::pair<int64_t, std::shared_ptr<fnfl_image>>> images;
+        if (!files.empty()) {
+            if (!prompt.is_string()) {
+                throw std::invalid_argument("images need a chat prompt");
+            }
+            std::vector<std::pair<int32_t, int32_t>> grids;
+            for (size_t i = 0; i < files.size(); ++i) {
+                fnfl_image_info info;
+                std::string     err;
+                fnfl_image * im = fnfl_image_prepare(files[i].data(), files[i].size(), fnfl_image_limits(), info, err);
+                if (im == nullptr) {
+                    throw std::invalid_argument("image " + std::to_string(i + 1) + ": " + err);
+                }
+                images.emplace_back(0, std::shared_ptr<fnfl_image>(im, fnfl_image_free));
+                grids.emplace_back(info.nx, info.ny);
+            }
+            files.clear();
+            std::vector<int64_t> cells;
+            inputs.emplace_back(
+                tokenize_with_images(ctx_server.vocab, prompt.get<std::string>(), grids, fnfl_image_token(), cells));
+            for (size_t i = 0; i < images.size(); ++i) {
+                images[i].first = cells[i];
+            }
+        } else {
+            inputs = tokenize_input_prompts(ctx_server.vocab, prompt, true, true);
+        }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
@@ -2624,6 +2873,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
+            task.images = images;  // VIS1 Stage B (one prompt when it has images)
             task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
@@ -2632,7 +2882,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
-            task.id_slot = json_value(data, "id_slot", -1);
+            // SSF1: a slot that does not exist is refused here; the lookup's null would fall through to any free slot
+            const int64_t id_slot = json_value(data, "id_slot", int64_t(-1));
+            if (!slot_id_valid(id_slot, params.n_parallel, true)) {
+                throw std::invalid_argument("Invalid slot ID");
+            }
+            task.id_slot      = static_cast<int>(id_slot);
             sse_ping_interval = task.params.sse_ping_interval;
 
             // OAI-compat
@@ -2844,6 +3099,11 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
     });
 }
 
+void server_print_fnfl_build(FILE * out) {
+    fprintf(out, "fnfl: commit %s\n", fnfl_build_commit());
+    fflush(out);
+}
+
 static json get_res_model_info(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
@@ -2939,6 +3199,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
         { "tu",                          tu }, // (ticket TU2; MU1) two-user scheduling, the effective values
     };
+    props["prompt_graphs"] = fnfl_prompt_graphs();  // APF2: the prompt path's unit graphs switch
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
             props["chat_template_tool_use"] = tmpl_tools;
@@ -3077,10 +3338,9 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::string id_slot_str = req.get_param("id_slot");
 
-        int id_slot;
-        try {
-            id_slot = std::stoi(id_slot_str);
-        } catch (const std::exception &) {
+        // SSF1: the whole string, in range (stoi took a numeric prefix, so "3abc" erased slot 3)
+        int32_t id_slot = -1;
+        if (!slot_id_parse(id_slot_str, params.n_parallel, id_slot)) {
             res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
             return res;
         }
@@ -3113,7 +3373,17 @@ void server_routes::init_routes() {
 
     this->post_props = [this](const server_http_req & req) {
         auto res = create_response();
-        if (!params.endpoint_props) {
+        json body;
+        try {
+            body = req.body.empty() ? json::object() : json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        // APF2: a body of {"prompt_graphs": true|false} alone is taken without --props (the production launch has none):
+        // it changes no output, only whether the prompt path's units replay as graphs or run eagerly
+        const bool graphs_only = body.is_object() && body.size() == 1 && body.contains("prompt_graphs");
+        if (!params.endpoint_props && !graphs_only) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
@@ -3123,12 +3393,23 @@ void server_routes::init_routes() {
         // rejected request changes nothing; the owner thread applies it between steps and answers with the effective
         // values. FNFL's TU is engaged whenever the server has more than one slot, and TU6's fix and fair_read are its
         // permanent behavior: every other tu. field is rejected
-        json body;
-        try {
-            body = req.body.empty() ? json::object() : json::parse(req.body);
-        } catch (const std::exception & e) {
-            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
-            return res;
+        // APF2: {"prompt_graphs": true|false}, the prompt path's unit graphs (fnfl_set_prompt_graphs: process-wide, on
+        // the split the back follows at its next read). Applied at once: a chunk begun after it takes the switch
+        if (body.is_object() && body.contains("prompt_graphs")) {
+            const json & pg = body.at("prompt_graphs");
+            if (!pg.is_boolean()) {
+                res->error(format_error_response("prompt_graphs must be true or false", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            fnfl_set_prompt_graphs(pg.get<bool>());
+            LOG_WRN("prompt graphs %s (POST /props)\n", pg.get<bool>() ? "on" : "off");
+            if (!body.contains("tu")) {
+                res->ok({
+                    { "success",       true                 },
+                    { "prompt_graphs", fnfl_prompt_graphs() }
+                });
+                return res;
+            }
         }
         if (body.is_object() && body.contains("tu")) {
             const json & tu = body.at("tu");
@@ -3152,6 +3433,10 @@ void server_routes::init_routes() {
                     } else {
                         task.tu_set.group = (int32_t) std::min<int64_t>(v.get<int64_t>(), INT32_MAX);
                     }
+                } else if (key == "writer_pause_ms") {
+                    // APF1: the writers' pause target beside any read, an integer from 10 to 1,000 ms (a rejected
+                    // request changes nothing: the valid P stays)
+                    tu_pause_parse(v, task.tu_set.writer_pause_ms, err);
                 } else if (key == "enabled" || key == "fix" || key == "fair_read") {
                     err = "tu." + key + " is not a setting on FNFL: two-user scheduling is engaged with more than one "
                           "slot, and TU6's fix and fair read are its permanent behavior";
@@ -3284,14 +3569,10 @@ void server_routes::init_routes() {
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params);
-        return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            TASK_RESPONSE_TYPE_OAI_CHAT);
+        std::vector<raw_buffer> files;  // VIS1 Stage B
+        json                    body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, &files);
+        return handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, body_parsed, TASK_RESPONSE_TYPE_OAI_CHAT,
+                                       std::move(files));
     };
 
     this->post_chat_completions_tok = [this](const server_http_req & req) {
@@ -3303,14 +3584,10 @@ void server_routes::init_routes() {
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params);
-        return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            TASK_RESPONSE_TYPE_OAI_RESP);
+        std::vector<raw_buffer> files;  // VIS1 Stage B
+        json                    body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, &files);
+        return handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, body_parsed, TASK_RESPONSE_TYPE_OAI_RESP,
+                                       std::move(files));
     };
 
     this->post_responses_tok_oai = [this](const server_http_req & req) {
@@ -3322,14 +3599,10 @@ void server_routes::init_routes() {
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params);
-        return handle_completions_impl(
-            req,
-            SERVER_TASK_TYPE_COMPLETION,
-            body_parsed,
-            TASK_RESPONSE_TYPE_ANTHROPIC);
+        std::vector<raw_buffer> files;  // VIS1 Stage B
+        json                    body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, &files);
+        return handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, body_parsed, TASK_RESPONSE_TYPE_ANTHROPIC,
+                                       std::move(files));
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {
@@ -3340,9 +3613,8 @@ void server_routes::init_routes() {
     this->post_apply_template = [this](const server_http_req & req) {
         auto res = create_response();
         json body = json::parse(req.body);
-        json data = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params);
+        std::vector<raw_buffer> files;  // VIS1 Stage B: the template shows the media markers
+        json                    data = oaicompat_chat_params_parse(body, meta->chat_params, &files);
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };

@@ -4,6 +4,7 @@
 #include "fn/kernels/qsa/attend.h"
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/proto/xp1/timing.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -40,11 +41,7 @@ constexpr double fma_per_us = 72.0 * 64.0 * 1380.0; // FP32 lanes x clock
 constexpr int64_t flush_bytes = 12 << 20;           // the L2 flush (XP1 Amendment 4)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "qa2-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "qa2-bench", what);
 }
 
 std::string utc_now() {

@@ -16,14 +16,22 @@
 // Run in load 1 after rollback-test mu1 (rollback-test IDS OUT mu1 --joint-kl DEEP: the same process, the model taken
 // from its engine), or standalone: fnfl-drive joint-kl DEEP OUT [real|dry] (dry: zero weights, plumbing only; the
 // logits all equal, so every KL is 0).
+//
+// MUP2 (--kl-depths D,... [--kl-d d], the split only): the same comparison at depth. Each lane's text starts 24,576
+// tokens after the previous lane's; its first D tokens are read first (the lone bulk geometry, q8 or BF16 KV as the
+// pass), the processed tokens kept, and the forced rounds cover positions D .. D + 1,023. Each pass (lone, joint,
+// the yardstick) reads its histories again. A depth's slots hold its history and rounds in whole KV pages; a depth
+// whose read's last page would not hold the rounds is refused. Outputs carry -depth<D>.
 
 #include "fn/kernels/head/head.h"
 #include "fn/loader/run_load.h"
 #include "fn/model/model.h"
+#include "fn/model/prompt.h"
 #include "fn/runtime/joint.h"
 #include "fn/runtime/runtime.h"
 #include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -61,16 +69,14 @@ constexpr int32_t lane_tokens_of(int32_t rows) {
 }                                          // 1,025 at R = 5
 
 constexpr int32_t max_lane_tokens = 1026;  // R = 3's, the most
+// MUP2: joint-kl at depth: the lanes' texts 24,576 tokens apart (the histories distinct within HX7's 196,608 tokens)
+constexpr int32_t depth_lane_stride = 24576;
 static_assert(lane_tokens_of(2) <= max_lane_tokens && lane_tokens_of(3) <= max_lane_tokens &&
                   lane_tokens_of(4) <= max_lane_tokens && lane_tokens_of(5) <= max_lane_tokens,
               "the source holds every R's lane tokens");
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "joint-kl: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "joint-kl", what);
 }
 
 bool read_ids(const std::string & path, std::vector<int32_t> & out) {
@@ -541,8 +547,9 @@ bool make_engine_split(const fnfl_target_args &   a,
             return false;
         }
         rt::read_status rs = rt::read_status::yielded;
-        while (rs == rt::read_status::yielded || rs == rt::read_status::chunk_done) {
-            rs = L.read_step(k, fn::n_layer, rt::read_mode::shared);
+        while (rs == rt::read_status::yielded || rs == rt::read_status::chunk_done ||
+               rs == rt::read_status::front_done) {
+            rs = L.read_step(k, fn::n_layer, rt::read_mode::shared);  // PRD1: front_done polls to the end
         }
         if (rs != rt::read_status::done) {
             fprintf(stderr, "joint-kl: lane %d's read did not finish: %s\n", k, L.error().c_str());
@@ -561,15 +568,48 @@ void store_logits(const std::vector<float> & lg, int32_t rows, int32_t k, int32_
     }
 }
 
-// each lane alone (a forced step group of one a round), from a reset with its text as the ledger on both boxes
+// MUP2: a lane's start: with no history a reset with its text as the ledger on both boxes; with a history (joint-kl
+// at depth) the history read from token 0 (the lone bulk geometry), its tokens kept and the text appended, so the
+// forced rounds run at that depth
+bool lane_start(st::leader &                 L,
+                int32_t                      k,
+                const std::vector<int32_t> & hist,
+                const std::vector<int32_t> & tok,
+                rt::read_mode                mode = rt::read_mode::lone) {
+    if (hist.empty()) {
+        if (L.test_prompt(k, tok) != rt::run_status::ok) {
+            fprintf(stderr, "joint-kl: lane %d reset: %s\n", k, L.error().c_str());
+            return false;
+        }
+        return true;
+    }
+    int32_t np = 0;
+    if (L.read_begin(k, hist.data(), int32_t(hist.size()), 0, np) != 0) {
+        fprintf(stderr, "joint-kl: lane %d's history read: %s\n", k, L.error().c_str());
+        return false;
+    }
+    rt::read_status rs = rt::read_status::yielded;
+    while (rs == rt::read_status::yielded || rs == rt::read_status::chunk_done) {
+        rs = L.read_step(k, fn::n_layer, mode);
+    }
+    if (rs != rt::read_status::done || L.test_prompt(k, tok, true) != rt::run_status::ok) {
+        fprintf(stderr, "joint-kl: lane %d's history: %s\n", k, L.error().c_str());
+        return false;
+    }
+    return true;
+}
+
+// each lane alone (a forced step group of one a round), from a reset with its text as the ledger on both boxes (MUP2:
+// or from its history, lane_start)
 bool lone_pass_split(st::leader & L,
                      int32_t      rows,
+                     const std::vector<int32_t> (&hist)[lanes],
                      const std::vector<int32_t> (&tok)[lanes],
                      logit_store & s,
-                     int32_t &     failed) {
+                     int32_t &     failed,
+                     rt::read_mode mode = rt::read_mode::lone) {
     for (int32_t k = 0; k < lanes; ++k) {
-        if (L.test_prompt(k, tok[k]) != rt::run_status::ok) {
-            fprintf(stderr, "joint-kl: lane %d reset: %s\n", k, L.error().c_str());
+        if (!lane_start(L, k, hist[k], tok[k], mode)) {
             return false;
         }
         for (int32_t i = 0; i < rounds_of(rows); ++i) {
@@ -592,13 +632,13 @@ bool lone_pass_split(st::leader & L,
 bool joint_pass_split(st::leader & L,
                       int32_t      groups,
                       int32_t      rows,
+                      const std::vector<int32_t> (&hist)[lanes],
                       const std::vector<int32_t> (&tok)[lanes],
                       logit_store & s,
                       int32_t &     failed,
                       int32_t &     joint_lanes) {
     for (int32_t k = 0; k < lanes; ++k) {
-        if (L.test_prompt(k, tok[k]) != rt::run_status::ok) {
-            fprintf(stderr, "joint-kl: lane %d reset: %s\n", k, L.error().c_str());
+        if (!lane_start(L, k, hist[k], tok[k])) {
             return false;
         }
     }
@@ -649,6 +689,7 @@ bool kl_at_split(const fnfl_target_args &     a,
                  int32_t                      cells,
                  const std::vector<int32_t> & src,
                  int32_t                      d,
+                 int32_t                      depth,
                  fnfl_split &                 sp,
                  logit_store &                lone,
                  logit_store &                other,
@@ -656,14 +697,19 @@ bool kl_at_split(const fnfl_target_args &     a,
     const int32_t        rows        = d + 1;
     const int32_t        rounds      = rounds_of(rows);
     const int32_t        lane_tokens = lane_tokens_of(rows);
-    std::vector<int32_t> tok[lanes];
+    // MUP2: at depth each lane's text starts 24,576 tokens after the previous lane's (four distinct histories in
+    // HX7's 196,608 tokens), its first depth tokens the history read before the forced rounds
+    const int32_t        stride      = depth > 0 ? depth_lane_stride : positions;
+    std::vector<int32_t> tok[lanes], hist[lanes];
     for (int32_t k = 0; k < lanes; ++k) {
-        tok[k].assign(src.begin() + k * positions, src.begin() + k * positions + lane_tokens);
+        const size_t at = size_t(k) * size_t(stride);
+        hist[k].assign(src.begin() + at, src.begin() + at + size_t(depth));
+        tok[k].assign(src.begin() + at + size_t(depth), src.begin() + at + size_t(depth) + size_t(lane_tokens));
     }
     printf(
-        "joint-kl: d = %d (the split, k %d): four lanes at offsets 0, 1024, 2048, 3072, %d tokens each (%d forced "
-        "rounds of %d rows), positions 0 .. %d of each reported\n",
-        d, a.split_k, lane_tokens, rounds, rows, positions - 1);
+        "joint-kl: d = %d (the split, k %d): four lanes at offsets 0, %d, %d, %d, %d tokens each (%d forced "
+        "rounds of %d rows) after a history of %d tokens, positions %d .. %d of each reported\n",
+        d, a.split_k, stride, 2 * stride, 3 * stride, lane_tokens, rounds, rows, depth, depth, depth + positions - 1);
     st::leader &         L = *sp.lead;
     std::vector<int32_t> gs;
     if (a.split_groups == 0 || a.split_groups == 1) {
@@ -684,14 +730,14 @@ bool kl_at_split(const fnfl_target_args &     a,
     {
         std::unique_ptr<rt::engine> e;
         if (!make_engine_split(a, std::move(m), cells, d, true, tok, sp, e) ||
-            !lone_pass_split(L, rows, tok, lone, w_lone)) {
+            !lone_pass_split(L, rows, hist, tok, lone, w_lone)) {
             return false;
         }
         printf("joint-kl: d = %d: lone pass (q8 KV, the split): %d lanes x %d rounds\n", d, lanes, rounds);
         for (size_t q = 0; q < gs.size(); ++q) {
             int32_t       joint_lanes = 0;
             const int64_t r0          = e->test_joint_frame()->rounds();
-            if (!joint_pass_split(L, gs[q], rows, tok, other, w_joint[q], joint_lanes)) {
+            if (!joint_pass_split(L, gs[q], rows, hist, tok, other, w_joint[q], joint_lanes)) {
                 return false;
             }
             printf(
@@ -720,7 +766,7 @@ bool kl_at_split(const fnfl_target_args &     a,
     {
         std::unique_ptr<rt::engine> e;
         if (!make_engine_split(a, std::move(m), cells, d, false, tok, sp, e) ||
-            !lone_pass_split(L, rows, tok, other, w_yard)) {
+            !lone_pass_split(L, rows, hist, tok, other, w_yard)) {
             return false;
         }
         printf("joint-kl: d = %d: lone pass (BF16 KV, the split, the yardstick): %d lanes x %d rounds\n", d, lanes,
@@ -753,7 +799,8 @@ bool kl_at_split(const fnfl_target_args &     a,
         printf("joint-kl: d = %d: %s: joint p50 %s, p99 %s, max %s, top-1 %s the yardstick's; every round %s\n", d,
                name, p50 ? "<=" : "ABOVE", p99 ? "<=" : "ABOVE", pmax ? "<=" : "ABOVE", ptop ? "<=" : "ABOVE",
                words ? "clean (a set error word fails its round on either box)" : "NOT clean");
-        const std::string stem = a.out_dir + "/joint-kl-d" + std::to_string(d) + "-g" + std::to_string(gs[q]);
+        const std::string stem = a.out_dir + "/joint-kl-d" + std::to_string(d) + "-g" + std::to_string(gs[q]) +
+                                 (depth > 0 ? "-depth" + std::to_string(depth) : "");
         FILE *            jf   = fopen((stem + ".json").c_str(), "w");
         FILE *            tf   = fopen((stem + "-per-position.tsv").c_str(), "w");
         if (jf == nullptr || tf == nullptr) {
@@ -767,12 +814,13 @@ bool kl_at_split(const fnfl_target_args &     a,
             return false;
         }
         fprintf(jf,
-                "{\"d\": %d, \"rows\": %d, \"positions\": %d, \"split\": {\"k\": %d, \"groups\": %d}, \"joint\": "
+                "{\"d\": %d, \"depth\": %d, \"rows\": %d, \"positions\": %d, \"split\": {\"k\": %d, \"groups\": %d}, "
+                "\"joint\": "
                 "{\"p50\": %.9g, \"p99\": %.9g, \"max\": %.9g, \"top1_differ\": %d}, \"yardstick\": {\"p50\": %.9g, "
                 "\"p99\": %.9g, \"max\": %.9g, \"top1_differ\": %d}, \"first_divergence\": [%d, %d, %d, %d], "
                 "\"failed_rounds\": [%d, %d, %d], \"dry\": %s}\n",
-                d, rows, lanes * positions, a.split_k, gs[q], j.p50, j.p99, j.max, j.top1, y.p50, y.p99, y.max, y.top1,
-                j.first[0], j.first[1], j.first[2], j.first[3], w_lone, w_joint[q], w_yard,
+                d, depth, rows, lanes * positions, a.split_k, gs[q], j.p50, j.p99, j.max, j.top1, y.p50, y.p99, y.max,
+                y.top1, j.first[0], j.first[1], j.first[2], j.first[3], w_lone, w_joint[q], w_yard,
                 a.mode == "dry" ? "true" : "false");
         fprintf(tf, "lane\tpos\tkl_lone_joint\tkl_bf16_q8\ttop1_lone\ttop1_joint\ttop1_bf16\n");
         for (int32_t i = 0; i < lanes * positions; ++i) {
@@ -785,6 +833,217 @@ bool kl_at_split(const fnfl_target_args &     a,
         printf("joint-kl: d = %d: %s: %s\n", d, name, ok ? "PASS" : "FAIL");
         pass = pass && ok;
     }
+    return true;
+}
+
+// APF2 (--route-kl): the kernel-size ladder's whole-model contract (APF2 section 5) at depth on the split. Each lane's
+// history is read under the arm's prompt routes on both boxes (stage::leader::test_force_route), then the forced
+// rounds (d + 1 rows, under 8 rows: the retained routes in every arm) report the next-token distributions that
+// follow. In q8 KV: the reference, every route retained (dense converted, HC converted, per-task experts, eager);
+// the table's routes (serving's); the new routes (each product the cost model's first rank, the grouped experts
+// wherever the format takes them, graphs on); the table's routes in 1,024-row pieces (writers mode, the partition a
+// read beside writers takes); the table's routes again (bitwise its first run: determinism). In BF16 KV: the
+// reference's routes, the yardstick. PASS: every arm's KL(reference || arm) p50, p99, max and top-1 differences each at
+// most the yardstick's KL(BF16 || q8 reference); the rerun's logits bitwise; every round clean; the reference arm
+// retained on both boxes, and (UD-Q4_K_XL) the table arm's front ladder products counted.
+uint64_t logits_hash(logit_store & s, int32_t i) {
+    const float * p = s.at(i / positions, i % positions);
+    uint64_t      h = 1469598103934665603ull;
+    const auto *  b = reinterpret_cast<const uint8_t *>(p);
+    for (size_t j = 0; j < size_t(V) * 4; ++j) {
+        h = (h ^ b[j]) * 1099511628211ull;
+    }
+    return h;
+}
+
+std::vector<uint64_t> hashes_of(logit_store & s) {
+    std::vector<uint64_t>    h(size_t(lanes) * positions);
+    const int32_t            nt = std::max(1, std::min(32, int32_t(std::thread::hardware_concurrency())));
+    std::vector<std::thread> th;
+    for (int32_t w = 0; w < nt; ++w) {
+        th.emplace_back([&, w]() {
+            for (int32_t i = w; i < lanes * positions; i += nt) {
+                h[size_t(i)] = logits_hash(s, i);
+            }
+        });
+    }
+    for (std::thread & t : th) {
+        t.join();
+    }
+    return h;
+}
+
+// the front process's totals now (collected)
+md::prompt_path::route_counts front_totals() {
+    md::prompt_path::route_counts r;
+    uint32_t                      g = 0;
+    md::prompt_route_totals(r, g, true);
+    return r;
+}
+
+bool route_kl_split(const fnfl_target_args &     a,
+                    std::unique_ptr<md::model> & m,
+                    int32_t                      cells,
+                    const std::vector<int32_t> & src,
+                    int32_t                      d,
+                    int32_t                      depth,
+                    fnfl_split &                 sp,
+                    logit_store &                lone,
+                    logit_store &                other,
+                    bool &                       pass) {
+    const int32_t        rows        = d + 1;
+    const int32_t        lane_tokens = lane_tokens_of(rows);
+    const int32_t        stride      = depth_lane_stride;
+    std::vector<int32_t> tok[lanes], hist[lanes];
+    for (int32_t k = 0; k < lanes; ++k) {
+        const ptrdiff_t at = ptrdiff_t(k) * stride;
+        hist[k].assign(src.begin() + at, src.begin() + at + depth);
+        tok[k].assign(src.begin() + at + depth, src.begin() + at + depth + lane_tokens);
+    }
+    printf(
+        "joint-kl: route-kl: d = %d (the split, k %d): four lanes %d tokens apart, each a history of %d tokens read "
+        "under the arm's routes, then %d forced rounds of %d rows; positions %d .. %d of each reported\n",
+        d, a.split_k, stride, depth, rounds_of(rows), rows, depth, depth + positions - 1);
+    st::leader &                 L = *sp.lead;
+    const md::prompt_route_force retained{ 2, 2, 2, 2 }, table{}, fresh{ 1, 1, 1, 1 };
+    md::prompt_route_collect(true);
+
+    struct arm {
+        const char *                  name;
+        md::prompt_route_force        force;
+        int32_t                       piece_rows;
+        kl_stats                      st;
+        md::prompt_path::route_counts front, back;
+        int32_t                       failed  = 0;
+        bool                          bitwise = false;
+    };
+
+    arm arms[] = {
+        { "reference (retained routes)",          retained, 0,    {}, {}, {} },
+        { "the table's routes",                   table,    0,    {}, {}, {} },
+        { "the new routes",                       fresh,    0,    {}, {}, {} },
+        { "the table's routes, 1,024-row pieces", table,    1024, {}, {}, {} },
+        { "the table's routes again (rerun)",     table,    0,    {}, {}, {} },
+    };
+    const int32_t         n_arms = int32_t(sizeof arms / sizeof arms[0]);
+    std::vector<uint64_t> h_table;
+    bool                  dense_q8 = false;
+    if (!lay_out(*m, cells, true)) {
+        return false;
+    }
+    {
+        std::unique_ptr<rt::engine> e;
+        if (!make_engine_split(a, std::move(m), cells, d, true, tok, sp, e)) {
+            return false;
+        }
+        dense_q8 = md::dense_q8_of(e->test_model());
+        for (int32_t i = 0; i < n_arms; ++i) {
+            arm &                         x = arms[i];
+            md::prompt_path::route_counts b0, b1;
+            if (L.test_force_route(x.force, &b0) != rt::run_status::ok) {
+                fprintf(stderr, "joint-kl: route-kl: %s: %s\n", x.name, L.error().c_str());
+                return false;
+            }
+            e->test_piece_rows(x.piece_rows);
+            const md::prompt_path::route_counts f0 = front_totals();
+            const bool ok = lone_pass_split(L, rows, hist, tok, i == 0 ? lone : other, x.failed,
+                                            x.piece_rows > 0 ? rt::read_mode::writers : rt::read_mode::lone);
+            e->test_piece_rows(0);
+            const md::prompt_path::route_counts f1 = front_totals();
+            if (!ok || L.test_force_route(table, &b1) != rt::run_status::ok) {
+                fprintf(stderr, "joint-kl: route-kl: %s: %s\n", x.name, ok ? L.error().c_str() : "the pass failed");
+                return false;
+            }
+            x.front.add_since(f1, f0);
+            x.back.add_since(b1, b0);
+            if (i > 0) {
+                std::vector<double>  k;
+                std::vector<int32_t> tr, ta;
+                compare(lone, other, k, tr, ta);
+                x.st = stats_of(k, tr, ta);
+                if (i == 1) {
+                    h_table = hashes_of(other);
+                } else if (i == n_arms - 1) {
+                    x.bitwise = hashes_of(other) == h_table;
+                }
+            }
+            printf("joint-kl: route-kl: d = %d, depth %d: %s (q8 KV): front %s; back %s; failed rounds %d\n", d, depth,
+                   x.name, x.front.text().c_str(), x.back.text().c_str(), x.failed);
+            fflush(stdout);
+        }
+        m = e->test_take_model();
+    }
+    // the yardstick: BF16 KV, the reference's routes
+    if (m == nullptr || !lay_out(*m, cells, false)) {
+        return false;
+    }
+    std::vector<double>  ky;
+    std::vector<int32_t> t_bf16, t_lone2;
+    int32_t              w_yard = 0;
+    {
+        std::unique_ptr<rt::engine> e;
+        if (!make_engine_split(a, std::move(m), cells, d, false, tok, sp, e) ||
+            L.test_force_route(retained) != rt::run_status::ok || !lone_pass_split(L, rows, hist, tok, other, w_yard) ||
+            L.test_force_route(table) != rt::run_status::ok) {
+            return false;
+        }
+        compare(other, lone, ky, t_bf16, t_lone2);
+        m = e->test_take_model();
+    }
+    const kl_stats y = stats_of(ky, t_bf16, t_lone2);
+    printf(
+        "joint-kl: route-kl: d = %d, depth %d: yardstick KL(BF16 KV || q8 KV), the reference's routes: p50 %.6g p99 "
+        "%.6g max %.6g; top-1 differs at %d\n",
+        d, depth, y.p50, y.p99, y.max, y.top1);
+    const md::prompt_path::route_counts & rf = arms[0].front;
+    const md::prompt_path::route_counts & rb = arms[0].back;
+    const bool ret_ok    = rf.dense_ladder == 0 && rf.hc_ladder == 0 && rf.ex_grouped == 0 && rf.exd_grouped == 0 &&
+                           rf.graph_units == 0 && rb.dense_ladder == 0 && rb.hc_ladder == 0 && rb.ex_grouped == 0 &&
+                           rb.exd_grouped == 0 && rb.graph_units == 0 && rf.dense_retained > 0;
+    const bool table_ran = !dense_q8 || md::lad_table().empty() || arms[1].front.dense_ladder > 0;
+    printf(
+        "joint-kl: route-kl: d = %d, depth %d: the reference arm retained on both boxes: %s; the table's entries "
+        "ran (front ladder products in the table arm%s): %s\n",
+        d, depth, ret_ok ? "yes" : "NO", dense_q8 ? "" : "; not UD-Q4_K_XL: none expected", table_ran ? "yes" : "NO");
+    pass                   = ret_ok && table_ran && w_yard == 0 && arms[0].failed == 0;
+    const std::string stem = a.out_dir + "/route-kl-d" + std::to_string(d) + "-depth" + std::to_string(depth);
+    FILE *            jf   = fopen((stem + ".json").c_str(), "w");
+    if (jf == nullptr) {
+        fprintf(stderr, "joint-kl: cannot write %s.json\n", stem.c_str());
+        return false;
+    }
+    fprintf(jf,
+            "{\"d\": %d, \"depth\": %d, \"positions\": %d, \"yardstick\": {\"p50\": %.9g, \"p99\": %.9g, "
+            "\"max\": %.9g, \"top1_differ\": %d}, \"reference_retained\": %s, \"table_ran\": %s, \"arms\": [",
+            d, depth, lanes * positions, y.p50, y.p99, y.max, y.top1, ret_ok ? "true" : "false",
+            table_ran ? "true" : "false");
+    for (int32_t i = 1; i < n_arms; ++i) {
+        const arm & x   = arms[i];
+        const bool  p50 = x.st.p50 <= y.p50, p99 = x.st.p99 <= y.p99, pmax = x.st.max <= y.max,
+                    ptop = x.st.top1 <= y.top1;
+        const bool  det  = i != n_arms - 1 || x.bitwise;
+        const bool  ok   = p50 && p99 && pmax && ptop && det && x.failed == 0;
+        printf(
+            "joint-kl: route-kl: d = %d, depth %d: %s: KL(reference || arm) p50 %.6g (%s), p99 %.6g (%s), max "
+            "%.6g (%s), top-1 differs at %d (%s) against the yardstick%s; %s\n",
+            d, depth, x.name, x.st.p50, p50 ? "<=" : "ABOVE", x.st.p99, p99 ? "<=" : "ABOVE", x.st.max,
+            pmax ? "<=" : "ABOVE", x.st.top1, ptop ? "<=" : "ABOVE",
+            i == n_arms - 1 ? (x.bitwise ? "; logits bitwise the first table run's" :
+                                           "; logits DIFFER from the "
+                                           "first table run's") :
+                              "",
+            ok ? "PASS" : "FAIL");
+        fprintf(jf,
+                "%s{\"arm\": \"%s\", \"p50\": %.9g, \"p99\": %.9g, \"max\": %.9g, \"top1_differ\": %d, "
+                "\"bitwise_rerun\": %s, \"failed_rounds\": %d, \"front\": \"%s\", \"back\": \"%s\"}",
+                i > 1 ? ", " : "", x.name, x.st.p50, x.st.p99, x.st.max, x.st.top1,
+                i == n_arms - 1 ? (x.bitwise ? "true" : "false") : "null", x.failed, x.front.text().c_str(),
+                x.back.text().c_str());
+        pass = pass && ok;
+    }
+    fprintf(jf, "]}\n");
+    fclose(jf);
+    printf("joint-kl: route-kl: d = %d, depth %d: %s\n", d, depth, pass ? "PASS" : "FAIL");
     return true;
 }
 }  // namespace
@@ -805,9 +1064,14 @@ bool fnfl_lay_out(fn::model::model & m, int32_t cells, int32_t slots, bool kv_q8
     sp.single              = m.single;
     sp.kv_q8               = kv_q8;
     sp.win                 = m.win;  // TTTS1
+    fn::loader::file_state_params(m, sp);  // TTTS3: the Q4 file's head and PLE state, as the run load's
     int64_t     host_bytes = 0;
     std::string err;
-    if (!fn::loader::reserve_state(m, sp, slots, host_bytes, err) || !fn::loader::fill_ex1_grids(m, err)) {
+    // MUP2: the shared pool (either format, more than one slot) holds four whole slots: joint-kl's four lanes at depth
+    // each fill most of one, and rollback-test mu1's section 9 holds a 64K read beside four writers (0 would be one
+    // slot's pages; every slot's would double the 8-slot follower's BF16 pool at depth 100,000)
+    const int32_t pool = slots > 1 ? std::min(slots, 4) * cells : 0;
+    if (!fn::loader::reserve_state(m, sp, slots, host_bytes, err, pool) || !fn::loader::fill_ex1_grids(m, err)) {
         fprintf(stderr, "joint-kl: the %s reservation: %s\n", kv_q8 ? "q8" : "BF16", err.c_str());
         return false;
     }
@@ -832,8 +1096,29 @@ int fnfl_joint_kl_on(const fnfl_target_args & a, std::unique_ptr<fn::model::mode
         return 1;
     }
     std::vector<int32_t> src;
-    const int32_t        need      = 3 * positions + max_lane_tokens;
-    const bool           from_file = read_ids(a.joint_kl, src) && int32_t(src.size()) >= need;
+    // MUP2: the depths (0: none) and the d's
+    std::vector<int32_t> depths = a.kl_depths.empty() ? std::vector<int32_t>{ 0 } : a.kl_depths;
+    const int32_t        d0 = a.kl_d > 0 ? a.kl_d : 1, d1 = a.kl_d > 0 ? a.kl_d : max_rows - 1;
+    const int32_t        deepest = *std::max_element(depths.begin(), depths.end());
+    if (deepest > 0 && sp == nullptr) {
+        fprintf(stderr, "joint-kl: --kl-depths runs on the split\n");
+        return 2;
+    }
+    if (a.route_kl && (sp == nullptr || deepest == 0)) {
+        fprintf(stderr, "joint-kl: --route-kl runs on the split at depth (--kl-depths)\n");
+        return 2;
+    }
+    for (const int32_t dp : depths) {
+        // the read's pages (its tokens and next step) hold the compared rounds' cells
+        const int32_t pc = fn::model::kv_page_cells;
+        if (dp > 0 && (dp + 5 + pc - 1) / pc * pc < dp + max_lane_tokens) {
+            fprintf(stderr, "joint-kl: depth %d: the compared rounds would leave its read's last KV page\n", dp);
+            return 2;
+        }
+    }
+    const int32_t need =
+        deepest > 0 ? 3 * depth_lane_stride + deepest + max_lane_tokens : 3 * positions + max_lane_tokens;
+    const bool from_file = read_ids(a.joint_kl, src) && int32_t(src.size()) >= need;
     if (!from_file) {
         if (a.mode != "dry") {
             fprintf(stderr, "joint-kl: %s holds fewer than %d tokens\n", a.joint_kl.c_str(), need);
@@ -844,8 +1129,8 @@ int fnfl_joint_kl_on(const fnfl_target_args & a, std::unique_ptr<fn::model::mode
             src[i] = int32_t(1000 + (i * 7919u) % 150000u);  // dry: a seeded sequence of vocabulary IDs
         }
     }
-    printf("joint-kl: %s; d = 1 .. 4 in turn%s\n", from_file ? a.joint_kl.c_str() : "a seeded sequence (dry)",
-           a.mode == "dry" ? "; DRY: zero weights (plumbing only)" : "");
+    printf("joint-kl: %s; d = %d .. %d in turn%s%s\n", from_file ? a.joint_kl.c_str() : "a seeded sequence (dry)", d0,
+           d1, deepest > 0 ? "; MUP2: at depth" : "", a.mode == "dry" ? "; DRY: zero weights (plumbing only)" : "");
     float * pinned = nullptr;
     if (!cuda_ok(cudaMallocHost(&pinned, size_t(2) * max_rows * VC * 4), "pinned logits")) {
         return 1;
@@ -855,21 +1140,29 @@ int fnfl_joint_kl_on(const fnfl_target_args & a, std::unique_ptr<fn::model::mode
     lone.init();
     other.init();
     bool all = true;
-    for (int32_t d = 1; d <= max_rows - 1; ++d) {
-        bool pass = false;
-        if (sp != nullptr ? !kl_at_split(a, m, cells, src, d, *sp, lone, other, pass) :
-                            !kl_at(a, m, cells, src, d, pinned, lone, other, pass)) {
-            if (sp != nullptr) {
-                sp->lead->bye();
+    for (const int32_t dp : depths) {
+        // MUP2: a slot's cells hold the history and the compared rounds (whole pages)
+        const int32_t pc = fn::model::kv_page_cells;
+        const int32_t cl = std::max(cells, (dp + max_lane_tokens + pc - 1) / pc * pc);
+        for (int32_t d = d0; d <= d1; ++d) {
+            bool pass = false;
+            const bool ran  = a.route_kl    ? route_kl_split(a, m, cl, src, d, dp, *sp, lone, other, pass) :
+                              sp != nullptr ? kl_at_split(a, m, cl, src, d, dp, *sp, lone, other, pass) :
+                                              kl_at(a, m, cl, src, d, pinned, lone, other, pass);
+            if (!ran) {
+                if (sp != nullptr) {
+                    sp->lead->bye();
+                }
+                return 1;
             }
-            return 1;
+            printf("joint-kl: depth %d, d = %d: %s\n", dp, d, pass ? "PASS" : "FAIL");
+            all = all && pass;
         }
-        all = all && pass;
     }
     if (sp != nullptr) {
         sp->lead->bye();
     }
-    printf("joint-kl: %s (d = 1 .. 4)\n", all ? "PASS" : "FAIL");
+    printf("joint-kl: %s (d = %d .. %d)\n", all ? "PASS" : "FAIL", d0, d1);
     return all ? 0 : 1;
 }
 

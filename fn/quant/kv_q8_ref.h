@@ -10,7 +10,7 @@
 //   decoded value = float(code) * s, exact in F32 (at most 7 + 11 significant bits, exponent >= -38)
 // Inputs are finite and amax <= 127 * 65504 (a larger amax rounds the scale to +inf: out of contract).
 //
-// Reused from Strata-V100 (/home/jeremy/src/Strata-V100, d931e1d7): the group-64 format and its quantizer
+// Reused from Strata-V100 (d931e1d7): the group-64 format and its quantizer
 // (src/kernels/cuda/kv_q8.cu quantize_group64 / kv_append_q8_cell) and the exact FP16 conversions
 // (include/strata/kernels/f16_bits.hpp f16_from_f32, f32_from_f16), adapted. Deviation: Strata's gather rounds the
 // decoded value to FP16 for its scratch; FNFL's decode attention keeps it exact in F32.

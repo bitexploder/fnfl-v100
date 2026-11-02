@@ -1,7 +1,9 @@
+#include "fn/kernels/experts/codec.cuh"
+#include "fn/kernels/experts/codec_down.cuh"
 #include "fn/kernels/experts/experts.h"
-
 #include "fn/kernels/experts/experts_dev.cuh"
 #include "fn/kernels/experts/experts_inst.h"
+#include "fn/kernels/experts/profiles.h"
 #include "fn/xchg/xchg.cuh"
 #include "fn/xchg/xchg.h"
 
@@ -17,18 +19,10 @@ namespace fn::experts {
 namespace {
 
 // ---- down -------------------------------------------------------------------------------------------------------
-constexpr int32_t act_stride = 336;    // bytes per staged slot: 320 + 16, 21 x 16 B (odd), so two slots never share a
-                                       // bank group in one 16-byte read
 constexpr int32_t max_rows_block = 36; // ceil(2560 / 72)
 constexpr int32_t dn_threads = 544;    // 17 warps: three groups of 5 R <= 180 item threads (XB4)
-constexpr int32_t dn_depth_q2 = 3;     // Q2_0 items in flight a thread: 540 x 3 x 18 B = 28 KB an SM
-constexpr int32_t dn_depth_nl = 2;     // IQ4_NL: 540 x 2 x 36 B = 38 KB an SM; Q8_0 (DR1): 512 x 2 x 68 B = 68 KB an SM
-// Q8_0 down (the draft's layer) keeps 71b92a9's thread-strided walk at 512 threads: at 544 the cap is 96 registers
-// (5 warps on one of the SM's four 16K-register partitions), and K5 spills 48 bytes there (XB4)
+// TTTS3: each format's walk, threads and depth are its codec's (codec.cuh dn_codec)
 constexpr int32_t dn_threads_strided = 512;
-template <fmt F> constexpr int32_t dn_threads_of() {
-    return F == fmt::q8_0 ? dn_threads_strided : dn_threads;
-}
 
 // SP2: C, the routing capacity (cap_of(B)): capacity 4 is the layout B <= 4 had before SP2
 template <int C> struct dn_smem {
@@ -54,30 +48,6 @@ __device__ __forceinline__ uint4 transpose16(uint32_t w0, uint32_t w1, uint32_t 
                       __byte_perm(b01, b23, 0x7632));
 }
 
-// kvalues_iq4nl of the 8 nibbles of q (ggml's get_int_from_table_16): lo = the low nibbles' values, hi = the high
-__device__ __forceinline__ void table16(uint32_t q, const uint32_t (&t)[4], uint32_t & lo, uint32_t & hi) {
-    const uint32_t sel = 0x32103210u | ((q & 0x88888888u) >> 1);
-    const uint32_t l0 = __byte_perm(t[0], t[1], q), h0 = __byte_perm(t[2], t[3], q);
-    const uint32_t l1 = __byte_perm(t[0], t[1], q >> 16), h1 = __byte_perm(t[2], t[3], q >> 16);
-    const uint32_t x0 = __byte_perm(l0, h0, sel), x1 = __byte_perm(l1, h1, sel >> 16);
-    lo = __byte_perm(x0, x1, 0x6420);
-    hi = __byte_perm(x0, x1, 0x7531);
-}
-
-template <fmt F> struct dn_slot {
-    uint4 c[down_chunks(F)];
-    // FP16 d (Q2_0: low half; IQ4_NL and Q8_0: both blocks); ME1, Q5_1: the blocks' qh words, then d0 m0, d1 m1
-    std::conditional_t<F == fmt::q5_1, uint4, uint32_t> d;
-};
-
-template <fmt F> __host__ __device__ constexpr int64_t dn_expert_bytes() {
-    return F == fmt::q2_0 ? 230400 : F == fmt::q8_0 ? 870400 : F == fmt::q5_1 ? 614400 : 460800;
-}
-static_assert(dn_expert_bytes<fmt::q8_0>() == int64_t(n_item_k) * (down_chunks(fmt::q8_0) * 16 + 4) * D,
-              "Q8_0 down bytes");
-static_assert(dn_expert_bytes<fmt::q5_1>() == int64_t(n_item_k) * (down_chunks(fmt::q5_1) * 16 + 16) * D,
-              "Q5_1 down bytes (GGUF's: 24 bytes a 32 weights)");
-
 // item (j5, n) of one expert's packed down: the byte offsets of its chunk-0 codes and of its d from the expert's first
 // byte (at most 870,400)
 template <fmt F> __device__ __forceinline__ int32_t dn_code_off(int32_t j5, int32_t n) {
@@ -86,148 +56,6 @@ template <fmt F> __device__ __forceinline__ int32_t dn_code_off(int32_t j5, int3
 template <fmt F> __device__ __forceinline__ int32_t dn_d_off(int32_t j5, int32_t n) {
     constexpr int32_t d_plane = n_item_k * down_chunks(F) * D * 16;
     return d_plane + (j5 * D + n) * down_d_bytes(F);
-}
-
-// an item's codes at pc (chunk c at pc + c x D x 16, an immediate offset) and its d at pd
-template <fmt F> __device__ __forceinline__ dn_slot<F> dn_load(const uint8_t * pc, const uint8_t * pd, uint32_t z) {
-    dn_slot<F> v;
-#pragma unroll
-    for (int32_t c = 0; c < down_chunks(F); ++c) {
-        v.c[c] = __ldcs(reinterpret_cast<const uint4 *>(pc + c * D * 16 + z));
-    }
-    if constexpr (F == fmt::q5_1) {
-        v.d = __ldcs(reinterpret_cast<const uint4 *>(pd + z));
-    } else if (F == fmt::q2_0) {
-        v.d = __ldcs(reinterpret_cast<const unsigned short *>(pd + z));
-    } else {
-        v.d = __ldcs(reinterpret_cast<const uint32_t *>(pd + z));
-    }
-    return v;
-}
-
-// FMS4 item 3 (the ticket's fallback form): an item's rows, in mask order (their slots consecutive from slot; the row
-// body reads only the slot): the first unguarded, since a routed unit always has a row, then rows 1..B-1 each guarded
-// by the row count. B - 1 guards instead of B, and no guard at B = 1. ALL: the shared expert's call, every row (a
-// constant mask), unrolled as before.
-template <int B, bool ALL, typename R> __device__ __forceinline__ void dn_rows(uint32_t mask, int32_t slot, R && row) {
-    if constexpr (ALL) {
-#pragma unroll
-        for (int32_t b = 0; b < B; ++b) {
-            row(slot + b);
-        }
-    } else {
-        const int32_t nr = __popc(mask);
-        row(slot);
-#pragma unroll
-        for (int32_t k = 1; k < B; ++k) {
-            if (k < nr) {
-                row(slot + k);
-            }
-        }
-    }
-}
-
-// One item: output row n's dot with columns 64 j5 .. 64 j5 + 63 of one expert, for each row b in mask (their slots
-// consecutive from slot), into part[slot][j5][n]. ALL: mask is every row's (the shared expert).
-template <fmt F, int B, bool ALL = false, typename S>
-__device__ __forceinline__ void dn_item(S & s, const dn_slot<F> & v, int32_t j5, int32_t n, uint32_t mask,
-                                        int32_t slot, const uint32_t (&kv)[4]) {
-    const int32_t kb = 2 * j5; // the 32-value runs of this item
-    if constexpr (F == fmt::q2_0) {
-        uint32_t x[16]; // x[4 i + s] = 2-bit field s of each byte of word i
-#pragma unroll
-        for (int32_t wi = 0; wi < 4; ++wi) {
-            const uint32_t wv = word_of(v.c[0], wi);
-#pragma unroll
-            for (int32_t sh = 0; sh < 4; ++sh) {
-                x[4 * wi + sh] = (wv >> (2 * sh)) & 0x03030303u;
-            }
-        }
-        const float dw = half_lo(v.d);
-        dn_rows<B, ALL>(mask, slot, [&](int32_t slot) {
-            const uint4 * ap = reinterpret_cast<const uint4 *>(s.act + slot * act_stride + j5 * 64);
-            int32_t i0 = 0, i1 = 0;
-#pragma unroll
-            for (int32_t wi = 0; wi < 4; ++wi) {
-                const uint4 av = ap[wi];
-                int32_t & acc = wi < 2 ? i0 : i1;
-                acc = __dp4a(static_cast<int32_t>(x[4 * wi + 0]), static_cast<int32_t>(av.x), acc);
-                acc = __dp4a(static_cast<int32_t>(x[4 * wi + 1]), static_cast<int32_t>(av.y), acc);
-                acc = __dp4a(static_cast<int32_t>(x[4 * wi + 2]), static_cast<int32_t>(av.z), acc);
-                acc = __dp4a(static_cast<int32_t>(x[4 * wi + 3]), static_cast<int32_t>(av.w), acc);
-            }
-            const float dot = dw * (s.da[slot][kb] * static_cast<float>(i0 - s.asum[slot][kb]) +
-                                    s.da[slot][kb + 1] * static_cast<float>(i1 - s.asum[slot][kb + 1]));
-            s.part[slot][j5][n] = dot;
-        });
-    } else if constexpr (F == fmt::q5_1) {
-        // ME1: block kb + c's weights 0..15 (lo) and 16..31 (hi), 0..31 with bit 4 from the block's qh word; row b's
-        // partial is (d_c da_c) is_c + (m_c da_c) asum_c a block (asum: the run's exact code sum), one fused rounding
-        // each, then the two blocks' sum
-        uint32_t lo[8], hi[8];
-#pragma unroll
-        for (int32_t c = 0; c < 2; ++c) {
-            const uint32_t qh = c == 0 ? v.d.x : v.d.y;
-#pragma unroll
-            for (int32_t wi = 0; wi < 4; ++wi) {
-                const uint32_t x = word_of(v.c[c], wi);
-                lo[4 * c + wi] = (x & 0x0f0f0f0fu) | (spread4(qh >> (4 * wi)) << 4);
-                hi[4 * c + wi] = ((x >> 4) & 0x0f0f0f0fu) | (spread4(qh >> (16 + 4 * wi)) << 4);
-            }
-        }
-        const float d0 = half_lo(v.d.z), m0 = half_hi(v.d.z), d1 = half_lo(v.d.w), m1 = half_hi(v.d.w);
-        dn_rows<B, ALL>(mask, slot, [&](int32_t slot) {
-            const uint4 * ap = reinterpret_cast<const uint4 *>(s.act + slot * act_stride + j5 * 64);
-            int32_t is[2] = {0, 0};
-#pragma unroll
-            for (int32_t c = 0; c < 2; ++c) {
-                const uint4 a0 = ap[2 * c], a1 = ap[2 * c + 1]; // elements 0..15, 16..31 of block kb + c
-#pragma unroll
-                for (int32_t wi = 0; wi < 4; ++wi) {
-                    is[c] = __dp4a(static_cast<int32_t>(lo[4 * c + wi]), static_cast<int32_t>(word_of(a0, wi)), is[c]);
-                    is[c] = __dp4a(static_cast<int32_t>(hi[4 * c + wi]), static_cast<int32_t>(word_of(a1, wi)), is[c]);
-                }
-            }
-            const float da0 = s.da[slot][kb], da1 = s.da[slot][kb + 1];
-            const float t0 = __fmaf_rn(__fmul_rn(d0, da0), static_cast<float>(is[0]),
-                                       __fmul_rn(__fmul_rn(m0, da0), static_cast<float>(s.asum[slot][kb])));
-            const float t1 = __fmaf_rn(__fmul_rn(d1, da1), static_cast<float>(is[1]),
-                                       __fmul_rn(__fmul_rn(m1, da1), static_cast<float>(s.asum[slot][kb + 1])));
-            s.part[slot][j5][n] = __fadd_rn(t0, t1);
-        });
-    } else {
-        // block kb + c's weights 0..15 (lo) and 16..31 (hi): IQ4_NL's table values, Q8_0's own int8 (DR1)
-        uint32_t lo[8], hi[8];
-#pragma unroll
-        for (int32_t c = 0; c < 2; ++c) {
-#pragma unroll
-            for (int32_t wi = 0; wi < 4; ++wi) {
-                if constexpr (F == fmt::q8_0) {
-                    lo[4 * c + wi] = word_of(v.c[2 * c], wi);
-                    hi[4 * c + wi] = word_of(v.c[2 * c + 1], wi);
-                } else {
-                    table16(word_of(v.c[c], wi), kv, lo[4 * c + wi], hi[4 * c + wi]);
-                }
-            }
-        }
-        const float d0 = half_lo(v.d), d1 = half_hi(v.d);
-        dn_rows<B, ALL>(mask, slot, [&](int32_t slot) {
-            const uint4 * ap = reinterpret_cast<const uint4 *>(s.act + slot * act_stride + j5 * 64);
-            int32_t is[2] = {0, 0};
-#pragma unroll
-            for (int32_t c = 0; c < 2; ++c) {
-                const uint4 a0 = ap[2 * c], a1 = ap[2 * c + 1]; // elements 0..15, 16..31 of block kb + c
-#pragma unroll
-                for (int32_t wi = 0; wi < 4; ++wi) {
-                    is[c] = __dp4a(static_cast<int32_t>(lo[4 * c + wi]), static_cast<int32_t>(word_of(a0, wi)), is[c]);
-                    is[c] = __dp4a(static_cast<int32_t>(hi[4 * c + wi]), static_cast<int32_t>(word_of(a1, wi)), is[c]);
-                }
-            }
-            const float dot =
-                d0 * s.da[slot][kb] * static_cast<float>(is[0]) + d1 * s.da[slot][kb + 1] * static_cast<float>(is[1]);
-            s.part[slot][j5][n] = dot;
-        });
-    }
 }
 
 // The routed items' walk at dn_threads (K5): thread r of group g = tid / 5 R keeps item (j5, n) = (r / R, r % R) and
@@ -255,8 +83,8 @@ template <fmt F, int DEPTH, int C> struct dn_fixed_walk {
         has_sh = g == m.n_u % 3;
     }
     __device__ __forceinline__ dn_slot<F> load(int32_t u, uint32_t z) const {
-        const int64_t eo = int64_t(m.e[u]) * dn_expert_bytes<F>();
-        return dn_load<F>(pc + eo, pd + eo, z);
+        const int64_t eo = int64_t(m.e[u]) * dn_codec<F>::expert_bytes;
+        return dn_codec<F>::load(pc + eo, pd + eo, z);
     }
     // the ring's first DEPTH units; a load past the last unit reads the last unit again (never predicated, so never a
     // select of data in flight)
@@ -283,7 +111,7 @@ template <fmt F, int DEPTH, int C> struct dn_fixed_walk {
                 const dn_slot<F> v = rg[q];
                 rg[q] = load(min(ul, u_last), order_after(v.c[0].x, mz));
                 ul += 3;
-                dn_item<F, B>(s, v, sh_j5, sh_n, m.mask[u], m.slot_base[u], kv);
+                dn_codec<F>::template item<B, false>(s, v, sh_j5, sh_n, m.mask[u], m.slot_base[u], kv);
             }
         }
     }
@@ -336,8 +164,8 @@ template <fmt F, int DEPTH, int NT, int C> struct dn_strided_walk {
         return p;
     }
     __device__ __forceinline__ dn_slot<F> load(const pos p, uint32_t z) const {
-        const uint8_t * e = w + int64_t(m.e[p.u]) * dn_expert_bytes<F>();
-        return dn_load<F>(e + dn_code_off<F>(p.j5, n0 + p.n), e + dn_d_off<F>(p.j5, n0 + p.n), z);
+        const uint8_t * e = w + int64_t(m.e[p.u]) * dn_codec<F>::expert_bytes;
+        return dn_codec<F>::load(e + dn_code_off<F>(p.j5, n0 + p.n), e + dn_d_off<F>(p.j5, n0 + p.n), z);
     }
     // a load past the last item reads the last item again (never predicated)
     __device__ __forceinline__ void prime(dn_slot<F> (&rg)[DEPTH]) const {
@@ -370,7 +198,7 @@ template <fmt F, int DEPTH, int NT, int C> struct dn_strided_walk {
                 rg[q] = load(il < n_items ? pl : last, order_after(v.c[0].x, mz));
                 il += NT;
                 pl = advance(pl);
-                dn_item<F, B>(s, v, p.j5, p.n, m.mask[p.u], m.slot_base[p.u], kv);
+                dn_codec<F>::template item<B, false>(s, v, p.j5, p.n, m.mask[p.u], m.slot_base[p.u], kv);
                 p = advance(p);
             }
         }
@@ -409,7 +237,7 @@ template <fmt F, int DEPTH, int C> struct dn_fixed_walk_x {
             return {};
         }
         const uint8_t * e = wt[m.e[u]];
-        return dn_load<F>(e + co, e + dof, z);
+        return dn_codec<F>::load(e + co, e + dof, z);
     }
     __device__ __forceinline__ void prime(dn_slot<F> (&rg)[DEPTH]) const {
         if (n_mine > 0) {
@@ -434,7 +262,7 @@ template <fmt F, int DEPTH, int C> struct dn_fixed_walk_x {
                 rg[q] = load(min(ul, u_last), order_after(v.c[0].x, mz));
                 ul += 3;
                 if (!on_cpu(u)) {
-                    dn_item<F, B>(s, v, sh_j5, sh_n, m.mask[u], m.slot_base[u], kv);
+                    dn_codec<F>::template item<B, false>(s, v, sh_j5, sh_n, m.mask[u], m.slot_base[u], kv);
                 }
             }
         }
@@ -457,7 +285,7 @@ template <fmt F, int DEPTH, int NT, int C> struct dn_strided_walk_x : dn_strided
             return {};
         }
         const uint8_t * e = wt[this->m.e[p.u]];
-        return dn_load<F>(e + dn_code_off<F>(p.j5, this->n0 + p.n), e + dn_d_off<F>(p.j5, this->n0 + p.n), z);
+        return dn_codec<F>::load(e + dn_code_off<F>(p.j5, this->n0 + p.n), e + dn_d_off<F>(p.j5, this->n0 + p.n), z);
     }
     __device__ __forceinline__ void prime(dn_slot<F> (&rg)[DEPTH]) const {
         int32_t il = this->tid;
@@ -490,7 +318,8 @@ template <fmt F, int DEPTH, int NT, int C> struct dn_strided_walk_x : dn_strided
                 il += NT;
                 pl = this->advance(pl);
                 if (!on_cpu(p.u)) {
-                    dn_item<F, B>(s, v, p.j5, p.n, this->m.mask[p.u], this->m.slot_base[p.u], kv);
+                    dn_codec<F>::template item<B, false>(s, v, p.j5, p.n, this->m.mask[p.u], this->m.slot_base[p.u],
+                                                         kv);
                 }
                 p = this->advance(p);
             }
@@ -540,7 +369,7 @@ __global__ void __launch_bounds__(NT, 1) down_kernel(down_args a) {
                                  : make_uint4(0, 0, 0, 0);
     }
     uint32_t kv[4] = {0, 0, 0, 0};
-    if (F == fmt::iq4_nl || FS == fmt::iq4_nl) {
+    if (dn_codec<F>::kvalues || dn_codec<FS>::kvalues) {
         const uint4 t = __ldg(reinterpret_cast<const uint4 *>(a.grids + kvalues_off));
         kv[0] = t.x;
         kv[1] = t.y;
@@ -581,8 +410,8 @@ __global__ void __launch_bounds__(NT, 1) down_kernel(down_args a) {
     walk.prime(rg);
     dn_slot<FS> shv = {};
     if (walk.has_sh) {
-        shv = dn_load<FS>(a.sh_w + dn_code_off<FS>(walk.sh_j5, n0 + walk.sh_n),
-                          a.sh_w + dn_d_off<FS>(walk.sh_j5, n0 + walk.sh_n), 0u);
+        shv = dn_codec<FS>::load(a.sh_w + dn_code_off<FS>(walk.sh_j5, n0 + walk.sh_n),
+                                 a.sh_w + dn_d_off<FS>(walk.sh_j5, n0 + walk.sh_n), 0u);
     }
 
 #pragma unroll
@@ -612,7 +441,7 @@ __global__ void __launch_bounds__(NT, 1) down_kernel(down_args a) {
         s.da[slot][blk] = reinterpret_cast<const float *>(s.raw + glu_codes_c<C>)[2 * t]; // d of {d, s}
         s.asum[slot][blk] = sum; // exact; s (d x sum, rounded) is not used: see the header
         uint4 * dst = reinterpret_cast<uint4 *>(s.act + slot * act_stride + blk * 32);
-        if (slot < m.n_slots ? F == fmt::q2_0 : FS == fmt::q2_0) {
+        if (slot < m.n_slots ? dn_codec<F>::transposed : dn_codec<FS>::transposed) {
             dst[0] = transpose16(qw[0], qw[1], qw[2], qw[3]);
             dst[1] = transpose16(qw[4], qw[5], qw[6], qw[7]);
         } else {
@@ -624,7 +453,7 @@ __global__ void __launch_bounds__(NT, 1) down_kernel(down_args a) {
 
     walk.template run<B>(s, rg, kv, mz);
     if (walk.has_sh) {
-        dn_item<FS, B, true>(s, shv, walk.sh_j5, walk.sh_n, (1u << B) - 1u, m.n_slots, kv);
+        dn_codec<FS>::template item<B, true>(s, shv, walk.sh_j5, walk.sh_n, (1u << B) - 1u, m.n_slots, kv);
     }
     __syncthreads();
 
@@ -656,6 +485,48 @@ __global__ void __launch_bounds__(NT, 1) down_kernel(down_args a) {
     }
 }
 
+// down_kernel_lanes's staging of a lane's GLU slots (raw_v, loaded at entry): stored, then converted, as down_kernel
+// stores and converts them
+template <fmt F, fmt FS, int B, int C, int NT, int N_RAW_PER, int N_C16, int N_RAW16>
+__device__ __forceinline__ void stage_lane_slots(dn_smem<C> & s,
+                                                 const uint4 (&raw_v)[N_RAW_PER],
+                                                 const meta_c<C> & m,
+                                                 int32_t           tid) {
+#pragma unroll
+    for (int32_t k = 0; k < N_RAW_PER; ++k) {
+        const int32_t i = tid + k * NT;
+        if (i < N_C16) {
+            reinterpret_cast<uint4 *>(s.raw)[i] = raw_v[k];
+        } else if (i < N_RAW16) {
+            reinterpret_cast<uint4 *>(s.raw + glu_codes_c<C>)[i - N_C16] = raw_v[k];
+        }
+    }
+    __syncthreads();
+    for (int32_t t = tid; t < (m.n_slots + B) * 10; t += NT) {
+        const int32_t  slot = t / 10;
+        const int32_t  blk  = t - slot * 10;
+        const uint4 *  src  = reinterpret_cast<const uint4 *>(s.raw + t * 32);
+        const uint4    c0 = src[0], c1 = src[1];
+        const uint32_t qw[8] = { c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w };
+        int32_t        sum   = 0;
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            sum = __dp4a(static_cast<int32_t>(qw[i]), 0x01010101, sum);
+        }
+        s.da[slot][blk]   = reinterpret_cast<const float *>(s.raw + glu_codes_c<C>)[2 * t];
+        s.asum[slot][blk] = sum;
+        uint4 * dst       = reinterpret_cast<uint4 *>(s.act + slot * act_stride + blk * 32);
+        if (slot < m.n_slots ? dn_codec<F>::transposed : dn_codec<FS>::transposed) {
+            dst[0] = transpose16(qw[0], qw[1], qw[2], qw[3]);
+            dst[1] = transpose16(qw[4], qw[5], qw[6], qw[7]);
+        } else {
+            dst[0] = make_uint4(qw[0], qw[1], qw[2], qw[3]);
+            dst[1] = make_uint4(qw[4], qw[5], qw[6], qw[7]);
+        }
+    }
+    __syncthreads();
+}
+
 // down_kernel_lanes's arguments, a lane: its own, and FMS2 item 6's X-F peer rows (experts.h down_lanes_send): the
 // lane's 5 joint frame rows in the peer's slot, null for none. Beside the lane's arguments, the store's address shares
 // their per-lane offset (a separate array's offset spilled the iq4_nl + q2_0 instance at the 96-register cap)
@@ -670,15 +541,16 @@ struct down_lanes_kargs {
     uint32_t * x16_err; // FMS2 item 7: non-null, the peer rows take FP16 halves (x16_bits) and this the range flag
 };
 
-// FMU2 (build item 1, experts.h down_lanes): a joint round's lanes in one launch, the resident walk (dn_threads) at
-// B = 5. Block i runs lane k = i / NB on its arguments p.s[k] (read in place: __grid_constant__) and, in it, the lone
+// FMU2 (build item 1, experts.h down_lanes): a joint round's lanes in one launch, the resident walk at B = 5 (TTTS3
+// item 4: the routed format's codec's walk and threads, as down_kernel's: fixed at 544, or strided at 512 for Q8_0). Block i runs lane k = i / NB on its arguments p.s[k] (read in place: __grid_constant__) and, in it, the lone
 // launch's blocks vb = L (i % NB) .. L (i % NB) + L - 1 (L = 72 / NB, the lanes) in turn: each vb's output rows (n0 =
 // 2560 vb / 72, R 35 or 36), walk, shared item and weighted sum are down_kernel's, after one staging of the lane's GLU
 // slots, so the lane's out is bitwise its own down launch's (which block runs an item changes no result). A barrier
 // ends each vb before the next one's items write the partials.
 template <fmt F, fmt FS, int B, int DEPTH, int NB>
-__global__ void __launch_bounds__(dn_threads, 1) down_kernel_lanes(const __grid_constant__ down_lanes_kargs p) {
-    constexpr int32_t NT = dn_threads;
+__global__ void __launch_bounds__(dn_codec<F>::threads, 1) down_kernel_lanes(
+    const __grid_constant__ down_lanes_kargs p) {
+    constexpr int32_t NT = dn_codec<F>::threads;
     constexpr int32_t L = n_sm / NB;
     static_assert(L * NB == n_sm && L >= 2 && L <= max_lanes, "the lanes share the 72 blocks evenly");
     constexpr int32_t C = cap_of(B);
@@ -705,7 +577,7 @@ __global__ void __launch_bounds__(dn_threads, 1) down_kernel_lanes(const __grid_
                                  : make_uint4(0, 0, 0, 0);
     }
     uint32_t kv[4] = {0, 0, 0, 0};
-    if (F == fmt::iq4_nl || FS == fmt::iq4_nl) {
+    if (dn_codec<F>::kvalues || dn_codec<FS>::kvalues) {
         const uint4 t = __ldg(reinterpret_cast<const uint4 *>(a.grids + kvalues_off));
         kv[0] = t.x;
         kv[1] = t.y;
@@ -748,7 +620,15 @@ __global__ void __launch_bounds__(dn_threads, 1) down_kernel_lanes(const __grid_
         }
         return;
     }
-    using walk_r = dn_fixed_walk<F, DEPTH, C>;
+    using walk_r = std::conditional_t<NT == dn_threads, dn_fixed_walk<F, DEPTH, C>, dn_strided_walk<F, DEPTH, NT, C>>;
+    // TTTS3 item 4: a shared slot of more than two chunks (Q8_0's, 68 bytes) loads after the walk, not held across it;
+    // a ring of more than 72 bytes at 544 threads (Q5_1's 48-byte slots) stages the GLU slots before the first vb, so
+    // their registers are not held across the vbs (96 registers)
+    constexpr bool sh_late     = dn_codec<FS>::chunks > 2;
+    constexpr bool stage_first = NT == dn_threads && DEPTH * (dn_codec<F>::chunks * 16 + dn_codec<F>::d_bytes) > 72;
+    if constexpr (stage_first) {
+        stage_lane_slots<F, FS, B, C, NT, n_raw_per, n_c16, n_raw16>(s, raw_v, m, tid);
+    }
 #pragma unroll 1
     for (int32_t v = 0; v < L; ++v) {
         const int32_t vb = vb0 + v;
@@ -758,49 +638,21 @@ __global__ void __launch_bounds__(dn_threads, 1) down_kernel_lanes(const __grid_
         dn_slot<F> rg[DEPTH] = {};
         walk.prime(rg);
         dn_slot<FS> shv = {};
-        if (walk.has_sh) {
-            shv = dn_load<FS>(a.sh_w + dn_code_off<FS>(walk.sh_j5, n0 + walk.sh_n),
-                              a.sh_w + dn_d_off<FS>(walk.sh_j5, n0 + walk.sh_n), 0u);
+        if (!sh_late && walk.has_sh) {
+            shv = dn_codec<FS>::load(a.sh_w + dn_code_off<FS>(walk.sh_j5, n0 + walk.sh_n),
+                                     a.sh_w + dn_d_off<FS>(walk.sh_j5, n0 + walk.sh_n), 0u);
         }
-        if (v == 0) {
+        if (!stage_first && v == 0) {
             // the staged slots, as down_kernel stores and converts them, once for the lane's vbs
-#pragma unroll
-            for (int32_t k = 0; k < n_raw_per; ++k) {
-                const int32_t i = tid + k * NT;
-                if (i < n_c16) {
-                    reinterpret_cast<uint4 *>(s.raw)[i] = raw_v[k];
-                } else if (i < n_raw16) {
-                    reinterpret_cast<uint4 *>(s.raw + glu_codes_c<C>)[i - n_c16] = raw_v[k];
-                }
-            }
-            __syncthreads();
-            for (int32_t t = tid; t < (m.n_slots + B) * 10; t += NT) {
-                const int32_t slot = t / 10;
-                const int32_t blk = t - slot * 10;
-                const uint4 * src = reinterpret_cast<const uint4 *>(s.raw + t * 32);
-                const uint4 c0 = src[0], c1 = src[1];
-                const uint32_t qw[8] = {c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w};
-                int32_t sum = 0;
-#pragma unroll
-                for (int32_t i = 0; i < 8; ++i) {
-                    sum = __dp4a(static_cast<int32_t>(qw[i]), 0x01010101, sum);
-                }
-                s.da[slot][blk] = reinterpret_cast<const float *>(s.raw + glu_codes_c<C>)[2 * t];
-                s.asum[slot][blk] = sum;
-                uint4 * dst = reinterpret_cast<uint4 *>(s.act + slot * act_stride + blk * 32);
-                if (slot < m.n_slots ? F == fmt::q2_0 : FS == fmt::q2_0) {
-                    dst[0] = transpose16(qw[0], qw[1], qw[2], qw[3]);
-                    dst[1] = transpose16(qw[4], qw[5], qw[6], qw[7]);
-                } else {
-                    dst[0] = make_uint4(qw[0], qw[1], qw[2], qw[3]);
-                    dst[1] = make_uint4(qw[4], qw[5], qw[6], qw[7]);
-                }
-            }
-            __syncthreads();
+            stage_lane_slots<F, FS, B, C, NT, n_raw_per, n_c16, n_raw16>(s, raw_v, m, tid);
         }
         walk.template run<B>(s, rg, kv, mz);
         if (walk.has_sh) {
-            dn_item<FS, B, true>(s, shv, walk.sh_j5, walk.sh_n, (1u << B) - 1u, m.n_slots, kv);
+            if (sh_late) {
+                shv = dn_codec<FS>::load(a.sh_w + dn_code_off<FS>(walk.sh_j5, n0 + walk.sh_n),
+                                         a.sh_w + dn_d_off<FS>(walk.sh_j5, n0 + walk.sh_n), 0u);
+            }
+            dn_codec<FS>::template item<B, true>(s, shv, walk.sh_j5, walk.sh_n, (1u << B) - 1u, m.n_slots, kv);
         }
         __syncthreads();
         // the weighted sum, route order, then the shared expert's term (down_kernel's); FMS2 item 6: a chunk of the
@@ -895,11 +747,11 @@ template <typename V> bool act_ok(const V & v, int32_t rows, int32_t k) {
 }
 
 template <bool X, fmt F, fmt FS, int B> bool launch_down_x(const down_args & a, cudaStream_t st) {
-    constexpr int32_t depth = F == fmt::q2_0 ? dn_depth_q2 : dn_depth_nl;
+    constexpr int32_t depth = dn_codec<F>::depth;
     constexpr int32_t smem = static_cast<int32_t>(sizeof(dn_smem<cap_of(B)>));
     static_assert(smem <= 96 * 1024, "one block's shared memory");
     static std::atomic<uint32_t> attr_done{0u};
-    constexpr int32_t nt = dn_threads_of<F>();
+    constexpr int32_t            nt = dn_codec<F>::threads;
     if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(down_kernel<X, F, FS, B, depth, nt>),
                                 smem)) {
         return false;
@@ -1052,11 +904,11 @@ int64_t gate_up_bytes(fmt f) {
 }
 
 int64_t down_bytes(fmt f) {
-    return f == fmt::q2_0     ? 230400
-           : f == fmt::iq4_nl ? 460800
-           : f == fmt::q8_0   ? dn_expert_bytes<fmt::q8_0>()
-           : f == fmt::q5_1   ? dn_expert_bytes<fmt::q5_1>()
-                              : 0;
+    return f == fmt::q2_0   ? dn_codec<fmt::q2_0>::expert_bytes :
+           f == fmt::iq4_nl ? dn_codec<fmt::iq4_nl>::expert_bytes :
+           f == fmt::q8_0   ? dn_codec<fmt::q8_0>::expert_bytes :
+           f == fmt::q5_1   ? dn_codec<fmt::q5_1>::expert_bytes :
+                              0;
 }
 
 bool grid_table(const void * const src[6], const size_t src_bytes[6], uint8_t * dst) {
@@ -1309,20 +1161,11 @@ bool gate_up_prepared(const gate_up_args & in, int32_t rows, gate_up_args & a) {
            a.skip >= 0 && a.skip <= 2 && (a.skip == 0 || a.wt != nullptr) && null_or_aligned(a.run_if, 4);
 }
 
-bool deployed_gu(fmt f, fn::dense::fmt fg, fn::dense::fmt fu) {
-    for (const gu_entry & e : gu_table) {
-        if (e.f == f && e.fg == fg && e.fu == fu) {
-            return true;
-        }
-    }
-    return false;
-}
-
 } // namespace
 
 bool gate_up_pair_supported(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_pair_args & a) {
     const bool iq = f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s || f == fmt::iq3_xxs || f == fmt::iq3_s;
-    if (!iq || (rows != 4 && rows != 5) || !deployed_gu(f, fg, fu)) {
+    if (!iq || (rows != 4 && rows != 5) || !compiled_gu(f, fg, fu)) {
         return false;
     }
     gate_up_args p[2];
@@ -1358,11 +1201,12 @@ bool gate_up_lanes_supported(fmt                        f,
                              int32_t                    lanes,
                              int32_t                    rows,
                              const gate_up_lanes_args & a) {
-    const bool iq2 = f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s;
-    const bool iq3 = f == fmt::iq3_xxs || f == fmt::iq3_s;
-    // FMS13: rows 2 .. 5; the IQ3 body is B = 4 and 5 only (the lone IQ3 launch at B <= 3 is the per-triple kernel)
-    if ((!iq2 && !iq3) || lanes < 2 || lanes > max_lanes || rows < (iq3 ? 4 : 2) || rows > max_rows ||
-        !deployed_gu(f, fg, fu)) {
+    // TTTS3 item 2: the routed format's family body (its codec's body_b), at rows 2 .. 5 from the body's smallest B
+    // (FMS13; the IQ3 body is B = 4 and 5, its lone launch at B <= 3 the per-triple kernel), with a profiled triple
+    const int32_t body_b = gu_body_b(f);
+    const bool iq2 = f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s;  // SP4 H2: the IQ2 body also under map 2
+    if (body_b == 0 || lanes < 2 || lanes > max_lanes || rows < std::max(body_b, 2) || rows > max_rows ||
+        !compiled_gu(f, fg, fu)) {
         return false;
     }
     for (int32_t k = 0; k < lanes; ++k) {
@@ -1402,9 +1246,17 @@ bool gate_up_lanes(fmt                        f,
         }
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
-    const bool iq3 = f == fmt::iq3_xxs || f == fmt::iq3_s;
-    return iq3 ? detail::gate_up_lanes_iq3(f, fg, fu, lanes, rows, a, st) :
-                 detail::gate_up_lanes_iq2(f, fg, fu, lanes, rows, a, st);
+    switch (f) {  // the routed format's family body
+        case fmt::iq3_xxs:
+        case fmt::iq3_s:
+            return detail::gate_up_lanes_iq3(f, fg, fu, lanes, rows, a, st);
+        case fmt::q4_k:
+            return detail::gate_up_lanes_q4_k(f, fg, fu, lanes, rows, a, st);
+        case fmt::q5_k:
+            return detail::gate_up_lanes_q5_k(f, fg, fu, lanes, rows, a, st);
+        default:
+            return detail::gate_up_lanes_iq2(f, fg, fu, lanes, rows, a, st);
+    }
 }
 
 bool gate_up(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & in, void * stream) {
@@ -1538,14 +1390,14 @@ bool down(fmt f, fmt fs, int32_t rows, const down_args & a, void * stream) {
 namespace {
 
 template <fmt F, fmt FS, int B, int NB> bool launch_down_lanes(const down_lanes_kargs & a, cudaStream_t st) {
-    constexpr int32_t depth = F == fmt::q2_0 ? dn_depth_q2 : dn_depth_nl;
+    constexpr int32_t            depth = dn_codec<F>::depth;
     constexpr int32_t smem = static_cast<int32_t>(sizeof(dn_smem<cap_of(B)>));
     static std::atomic<uint32_t> attr_done{0u};
     if (!detail::smem_attr_once(attr_done, reinterpret_cast<const void *>(down_kernel_lanes<F, FS, B, depth, NB>),
                                 smem)) {
         return false;
     }
-    down_kernel_lanes<F, FS, B, depth, NB><<<n_sm, dn_threads, smem, st>>>(a);
+    down_kernel_lanes<F, FS, B, depth, NB><<<n_sm, dn_codec<F>::threads, smem, st>>>(a);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
@@ -1586,20 +1438,15 @@ bool down_lane_ok(const down_args & a) {
            a.ext_slots_d == nullptr;
 }
 
+// a profiled down pair whose routed format's codec has the lanes form (TTTS3 item 2)
 bool resident_down(fmt f, fmt fs) {
-    for (const dn_entry & e : dn_table) {
-        if (e.f == f && e.fs == fs) {
-            return f == fmt::q2_0 || f == fmt::iq4_nl;
-        }
-    }
-    return false;
+    return compiled_dn(f, fs) && dn_lanes(f);
 }
 
 } // namespace
 
 bool down_lanes_supported(fmt f, fmt fs, int32_t lanes, int32_t rows, const down_lanes_args & a) {
-    if (lanes < 2 || lanes > max_lanes || rows < 2 || rows > max_rows || !resident_down(f, fs) ||
-        dn_threads_of<fmt::q2_0>() != dn_threads || dn_threads_of<fmt::iq4_nl>() != dn_threads) {
+    if (lanes < 2 || lanes > max_lanes || rows < 2 || rows > max_rows || !resident_down(f, fs)) {
         return false;
     }
     for (int32_t k = 0; k < lanes; ++k) {
@@ -1645,12 +1492,13 @@ bool down_lanes_send(fmt                     f,
     k.x16_err = peer != nullptr ? x16_err : nullptr;
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
 #define FN_EXPERTS_DN_CASE(rf, sf, layer)                               \
-    if constexpr (fmt::rf == fmt::q2_0 || fmt::rf == fmt::iq4_nl) {     \
+    if constexpr (dn_codec<fmt::rf>::lanes) {                           \
         if (f == fmt::rf && fs == fmt::sf) {                            \
             return down_lanes_of<fmt::rf, fmt::sf>(lanes, rows, k, st); \
         }                                                               \
     }
     FN_EXPERTS_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)
+    FN_EXPERTS_Q4_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)  // TTTS3 item 4: Q5_1 (Q8_0's entry is the deployed one's)
 #undef FN_EXPERTS_DN_CASE
     return false;
 }

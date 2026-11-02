@@ -120,9 +120,20 @@ int fnfl_grid_test(const char * header) {
                differ == 0 ? "identical" : "DIFFER");
         pass = pass && differ == 0;
     }
-    const int64_t wrong = packed ? fnfl_grid_sel_device(buf.data(), 0) : -1;
-    printf("grid-test: the selector recipe on the device: %lld of 360448 cases wrong\n", static_cast<long long>(wrong));
-    pass = pass && wrong == 0;
     printf("grid-test: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+int fnfl_grid_gpu_test(int dev) {
+    using namespace fn::experts;
+    std::vector<uint8_t> buf(grid_bytes);
+    const bool           packed = grid_table(grid_src, grid_src_bytes, buf.data());
+    printf("grid-gpu-test: grid_table packs the six and the selector tables into %zu bytes: %s\n", grid_bytes,
+           packed ? "yes" : "NO");
+    const int64_t wrong = packed ? fnfl_grid_sel_device(buf.data(), dev) : -1;
+    printf("grid-gpu-test: the selector recipe on device %d: %lld of 360448 cases wrong\n", dev,
+           static_cast<long long>(wrong));
+    const bool pass = packed && wrong == 0;
+    printf("grid-gpu-test: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }

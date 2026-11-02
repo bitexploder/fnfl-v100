@@ -103,6 +103,9 @@ struct pt_args {
     int64_t ld16 = 0;
     uint32_t * err = nullptr;
     uint32_t err_bit = 0;
+    // MUP1 piece 2: at most 64 rows run on a 64 x 64 tile, the same outputs; big_tile keeps the 128 x 128 tile (pd-test
+    // compares the two bitwise)
+    bool big_tile = false;
 };
 
 bool pd_tc(const pt_args & a, void * stream);
@@ -112,6 +115,49 @@ bool pd_tc(const pt_args & a, void * stream);
 // power of two that brings its largest magnitude into [2^14, 2^15) (the range check: no row overflows or flushes for
 // its range), col_s[row] = 2^-e for pd_tc's col_scale (e = 0 for a zero row). A warp a row.
 bool pd_convert_bf16(const uint16_t * w, int32_t n, int32_t k, uint16_t * wt, float * col_s, void * stream);
+// APF1: pd_convert_bf16's col_s alone (the same exponent rule), for pq_tc's BF16 rows prepared once at load
+bool pd_bf16_scales(const uint16_t * w, int32_t n, int32_t k, float * col_s, void * stream);
+
+// pq_tc (APF1 Part 4, the ladder's fused dense route): pd_tc's product with each weight formed in the tile loader
+// instead of a converted FP16 matrix, so a small read pays no per-read conversion.
+//   math and numerics: the B operand of each column is exactly pd_convert's FP16 weight (the same device decode,
+//            weights16's rounding) or, for BF16 rows, pd_convert_bf16's (the BF16 value times the row's 2^e from the
+//            prepared col_s, rounded once); each output sums the k4 steps in K order into one F32 accumulator as
+//            pd_tc does, so every output is bitwise pd_convert (or pd_convert_bf16) then pd_tc. Rows independent, no
+//            split K. The epilogue is pd_tc's (segments, row and column scales, out16 with the range bit).
+//   sources: up to three packed matrices of one format and layout (pd_convert's formats), each its own n columns
+//            (a multiple of 32) placed one after another along the product's N; or BF16 rows from two bases (rows
+//            [0, n0) of w0, [n0, n0 + n1) of w1, the rest zero) with col_s prepared by pd_bf16_scales.
+//   shapes:  a CTA 64 rows x 32 columns, four warps of 32 x 16; K a stage 128 (DP2, BF16) or 64 (EX1 down); the
+//            stage's weights decoded by threads 0..63 (DP2: a column's quarter each) into shared memory, the
+//            activations staged by all 128 threads, two stages in flight. Grid (row tiles, column tiles).
+//   budget:  48 KiB dynamic shared memory (two stages of 64 x 128 + 32 x 128 FP16); checked by ptxas (no spills).
+//   evidence: pd-test compares it bitwise against pd_convert + pd_tc (and pd_convert_bf16 + pd_tc) at every rung's
+//            boundary rows; the route is selected by fn/model/prompt.h's ladder (APF1 Part 4).
+struct pq_src {
+    const uint8_t * w = nullptr;  // the packed matrix (pd_args::w's layout)
+    int32_t         n = 0;        // its columns (a multiple of 32)
+};
+
+struct pq_args {
+    // packed sources (n_src > 0): f, lay, k and grids as pd_args
+    fmt             f   = fmt::q8_0;
+    pd_layout       lay = pd_layout::dp2;
+    pq_src          src[3];
+    int32_t         n_src = 0;
+    const uint8_t * grids = nullptr;
+    // BF16 rows (n_src == 0)
+    const uint16_t *b0 = nullptr, *b1 = nullptr;
+    int32_t         n0 = 0, n1 = 0;
+    const float *   b_scale = nullptr;  // [n] pd_bf16_scales' col_s (rows past n0 + n1: zero, so 0 there)
+    // the product and its epilogue, as pt_args (w unused); n the sources' columns summed (or the BF16 rows' n)
+    pt_args         t;
+};
+
+bool pq_tc(const pq_args & a, void * stream);
+// every pq_tc instance's shared memory opt-in on the current device, ahead of a launch (APF1 Part 4: before any
+// stream capture, so a captured launch sets no attribute)
+bool pq_tc_attributes();
 
 struct pb_args {
     const uint16_t * w_lo   = nullptr;      // BF16 rows
@@ -122,6 +168,13 @@ struct pb_args {
     int64_t          ldx    = 0;
     float *          out    = nullptr;      // F32 [rows][ld_out]
     int64_t          ld_out = 0;
+    // TTTS2: the rows are F32 (w_lo / w_hi point at F32 [rows][k]; UD-Q4_K_XL's PLE matrices, expanded at load), the
+    // same products, steps and order
+    bool             f32    = false;
+    // TTTS3: the rows are Q8_0 as the file stores them (w_lo / w_hi point at k / 32 blocks of 34 bytes a row: the F16
+    // d, then 32 int8 codes; UD-Q4_K_XL's PLE matrices), each weight d x q formed exactly in F32: the F32 rows'
+    // products, steps and order, bitwise. Not with f32.
+    bool             q8     = false;
 };
 
 bool pd_bf16(const pb_args & a, void * stream);
@@ -161,6 +214,8 @@ struct pd_resources {
 };
 
 bool pd_kernel_resources(fmt f, pd_layout lay, pd_resources & r);
+// APF1: pq_tc's kernel for (f, lay), or its BF16 instance (bf16)
+bool pq_tc_resources(bool bf16, fmt f, pd_layout lay, pd_resources & r);
 // pd_tc's kernel and pd_convert's for (f, lay)
 bool pd_tc_resources(pd_resources & r);
 bool pd_convert_resources(fmt f, pd_layout lay, pd_resources & r);

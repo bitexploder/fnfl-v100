@@ -8,13 +8,14 @@
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
 #include "fn/quant/synth.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/tools/test_dump.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <cfloat>
 #include <atomic>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -34,6 +35,9 @@ namespace {
 constexpr uint64_t dp_seed_index = 0x44500000u;
 
 quant::wfmt to_wfmt(fmt f) {
+    if (f == fmt_q8_0f) {  // TTTS3: GGUF Q8_0 rows as stored
+        return quant::wfmt::q8_0;
+    }
     switch (f) {
         case fmt::q4_k:
             return quant::wfmt::q4_k;
@@ -97,11 +101,7 @@ uint64_t name_seed(const std::string & s) {
 }
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "dp-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "dp-test", what);
 }
 
 // owns one device allocation of n bytes

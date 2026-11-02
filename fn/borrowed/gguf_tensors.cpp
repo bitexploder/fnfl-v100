@@ -200,3 +200,57 @@ bool fnfl_gguf_shard_paths(const std::string & first, std::vector<std::string> &
     }
     return true;
 }
+
+bool fnfl_gguf_read_string(const std::string & path, const std::string & key, std::string & out) {
+    out.clear();
+    const key_ref r = find_key(path, key);
+    if (r.id < 0 || gguf_get_kv_type(r.ctx.get(), r.id) != GGUF_TYPE_STRING) {
+        return false;
+    }
+    out = gguf_get_val_str(r.ctx.get(), r.id);
+    return true;
+}
+
+bool fnfl_gguf_read_bools(const std::string & path, const std::string & key, std::vector<bool> & out) {
+    out.clear();
+    const key_ref r = find_key(path, key);
+    if (r.id < 0) {
+        return false;
+    }
+    if (gguf_get_kv_type(r.ctx.get(), r.id) == GGUF_TYPE_BOOL) {
+        out.push_back(gguf_get_val_bool(r.ctx.get(), r.id));
+        return true;
+    }
+    if (gguf_get_kv_type(r.ctx.get(), r.id) != GGUF_TYPE_ARRAY || gguf_get_arr_type(r.ctx.get(), r.id) != GGUF_TYPE_BOOL) {
+        return false;
+    }
+    const size_t n = gguf_get_arr_n(r.ctx.get(), r.id);
+    const auto * p = static_cast<const int8_t *>(gguf_get_arr_data(r.ctx.get(), r.id));
+    for (size_t i = 0; i < n; ++i) {
+        out.push_back(p[i] != 0);
+    }
+    return true;
+}
+
+bool fnfl_gguf_read_floats(const std::string & path, const std::string & key, std::vector<double> & out) {
+    out.clear();
+    const key_ref r = find_key(path, key);
+    if (r.id < 0 || gguf_get_kv_type(r.ctx.get(), r.id) != GGUF_TYPE_ARRAY) {
+        return false;
+    }
+    const size_t n = gguf_get_arr_n(r.ctx.get(), r.id);
+    const void * p = gguf_get_arr_data(r.ctx.get(), r.id);
+    for (size_t i = 0; i < n; ++i) {
+        switch (gguf_get_arr_type(r.ctx.get(), r.id)) {
+            case GGUF_TYPE_FLOAT32:
+                out.push_back(static_cast<const float *>(p)[i]);
+                break;
+            case GGUF_TYPE_FLOAT64:
+                out.push_back(static_cast<const double *>(p)[i]);
+                break;
+            default:
+                return false;
+        }
+    }
+    return true;
+}

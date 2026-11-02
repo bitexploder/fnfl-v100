@@ -5,12 +5,17 @@
 
 #include "cache_settings.h"
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
 struct fnfl_engine;
+
+// PRD1: the build's stamp, generated on every build: the source commit, "-dirty" appended when tracked files differ
+// from it ("unknown" outside a git tree). llama-server and fnfl-drive print it with --version ("fnfl: commit ...")
+const char * fnfl_build_commit();
 
 enum fnfl_status : int32_t {
     FNFL_OK = 0,
@@ -26,7 +31,12 @@ enum fnfl_status : int32_t {
 struct fnfl_config {
     std::string draft_subset; // the draft's subset ID file (--fnfl-draft-subset)
     std::string ple_table;    // PN1: the PLE table's residency, lazy or full (--fnfl-ple-table); empty: lazy
+    // STALL (--fnfl-ple-warm on|off): a lazy table is read in (and locked when RAM allows) on a background thread
+    // once loaded; it expires when the engineer decides lazy residency keeps the warm as its only path
+    bool        ple_warm = true;
     int32_t spec_d = 2;       // SP2: the drafts a speculative step proposes, 1..4 (--fnfl-spec-d)
+    // MUP1 (--fnfl-small-read-rows N, 0 .. 8192; 0 off): beside writers a read of at most N rows runs in one step
+    int32_t     small_read_rows = 512;
     // SP2's switch (--fnfl-draft-attention dense|sparse; empty: dense): the draft's attention over its cells; it
     // expires at Fable's disposition of SP2
     std::string draft_attention;
@@ -65,6 +75,10 @@ struct fnfl_config {
     int32_t                                          split_port  = 13371;
     std::string                                      split_commit;
     std::string                                      split_digest;
+    // VIS1 Stage B (--mmproj PATH): the vision projector (the Qwen3-VL merger FNFL supports; another is refused at
+    // load). Its classes are reserved on the box that embeds (the split's front: in the unused other-reader arena);
+    // the split's follower then runs with --image-planes (X-HELLO's settings carry it). Empty: text only
+    std::string                                      mmproj;
 };
 
 // KV8 Amendment 1 (operator, 2026-10-22: q8 the serving default): the target KV's format from c alone (its kv_format
@@ -112,6 +126,7 @@ struct fnfl_sampling {
     float min_p = 0.05f;
     int32_t max_tokens = -1; // the request's n_predict; -1: unlimited, which becomes the context room
     int32_t n_ctx = 0;       // the shell's slot context (the room is n_ctx less the tokens the slot holds)
+    bool ignore_eos = false; // VBENCH: end only at the budget; an end-of-generation token is returned (vLLM's)
 };
 
 // what the server reports and renders with, read from the GGUF on the CPU
@@ -187,6 +202,20 @@ fnfl_status fnfl_step_pipe(fnfl_engine *      engine,
                            std::string *      errors,
                            bool *             done);
 
+// TTTS7: a named NVTX range on the calling thread, so an nsys capture attributes the shell's host phases beside the
+// engine's (nothing happens without a tool attached); fnfl_range_scope pushes at construction and pops at its end
+void fnfl_range_push(const char * name);
+void fnfl_range_pop();
+
+struct fnfl_range_scope {
+    explicit fnfl_range_scope(const char * name) { fnfl_range_push(name); }
+
+    ~fnfl_range_scope() { fnfl_range_pop(); }
+
+    fnfl_range_scope(const fnfl_range_scope &)             = delete;
+    fnfl_range_scope & operator=(const fnfl_range_scope &) = delete;
+};
+
 // keep the slot's first n_keep tokens (cancellation and prefix reuse)
 fnfl_status fnfl_truncate(fnfl_engine * engine, int32_t slot, int32_t n_keep);
 
@@ -204,11 +233,12 @@ void fnfl_release(fnfl_engine * engine);
 // its chunk in progress (FNFL's chunk: PF1's partition, the --parallel 1 path's), cancel stops it at a chunk's end.
 
 enum fnfl_read_status : int32_t {
-    FNFL_READ_YIELDED = 0,    // the chunk has more groups
-    FNFL_READ_CHUNK_DONE = 1, // the chunk is joined, committed, published and checkpointed; the read has more chunks
-    FNFL_READ_DONE = 2,       // the last chunk, the draft catch-up and the head are done: the slot can step
-    FNFL_READ_CANCELLED = 3,  // BG1: stopped at a chunk's end (or before any chunk); completed chunks kept
-    FNFL_READ_ERROR = 4,      // a step failed (fnfl_last_error); the slot re-reads from token 0 or a checkpoint
+    FNFL_READ_YIELDED    = 0,  // the chunk has more groups
+    FNFL_READ_CHUNK_DONE = 1,  // the chunk is joined, committed, published and checkpointed; the read has more chunks
+    FNFL_READ_DONE       = 2,  // the last chunk, the draft catch-up and the head are done: the slot can step
+    FNFL_READ_CANCELLED  = 3,  // BG1: stopped at a chunk's end (or before any chunk); completed chunks kept
+    FNFL_READ_ERROR      = 4,  // a step failed (fnfl_last_error); the slot re-reads from token 0 or a checkpoint
+    FNFL_READ_FRONT_DONE = 5,  // PRD1 (the split): the front's read ended, the back's halves are out (fnfl_read_poll)
 };
 
 // FMU1: who else has model work when a read step runs (resident TP; elsewhere every step is shared): lone, nobody (the
@@ -219,6 +249,24 @@ enum fnfl_read_mode : int32_t {
     FNFL_READ_SHARED = 0,
     FNFL_READ_WRITERS = 1,
     FNFL_READ_LONE = 2,
+};
+
+// MUP2 piece 4: a read's units on one box: units, the steps that ran them and the most in one, the units run with no
+// writer step pending (floor), the smallest and largest piece's rows, the units' GPU time and the floor's, B (the mean
+// over the steps with a known budget; -1: none), the box's read job service, and whether 1,024-row pieces were above
+// B. PRD1 item 12: budget_misses, the halves kept whole whose largest unit was predicted over B. APF1: P, the budgeted
+// steps whose budget was zero or unknown, and the box's pacing over the read: its decisions, the writers' completion
+// gaps (the longest, the overruns of P and their reasons: no read on this box, budgeted units, the minimum unit, a
+// small read whole, the follower's idle drain; the overruns' excess over P)
+struct fnfl_read_units {
+    int64_t units = 0;
+    int32_t steps = 0, most = 0, floor_units = 0, piece_min = 0, piece_max = 0, budget_misses = 0;
+    double  gpu_ms = 0, floor_ms = 0, budget_ms = -1, service_ms = 0;
+    bool    below_floor = false;
+    int32_t pause_ms = 0, budget_zero = 0, budget_unknown = 0;
+    int64_t pace_steps = 0, pace_known = 0, pace_zero = 0, pace_unknown = 0, completions = 0, gaps = 0, over = 0;
+    int64_t over_none = 0, over_budgeted = 0, over_minimum = 0, over_small = 0, over_idle = 0;
+    double  longest_gap_ms = 0, over_ms = 0;
 };
 
 // a slot's read as the scheduler sees it
@@ -237,6 +285,7 @@ struct fnfl_read_report {
     int32_t steps = 0, chunks_done = 0, checkpoints = 0;
     double service_ms = 0, longest_step_ms = 0; // host clock around the read's steps
     double last_group_ms = -1;                  // the last step's time a group, -1 at a chunk's start or end
+    fnfl_read_units here, back;  // MUP2: this box's (the front on the split) and the back's units
 };
 
 // the shared KV pool
@@ -258,11 +307,44 @@ int32_t fnfl_read_begin(fnfl_engine * engine, int32_t slot, const int32_t * toke
 // when free, else in the other-reader lane when it fits; fnfl_lane_rows), complete on both cards when it returns
 fnfl_read_status fnfl_read_step(fnfl_engine * engine, int32_t slot, int32_t n_groups,
                                 fnfl_read_mode mode = FNFL_READ_SHARED);
+// APF1: the writers' pause target P (ms, 10 .. 1,000; the server's --fnfl-writer-pause-ms and POST /props
+// tu.writer_pause_ms): false and unchanged outside that range. The next read-step decision on each box takes it
+bool             fnfl_writer_pause_valid(int64_t pause_ms);
+bool             fnfl_set_writer_pause(fnfl_engine * engine, int32_t pause_ms);
+int32_t          fnfl_writer_pause(const fnfl_engine * engine);
+// APF2: the prompt path's unit graphs (capture once, replay by parameter update; default on), process-wide; on the
+// split the back follows at its next read (the read command carries it). The server's POST /props prompt_graphs
+void             fnfl_set_prompt_graphs(bool on);
+bool             fnfl_prompt_graphs();
+// APF1: a read step beside writers (writers mode) under this box's writer-pause deadline (the latest start that keeps
+// every writer group's next completion within P of its last one, fn/runtime/pace.h): units while the next one's
+// prediction fits the budget, at least one (unknown budget: one). On the split the back budgets its own units from its
+// own deadline under the same P. Best effort: the minimum unit, a small read whole and prediction errors can overrun P
+fnfl_read_status fnfl_read_step_paced(fnfl_engine * engine, int32_t slot);
+
+// APF1: the last paced read step's decision on this box (the front on the split), for the server's iteration line
+struct fnfl_pace_report {
+    bool         known     = false;
+    double       budget_ms = -1, slack_ms = 0;
+    int32_t      pause_ms   = 0;
+    int32_t      group      = -1;
+    const char * phase      = "none";
+    bool         projected  = false;
+    double       since_c_ms = -1, f_ms = -1, b_ms = -1;  // C as now less C (ms); F and B (-1: unknown)
+    const char * why = "";
+};
+
+bool             fnfl_pace_last(const fnfl_engine * engine, fnfl_pace_report & out);
 // FMU1 (resident TP): now_slot's read has the main lane's turn in progress or starting next, next_slot's read follows
 // it (-1: none); next's next chunk is staged ahead on the staging thread. Never waits; false: a CUDA failure
 bool fnfl_read_prefetch(fnfl_engine * engine, int32_t now_slot, int32_t next_slot);
 // FMU1: resident TP (the KV pool on two cards, no expert cache, no host KV): the presence-based paths apply
 bool fnfl_resident_tp(const fnfl_engine * engine);
+// PRD1 item 9 (the split): a slot whose read returned FNFL_READ_FRONT_DONE: ready when every back half has answered
+// (never waits), then its end from poll: DONE, CANCELLED or ERROR (FRONT_DONE while not ready). The front is free
+// meanwhile: another slot's read may step
+bool             fnfl_read_ready(fnfl_engine * engine, int32_t slot);
+fnfl_read_status fnfl_read_poll(fnfl_engine * engine, int32_t slot);
 // BG1: marks the read's cancellation and returns; its next steps finish the chunk in progress, then CANCELLED
 void fnfl_read_cancel(fnfl_engine * engine, int32_t slot);
 bool fnfl_read_info(const fnfl_engine * engine, int32_t slot, fnfl_read_report & info);
@@ -273,6 +355,80 @@ int32_t fnfl_lane_rows(const fnfl_engine * engine, int32_t lane);
 int32_t fnfl_lane_owner(const fnfl_engine * engine, int32_t lane);
 // the shell released the slot (its request ended or was cancelled): idle, its pages reclaimable
 fnfl_status fnfl_release_slot(fnfl_engine * engine, int32_t slot);
+// MUP1 piece 5 (VIS1's): the slot's rotary position offset for its later rows, between its requests (both boxes on
+// the split); each rotary position is then its cell plus off. Text keeps 0, the default
+fnfl_status      fnfl_set_pos_offset(fnfl_engine * engine, int32_t slot, int32_t off);
 // the tokens the engine holds for the slot (fewer than the shell's after a reclaim: the shell keeps that prefix)
 int32_t fnfl_slot_held(const fnfl_engine * engine, int32_t slot);
 bool fnfl_pool(const fnfl_engine * engine, fnfl_pool_report & out);
+
+// SSF1: the slow-wait trace (fn/xchg/slow.h). Its lines go to sink (the server's log, for its timestamps; nullptr:
+// stderr), and print only while a slot generates: the shell gives the generating slots each turn (a bit a slot)
+void fnfl_trace_sink(void (*sink)(const char * line));
+void fnfl_trace_writers(uint64_t mask);
+
+// ---- VIS1 Stage B: images ----
+// An image in a prompt is a run of nx ny cells, each holding fnfl_image_token() (the chat template's vision start and
+// end tokens around it are text). The shell decodes nothing itself: fnfl_image_prepare checks, decodes, resizes and
+// cuts the image (CPU, any thread) and gives its grid; the shell writes nx ny image tokens where the template's image
+// goes and passes each image's first cell with the read. Every read passes all of its prompt's images, in absolute
+// cells of the whole prompt (the kept n_reuse tokens, then the new ones): the engine keys its reuse and checkpoints by
+// each image's content, so a prompt whose images differ from the slot's is read again from the first that differs.
+struct fnfl_image;
+
+int32_t fnfl_image_token();
+
+// the request limits for untrusted images: encoded bytes, decoded pixels (checked from the header before any pixel is
+// decoded), the widest side, and images a request; JPEG and PNG only
+struct fnfl_image_limits {
+    int64_t max_bytes   = 20000000;
+    int64_t max_decoded = 50000000;
+    int32_t max_side    = 46000;
+    int32_t max_images  = 8;
+};
+
+struct fnfl_image_info {
+    int32_t nx = 0, ny = 0;         // its tokens across and down (nx ny cells in the prompt)
+    int32_t width = 0, height = 0;  // decoded
+    int32_t resized_w = 0, resized_h = 0;
+};
+
+// nullptr with err set when the image is refused (a request error: too large, not JPEG or PNG, corrupt, ...); else a
+// handle the shell frees with fnfl_image_free whenever it likes (a read keeps what it needs)
+fnfl_image * fnfl_image_prepare(const uint8_t *           data,
+                                size_t                    n,
+                                const fnfl_image_limits & limits,
+                                fnfl_image_info &         info,
+                                std::string &             err);
+void         fnfl_image_free(fnfl_image * image);
+
+// the engine reads images (a projector loaded with --mmproj)
+bool fnfl_vision(const fnfl_engine * engine);
+
+struct fnfl_prompt_image {
+    int64_t            cell  = 0;  // its first cell in the whole prompt
+    const fnfl_image * image = nullptr;
+};
+
+// fnfl_prefill and fnfl_read_begin with the prompt's images (n_images 0: as those). Refused (FNFL_BAD_REQUEST, or -1)
+// without a projector, for images whose cells do not hold the image token or overlap, and when the prompt's last
+// partial QSA block holds an image row (at least the tokens the error names must follow the last image; chat
+// templates always do)
+fnfl_status fnfl_prefill_images(fnfl_engine *             engine,
+                                int32_t                   slot,
+                                const int32_t *           tokens,
+                                int32_t                   n_tokens,
+                                int32_t                   n_reuse,
+                                const fnfl_prompt_image * images,
+                                int32_t                   n_images,
+                                int32_t *                 n_processed = nullptr,
+                                fnfl_progress             progress    = nullptr,
+                                void *                    user        = nullptr);
+int32_t     fnfl_read_begin_images(fnfl_engine *             engine,
+                                   int32_t                   slot,
+                                   const int32_t *           tokens,
+                                   int32_t                   n_tokens,
+                                   int32_t                   n_reuse,
+                                   const fnfl_prompt_image * images,
+                                   int32_t                   n_images,
+                                   int32_t *                 n_processed = nullptr);

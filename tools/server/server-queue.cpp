@@ -379,6 +379,15 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                // SSF1: with a slot processing, update_slots posts NEXT_RESPONSE, so this wait should not time out
+                const bool busy = slots_processing.load(std::memory_order_relaxed);
+                if (busy || !queue_tasks_deferred.empty()) {
+                    QUE_WRN(
+                        "FNFL slow: the loop's task wait timed out after %lld s with %s and %zu deferred task(s), "
+                        "t_us=%lld\n",
+                        (long long) max_wait_time.count(), busy ? "a slot processing" : "no slot processing",
+                        queue_tasks_deferred.size(), (long long) ggml_time_us());
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }
@@ -469,10 +478,12 @@ server_task_result_ptr server_response::recv(const std::unordered_set<int> & id_
     // should never reach here
 }
 
+// PRD1 item 14: one wait. nullptr when it ends with no result of id_tasks: at the timeout, or woken for another task
+// (other slots' tokens wake every waiter), so the caller polls its stop condition (a closed connection) on every wake,
+// not only when no slot has streamed for the whole timeout
 server_task_result_ptr server_response::recv_with_timeout(const std::unordered_set<int> & id_tasks, int timeout) {
-    while (true) {
-        std::unique_lock<std::mutex> lock(mutex_results);
-
+    std::unique_lock<std::mutex> lock(mutex_results);
+    const auto                   take = [&]() -> server_task_result_ptr {
         for (int i = 0; i < (int) queue_results.size(); i++) {
             if (id_tasks.find(queue_results[i]->id) != id_tasks.end()) {
                 server_task_result_ptr res = std::move(queue_results[i]);
@@ -480,18 +491,17 @@ server_task_result_ptr server_response::recv_with_timeout(const std::unordered_s
                 return res;
             }
         }
-
-        std::cv_status cr_res = condition_results.wait_for(lock, std::chrono::seconds(timeout));
-        if (!running) {
-            RES_DBG("%s : queue result stop\n", __func__);
-            std::terminate(); // we cannot return here since the caller is HTTP code
-        }
-        if (cr_res == std::cv_status::timeout) {
-            return nullptr;
-        }
+        return nullptr;
+    };
+    if (server_task_result_ptr res = take()) {
+        return res;
     }
-
-    // should never reach here
+    condition_results.wait_for(lock, std::chrono::seconds(timeout));
+    if (!running) {
+        RES_DBG("%s : queue result stop\n", __func__);
+        std::terminate();  // we cannot return here since the caller is HTTP code
+    }
+    return take();
 }
 
 server_task_result_ptr server_response::recv(int id_task) {
@@ -567,7 +577,7 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
     while (true) {
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
-            // timeout, check stop condition
+            // no result in this wait (a timeout or another task's wake): check the stop condition
             if (should_stop()) {
                 return nullptr;
             }

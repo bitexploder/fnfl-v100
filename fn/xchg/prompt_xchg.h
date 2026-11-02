@@ -31,7 +31,8 @@ constexpr uint32_t err_prange = 1u << 26;  // a prompt FP16 operand out of range
 
 enum class pkind : int32_t { emb = 1, attn = 2, ffn = 3, sel = 4, mom = 5, dmix = 6, pred = 7 };
 
-// the generation of a message: chunk (24 bits), layer (0..48: 48 the draft), sublayer (0, 1), half (0, 1), kind
+// the generation of a message: chunk (24 bits), layer (0..48: 48 the draft), sublayer (0, 1), half or piece (MUP2:
+// 0 .. 127, its low 4 bits at bits 8-11 and its high 3 at bits 13-15; the halves' generations unchanged), kind
 uint64_t pgen(int64_t chunk, int32_t layer, int32_t sub, int32_t half, pkind kind);
 
 inline int64_t pmsg_bytes(int64_t payload_bytes) {

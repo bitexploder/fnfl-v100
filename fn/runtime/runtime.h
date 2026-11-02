@@ -21,8 +21,10 @@
 
 #include "fn/kernels/samp/samp.h"
 #include "fn/runtime/joint.h"
+#include "fn/runtime/pace.h"
 #include "fn/runtime/prefill.h"
 #include "fn/runtime/target.h"
+#include "fn/runtime/vision_service.h"
 
 #include <array>
 #include <chrono>
@@ -150,6 +152,18 @@ struct engine_config {
     // TTTS1 (fnfl-drive spec run's records): each step's decision hash read after it (one synchronous read a step;
     // off in serving)
     bool                                  record_hash = false;
+    // MUP1 piece 3 (--fnfl-small-read-rows N; 0 off): beside writers (read_mode::writers, resident TP) a read of at most
+    // N rows runs each of its chunks in the lone geometry, the box's layers as one group with its end and finish in
+    // the same step; the split's follower runs the chunk's back half whole (op::read_step's c.a 0) without the leader
+    // waiting for it. Longer reads keep the writers geometry (1-layer groups)
+    int32_t                               small_read_rows = 512;
+    // VIS1 Stage B: the vision projector's file (empty: none). The engine loads it into the vision classes the load
+    // reserved for it (loader::load_params::mmproj, on the box that embeds) and reads images with it
+    std::string                           mmproj;
+    // VIS1 Stage B: the split's back with images on the front: the planes only (loader::load_params::image_planes)
+    bool                                  image_planes = false;
+    // TEST (split-test's image case): synthetic image rows in place of the encoder (vision_service::init_synthetic)
+    vision_service::synthetic_rows        test_image_rows;
 };
 
 constexpr int32_t max_split_slots = 8;  // TTTS1: the split's slots (one box: 4)
@@ -169,6 +183,7 @@ struct request_options {
     fn::samp::options sampling;
     int32_t max_tokens = -1; // the request's token limit; -1: the context room
     int32_t n_ctx = 0;       // the shell's slot context (the room's limit); 0: the engine's
+    bool ignore_eos = false; // VBENCH: no end of generation, so only the budget ends the request (vLLM's ignore_eos)
 };
 
 // one request's steps (the per-request summary)
@@ -184,10 +199,26 @@ struct request_summary {
 };
 
 // MU1 (the multi-slot engine): a read job's step outcome (fn/runtime/prefill.h pf_step) and what the scheduler reads
-enum class read_status : int32_t { yielded, chunk_done, done, cancelled, error };
+// PRD1 item 9: front_done (the split's leader only): the front's read ended and its back halves are still out; the
+// slot is polled with leader::read_poll until its end (done, cancelled or error), and another read may run meanwhile
+enum class read_status : int32_t { yielded, chunk_done, done, cancelled, error, front_done };
 // FMU1: who else has model work when a read step runs (the server's presence rule): no one (lone), generating slots
 // (writers), or only other readers (shared). Resident TP only; elsewhere every step is shared (MU1, MXMU1)
 enum class read_mode : int32_t { shared, writers, lone };
+
+// APF1: a writers-mode step's budget on this box, the writer-pause deadline's (fn/runtime/pace.h: the owner's
+// decision): units while the next one's prediction fits budget_ms, at least one (budget_ms < 0: unknown, one unit);
+// pause_ms the P it came from (the split's back receives it). floor: no writer step is pending here, one unit. The
+// owner's totals before and after the decision give the read job line its pacing account
+struct read_budget {
+    double      budget_ms = -1;
+    int32_t     pause_ms  = pace::pause_default_ms;
+    bool        known     = false;
+    bool        floor     = false;
+    bool        lagged    = false;  // PRD1 item 8 (with floor): the follower's idle drain, a unit launched unjoined
+    bool        paced     = false;  // pace_before and pace_after are set
+    pace::stats pace_before, pace_after;
+};
 struct read_info {
     int32_t slot = -1;
     int64_t job = 0;                           // FMU1: the read's job number (its staging tags)
@@ -204,6 +235,17 @@ struct read_info {
     int64_t groups_done = 0;                   // groups run (each step's are complete when it returns)
     int32_t steps = 0, chunks_done = 0, checkpoints = 0;
     double service_s = 0, longest_step_s = 0, last_group_s = -1; // host clock around the job's steps
+    // MUP2 piece 4: its units (pf_job's account). APF1: P (the last budgeted step's), the budgeted steps whose budget
+    // was zero or unknown, whether the last step ran only its progress unit, and this box's pacing over the read
+    // (pace_ns: the decisions and writer completion gaps between its first and last budgeted step)
+    int64_t     units_run  = 0;
+    int32_t     unit_steps = 0, most_units = 0, floor_units = 0, budget_n = 0, piece_min = 0, piece_max = 0;
+    double      unit_ms = 0, floor_ms = 0, budget_ms_sum = 0;
+    int32_t     pause_ms = 0, budget_zero = 0, budget_unknown = 0;
+    int32_t     budget_misses = 0;  // PRD1 item 12: halves kept whole whose largest unit was predicted over B
+    bool        below_floor   = false;
+    bool        last_minimum  = false;
+    pace::stats pace_ns;
 };
 // MU1: the shared KV pool as the engine sees it
 struct pool_info {
@@ -249,8 +291,19 @@ class engine {
     // end without a valid state (the next prefill restores a checkpoint at or below them), n_processed is their count
     // and the status is cancelled. MU1: on a multi-slot engine the same through the slot's read job, every group in
     // one step (no other slot runs during the call)
-    run_status prefill(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse, int32_t & n_processed,
-                       const prefill_progress & progress = {});
+    // VIS1 Stage B: images, the prompt's images in absolute cells of the whole prompt (the kept n_reuse tokens then
+    // the new ones; null or empty: text), each cell holding image_token (fn/runtime/image_rows.h), each with its
+    // prepared image (target.h prompt_image; needed for every image the read reaches). They need the vision projector
+    // (engine_config::mmproj) and the end rule; n_reuse is cut to the prefix whose images match the
+    // slot's (a different image, or an image cut by n_reuse, is read again). With images held or given the read sets
+    // the slot's rotary offset from them (at its start, then off(N) at its end); text alone leaves it as set
+    run_status               prefill(int32_t                           slot,
+                                     const int32_t *                   tokens,
+                                     int32_t                           n_tokens,
+                                     int32_t                           n_reuse,
+                                     int32_t &                         n_processed,
+                                     const prefill_progress &          progress = {},
+                                     const std::vector<prompt_image> * images   = nullptr);
     // out holds max_step_tokens tokens. MU1: the slot's next cells mapped first (the KV pool; an idle slot reclaimed
     // when the pool is full; no_context when it stays full)
     run_status step(int32_t slot, int32_t * out, int32_t & n_out, bool & end);
@@ -264,6 +317,13 @@ class engine {
     // prefill instead (its other box could not keep it), holding the same tokens
     bool       in_place(int32_t slot) const;
     void       to_restore(int32_t slot);
+    // MUP1 piece 5: the slot's rotary position offset (target::set_pos_offset): every rotary site of its later rows
+    // reads cell + off (prefill, decode, the draft and its catch-up, rollback, joint rounds); cells, QSA blocks and
+    // checkpoints stay on cells. Text: 0 (the default; its bits unchanged). Between the slot's requests (no read live);
+    // |off| <= max_pos_offset, so every position stays an exact F32 integer
+    static constexpr int32_t max_pos_offset = 1 << 23;
+    run_status               set_pos_offset(int32_t slot, int32_t off);
+    int32_t                  pos_offset(int32_t slot) const;
     // the tokens the slot's state holds (processed) and its pending token (-1: none)
     run_status history(int32_t slot, std::vector<int32_t> & tokens, int32_t & pending) const;
 
@@ -272,19 +332,53 @@ class engine {
     // slot's latest matching checkpoint restored, or a reset), the chunk plan made and the pool's pages for the whole
     // prompt and the next step mapped (an idle slot reclaimed when the pool is full). Returns 0 (prepared), 1 (the
     // context or the pool cannot hold it: the slot's state unchanged) or -1 (invalid: err). n_processed as prefill's.
-    int32_t read_begin(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse, int32_t & n_processed);
+    // VIS1 Stage B: images as prefill's
+    int32_t     read_begin(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const std::vector<prompt_image> * images = nullptr);
     // the job's next step: up to n_groups layer groups of its chunk in progress (or of its next chunk, started now in
     // the main arena when free, else in the other-reader lane when it fits), complete on both cards when it returns
     // FMU1: mode fixes a chunk's geometry when the step starts it (fn/runtime/prefill.h pf_mode)
-    read_status read_step(int32_t slot, int32_t n_groups, read_mode mode = read_mode::shared);
+    // MUP2: writers mode runs units under budget; PRD1 item 7: MUP1's small read whole beside writers; item 8: a
+    // chunk begun in units runs up to n_groups units a step with no budget. A lagged floor budget (the follower's
+    // idle drain) returns with its unit launched, not complete: read_settle completes it
+    read_status read_step(int32_t             slot,
+                          int32_t             n_groups,
+                          read_mode           mode   = read_mode::shared,
+                          const read_budget * budget = nullptr);
+    // PRD1 item 8: the idle drain's launched units joined and accounted (before any other work on this box; false:
+    // the engine failed), its units not yet complete, and the units it launched since init (a test's counts)
+    bool        read_settle();
+    bool        read_draining() const;
+    int32_t     read_in_flight() const;
+    int64_t     read_drained() const;
     // FMU1 (P, resident TP): now_slot's read has the main lane's turn in progress or starting next, next_slot's read
     // follows it (-1: none): next's next chunk is staged ahead on the staging thread (prefiller::prefetch); never waits
     bool read_prefetch(int32_t now_slot, int32_t next_slot);
     // FMU1: resident TP (the KV pool, two cards, no expert service): the presence-based paths are on
     bool resident_tp() const;
-    // BG1: the job stops at its chunk's end (or before its next chunk); never synchronous work here
+    // BG1: the job stops at its chunk's end (or before its next chunk); never synchronous work here. PRD1 item 14:
+    // the last chunk's end included (the read ends cancelled, the chunk kept, no handoff)
     void read_cancel(int32_t slot);
+    // PRD1 item 14 (the split's back): the job finishes its first `chunks` chunks (the front's), then stops as
+    // read_cancel does, at the last chunk's end too
+    void        read_cancel_after(int32_t slot, int64_t chunks);
     bool get_read_info(int32_t slot, read_info & out) const;
+    // MUP1 piece 3: the slot's live read is small (engine_config::small_read_rows): beside writers its chunks run in
+    // the lone geometry
+    bool        small_read(int32_t slot) const;
+
+    // APF1 (resident TP without a split): this box's writer-pause book (fn/runtime/pace.h). step and step_joint record
+    // the writers' steps; a slot's request boundaries (set_sampling, prefill, read_begin, truncate, release_slot) and
+    // a step's end of generation take it out of the writers; the last one out clears the group
+    pace::pacer & pacer() { return pace_; }
+
+    const pace::pacer & pacer() const { return pace_; }
+    // MUP2 (TEST ONLY): writers-mode chunks' pieces (prefiller::test_piece_rows)
+    void        test_piece_rows(int32_t r);
     // layers a group for chunks that start after the call (1 .. 48)
     bool set_read_group(int32_t layers);
     int32_t read_group() const { return read_group_; }
@@ -344,6 +438,8 @@ class engine {
     void split_joint_off() { joint_off_ = true; }
 
     const engine_config & config() const { return c_; }
+    // VBENCH: the end-of-generation IDs of the slot's request (none with its ignore_eos)
+    const std::vector<int32_t> & eog(int32_t slot) const;
 
     // the slot's last step's decision hash (record_hash; 0 without)
     uint64_t split_last_hash(int32_t slot) const;
@@ -354,6 +450,9 @@ class engine {
             s_[size_t(slot)].round_bias += n;
         }
     }
+
+    // MUP2 (split-test pieces): the rounds the slot's decision hashes leave out
+    uint64_t test_round_bias(int32_t slot) const { return slot_ok(slot) ? s_[size_t(slot)].round_bias : 0; }
 
     // TTTS1 (the follower's spec run records): slot's last finished request's steps
     const std::vector<step_info> & last_steps_of(int32_t slot) const { return s_[size_t(slot)].last_steps; }
@@ -377,6 +476,7 @@ class engine {
         bool valid = false;        // the device state matches the ledger (false: restore a checkpoint or re-prefill)
         std::vector<int32_t> keep; // while !valid: the tokens the slot holds, restored or re-prefilled next
         bool open = false;         // a request's steps have run and it has not finished
+        bool                 ended = false;  // PRD1: its request finished (eog or budget); no step until its next read
         bool unchecked = false;    // a decision ran since the last closing check
         int32_t n_gen = 0;         // the open request's tokens
         int32_t fail_step = 0;     // armed --fnfl-test-fail-step
@@ -414,6 +514,19 @@ class engine {
     // MU1: the slot's first cells mapped (the pool), reclaiming idle slots when it is full; capacity: it stayed full
     bool ensure_cells(int32_t slot, int64_t cells, bool & capacity, std::string & err);
     void reclaim(int32_t slot, int32_t for_slot);
+    // VIS1 Stage B: the read's image ledger into out, before anything changes on the slot: images validated against
+    // the whole prompt with the end rule, and n_reuse cut to the prefix the slot's ledger and out agree on (tokens and
+    // n_tokens then point at the prompt from the cut, held in cut). vis: images held or given (the read sets the
+    // offset). False: a bad request (err_)
+    bool       read_images(slot_rt &                                              x,
+                           const int32_t *&                                       tokens,
+                           int32_t &                                              n_tokens,
+                           int32_t &                                              n_reuse,
+                           const std::vector<prompt_image> *                      images,
+                           std::vector<int32_t> &                                 cut,
+                           image_rows &                                           out,
+                           std::vector<std::shared_ptr<const vision::prepared>> & px,
+                           bool &                                                 vis);
     void prefill_lines(slot_rt & x, const char * how, int64_t from, int32_t n_processed, int32_t n_reuse,
                        int32_t n_tokens, double secs, bool ok, std::chrono::steady_clock::time_point entry);
 
@@ -421,6 +534,7 @@ class engine {
     void shutdown();                            // the destructor's teardown, the model kept
     std::unique_ptr<model::expert_service> ex_; // ME1 (destroyed after the targets and the prefiller)
     std::vector<slot_rt> s_;
+    std::unique_ptr<vision_service>        vs_;  // VIS1 Stage B (engine_config::mmproj); destroyed after the prefiller
     std::unique_ptr<prefiller> pf_;
     engine_config c_;
     std::string err_;
@@ -434,6 +548,11 @@ class engine {
     uint64_t release_seq_ = 0;
     int32_t reclaims_ = 0;
     std::unique_ptr<joint_frame> joint_; // FMU2: resident TP with two or more slots (engine_config::joint)
+    pace::pacer                  pace_{ pace::role::resident };  // APF1 (pacer())
+    uint32_t                     pace_writers_ = 0;              // the slots generating (bit a slot)
+    void                         pace_steps(const int32_t * slots, int32_t n, double t0, const bool * left);
+    void                         pace_leave(int32_t slot);
+    void                         step_joint_body(const int32_t * slots, int32_t n, joint_step_out * res);
     bool joint_off_ = false;             // FMU2: a joint capture failed; later steps take turns
 };
 

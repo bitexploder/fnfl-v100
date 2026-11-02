@@ -134,9 +134,9 @@ int64_t bytes_per_cell(int32_t card, bool kv_q8, const window & w) {
 }
 
 bool host_class(const std::string & name, bool single, bool kv_host) {
-    return (single && name == "prefill checkpoints (PF1)") ||
-           (kv_host && (name == "target KV (K0)" || name == "draft KV (F16)" ||
-                        name == "target index keys (ME6)" || name == "draft index keys (ME6)"));
+    return name == "vision staging (VIS1)" || (single && name == "prefill checkpoints (PF1)") ||
+           (kv_host && (name == "target KV (K0)" || name == "draft KV (F16)" || name == "target index keys (ME6)" ||
+                        name == "draft index keys (ME6)"));
 }
 
 std::vector<buffer_class> state_classes(const state_params & p) {
@@ -243,7 +243,7 @@ std::vector<buffer_class> state_classes(const state_params & p) {
             "draft head copy (DR1)",
             "head.h: 32,768 Q5_K rows of 2,560 (head::draft_head_bytes, 57,671,680 bytes) and their ID map, "
             "I32 [32,768], on each card",
-            { both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card)),
+            { both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card, p.head_q8)),
               both("draft head ID map", int64_t(fn::head::n_draft_card) * 4) }
         });
     }
@@ -330,8 +330,8 @@ std::vector<buffer_class> state_classes(const state_params & p) {
               both("DA-TC q16", int64_t(fn::draft::max_rows) * 12 * 256 * 2),
               both("DA-TC partials", (int64_t) fn::draft::part_bytes()),
               both("draft logits", int64_t(fn::samp::max_drafts) * fn::head::n_draft_card * 4),
-              both("draft head work",
-              std::max<int64_t>(256, (int64_t) fn::head::logits_work_bytes(fn::head::n_draft_card))) }
+              both("draft head work", std::max<int64_t>(256, (int64_t) fn::head::logits_work_bytes(
+                                                                 fn::head::n_draft_card, p.head_q8))) }
         });
     }
     // SM1: the sampler's per-slot state (samp.h): the options and decision record, the bias table and penalty counts
@@ -374,10 +374,10 @@ std::vector<buffer_class> state_classes(const state_params & p) {
                    {part{"prompt arena",
                          {prompt_arena_bytes(prompt_chunk_rows, prompt_half_rows, p.single, 0),
                           prompt_arena_bytes(prompt_chunk_rows, prompt_half_rows, p.single, 1)}}}});
-    out.push_back({"HC and PLE replicas (PB1)",
-                   "prompt.h prompt_replica_bytes: the peer's w_down, w_up and gamma of the 96 HC sublayers, its PLE "
-                   "key, value, norms and taps, the draft's full enorm and hnorm",
-                   {both("replicas", prompt_replica_bytes(p.single))}});
+    out.push_back({ "HC and PLE replicas (PB1)",
+                    "prompt.h prompt_replica_bytes: the peer's w_down, w_up and gamma of the 96 HC sublayers, its PLE "
+                    "key, value, norms and taps, the draft's full enorm and hnorm",
+                    { both("replicas", prompt_replica_bytes(p.single, p.ple_kv, p.ple_conv32)) } });
     return out;
 }
 
@@ -402,6 +402,53 @@ std::vector<buffer_class> lane_classes() {
             {"other-reader staging (MU1)",
              "FC-PLE1 at prompt rows: one slot of 4,096 rows x 2,560 F32 (the lane's chunk's PLE input e)",
              {both("lane PLE staging", int64_t(lane_rows) * 2560 * 4)}}};
+}
+
+int64_t vision_bplane_offset(int32_t rows) {
+    return (int64_t(rows) * 16 + 255) / 256 * 256;
+}
+
+int64_t vision_plane_bytes(int32_t rows) {
+    return vision_bplane_offset(rows) + (int64_t(rows) / 4 + 1) * 16;
+}
+
+std::vector<buffer_class> vision_classes(const vision_params & p) {
+    buffer_class w{ "vision weights (VIS1)",
+                    "fn/vision/sizes.h weight_bytes: card 0 blocks 0-13 and the patch embedding, card 1 blocks 14-26 "
+                    "and the merger; one box: the image token's embedding row (state.h vtr_*)",
+                    {} };
+    w.parts.push_back({
+        "encoder weights", { p.weights[0], p.weights[1] }
+    });
+    w.parts.push_back(both("image token row (the draft)", p.token_row ? vision_token_row_bytes : 0));
+    buffer_class d{ "vision work (VIS1)",
+                    "fn/vision/sizes.h plan_scratch(16,384 patches); a lane's encoder rows 4,096 x 2,560 F32, supplied "
+                    "rows lane rows x 1,280 F32 and rope planes",
+                    {} };
+    d.parts.push_back(both("encoder scratch", p.scratch));
+    for (int32_t l = 0; l < 2; ++l) {
+        const bool        on   = l < p.lanes;
+        const int32_t     rows = on ? p.lane_rows[l] : 0;
+        const std::string n    = " (lane " + std::to_string(l) + ")";
+        const bool        rw   = on && !p.planes_only;
+        d.parts.push_back({
+            "encoder rows" + n, { 0, rw ? int64_t(4096) * 2560 * 4 : 0 }
+        });
+        d.parts.push_back(both("supplied rows" + n, rw ? int64_t(rows) * 1280 * 4 : 0));
+        d.parts.push_back(both("rope planes" + n, on ? vision_plane_bytes(rows) : 0));
+    }
+    buffer_class h{ "vision staging (VIS1)",
+                    "fn/vision/sizes.h patch_stage_bytes(16,384): one image's patch rows (card 0); each lane's two "
+                    "plane upload slots",
+                    {} };
+    h.parts.push_back({
+        "patch rows", { p.patch_stage, 0 }
+    });
+    for (int32_t l = 0; l < 2; ++l) {
+        h.parts.push_back(both("plane slots (lane " + std::to_string(l) + ")",
+                               l < p.lanes ? 2 * vision_plane_bytes(p.lane_rows[l]) : 0));
+    }
+    return { w, d, h };
 }
 
 buffer_class chunk_class(int32_t chunk_rows) {

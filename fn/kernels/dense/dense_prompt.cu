@@ -1,10 +1,13 @@
 #include "fn/kernels/dense/dense_dec.cuh"
 #include "fn/kernels/dense/dense_prompt.h"
+#include "fn/kernels/dense/dense_ladder.cuh"
+#include "fn/kernels/dense/dense_prompt_dec.cuh"
 #include "fn/kernels/tc/tc_gemm.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cfloat>
 #include <cstdint>
 #include <cstdio>
@@ -13,188 +16,13 @@
 namespace fn::dense {
 namespace {
 
+using namespace pdc;  // APF2: the decode helpers and pd_tc's epilogue, shared with the ladder (dense_prompt_dec.cuh)
+
 constexpr int32_t pd_threads = 256;
 constexpr int32_t pd_cols    = 256;  // columns a block: 8 warps x 32
 constexpr int32_t pd_rows =
     64;  // rows a panel (8 tiles of 8; one CTA an SM: the unpack and the tiles need about 150-200 registers)
 constexpr int32_t pd_nt     = pd_rows / 8;
-constexpr int32_t dp2_stage = 128;   // K a stage (two quarters of a 256-weight step)
-constexpr int32_t ex1_stage = 64;    // K a stage of EX1's down layout (one Q2_0 block, two IQ4_NL blocks)
-constexpr int32_t ex1_n     = 2560;  // the shared down's outputs a card
-constexpr int32_t ex1_k     = 320;   // its inputs (the card's channels)
-
-// ---- small helpers -----------------------------------------------------------------------------------------------
-
-__device__ __forceinline__ uint32_t hsub2(uint32_t a, uint32_t b) {
-    const half2 r = __hsub2(*reinterpret_cast<const half2 *>(&a), *reinterpret_cast<const half2 *>(&b));
-    return *reinterpret_cast<const uint32_t *>(&r);  // reinterpret: half2 is the word's two halves
-}
-
-// D += A B: one m8n8k4 product per quadpair, FP16 inputs, F32 accumulators (HMMA.884.F32)
-__device__ __forceinline__ void mma884(float (&d)[8], uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
-    asm volatile(
-        "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9}, "
-        "{%10, %11}, {%0, %1, %2, %3, %4, %5, %6, %7};"
-        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7])
-        : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
-}
-
-// an A fragment (8 bytes) from shared memory, asm volatile so it stays beside its product: ptxas otherwise reads a
-// group's fragments of every tile ahead of the products and runs out of registers
-__device__ __forceinline__ uint2 lds64(const uint8_t * p) {
-    uint2 v;
-    asm volatile("ld.shared.v2.u32 {%0, %1}, [%2];"
-                 : "=r"(v.x), "=r"(v.y)
-                 : "r"(static_cast<uint32_t>(__cvta_generic_to_shared(p))));
-    return v;
-}
-
-// the C element i of a lane: its row and column in the quadpair's 8 x 8 block (m8n8k4, F32 accumulators)
-__device__ __forceinline__ int32_t c_row(int32_t lane, int32_t i) {
-    return (i & 2) | ((lane & 16) ? 4 : 0) | (lane & 1);
-}
-
-__device__ __forceinline__ int32_t c_col(int32_t lane, int32_t i) {
-    return (i & 1) | (((lane >> 1) & 1) << 1) | ((i >> 2) << 2);
-}
-
-// the lane holding column col's B fragment in the lane's quadpair (row r of m8n8k4's B is lane (r & 3) | (r & 4) << 2)
-__device__ __forceinline__ int32_t col_lane(int32_t lane, int32_t col) {
-    return (col & 3) | (lane & 12) | ((col & 4) << 2);
-}
-
-// A code word (4 codes as bytes) as the two FP16 pairs of one k4 B fragment: bitcast(0x6400 | byte) - bias, exact
-__device__ __forceinline__ void codes16(uint32_t w, uint32_t bias2, uint32_t & lo, uint32_t & hi) {
-    lo = hsub2(__byte_perm(w, 0x64646464u, 0x5140u), bias2);
-    hi = hsub2(__byte_perm(w, 0x64646464u, 0x5342u), bias2);
-}
-
-constexpr uint32_t bias_u = 0x64006400u;  // 1024: unsigned codes
-constexpr uint32_t bias_s = 0x64806480u;  // 1152: signed codes biased by 128
-
-// ---- the formats ----------------------------------------------------------------------------------------------------
-// fmt_dec<F, L>: per lane, its column's codes for one stage as 32-bit words (4 codes each, in the kernel's K order),
-// the groups' scales and mins. DP2: a stage is quarters 2 h, 2 h + 1 of a 256-weight step (16 words each), decoded
-// by DP2's own device code (dense_dec.cuh). EX1 down: a stage is 64 weights.
-
-// a stage's decoded words for one quarter (DP2) and its groups
-struct quarter_codes {
-    uint32_t w[16];
-    float    f[4], m[4];  // per group: DP2 non-Q6_K groups 0, 1 (words 8 j ..); Q6_K groups 0..3 (words 4 i ..)
-};
-
-template <fmt F> __host__ __device__ constexpr bool is_signed_code() {
-    return F == fmt::iq4_xs || F == fmt::iq3_s || F == fmt::q8_0 || F == fmt::q6_k || F == fmt::iq4_nl ||
-           F == fmt::q2_0;
-}
-
-template <fmt F> __host__ __device__ constexpr bool has_min() {
-    return F == fmt::q4_k || F == fmt::q5_k;
-}
-
-// words a group (Q6_K: 16 weights)
-template <fmt F> __host__ __device__ constexpr int32_t group_words() {
-    return F == fmt::q6_k ? 4 : 8;
-}
-
-// DP2: decode quarter q of the lane's column (r: its row in the 8-row tile) at step base p
-template <fmt F>
-__device__ __forceinline__ void dp2_quarter(const uint8_t *  p,
-                                            int32_t          r,
-                                            int32_t          q,
-                                            const uint4 &    kv,
-                                            const uint32_t * grid,
-                                            quarter_codes &  o) {
-    raw<F>       v;
-    const cursor c = make_cursor<F>(p, r, q);
-    load_full<F, 0>(v, c);
-    dec64 d;
-    decode<F>(v, q, kv, grid, d);
-    if constexpr (F == fmt::q6_k) {
-        // codes q (0..63) as the signed q - 32: byte + 96 then the signed bias (no byte carries: 63 + 96 < 256)
-#pragma unroll
-        for (int32_t i = 0; i < 16; ++i) {
-            o.w[i] = d.w[i] + 0x60606060u;
-        }
-#pragma unroll
-        for (int32_t i = 0; i < 4; ++i) {
-            o.f[i] = d.d * static_cast<float>(d.sc[i]);
-            o.m[i] = 0.0f;
-        }
-    } else {
-#pragma unroll
-        for (int32_t i = 0; i < 16; ++i) {
-            o.w[i] = is_signed_code<F>() ? d.w[i] ^ 0x80808080u : d.w[i];
-        }
-        o.f[0] = d.f0;
-        o.f[1] = d.f1;
-        o.m[0] = has_min<F>() ? d.m0 : 0.0f;
-        o.m[1] = has_min<F>() ? d.m1 : 0.0f;
-        o.f[2] = o.f[3] = o.m[2] = o.m[3] = 0.0f;
-    }
-}
-
-// EX1 down: the lane's column n at stage s (64 weights): 16 words, groups 0 and 1 (32 weights each)
-template <fmt F>
-__device__ __forceinline__ void ex1_stage_codes(const uint8_t * w,
-                                                int32_t         n,
-                                                int32_t         s,
-                                                const uint4 &   kv,
-                                                quarter_codes & o) {
-    if constexpr (F == fmt::iq4_nl) {
-        constexpr int64_t d_plane = int64_t(10) * ex1_n * 16;
-        const uint32_t    dd = __ldg(reinterpret_cast<const uint32_t *>(w + d_plane + (int64_t(s) * ex1_n + n) * 4));
-#pragma unroll
-        for (int32_t bb = 0; bb < 2; ++bb) {
-            const uint4 qs = __ldg(reinterpret_cast<const uint4 *>(w + (int64_t(2 * s + bb) * ex1_n + n) * 16));
-#pragma unroll
-            for (int32_t c = 0; c < 4; ++c) {
-                uint32_t lo, hi;
-                iq4_lookup(word(qs, c), kv, lo, hi);
-                o.w[8 * bb + 2 * c]     = lo ^ 0x80808080u;
-                o.w[8 * bb + 2 * c + 1] = hi ^ 0x80808080u;
-            }
-            o.f[bb] = __half2float(__ushort_as_half(static_cast<unsigned short>((dd >> (16 * bb)) & 0xffffu)));
-            o.m[bb] = 0.0f;
-        }
-    } else {
-        static_assert(F == fmt::q2_0, "EX1 down: IQ4_NL or Q2_0");
-        constexpr int64_t d_plane = int64_t(5) * ex1_n * 16;
-        const uint4       qs      = __ldg(reinterpret_cast<const uint4 *>(w + (int64_t(s) * ex1_n + n) * 16));
-        const float       d       = __half2float(__ushort_as_half(
-            __ldg(reinterpret_cast<const unsigned short *>(w + d_plane + (int64_t(s) * ex1_n + n) * 2))));
-#pragma unroll
-        for (int32_t x = 0; x < 16; ++x) {
-            // byte x holds weights 4x .. 4x + 3 in its 2-bit fields: each to its own byte, then q - 1 biased by 128
-            const uint32_t b  = (word(qs, x >> 2) >> (8 * (x & 3))) & 0xffu;
-            const uint32_t sp = (b & 3u) | ((b & 0xcu) << 6) | ((b & 0x30u) << 12) | ((b & 0xc0u) << 18);
-            o.w[x]            = sp + 0x7f7f7f7fu;
-        }
-        o.f[0] = o.f[1] = d;
-        o.m[0] = o.m[1] = 0.0f;
-    }
-    o.f[2] = o.f[3] = o.m[2] = o.m[3] = 0.0f;
-}
-
-// The original K (within its stage) of byte i of word x: DP2 non-Q6_K words are in K order (quarter qq's word x at
-// 64 qq + 4 x); Q6_K's lane q = 2 n + h covers 16h + 32i + l' of half n (its word 4i + m: l' = 4m + byte); EX1's
-// IQ4_NL word 2c (lo) / 2c + 1 (hi) of block bb holds nibbles in GGUF order (byte j: weight j low, 16 + j high).
-// stage_a places that value at 64 qq + 4 x + i (EX1: 4 x + i), so a word's four values are one 8-byte A fragment.
-template <fmt F, pd_layout L> __device__ __forceinline__ int32_t k_of(int32_t qq, int32_t x, int32_t i) {
-    if constexpr (L == pd_layout::ex1_down) {
-        if constexpr (F == fmt::iq4_nl) {
-            const int32_t bb = x >> 3, xx = x & 7, c = xx >> 1, h = xx & 1;
-            return 32 * bb + 4 * c + 2 * h + (i >> 1) + 16 * (i & 1);
-        } else {
-            return 4 * x + i;
-        }
-    } else if constexpr (F == fmt::q6_k) {
-        const int32_t ii = x >> 2, m = x & 3;
-        return 16 * qq + 32 * ii + 4 * m + i;
-    } else {
-        return 64 * qq + 4 * x + i;
-    }
-}
 
 // ---- the product kernel -------------------------------------------------------------------------------------------
 
@@ -442,24 +270,20 @@ __global__ void __launch_bounds__(pd_threads) pd_codes_kernel(pd_kargs k, float 
 
 // ---- PB3: convert once, then the tensor product ---------------------------------------------------------------------
 
-// four FP16 codes (lo, hi: k4 B fragment halves) to the decoder's F32 weights f x code - m, each rounded to FP16
-__device__ __forceinline__ uint2 weights16(uint32_t lo, uint32_t hi, float f, float m) {
-    const uint32_t h[2] = { lo, hi };
-    uint32_t       o[2];
-#pragma unroll
-    for (int32_t j = 0; j < 2; ++j) {
-        const float c0 = __half2float(__ushort_as_half(static_cast<unsigned short>(h[j] & 0xffffu)));
-        const float c1 = __half2float(__ushort_as_half(static_cast<unsigned short>(h[j] >> 16)));
-        const float v0 = __fsub_rn(__fmul_rn(f, c0), m), v1 = __fsub_rn(__fmul_rn(f, c1), m);
-        o[j]           = static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v0))) |
-               (static_cast<uint32_t>(__half_as_ushort(__float2half_rn(v1))) << 16);
-    }
-    return make_uint2(o[0], o[1]);
+
+// MUP1 piece 2: a quarter's 16 eight-byte words of each of the warp's 32 columns in its staging buffer (4 KiB a warp,
+// so 32 KiB a CTA and three CTAs an SM), word x of column c at 16 c + (x ^ (c & 15)): the warp's 32 columns storing
+// one word, or 16 lanes reading one column's words, spread over the banks
+__device__ __forceinline__ int32_t cv_at(int32_t c, int32_t x) {
+    return 16 * c + (x ^ (c & 15));
 }
 
-// a CTA per (256 columns, stage): lane (qp, r) decodes column n's stage (pd_codes_kernel's walk) and writes its
-// weights in K order, 8 bytes a store (a word's 4 values are consecutive in K except IQ4_NL's, whose word pair
-// 2c, 2c + 1 holds K 4c .. 4c + 3 and 4c + 16 .. 4c + 19 of its block)
+// a CTA per (256 columns, stage): lane (qp, r) decodes column n's stage (pd_codes_kernel's walk) into its weights in
+// K order, 8 bytes a word (a word's 4 values are consecutive in K except IQ4_NL's, whose word pair 2c, 2c + 1 holds
+// K 4c .. 4c + 3 and 4c + 16 .. 4c + 19 of its block). MUP1 piece 2: each warp stages its 32 columns' words of a
+// quarter in shared memory, then stores them row by row (two rows of wt an instruction, 16 lanes a row: DP2 and EX1's
+// Q2_0 and Q8_0 write 128 contiguous bytes a row, Q6_K four 32-byte runs), not one word in each of 32 rows a store;
+// the same values at the same places. EX1's IQ4_NL keeps its own stores.
 template <fmt F, pd_layout L>
 __global__ void __launch_bounds__(pd_threads) pd_convert_kernel(const pd_kargs k, uint16_t * wt) {
     constexpr int32_t   SK  = L == pd_layout::dp2 ? dp2_stage : ex1_stage;
@@ -484,7 +308,8 @@ __global__ void __launch_bounds__(pd_threads) pd_convert_kernel(const pd_kargs k
     if (static_cast<int32_t>(blockIdx.x) * pd_cols + 32 * w >= k.a.n) {
         return;
     }
-    uint16_t * row = wt + int64_t(n) * k.a.k + int64_t(s) * SK;
+    constexpr bool   own_stores = L == pd_layout::ex1_down && F == fmt::iq4_nl;
+    __shared__ uint2 cv_s[pd_threads / 32][own_stores ? 1 : 32 * 16];
 #pragma unroll
     for (int32_t qq = 0; qq < QPS; ++qq) {
         quarter_codes qc;
@@ -496,7 +321,8 @@ __global__ void __launch_bounds__(pd_threads) pd_convert_kernel(const pd_kargs k
             ex1_stage_codes<F>(k.a.w, n, s, kv, qc);
         }
         constexpr uint32_t bias = is_signed_code<F>() ? bias_s : bias_u;
-        if constexpr (L == pd_layout::ex1_down && F == fmt::iq4_nl) {
+        if constexpr (own_stores) {
+            uint16_t * const row = wt + int64_t(n) * k.a.k + int64_t(s) * SK;
 #pragma unroll
             for (int32_t x = 0; x < 16; x += 2) {
                 uint32_t lo0, hi0, lo1, hi1;
@@ -511,27 +337,26 @@ __global__ void __launch_bounds__(pd_threads) pd_convert_kernel(const pd_kargs k
                 *reinterpret_cast<uint2 *>(row + k0 + 16) = far;
             }
         } else {
+            uint2 * const    buf   = cv_s[w];
+            const int32_t    c_own = 8 * qp + r;  // the lane's column within the warp's 32
+            uint16_t * const base  = wt + (int64_t(blockIdx.x) * pd_cols + 32 * w) * k.a.k + int64_t(s) * SK;
 #pragma unroll
             for (int32_t x = 0; x < 16; ++x) {
                 uint32_t lo, hi;
                 codes16(qc.w[x], bias, lo, hi);
-                *reinterpret_cast<uint2 *>(row + k_of<F, L>(qq, x, 0)) = weights16(lo, hi, qc.f[x / GW], qc.m[x / GW]);
+                buf[cv_at(c_own, x)] = weights16(lo, hi, qc.f[x / GW], qc.m[x / GW]);
             }
+            __syncwarp();
+            const int32_t x = lane & 15;
+#pragma unroll 4
+            for (int32_t p = 0; p < 16; ++p) {
+                const int32_t c = 2 * p + (lane >> 4);
+                *reinterpret_cast<uint2 *>(base + int64_t(c) * k.a.k + k_of<F, L>(qq, x, 0)) = buf[cv_at(c, x)];
+            }
+            __syncwarp();  // the buffer is rewritten by the next quarter
         }
     }
 }
-
-struct pt_kargs {
-    fn::tc::problem    p;
-    pt_seg             seg[3];
-    int32_t            n_seg;
-    const float *      row_scale;
-    const float *      col_scale;
-    uint16_t * out16;
-    int64_t ld16;
-    uint32_t * err;
-    uint32_t err_bit;
-};
 
 // PB3: a CTA 128 x 128 of four warps, each 64 x 64 (0.125 shared operand bytes a MAC against the 64 x 32 warp
 // tile's 0.1875; the K order and so every output unchanged)
@@ -542,41 +367,345 @@ constexpr int32_t pt_smem    = pt_shape::smem;
 
 __global__ void __launch_bounds__(pt_threads, 2) pt_kernel(const pt_kargs k) {
     extern __shared__ uint4 pt_sm[];
-    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) {
-        if (c0 >= k.p.n) {
-            return;
-        }
-        // the segment by selects (a runtime index into the parameter array would copy it to the stack)
-        const bool    s1    = k.n_seg > 1 && c0 >= k.seg[0].end;
-        const bool    s2    = k.n_seg > 2 && c0 >= k.seg[1].end;
-        float *       base  = s2 ? k.seg[2].out : s1 ? k.seg[1].out : k.seg[0].out;
-        const int64_t ld    = s2 ? k.seg[2].ld : s1 ? k.seg[1].ld : k.seg[0].ld;
-        const int32_t start = s2 ? k.seg[1].end : s1 ? k.seg[0].end : 0;
-        const float   sc    = k.row_scale != nullptr ? __ldg(k.row_scale + row) : 1.0f;
-        if (k.out16 != nullptr) {
-            const float f[4] = {v[0] * sc, v[1] * sc, v[2] * sc, v[3] * sc};
-            if (!(fabsf(f[0]) <= 65504.0f) || !(fabsf(f[1]) <= 65504.0f) || !(fabsf(f[2]) <= 65504.0f) ||
-                !(fabsf(f[3]) <= 65504.0f)) {
-                atomicOr(k.err, k.err_bit);
-            }
-            uint16_t * o16 = k.out16 + int64_t(row) * k.ld16 + c0;
-            *reinterpret_cast<uint32_t *>(o16) = fn::tc::pack2(f[0], f[1]);
-            *reinterpret_cast<uint32_t *>(o16 + 4) = fn::tc::pack2(f[2], f[3]);
-            return;
-        }
-        float *       out   = base + int64_t(row) * ld + (c0 - start);
-        if (k.col_scale != nullptr) {
-            const float2 c01 = __ldg(reinterpret_cast<const float2 *>(k.col_scale + c0));
-            const float2 c45 = __ldg(reinterpret_cast<const float2 *>(k.col_scale + c0 + 4));
-            *reinterpret_cast<float2 *>(out)     = make_float2(v[0] * c01.x * sc, v[1] * c01.y * sc);
-            *reinterpret_cast<float2 *>(out + 4) = make_float2(v[2] * c45.x * sc, v[3] * c45.y * sc);
-            return;
-        }
-        *reinterpret_cast<float2 *>(out)     = make_float2(v[0] * sc, v[1] * sc);
-        *reinterpret_cast<float2 *>(out + 4) = make_float2(v[2] * sc, v[3] * sc);
-    };
+    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) { pt_epi(k, row, c0, v); };
     fn::tc::gemm_cta<pt_bn, 4, 4>(k.p, static_cast<int32_t>(blockIdx.y) * pt_shape::rows,
                                   static_cast<int32_t>(blockIdx.x) * pt_bn, reinterpret_cast<uint8_t *>(pt_sm), epi);
+}
+
+// MUP1 piece 2: a small read's tile, 64 x 64 of four warps (each 32 x 32), for at most 64 rows: a 64-row read's
+// 128 x 128 tile left three quarters of its rows empty and its grids 1-64 CTAs (Load 1). Every output's K-order sum
+// is the same (the m8n8k4 products of a k4 step in K order whatever the tile), so the outputs equal pt_kernel's
+constexpr int32_t pt_small_bn      = 64;
+using pt_small_shape = fn::tc::shape<pt_small_bn, 2, 2>;
+constexpr int32_t pt_small_threads = pt_small_shape::threads;
+constexpr int32_t pt_small_smem    = pt_small_shape::smem;
+
+__global__ void __launch_bounds__(pt_small_threads, 4) pt_small_kernel(const pt_kargs k) {
+    extern __shared__ uint4 pt_sm[];
+    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) { pt_epi(k, row, c0, v); };
+    fn::tc::gemm_cta<pt_small_bn, 2, 2>(k.p, static_cast<int32_t>(blockIdx.y) * pt_small_shape::rows,
+                                        static_cast<int32_t>(blockIdx.x) * pt_small_bn,
+                                        reinterpret_cast<uint8_t *>(pt_sm), epi);
+}
+
+// ---- APF1 Part 4: the fused route (pq_tc) -------------------------------------------------------------------------
+// A CTA 64 rows x 32 columns, four warps (2 down x 2 across) of 32 x 16; quadpair q of a warp holds rows
+// 8 (q & 1) .. + 7 and columns 8 (q >> 1) .. + 7 of each 16 x 16 tile, as fn/kernels/tc's core does. A stage of SK
+// K values in shared memory: activations [64][SK], weights [32][SK], rows of SK halves with the 16-byte chunk c of
+// row x at c ^ (x & 7), so the 8 rows (columns) of a quadpair's fragment read fall in distinct bank groups.
+constexpr int32_t pq_bn      = 32;
+constexpr int32_t pq_bm      = 64;
+constexpr int32_t pq_threads = 128;
+
+__host__ __device__ constexpr int32_t pq_smem(int32_t sk) {
+    return 2 * (pq_bm + pq_bn) * sk * 2;
+}
+
+static_assert(pq_smem(dp2_stage) <= 48 * 1024, "two stages in the default shared memory");
+
+struct pq_kargs {
+    pt_kargs        e;        // the activation operand, rows, n, k and pd_tc's epilogue
+    const uint8_t * w[3];
+    int32_t         col0[4];  // source s's first column; col0[n_src] = n
+    int32_t         n_src;
+    int32_t         rb8;      // DP2: a tile's bytes a step
+    int32_t         steps;    // stages over K
+    const uint8_t * grids;
+    const uint16_t *b0, *b1;  // BF16 rows (n_src 0)
+    int32_t         n0, n1;
+    const float *   b_scale;
+};
+
+// the byte offset of (row, k) in a stage of rows of SK halves (k a multiple of 4 for 8-byte stores, of 8 for 16)
+template <int32_t SK> __device__ __forceinline__ uint32_t pq_at(int32_t row, int32_t k) {
+    return static_cast<uint32_t>(row * SK * 2 + 16 * ((k >> 3) ^ (row & 7)) + 2 * (k & 7));
+}
+
+__device__ __forceinline__ void pq_sts64(uint32_t addr, const uint2 & v) {
+    asm volatile("st.shared.v2.u32 [%0], {%1, %2};" ::"r"(addr), "r"(v.x), "r"(v.y));
+}
+
+// the stage's activation chunks a thread loads (all 128 threads), then stores
+template <int32_t SK> struct pq_a_regs {
+    static constexpr int32_t CH = SK / 8;
+    static constexpr int32_t IT = pq_bm * CH / pq_threads;
+    uint4                    v[IT];
+};
+
+template <int32_t SK>
+__device__ __forceinline__ void pq_load_a(const pq_kargs & k, int32_t row0, int32_t s, pq_a_regs<SK> & r) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+#pragma unroll
+    for (int32_t i = 0; i < pq_a_regs<SK>::IT; ++i) {
+        const int32_t ci = tid + i * pq_threads, row = ci / pq_a_regs<SK>::CH, c = ci % pq_a_regs<SK>::CH;
+        r.v[i] = fn::tc::detail::load_a(k.e.p.a, k.e.p.rows, row0 + row, s * SK + 8 * c);
+    }
+}
+
+template <int32_t SK> __device__ __forceinline__ void pq_store_a(uint32_t abase, const pq_a_regs<SK> & r) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+#pragma unroll
+    for (int32_t i = 0; i < pq_a_regs<SK>::IT; ++i) {
+        const int32_t ci = tid + i * pq_threads, row = ci / pq_a_regs<SK>::CH, c = ci % pq_a_regs<SK>::CH;
+        fn::tc::detail::sts128(abase + pq_at<SK>(row, 8 * c), r.v[i]);
+    }
+}
+
+// stage s's weights of the CTA's 32 columns into bbase, each exactly pd_convert_kernel's FP16 value at its K place.
+// DP2: threads 0..63, column t & 31, quarter t >> 5 of the stage (dp2_quarter); EX1 down: threads 0..31, a column's
+// 64 weights (ex1_stage_codes)
+template <fmt F, pd_layout L>
+__device__ __forceinline__ void pq_decode(const pq_kargs & k,
+                                          int32_t          colt0,
+                                          int32_t          s,
+                                          uint32_t         bbase,
+                                          const uint4 &    kv,
+                                          const uint32_t * grid_s) {
+    constexpr int32_t  SK   = L == pd_layout::dp2 ? dp2_stage : ex1_stage;
+    constexpr int32_t  GW   = group_words<F>();
+    constexpr uint32_t bias = is_signed_code<F>() ? bias_s : bias_u;
+    const int32_t      tid  = static_cast<int32_t>(threadIdx.x);
+    if (tid >= (L == pd_layout::dp2 ? 2 * pq_bn : pq_bn)) {
+        return;
+    }
+    const int32_t col = tid & (pq_bn - 1), qq = L == pd_layout::dp2 ? tid >> 5 : 0;
+    const int32_t n = colt0 + col;
+    quarter_codes qc;
+    if constexpr (L == pd_layout::dp2) {
+        const int32_t   src = (k.n_src > 1 && n >= k.col0[1]) + (k.n_src > 2 && n >= k.col0[2]);
+        const int32_t   nl  = n - k.col0[src];
+        const uint8_t * p   = k.w[src] + int64_t(nl >> 3) * k.rb8 * (k.e.p.k / 256) + int64_t(s >> 1) * k.rb8;
+        dp2_quarter<F>(p, nl & 7, 2 * (s & 1) + qq, kv, grid_s, qc);
+    } else {
+        ex1_stage_codes<F>(k.w[0], n, s, kv, qc);
+    }
+    if constexpr (L == pd_layout::ex1_down && F == fmt::iq4_nl) {
+        // pd_convert_kernel's own stores: word pair x, x + 1 holds K 4c .. 4c + 3 (near) and 4c + 16 .. 4c + 19 (far)
+#pragma unroll
+        for (int32_t x = 0; x < 16; x += 2) {
+            uint32_t lo0, hi0, lo1, hi1;
+            codes16(qc.w[x], bias, lo0, hi0);
+            codes16(qc.w[x + 1], bias, lo1, hi1);
+            const uint2   a    = weights16(lo0, hi0, qc.f[x / GW], qc.m[x / GW]);
+            const uint2   b    = weights16(lo1, hi1, qc.f[x / GW], qc.m[x / GW]);
+            const int32_t k0   = k_of<F, L>(qq, x, 0);
+            const uint2   near = make_uint2(__byte_perm(a.x, a.y, 0x5410), __byte_perm(b.x, b.y, 0x5410));
+            const uint2   far  = make_uint2(__byte_perm(a.x, a.y, 0x7632), __byte_perm(b.x, b.y, 0x7632));
+            pq_sts64(bbase + pq_at<SK>(col, k0), near);
+            pq_sts64(bbase + pq_at<SK>(col, k0 + 16), far);
+        }
+    } else {
+#pragma unroll
+        for (int32_t x = 0; x < 16; ++x) {
+            uint32_t lo, hi;
+            codes16(qc.w[x], bias, lo, hi);
+            pq_sts64(bbase + pq_at<SK>(col, k_of<F, L>(qq, x, 0)), weights16(lo, hi, qc.f[x / GW], qc.m[x / GW]));
+        }
+    }
+}
+
+// the BF16 rows' stage: 32 columns x 16 chunks of 8, four a thread; loaded before the stage's products, converted
+// (pd_convert_bf16's value: BF16 times the row's 2^e, rounded once) and stored after them
+struct pq_b16_regs {
+    uint4 v[4];
+    float sc[4];
+};
+
+__device__ __forceinline__ void pq_load_b16(const pq_kargs & k, int32_t colt0, int32_t s, pq_b16_regs & r) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+        const int32_t    ci = tid + i * pq_threads, col = ci >> 4, c = ci & 15;
+        const int32_t    n   = colt0 + col;
+        const uint16_t * row = n < k.n0        ? k.b0 + int64_t(n) * k.e.p.k :
+                               n < k.n0 + k.n1 ? k.b1 + int64_t(n - k.n0) * k.e.p.k :
+                                                 nullptr;
+        r.v[i]               = row != nullptr ? __ldg(reinterpret_cast<const uint4 *>(row + s * dp2_stage + 8 * c)) :
+                                                make_uint4(0u, 0u, 0u, 0u);
+        // the prepared 2^-e, inverted exactly (a power of two in range)
+        r.sc[i]              = row != nullptr ? 1.0f / __ldg(k.b_scale + n) : 0.0f;
+    }
+}
+
+__device__ __forceinline__ void pq_store_b16(uint32_t bbase, const pq_b16_regs & r) {
+    const int32_t tid = static_cast<int32_t>(threadIdx.x);
+    const auto    f   = [](uint32_t h) {
+        return __uint_as_float(h << 16);
+    };
+#pragma unroll
+    for (int32_t i = 0; i < 4; ++i) {
+        const int32_t ci = tid + i * pq_threads, col = ci >> 4, c = ci & 15;
+        const float   sc = r.sc[i];
+        const uint4 & v  = r.v[i];
+        uint4         o;
+        o.x = fn::tc::pack2(f(v.x & 0xffffu) * sc, f(v.x >> 16) * sc);
+        o.y = fn::tc::pack2(f(v.y & 0xffffu) * sc, f(v.y >> 16) * sc);
+        o.z = fn::tc::pack2(f(v.z & 0xffffu) * sc, f(v.z >> 16) * sc);
+        o.w = fn::tc::pack2(f(v.w & 0xffffu) * sc, f(v.w >> 16) * sc);
+        fn::tc::detail::sts128(bbase + pq_at<dp2_stage>(col, 8 * c), o);
+    }
+}
+
+// one stage's products: chunk c is k4 steps 2c (x, y) and 2c + 1 (z, w), in K order for every accumulator
+template <int32_t SK> __device__ __forceinline__ void pq_mma(uint32_t abase, uint32_t bbase, float (&acc)[2][8]) {
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31, warp = static_cast<int32_t>(threadIdx.x) >> 5;
+    const int32_t q = (lane >> 2) & 3, ra = (lane & 3) | ((lane >> 2) & 4);
+    const int32_t ar0 = 32 * (warp & 1) + 8 * (q & 1) + ra, ar1 = ar0 + 16;
+    const int32_t bc = 16 * (warp >> 1) + 8 * (q >> 1) + ra;
+#pragma unroll
+    for (int32_t c = 0; c < SK / 8; ++c) {
+        const uint4 bf = fn::tc::detail::lds128(bbase + pq_at<SK>(bc, 8 * c));
+        const uint4 a0 = fn::tc::detail::lds128(abase + pq_at<SK>(ar0, 8 * c));
+        const uint4 a1 = fn::tc::detail::lds128(abase + pq_at<SK>(ar1, 8 * c));
+        fn::tc::detail::mma884(acc[0], a0.x, a0.y, bf.x, bf.y);
+        fn::tc::detail::mma884(acc[1], a1.x, a1.y, bf.x, bf.y);
+        fn::tc::detail::mma884(acc[0], a0.z, a0.w, bf.z, bf.w);
+        fn::tc::detail::mma884(acc[1], a1.z, a1.w, bf.z, bf.w);
+    }
+}
+
+__device__ __forceinline__ void pq_epilogue(const pq_kargs & k, int32_t row0, int32_t colt0, const float (&acc)[2][8]) {
+    const int32_t lane = static_cast<int32_t>(threadIdx.x) & 31, warp = static_cast<int32_t>(threadIdx.x) >> 5;
+    const int32_t q  = (lane >> 2) & 3;
+    const int32_t lr = ((lane & 16) ? 4 : 0) | (lane & 1), cc = 2 * ((lane >> 1) & 1);
+#pragma unroll
+    for (int32_t mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int32_t rh = 0; rh < 2; ++rh) {
+            const int32_t row = row0 + 32 * (warp & 1) + 16 * mi + 8 * (q & 1) + lr + 2 * rh;
+            if (row < k.e.p.rows) {
+                const float v[4] = { acc[mi][2 * rh], acc[mi][2 * rh + 1], acc[mi][2 * rh + 4], acc[mi][2 * rh + 5] };
+                pt_epi(k.e, row, colt0 + 16 * (warp >> 1) + 8 * (q >> 1) + cc, v);
+            }
+        }
+    }
+}
+
+template <fmt F, pd_layout L> __global__ void __launch_bounds__(pq_threads) pq_kernel(const pq_kargs k) {
+    constexpr int32_t       SK = L == pd_layout::dp2 ? dp2_stage : ex1_stage;
+    extern __shared__ uint4 pq_sm[];
+    __shared__ uint32_t     grid_s[F == fmt::iq3_s ? 512 : 1];
+    const int32_t           tid   = static_cast<int32_t>(threadIdx.x);
+    const int32_t           row0  = static_cast<int32_t>(blockIdx.x) * pq_bm;
+    const int32_t           colt0 = static_cast<int32_t>(blockIdx.y) * pq_bn;
+    const uint32_t          s0    = static_cast<uint32_t>(__cvta_generic_to_shared(pq_sm));
+    constexpr uint32_t      AB = pq_bm * SK * 2, BB = pq_bn * SK * 2;  // a stage's activation and weight bytes
+    const auto              abuf = [&](int32_t b) {
+        return s0 + static_cast<uint32_t>(b) * (AB + BB);
+    };
+    const auto bbuf = [&](int32_t b) {
+        return abuf(b) + AB;
+    };
+    if constexpr (F == fmt::iq3_s) {
+        for (int32_t i = tid; i < 512; i += pq_threads) {
+            grid_s[i] = __ldg(reinterpret_cast<const uint32_t *>(k.grids) + i);
+        }
+        __syncthreads();
+    }
+    uint4 kv = make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (F == fmt::iq4_xs || F == fmt::iq4_nl) {
+        kv = __ldg(reinterpret_cast<const uint4 *>(k.grids + 2048));
+    }
+    float acc[2][8];
+#pragma unroll
+    for (int32_t mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            acc[mi][i] = 0.0f;
+        }
+    }
+    pq_a_regs<SK> ar;
+    pq_load_a<SK>(k, row0, 0, ar);
+    pq_store_a<SK>(abuf(0), ar);
+    pq_decode<F, L>(k, colt0, 0, bbuf(0), kv, grid_s);
+    __syncthreads();
+#pragma unroll 1
+    for (int32_t s = 0; s < k.steps; ++s) {
+        const int32_t b    = s & 1;
+        const bool    more = s + 1 < k.steps;
+        if (more) {
+            pq_load_a<SK>(k, row0, s + 1, ar);
+        }
+        pq_mma<SK>(abuf(b), bbuf(b), acc);
+        if (more) {
+            pq_store_a<SK>(abuf(b ^ 1), ar);
+            pq_decode<F, L>(k, colt0, s + 1, bbuf(b ^ 1), kv, grid_s);
+        }
+        __syncthreads();
+    }
+    pq_epilogue(k, row0, colt0, acc);
+}
+
+__global__ void __launch_bounds__(pq_threads) pqb_kernel(const pq_kargs k) {
+    constexpr int32_t       SK = dp2_stage;
+    extern __shared__ uint4 pq_sm[];
+    const int32_t           row0  = static_cast<int32_t>(blockIdx.x) * pq_bm;
+    const int32_t           colt0 = static_cast<int32_t>(blockIdx.y) * pq_bn;
+    const uint32_t          s0    = static_cast<uint32_t>(__cvta_generic_to_shared(pq_sm));
+    constexpr uint32_t      AB = pq_bm * SK * 2, BB = pq_bn * SK * 2;
+    const auto              abuf = [&](int32_t b) {
+        return s0 + static_cast<uint32_t>(b) * (AB + BB);
+    };
+    const auto bbuf = [&](int32_t b) {
+        return abuf(b) + AB;
+    };
+    float acc[2][8];
+#pragma unroll
+    for (int32_t mi = 0; mi < 2; ++mi) {
+#pragma unroll
+        for (int32_t i = 0; i < 8; ++i) {
+            acc[mi][i] = 0.0f;
+        }
+    }
+    pq_a_regs<SK> ar;
+    pq_b16_regs   br;
+    pq_load_a<SK>(k, row0, 0, ar);
+    pq_load_b16(k, colt0, 0, br);
+    pq_store_a<SK>(abuf(0), ar);
+    pq_store_b16(bbuf(0), br);
+    __syncthreads();
+#pragma unroll 1
+    for (int32_t s = 0; s < k.steps; ++s) {
+        const int32_t b    = s & 1;
+        const bool    more = s + 1 < k.steps;
+        if (more) {
+            pq_load_a<SK>(k, row0, s + 1, ar);
+            pq_load_b16(k, colt0, s + 1, br);
+        }
+        pq_mma<SK>(abuf(b), bbuf(b), acc);
+        if (more) {
+            pq_store_a<SK>(abuf(b ^ 1), ar);
+            pq_store_b16(bbuf(b ^ 1), br);
+        }
+        __syncthreads();
+    }
+    pq_epilogue(k, row0, colt0, acc);
+}
+
+// pd_bf16_scales: pt_bf16_kernel's first pass alone (its maximum and exponent), a warp a row
+__global__ void __launch_bounds__(256) pq_bf16_scale_kernel(const uint16_t * w, int32_t n, int32_t k, float * col_s) {
+    const int32_t row  = static_cast<int32_t>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int32_t lane = static_cast<int32_t>(threadIdx.x & 31);
+    if (row >= n) {
+        return;
+    }
+    const uint4 * src = reinterpret_cast<const uint4 *>(w + int64_t(row) * k);
+    const auto    f   = [](uint32_t h) {
+        return __uint_as_float(h << 16);
+    };
+    float m = 0.0f;
+    for (int32_t g = lane; g < k / 8; g += 32) {
+        const uint4    v    = __ldg(src + g);
+        const uint32_t x[4] = { v.x, v.y, v.z, v.w };
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i) {
+            m = fmaxf(m, fmaxf(fabsf(f(x[i] & 0xffffu)), fabsf(f(x[i] >> 16))));
+        }
+    }
+    const int32_t e = fn::tc::range_exp(fn::tc::warp_max(m));
+    if (lane == 0) {
+        col_s[row] = fn::tc::pow2(-e);
+    }
 }
 
 // pd_convert_bf16: a warp a row, the row read twice (its maximum, then the scaled conversion; the second read an L2 hit)
@@ -631,9 +760,34 @@ __device__ __forceinline__ auto pb_row(const pb_args & a, int32_t n) -> const ui
     return (h == 0 || a.w_hi == nullptr ? a.w_lo : a.w_hi) + row * a.k;
 }
 
+// TTTS2: pb_row for F32 rows (pb_args::f32)
+__device__ const __forceinline__ float * pb_row32(const pb_args & a, int32_t n) {
+    int64_t          row  = n;
+    const uint16_t * base = a.w_lo;
+    if (a.period > 0) {
+        const int32_t m = n % a.period, h = m / a.half;
+        row  = int64_t(n / a.period) * a.half + (m % a.half);
+        base = h == 0 || a.w_hi == nullptr ? a.w_lo : a.w_hi;
+    }
+    return reinterpret_cast<const float *>(base) + row * a.k;
+}
+
+// TTTS3: pb_row for Q8_0 rows (pb_args::q8): the row's first block
+__device__ const __forceinline__ uint8_t * pb_row_q8(const pb_args & a, int32_t n) {
+    int64_t          row  = n;
+    const uint16_t * base = a.w_lo;
+    if (a.period > 0) {
+        const int32_t m = n % a.period, h = m / a.half;
+        row  = int64_t(n / a.period) * a.half + (m % a.half);
+        base = h == 0 || a.w_hi == nullptr ? a.w_lo : a.w_hi;
+    }
+    return reinterpret_cast<const uint8_t *>(base) + row * (a.k / 32) * 34;
+}
+
 // 64 rows x 64 outputs a block, 256 threads, 4 x 4 outputs a thread; each 32-K step's products summed fresh, then
-// added to the running sum (two levels: the K = 2,560 sums keep a short chain)
-__global__ void __launch_bounds__(256) pb_kernel(const pb_args a) {
+// added to the running sum (two levels: the K = 2,560 sums keep a short chain). W32: the weights widened to F32 before
+// the products, F32 rows (TTTS2) or Q8_0 rows (TTTS3, a.q8: each weight d x q, exactly the F32 rows' value)
+template <bool W32 = false> __global__ void __launch_bounds__(256) pb_kernel(const pb_args a) {
     __shared__ float xs[pb_k][pb_tile + 4];
     __shared__ float ws[pb_k][pb_tile + 4];
     const int32_t    tid = static_cast<int32_t>(threadIdx.x);
@@ -651,18 +805,45 @@ __global__ void __launch_bounds__(256) pb_kernel(const pb_args a) {
     const int32_t    lr = tid >> 2, lk = (tid & 3) * 8;
     const bool       xr = r0 + lr < a.rows, wr = n0 + lr < a.n;
     const float *    xp = a.x + int64_t(xr ? r0 + lr : 0) * a.ldx + lk;
-    const uint16_t * wp = pb_row(a, wr ? n0 + lr : 0) + lk;
+    const uint16_t * wp = W32 ? nullptr : pb_row(a, wr ? n0 + lr : 0) + lk;
+    const float *    wq = W32 && !a.q8 ? pb_row32(a, wr ? n0 + lr : 0) + lk : nullptr;
     for (int32_t k0 = 0; k0 < a.k; k0 += pb_k) {
         {
             const float4 x0    = xr ? __ldg(reinterpret_cast<const float4 *>(xp + k0)) : make_float4(0, 0, 0, 0);
             const float4 x1    = xr ? __ldg(reinterpret_cast<const float4 *>(xp + k0) + 1) : make_float4(0, 0, 0, 0);
-            const uint4  wv    = wr ? __ldg(reinterpret_cast<const uint4 *>(wp + k0)) : make_uint4(0, 0, 0, 0);
             const float  xv[8] = { x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w };
+            if constexpr (W32) {
+                float wf[8];
+                if (a.q8) {  // block k0 / 32: its d, then codes lk .. lk + 7 (2-byte aligned: four 16-bit loads)
+                    const uint8_t *        blk = pb_row_q8(a, wr ? n0 + lr : 0) + (k0 / 32) * 34;
+                    const unsigned short * cp  = reinterpret_cast<const unsigned short *>(blk + 2 + lk);
+                    const unsigned short   dh  = wr ? __ldg(reinterpret_cast<const unsigned short *>(blk)) : 0;
+                    const float            d   = __half2float(__ushort_as_half(dh));
 #pragma unroll
-            for (int32_t j = 0; j < 8; ++j) {
-                xs[lk + j][lr]    = xv[j];
-                const uint32_t h2 = word(wv, j >> 1);
-                ws[lk + j][lr]    = __uint_as_float((j & 1) ? (h2 & 0xffff0000u) : (h2 << 16));
+                    for (int32_t j = 0; j < 8; ++j) {
+                        const unsigned short c2 = wr ? __ldg(cp + j / 2) : static_cast<unsigned short>(0);
+                        wf[j]                   = static_cast<float>(static_cast<int8_t>(c2 >> (8 * (j & 1)))) * d;
+                    }
+                } else {
+                    const float4 * wv = reinterpret_cast<const float4 *>(wq + k0);
+                    const float4   w0 = wr ? __ldg(wv) : make_float4(0, 0, 0, 0);
+                    const float4   w1 = wr ? __ldg(wv + 1) : make_float4(0, 0, 0, 0);
+                    wf[0] = w0.x, wf[1] = w0.y, wf[2] = w0.z, wf[3] = w0.w;
+                    wf[4] = w1.x, wf[5] = w1.y, wf[6] = w1.z, wf[7] = w1.w;
+                }
+#pragma unroll
+                for (int32_t j = 0; j < 8; ++j) {
+                    xs[lk + j][lr] = xv[j];
+                    ws[lk + j][lr] = wf[j];
+                }
+            } else {
+                const uint4 wv = wr ? __ldg(reinterpret_cast<const uint4 *>(wp + k0)) : make_uint4(0, 0, 0, 0);
+#pragma unroll
+                for (int32_t j = 0; j < 8; ++j) {
+                    xs[lk + j][lr]    = xv[j];
+                    const uint32_t h2 = word(wv, j >> 1);
+                    ws[lk + j][lr]    = __uint_as_float((j & 1) ? (h2 & 0xffff0000u) : (h2 << 16));
+                }
             }
         }
         __syncthreads();
@@ -834,7 +1015,8 @@ bool pd_check(const pd_args & a, int32_t & steps, int32_t & rb8) {
         steps = a.k / dp2_stage;
         rb8   = step_bytes(a.f, 4);
     } else {
-        if ((a.f != fmt::iq4_nl && a.f != fmt::q2_0) || a.k != ex1_k || a.n != ex1_n || a.x.k_split != a.k) {
+        if ((a.f != fmt::iq4_nl && a.f != fmt::q2_0 && a.f != fmt::q8_0) || a.k != ex1_k || a.n != ex1_n ||
+            a.x.k_split != a.k) {
             return reject("EX1's down layout: IQ4_NL or Q2_0, K 320, N 2560");
         }
         steps = a.k / ex1_stage;
@@ -873,6 +1055,9 @@ template <typename Fn> bool dispatch(fmt f, pd_layout lay, Fn && fn) {
                           std::integral_constant<pd_layout, pd_layout::ex1_down>{});
             case fmt::q2_0:
                 return fn(std::integral_constant<fmt, fmt::q2_0>{},
+                          std::integral_constant<pd_layout, pd_layout::ex1_down>{});
+            case fmt::q8_0:
+                return fn(std::integral_constant<fmt, fmt::q8_0>{},
                           std::integral_constant<pd_layout, pd_layout::ex1_down>{});
             default:
                 return false;
@@ -927,9 +1112,12 @@ bool pd_convert(const pd_args & a, uint16_t * wt, void * stream) {
     });
 }
 
-bool pd_tc(const pt_args & a, void * stream) {
+namespace {
+
+// pd_tc's argument checks and kernel arguments (APF1: shared with pq_tc, which reads no FP16 w)
+bool pt_make(const pt_args & a, bool need_w, void * stream, pt_kargs & k) {
     if (a.rows < 1 || a.rows > pd_max_rows || a.n < 8 || a.n % 8 != 0 || a.k < fn::tc::bk || a.k % fn::tc::bk != 0 ||
-        !al16(a.w) || !al16(a.x.a0) || a.x.ld0 % 8 != 0 || a.x.k_split <= 0 || a.x.k_split > a.k ||
+        (need_w && !al16(a.w)) || !al16(a.x.a0) || a.x.ld0 % 8 != 0 || a.x.k_split <= 0 || a.x.k_split > a.k ||
         (a.x.k_split < a.k && (a.x.k_split % fn::tc::bk != 0 || !al16(a.x.a1) || a.x.ld1 % 8 != 0)) || a.n_seg < 1 ||
         a.n_seg > 3 || (a.col_scale != nullptr && (reinterpret_cast<uintptr_t>(a.col_scale) & 7u) != 0) ||
         (a.out16 != nullptr && (a.n_seg != 1 || a.col_scale != nullptr || !al16(a.out16) || a.ld16 % 8 != 0 ||
@@ -949,7 +1137,7 @@ bool pd_tc(const pt_args & a, void * stream) {
     if (start != a.n) {
         return reject("pd_tc: the segments must end at N");
     }
-    pt_kargs k = {};
+    k                = {};
     k.p.a.a0      = a.x.a0;
     k.p.a.ld0     = a.x.ld0;
     k.p.a.shift0  = a.x.shift0;
@@ -972,6 +1160,21 @@ bool pd_tc(const pt_args & a, void * stream) {
     k.ld16 = a.ld16;
     k.err = a.err;
     k.err_bit = a.err_bit;
+    return true;
+}
+
+}  // namespace
+
+bool pd_tc(const pt_args & a, void * stream) {
+    pt_kargs k = {};
+    if (!pt_make(a, true, stream, k)) {
+        return false;
+    }
+    if (a.rows <= pt_small_shape::rows && !a.big_tile) {  // MUP1 piece 2: a small read's tile (the same outputs)
+        const dim3 grid((a.n + pt_small_bn - 1) / pt_small_bn, 1);
+        pt_small_kernel<<<grid, pt_small_threads, pt_small_smem, static_cast<cudaStream_t>(stream)>>>(k);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
     const dim3 grid((a.n + pt_bn - 1) / pt_bn, (a.rows + pt_shape::rows - 1) / pt_shape::rows);
     pt_kernel<<<grid, pt_threads, pt_smem, static_cast<cudaStream_t>(stream)>>>(k);
     return cudaPeekAtLastError() == cudaSuccess;
@@ -983,6 +1186,246 @@ bool pd_convert_bf16(const uint16_t * w, int32_t n, int32_t k, uint16_t * wt, fl
     }
     pt_bf16_kernel<<<(n + 7) / 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(w, n, k, wt, col_s);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool pd_bf16_scales(const uint16_t * w, int32_t n, int32_t k, float * col_s, void * stream) {
+    if (n < 1 || k < 8 || k % 8 != 0 || !al16(w) || col_s == nullptr || stream == nullptr) {
+        return reject("pd_bf16_scales: shapes or pointers");
+    }
+    pq_bf16_scale_kernel<<<(n + 7) / 8, 256, 0, static_cast<cudaStream_t>(stream)>>>(w, n, k, col_s);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+namespace {
+
+// the dynamic shared memory opt-in of an instance on the current device (IQ3_S's 2 KiB grid table takes it past
+// 48 KiB): cudaFuncSetAttribute is per device and the prompt path runs on both cards, so one bit a device
+template <fmt F, pd_layout L> bool pq_attr() {
+    constexpr int32_t            SK = L == pd_layout::dp2 ? dp2_stage : ex1_stage;
+    static std::atomic<uint32_t> done{ 0u };
+    int                          dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 32) {
+        return false;
+    }
+    const uint32_t bit = 1u << dev;
+    if ((done.load(std::memory_order_acquire) & bit) != 0u) {
+        return true;
+    }
+    if (cudaFuncSetAttribute(pq_kernel<F, L>, cudaFuncAttributeMaxDynamicSharedMemorySize, pq_smem(SK)) !=
+        cudaSuccess) {
+        return false;
+    }
+    done.fetch_or(bit, std::memory_order_release);
+    return true;
+}
+
+template <fmt F, pd_layout L> bool pq_launch(const pq_kargs & k, cudaStream_t s) {
+    constexpr int32_t SK = L == pd_layout::dp2 ? dp2_stage : ex1_stage;
+    if (!pq_attr<F, L>()) {
+        return reject("pq_tc: the shared memory attribute");
+    }
+    const dim3 grid((k.e.p.rows + pq_bm - 1) / pq_bm, k.e.p.n / pq_bn);
+    pq_kernel<F, L><<<grid, pq_threads, pq_smem(SK), s>>>(k);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+}  // namespace
+
+bool pq_tc_attributes() {
+    bool ok = true;
+    for (const pd_layout lay : { pd_layout::dp2, pd_layout::ex1_down }) {
+        for (const fmt f :
+             { fmt::q4_k, fmt::q5_k, fmt::q6_k, fmt::iq4_xs, fmt::iq3_s, fmt::q8_0, fmt::iq4_nl, fmt::q2_0 }) {
+            bool       known = false;
+            const bool set   = dispatch(f, lay, [&](auto F, auto L) {
+                known = true;
+                return pq_attr<decltype(F)::value, decltype(L)::value>();
+            });
+            ok               = ok && (!known || set);
+        }
+    }
+    return ok;
+}
+
+bool pq_tc(const pq_args & a, void * stream) {
+    pq_kargs k = {};
+    // packed sources: N a multiple of 32 (whole column tiles); BF16 rows: of 8 (columns past N read zero rows and
+    // pd_tc's epilogue writes none)
+    if (!pt_make(a.t, false, stream, k.e) || (a.n_src > 0 && a.t.n % pq_bn != 0)) {
+        return reject("pq_tc: the product (pd_tc's checks; packed sources: N a multiple of 32)");
+    }
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    if (a.n_src == 0) {
+        if (!al16(a.b0) || a.n0 < 1 || a.n1 < 0 || (a.n1 > 0 && !al16(a.b1)) || a.n0 + a.n1 > a.t.n ||
+            a.b_scale == nullptr || a.t.k % dp2_stage != 0) {
+            return reject("pq_tc: the BF16 rows (K a multiple of 128) or their scales");
+        }
+        k.b0      = a.b0;
+        k.b1      = a.b1;
+        k.n0      = a.n0;
+        k.n1      = a.n1;
+        k.b_scale = a.b_scale;
+        k.steps   = a.t.k / dp2_stage;
+        const dim3 grid((a.t.rows + pq_bm - 1) / pq_bm, (a.t.n + pq_bn - 1) / pq_bn);
+        pqb_kernel<<<grid, pq_threads, pq_smem(dp2_stage), s>>>(k);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
+    if (a.n_src < 1 || a.n_src > 3 || (a.lay == pd_layout::ex1_down && a.n_src != 1)) {
+        return reject("pq_tc: one to three packed sources (EX1 down: one)");
+    }
+    int32_t n = 0;
+    for (int32_t i = 0; i < a.n_src; ++i) {
+        if (a.src[i].n < pq_bn || a.src[i].n % pq_bn != 0 || !al16(a.src[i].w)) {
+            return reject("pq_tc: a source's columns (a multiple of 32) or its pointer");
+        }
+        k.w[i]    = a.src[i].w;
+        k.col0[i] = n;
+        n += a.src[i].n;
+    }
+    k.col0[a.n_src] = n;
+    k.n_src         = a.n_src;
+    k.grids         = a.grids;
+    // pd_check on the whole product's shape: the format, layout, K and the grid table
+    pd_args c;
+    c.f           = a.f;
+    c.lay         = a.lay;
+    c.k           = a.t.k;
+    c.n           = n;
+    c.rows        = a.t.rows;
+    c.w           = a.src[0].w;
+    c.grids       = a.grids;
+    c.x           = a.t.x;
+    c.out         = reinterpret_cast<float *>(1);  // the check wants an output; pq_tc writes pd_tc's
+    int32_t steps = 0, rb8 = 0;
+    if (n != a.t.n || !pd_check(c, steps, rb8)) {
+        return reject("pq_tc: the sources' columns against N, or pd_convert's format checks");
+    }
+    k.rb8   = rb8;
+    k.steps = steps;
+    return dispatch(a.f, a.lay,
+                    [&](auto F, auto L) { return pq_launch<decltype(F)::value, decltype(L)::value>(k, s); });
+}
+
+// ---- APF2: the ladder's registry (dense_ladder.h) ---------------------------------------------------------------
+
+namespace {
+
+// the ladder kernel source of a's weights, or count when the registry does not take them
+pk::pl_src pl_source_of(const pq_args & a) {
+    using pk::pl_src;
+    if (a.n_src == 0) {
+        return pl_src::bf16;
+    }
+    if (a.lay == pd_layout::ex1_down) {
+        return a.f == fmt::q8_0 ? pl_src::q8_0_ex1 :
+               a.f == fmt::iq4_nl ? pl_src::iq4_nl_ex1 :
+               a.f == fmt::q2_0   ? pl_src::q2_0_ex1 :
+                                    pl_src::count;
+    }
+    switch (a.f) {
+        case fmt::q8_0:
+            return pl_src::q8_0;
+        case fmt::q4_k:
+            return pl_src::q4_k;
+        case fmt::q5_k:
+            return pl_src::q5_k;
+        case fmt::q6_k:
+            return pl_src::q6_k;
+        case fmt::iq4_xs:
+            return pl_src::iq4_xs;
+        case fmt::iq3_s:
+            return pl_src::iq3_s;
+        default:
+            return pl_src::count;
+    }
+}
+
+bool pl_q4_source(pk::pl_src s) {
+    return s == pk::pl_src::bf16 || s == pk::pl_src::q8_0 || s == pk::pl_src::q8_0_ex1;
+}
+
+}  // namespace
+
+bool pl_takes(const pq_args & a) {
+    return pl_source_of(a) != pk::pl_src::count;
+}
+
+bool pl_tc(const pq_args & a, int32_t t, int32_t splits, const pl_ws & ws, void * stream) {
+    pk::pl_kargs k = {};
+    const pk::pl_src src = pl_source_of(a);
+    if (src == pk::pl_src::count || t < 0 || t >= pl_n_tiles || !pt_make(a.t, false, stream, k.e) ||
+        (a.n_src > 0 && a.t.n % pq_bn != 0)) {
+        return reject("pl_tc: the sources, the tile or the product (pd_tc's checks; packed sources: N a multiple of 32)");
+    }
+    const int32_t steps = a.t.k / fn::tc::bk;
+    if (splits < 1 || splits > pl_max_splits || splits > steps) {
+        return reject("pl_tc: the split count (1 .. min(16, K / 32))");
+    }
+    if (splits > 1 && (ws.part == nullptr || ws.count == nullptr ||
+                       lad_split_floats(a.t.rows, a.t.n, t, splits) > ws.part_floats ||
+                       lad_tile_count(a.t.rows, a.t.n, t) > ws.count_len)) {
+        return reject("pl_tc: the split workspace");
+    }
+    k.splits     = splits;
+    k.ws.part    = ws.part;
+    k.ws.count   = ws.count;
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    if (a.n_src == 0) {
+        if (!al16(a.b0) || a.n0 < 1 || a.n1 < 0 || (a.n1 > 0 && !al16(a.b1)) || a.n0 + a.n1 > a.t.n ||
+            a.b_scale == nullptr) {
+            return reject("pl_tc: the BF16 rows or their scales");
+        }
+        k.b0      = a.b0;
+        k.b1      = a.b1;
+        k.n0      = a.n0;
+        k.n1      = a.n1;
+        k.b_scale = a.b_scale;
+        return pk::pl_launch_q4(k, src, t, s);
+    }
+    if (a.n_src < 1 || a.n_src > 3 || (a.lay == pd_layout::ex1_down && a.n_src != 1)) {
+        return reject("pl_tc: one to three packed sources (EX1 down: one)");
+    }
+    int32_t n = 0;
+    for (int32_t i = 0; i < a.n_src; ++i) {
+        if (a.src[i].n < pq_bn || a.src[i].n % pq_bn != 0 || !al16(a.src[i].w)) {
+            return reject("pl_tc: a source's columns (a multiple of 32) or its pointer");
+        }
+        k.w[i]    = a.src[i].w;
+        k.col0[i] = n;
+        n += a.src[i].n;
+    }
+    k.col0[a.n_src] = n;
+    k.n_src         = a.n_src;
+    k.grids         = a.grids;
+    pd_args c;
+    c.f            = a.f;
+    c.lay          = a.lay;
+    c.k            = a.t.k;
+    c.n            = n;
+    c.rows         = a.t.rows;
+    c.w            = a.src[0].w;
+    c.grids        = a.grids;
+    c.x            = a.t.x;
+    c.out          = reinterpret_cast<float *>(1);  // the check wants an output; pl_tc writes pd_tc's
+    int32_t dsteps = 0, rb8 = 0;
+    if (n != a.t.n || !pd_check(c, dsteps, rb8)) {
+        return reject("pl_tc: the sources' columns against N, or pd_convert's format checks");
+    }
+    k.rb8 = rb8;
+    k.kb  = a.t.k / 256;
+    return pl_q4_source(src) ? pk::pl_launch_q4(k, src, t, s) : pk::pl_launch_iq(k, src, t, s);
+}
+
+bool pl_attributes() {
+    return pk::pl_attr_q4() && pk::pl_attr_iq();
+}
+
+bool pl_resources(const pq_args & a, int32_t t, pd_resources & r) {
+    const pk::pl_src src = pl_source_of(a);
+    if (src == pk::pl_src::count || t < 0 || t >= pl_n_tiles) {
+        return false;
+    }
+    return pl_q4_source(src) ? pk::pl_res_q4(src, t, r) : pk::pl_res_iq(src, t, r);
 }
 
 bool pd_codes(fmt             f,
@@ -1020,11 +1463,15 @@ bool pd_codes(fmt             f,
 bool pd_bf16(const pb_args & a, void * stream) {
     if (a.rows < 1 || a.n < 1 || a.k < pb_k || a.k % pb_k != 0 || !al16(a.w_lo) ||
         (a.w_hi != nullptr && !al16(a.w_hi)) || !al16(a.x) || a.ldx % 4 != 0 || a.out == nullptr || stream == nullptr ||
-        (a.period > 0 && (a.half <= 0 || a.period % a.half != 0))) {
+        (a.period > 0 && (a.half <= 0 || a.period % a.half != 0)) || (a.q8 && a.f32)) {
         return reject("pd_bf16: shapes or pointers");
     }
     const dim3 grid((a.n + pb_tile - 1) / pb_tile, (a.rows + pb_tile - 1) / pb_tile);
-    pb_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    if (a.f32 || a.q8) {  // TTTS3: the widened instance reads the Q8_0 rows too
+        pb_kernel<true><<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    } else {
+        pb_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(a);
+    }
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
@@ -1060,8 +1507,8 @@ bool pd_kernel_resources(fmt f, pd_layout lay, pd_resources & r) {
     cudaFuncAttributes at   = {};
     int32_t            ctas = 0;
     if (f == fmt::bf16) {
-        if (cudaFuncGetAttributes(&at, pb_kernel) != cudaSuccess ||
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, pb_kernel, 256, 0) != cudaSuccess) {
+        if (cudaFuncGetAttributes(&at, pb_kernel<>) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, pb_kernel<>, 256, 0) != cudaSuccess) {
             return false;
         }
     } else {
@@ -1092,6 +1539,34 @@ bool pd_tc_resources(pd_resources & r) {
     r.local_bytes  = static_cast<int32_t>(at.localSizeBytes);
     r.shared_bytes = static_cast<int32_t>(at.sharedSizeBytes) + pt_smem;
     r.ctas_per_sm  = ctas;
+    return true;
+}
+
+bool pq_tc_resources(bool bf16, fmt f, pd_layout lay, pd_resources & r) {
+    cudaFuncAttributes at   = {};
+    int32_t            ctas = 0;
+    if (bf16) {
+        if (cudaFuncGetAttributes(&at, pqb_kernel) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, pqb_kernel, pq_threads, pq_smem(dp2_stage)) !=
+                cudaSuccess) {
+            return false;
+        }
+    } else {
+        const bool ok = dispatch(f, lay, [&](auto F, auto L) {
+            void (*kern)(pq_kargs) = pq_kernel<decltype(F)::value, decltype(L)::value>;
+            const int32_t sk       = decltype(L)::value == pd_layout::dp2 ? dp2_stage : ex1_stage;
+            return cudaFuncGetAttributes(&at, kern) == cudaSuccess &&
+                   cudaOccupancyMaxActiveBlocksPerMultiprocessor(&ctas, kern, pq_threads, pq_smem(sk)) == cudaSuccess;
+        });
+        if (!ok) {
+            return false;
+        }
+    }
+    r.regs        = at.numRegs;
+    r.local_bytes = static_cast<int32_t>(at.localSizeBytes);
+    r.shared_bytes =
+        static_cast<int32_t>(at.sharedSizeBytes) + pq_smem(lay == pd_layout::dp2 || bf16 ? dp2_stage : ex1_stage);
+    r.ctas_per_sm = ctas;
     return true;
 }
 

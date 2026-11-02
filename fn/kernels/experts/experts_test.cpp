@@ -1,5 +1,6 @@
 #include "fn/kernels/experts/experts_test.h"
 
+#include "fn/borrowed/gguf_tensors.h"
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/dense/dense.h"
 #include "fn/kernels/dense/dense_test.h"
@@ -13,6 +14,8 @@
 #include "fn/runtime/expert_cache.h"
 #include "fn/runtime/expert_policy.h"
 #include "fn/runtime/split_test.h"
+#include "fn/tools/cases.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/tools/test_dump.h"
 #include "fn/xchg/x16_ref.h"
 #include "fn/xchg/xchg.h"
@@ -183,11 +186,7 @@ namespace {
 constexpr double rel_bound = 1e-5;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ex-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "ex-test", what);
 }
 
 // owns one device allocation of n bytes
@@ -328,8 +327,50 @@ struct shared_w {
     fn::dense::synth s;
     int32_t off[2] = {0, 0};
     std::unique_ptr<dev_mem> d[2];
-    const uint8_t * row(int32_t card, int32_t i) const { return s.row((i + off[card]) % fn::dense::n_synth_rows); }
+    std::vector<uint8_t>     real[2];  // TTTS3 item 7: a real layer's down rows (card slices), read instead when set
+
+    const uint8_t * row(int32_t card, int32_t i) const {
+        return !real[card].empty() ? real[card].data() + size_t(i) * s.row_bytes :
+                                     s.row((i + off[card]) % fn::dense::n_synth_rows);
+    }
 };
+
+// TTTS3 item 7: layer `layer`'s real shared down (ffn_down_shexp, Q8_0 [2560][640]) in place of out's synthetic rows:
+// card r's row i the file's row i, columns 320 r .. 320 r + 319, packed by pack_down as the loader's EX2 shared down
+bool load_real_shared_down(const std::vector<fnfl_gguf_dir> & dirs, int32_t layer, shared_w & out) {
+    const std::string name = "blk." + std::to_string(layer) + ".ffn_down_shexp.weight";
+    const size_t      rb = out.s.row_bytes, full = 2 * rb;  // a card's 320 columns, the file's 640
+    for (const fnfl_gguf_dir & d : dirs) {
+        for (const fnfl_gguf_tensor & t : d.tensors) {
+            if (t.name != name) {
+                continue;
+            }
+            if (t.type_name != "q8_0" || t.bytes != full * size_t(D) || rb != size_t(n_ff_card / 32 * 34)) {
+                fprintf(stderr, "ex-test: %s: not Q8_0 [%d][%d]\n", name.c_str(), D, 2 * n_ff_card);
+                return false;
+            }
+            std::vector<uint8_t> all(full * size_t(D));
+            FILE *               fp = fopen(d.path.c_str(), "rb");
+            bool                 ok = fp != nullptr && fseeko(fp, static_cast<off_t>(t.offset), SEEK_SET) == 0 &&
+                                      fread(all.data(), 1, all.size(), fp) == all.size();
+            if (fp != nullptr) {
+                fclose(fp);
+            }
+            for (int32_t card = 0; card < 2 && ok; ++card) {
+                out.real[card].resize(rb * size_t(D));
+                for (int32_t n = 0; n < D; ++n) {
+                    std::memcpy(out.real[card].data() + rb * size_t(n),
+                                all.data() + full * size_t(n) + rb * size_t(card), rb);
+                }
+                std::vector<uint8_t> h(size_t(down_bytes(fmt::q8_0)), 0);
+                ok = pack_down(fmt::q8_0, out.real[card].data(), rb, h.data()) && out.d[card]->put(h.data(), h.size());
+            }
+            return ok;
+        }
+    }
+    fprintf(stderr, "ex-test: %s: missing\n", name.c_str());
+    return false;
+}
 
 bool make_shared(fn::dense::fmt f, bool down_fmt, int32_t salt, shared_w & out) {
     if (!fn::dense::make_synth(f, down_fmt ? n_ff_card : D, out.s)) {
@@ -766,11 +807,17 @@ bool is_iq2(fmt f) {
 bool is_iq3(fmt f) {
     return f == fmt::iq3_xxs || f == fmt::iq3_s;
 }
+
+bool is_kq(fmt f) {
+    return f == fmt::q4_k || f == fmt::q5_k;
+}
 // the instances map changes at B 4 and 5: maps 1 and 3 every target format, map 2 the IQ2 formats (the IQ3 formats
-// and Q8_0 run SP2's kernels under it)
-bool map_covers(int32_t map, fmt f) { // ME1: the Q4 candidate's K-quants take gate_up_kernel under every map
-    return map == 1 || map == 3 ? f != fmt::q8_0 && f != fmt::q2_0 && f != fmt::q4_k && f != fmt::q5_k
-                                : map == 2 && is_iq2(f); // ME7: Q2_0 (the draft's) as Q8_0
+// and Q8_0 run SP2's kernels under it). TTTS3 item 3: map 3 also the K-quants, at every B (their family bodies); ME1's
+// gate_up_kernel under maps 0-2
+bool map_covers(int32_t map, fmt f) {
+    return map == 1 ? f != fmt::q8_0 && f != fmt::q2_0 && !is_kq(f) :
+           map == 3 ? f != fmt::q8_0 && f != fmt::q2_0 :
+                      map == 2 && is_iq2(f);  // ME7: Q2_0 (the draft's) as Q8_0
 }
 
 // SP4: a launch's gate/up mapping (gate_up_args::map) and, when hmix is set, its X-HMIX slot (x is read from it, the
@@ -3116,9 +3163,14 @@ void me8_shared_route(test_ctx & c, const gu_inst_t & g, const dn_inst_t & d, bo
     check(c, ok && bad == 0 && unchanged == 0, name);
 }
 
-// ME8's cases: the target's B the row mask holds, resident and cached; a draft's P = 1..4 proposals of one row
-void me8_routes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vector<dn_inst_t> & dns,
-                const std::vector<int32_t> & Bs, bool q2d) {
+// ME8's cases: the target's B the row mask holds, resident and cached; a draft's P = 1..4 proposals of one row. TTTS3:
+// q4, the lists are UD-Q4_K_XL's (a target profile, no draft), so any down is the target's (a Q8_0 one too)
+void me8_routes(test_ctx &                     c,
+                const std::vector<gu_inst_t> & gus,
+                const std::vector<dn_inst_t> & dns,
+                const std::vector<int32_t> &   Bs,
+                bool                           q2d,
+                bool                           q4) {
     const auto gu_if = [&](auto pred) -> const gu_inst_t * {
         const auto it = std::find_if(gus.begin(), gus.end(), pred);
         return it == gus.end() ? nullptr : &*it;
@@ -3130,10 +3182,11 @@ void me8_routes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vec
     const auto draft_fmt = [](fmt f) { return f == fmt::q8_0 || f == fmt::q2_0; };
     me8_stats s;
     const gu_inst_t * tg = q2d ? nullptr : gu_if([&](const gu_inst_t & g) { return !draft_fmt(g.f); });
-    const dn_inst_t * td = q2d ? nullptr : dn_if([](const dn_inst_t & d) { return d.f != fmt::q8_0; });
+    const dn_inst_t * td = q2d ? nullptr : dn_if([&](const dn_inst_t & d) { return q4 || d.f != fmt::q8_0; });
     const fmt df = q2d ? fmt::q2_0 : fmt::q8_0; // the draft's routed format: Q8_0 in the deployed lists, ME7's Q2_0
-    const gu_inst_t * dg = gu_if([&](const gu_inst_t & g) { return g.f == df && g.fg == fn::dense::fmt::q8_0; });
-    const dn_inst_t * dd = dn_if([&](const dn_inst_t & d) { return d.f == df && d.fs == fmt::q8_0; });
+    const gu_inst_t * dg =
+        q4 ? nullptr : gu_if([&](const gu_inst_t & g) { return g.f == df && g.fg == fn::dense::fmt::q8_0; });
+    const dn_inst_t * dd = q4 ? nullptr : dn_if([&](const dn_inst_t & d) { return d.f == df && d.fs == fmt::q8_0; });
     if (tg != nullptr && td != nullptr) {
         for (const bool cached : {false, true}) {
             for (const int32_t B : Bs) {
@@ -3157,7 +3210,6 @@ void me8_routes(test_ctx & c, const std::vector<gu_inst_t> & gus, const std::vec
     check(c, s.cases > 0, "me8: a case in this list");
     check(c, s.cases == 0 || (s.ties_in > 0 && s.ties_cut > 0), "me8: tied routes exercised");
 }
-
 
 // ---- ME10: the one-device expert window (combine_finish, gate_up_pair) ---------------------------------------------
 // The finish against today's combine then X-F's exchange on one device (combine into card 0's partial; send_half of
@@ -3786,12 +3838,9 @@ void fmu2_lanes(test_ctx &                     c,
                 const std::vector<gu_inst_t> & gus,
                 const std::vector<dn_inst_t> & dns,
                 const row_case &               master) {
-    std::vector<dn_inst_t> rdn;
-    for (const dn_inst_t & d : dns) {
-        if ((d.f == fmt::q2_0 || d.f == fmt::iq4_nl) && (d.fs == fmt::q2_0 || d.fs == fmt::iq4_nl)) {
-            rdn.push_back(d);
-        }
-    }
+    // every listed down pair: IQ4_NL and Q2_0 (FMU2), TTTS3 item 4's Q5_1 and Q8_0 (the Q4 file's, and the Q8 draft's
+    // Q8_0 pair)
+    std::vector<dn_inst_t> rdn(dns);
     int32_t n_gu = 0, n_dn = 0, n_bad = 0, n_formats = 0, n_undef = 0, n_xf = 0, n_xf16 = 0, n_x16_over = 0;
     int32_t        n_iq3_alone = 0;  // FMS13: IQ3 sets at R <= 3, gate_up_lanes refused and each lane's own gate_up run
     int64_t n_x16_finite = 0; // FMS2 item 7: halves compared whose value is finite within FP16's range
@@ -3803,7 +3852,7 @@ void fmu2_lanes(test_ctx &                     c,
         for (row_case & rc : sp4_route_cases(c, master, rr, rng)) {
             cases.push_back(std::move(rc));
         }
-        for (const fmt f : { fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s }) {
+        for (const fmt f : { fmt::iq2_xxs, fmt::iq2_xs, fmt::iq2_s, fmt::iq3_xxs, fmt::iq3_s, fmt::q4_k, fmt::q5_k }) {
             const auto gi = std::find_if(gus.begin(), gus.end(), [&](const gu_inst_t & g) { return g.f == f; });
             if (gi == gus.end()) {
                 continue;
@@ -4200,19 +4249,19 @@ void fmu2_lanes(test_ctx &                     c,
     struct refusal {
         const char * what;
         int32_t lanes;
-        int32_t      kind;  // 0 none, 1 shared GLU, 2 shared meta, 3 table, 4 Q8_0 down, 5 map 1, 6 rows 1, 7 rows 6
+        int32_t kind;  // 0 none, 1 shared GLU, 2 shared meta, 3 table, 4 unprofiled down, 5 map 1, 6 rows 1, 7 rows 6
     };
 
     const refusal rs[] = {
-        { "one lane",      1, 0 },
-        { "five lanes",    5, 0 },
-        { "a shared GLU",  2, 1 },
-        { "a shared meta", 2, 2 },
-        { "a table (wt)",  2, 3 },
-        { "a Q8_0 down",   2, 4 },
-        { "map 1",         2, 5 },
-        { "rows 1",        2, 6 },
-        { "rows 6",        2, 7 }
+        { "one lane",                              1, 0 },
+        { "five lanes",                            5, 0 },
+        { "a shared GLU",                          2, 1 },
+        { "a shared meta",                         2, 2 },
+        { "a table (wt)",                          2, 3 },
+        { "an unprofiled down pair (Q5_1 + Q2_0)", 2, 4 },
+        { "map 1",                                 2, 5 },
+        { "rows 1",                                2, 6 },
+        { "rows 6",                                2, 7 }
     };
     bool refused = ok && w != nullptr && wd != nullptr, untouched = true;
     for (const refusal & r : rs) {
@@ -4237,8 +4286,8 @@ void fmu2_lanes(test_ctx &                     c,
         } else if (r.kind == 5) {
             la.s[1].map = 1;
         }
-        const fmt fd = r.kind == 4 ? fmt::q8_0 : dq.f, fsd = r.kind == 4 ? fmt::q8_0 : dq.fs;
-        // map 1 refuses gate_up only, a Q8_0 down down only: the other side is not called
+        const fmt     fd = r.kind == 4 ? fmt::q5_1 : dq.f, fsd = r.kind == 4 ? fmt::q2_0 : dq.fs;
+        // map 1 refuses gate_up only, an unprofiled down pair down only: the other side is not called
         const bool want_g = r.kind != 4, want_d = r.kind != 5;
         const int32_t rows = r.kind == 6 ? 1 : r.kind == 7 ? max_rows + 1 : max_rows;  // FMS13: rows outside 2 .. 5
         const bool    gs   = want_g && (gate_up_lanes_supported(g.f, g.fg, g.fu, r.lanes, rows, la) ||
@@ -4260,11 +4309,79 @@ void fmu2_lanes(test_ctx &                     c,
         }
     }
     printf(
-        "ex-test: fmu2 lanes refusals (%zu: one and five lanes, a shared GLU or meta, a table, a Q8_0 down, map 1, "
-        "rows 1 and 6): "
+        "ex-test: fmu2 lanes refusals (%zu: one and five lanes, a shared GLU or meta, a table, an unprofiled down "
+        "pair, map 1, rows 1 and 6): "
         "%s, outputs untouched: %s\n",
         sizeof(rs) / sizeof(rs[0]), refused ? "all refused" : "NOT ALL REFUSED", untouched && ok ? "yes" : "NO");
     check(c, ok && refused && untouched, "fmu2 lanes refusals");
+}
+
+// TTTS3 step 8: layer `layer`'s real routed experts of format f from a GGUF's shards (CPU reads of the tensor data,
+// no model load) in synth's layout: expert i the file's expert i, gate/up its ffn_gate_exps rows then its ffn_up_exps
+// rows, down its ffn_down_exps rows; expert n_synth (the poison, never routed) the file's expert n_synth
+bool load_real(fmt f, bool down, const std::vector<fnfl_gguf_dir> & dirs, int32_t layer, synth & out) {
+    const fn::quant::wfmt q = to_quant(f);
+    out.f                   = f;
+    out.down                = down;
+    out.row_bytes           = fn::quant::row_bytes(q, down ? NFF : D);
+    const int64_t rows      = down ? D : NFF;  // a tensor's rows an expert
+    const size_t  part      = out.row_bytes * size_t(rows);
+    out.expert_bytes        = down ? part : 2 * part;
+    out.bytes.assign(out.expert_bytes * (n_synth + 1), 0);
+    const std::string  pre      = "blk." + std::to_string(layer) + ".";
+    const char * const names[2] = { down ? "ffn_down_exps.weight" : "ffn_gate_exps.weight", "ffn_up_exps.weight" };
+    for (int32_t k = 0; k < (down ? 1 : 2); ++k) {
+        const fnfl_gguf_tensor * t  = nullptr;
+        const fnfl_gguf_dir *    td = nullptr;
+        for (const fnfl_gguf_dir & d : dirs) {
+            for (const fnfl_gguf_tensor & x : d.tensors) {
+                if (x.name == pre + names[k]) {
+                    t  = &x;
+                    td = &d;
+                }
+            }
+        }
+        if (t == nullptr || strcasecmp(t->type_name.c_str(), fmt_name(f)) != 0 || t->bytes != part * size_t(NE)) {
+            fprintf(stderr, "ex-test: %s%s: missing, not %s or not %zu bytes\n", pre.c_str(), names[k], fmt_name(f),
+                    part * size_t(NE));
+            return false;
+        }
+        FILE * fp = fopen(td->path.c_str(), "rb");
+        bool   ok = fp != nullptr;
+        for (int32_t i = 0; i <= n_synth && ok; ++i) {
+            ok = fseeko(fp, static_cast<off_t>(t->offset + part * size_t(i)), SEEK_SET) == 0 &&
+                 fread(out.bytes.data() + out.expert_bytes * size_t(i) + part * size_t(k), 1, part, fp) == part;
+        }
+        if (fp != nullptr) {
+            fclose(fp);
+        }
+        if (!ok) {
+            fprintf(stderr, "ex-test: %s%s: read failed\n", pre.c_str(), names[k]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// the routed gate/up or down format of layer `layer` in a GGUF's shards; false when the tensor is missing or not an
+// expert format
+bool real_fmt(const std::vector<fnfl_gguf_dir> & dirs, int32_t layer, bool down, fmt & f) {
+    const std::string name =
+        "blk." + std::to_string(layer) + (down ? ".ffn_down_exps.weight" : ".ffn_gate_exps.weight");
+    for (const fnfl_gguf_dir & d : dirs) {
+        for (const fnfl_gguf_tensor & x : d.tensors) {
+            if (x.name != name) {
+                continue;
+            }
+            for (const fmt c : { fmt::q4_k, fmt::q5_k, fmt::q5_1, fmt::q8_0 }) {
+                if (strcasecmp(x.type_name.c_str(), fmt_name(c)) == 0) {
+                    f = c;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 } // namespace
@@ -4296,8 +4413,31 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
     // format and each shared format once, every down pair), or those whose routed gate/up format is listed
     std::vector<gu_inst_t> gus;
     std::vector<dn_inst_t> dns;
-    // ME1: "q4", the Unsloth Q4 candidate's own lists (experts_inst.h FN_EXPERTS_Q4_*), gate/up and down
-    const bool q4 = sel == "q4";
+    // ME1: "q4", the Unsloth Q4 candidate's own lists (experts_inst.h FN_EXPERTS_Q4_*), gate/up and down. TTTS3 step 8:
+    // "q4@L", layer L's instances on its real routed experts from the UD-Q4_K_XL file (FNFL_EX_GGUF, else the
+    // model-q4 fixture; CPU reads, no model load)
+    const int32_t              real_layer = sel.rfind("q4@", 0) == 0 ? std::atoi(sel.c_str() + 3) : -1;
+    const bool                 q4         = sel == "q4" || real_layer >= 0;
+    std::vector<fnfl_gguf_dir> real_dirs;
+    fmt                        real_gu = fmt::q4_k, real_dn = fmt::q5_1;
+    if (real_layer >= 0) {
+        const char *             env   = std::getenv("FNFL_EX_GGUF");
+        const std::string        first = env != nullptr ? env : fn::cases::fixture_path("model-q4");
+        std::vector<std::string> paths;
+        std::string              err;
+        bool                     ok = fnfl_gguf_shard_paths(first, paths, err);
+        for (size_t i = 0; ok && i < paths.size(); ++i) {
+            real_dirs.emplace_back();
+            ok = fnfl_gguf_read_dir(paths[i], real_dirs.back(), err);
+        }
+        if (!ok || !real_fmt(real_dirs, real_layer, false, real_gu) ||
+            !real_fmt(real_dirs, real_layer, true, real_dn)) {
+            fprintf(stderr, "ex-test: q4@%d: %s\n", real_layer, err.empty() ? "no expert formats" : err.c_str());
+            return 1;
+        }
+        printf("ex-test: q4@%d: real routed experts %s gate/up and %s down from %s (%zu shards)\n", real_layer,
+               fmt_name(real_gu), fmt_name(real_dn), first.c_str(), paths.size());
+    }
     // ME7: "q2d", the Q2 draft's own lists (experts_inst.h FN_EXPERTS_DRAFT_Q2_*), gate/up and down
     const bool q2d = sel == "q2d";
     for (int32_t i = 0; q2d && i < n_draft_q2_gate_up_inst; ++i) {
@@ -4316,13 +4456,17 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
         gu_inst_t g{};
         int32_t layer = 0;
         q4_gate_up_inst(i, g.f, g.fg, g.fu, layer);
-        gus.push_back(g);
+        if (real_layer < 0 || g.f == real_gu) {
+            gus.push_back(g);
+        }
     }
     for (int32_t i = 0; q4 && i < n_q4_down_inst; ++i) {
         dn_inst_t d{};
         int32_t layer = 0;
         q4_down_inst(i, d.f, d.fs, layer);
-        dns.push_back(d);
+        if (real_layer < 0 || d.f == real_dn) {
+            dns.push_back(d);
+        }
     }
     for (int32_t i = 0; !q4 && !q2d && i < n_gate_up_inst; ++i) {
         gu_inst_t g{};
@@ -4380,6 +4524,11 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
             return 1;
         }
     }
+    // TTTS3 step 8: layer real_layer's routed experts in place of the synthetic ones of its two formats
+    if (real_layer >= 0 && (!load_real(real_gu, false, real_dirs, real_layer, c.routed[rkey(real_gu, false)]) ||
+                            !load_real(real_dn, true, real_dirs, real_layer, c.routed[rkey(real_dn, true)]))) {
+        return 1;
+    }
     int32_t salt = 0;
     for (const dfmt f : {dfmt::iq3_s, dfmt::iq4_xs, dfmt::q4_k, dfmt::q5_k, dfmt::q6_k}) {
         if (!make_shared(f, false, ++salt, c.sh_gu[int32_t(f)])) {
@@ -4398,6 +4547,13 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
         !make_shared(dfmt::q8_0, true, ++salt, c.sh_dn[int32_t(dfmt::q8_0)])) {
         fprintf(stderr, "ex-test: shared Q8_0 failed\n");
         return 1;
+    }
+    // TTTS3 item 7: q4@L's shared down is the layer's real one (Q8_0 in UD-Q4_K_XL)
+    if (real_layer >= 0) {
+        if (!load_real_shared_down(real_dirs, real_layer, c.sh_dn[int32_t(dfmt::q8_0)])) {
+            return 1;
+        }
+        printf("ex-test: q4@%d: the real shared down (ffn_down_shexp, Q8_0)\n", real_layer);
     }
     // the routed pool: n_synth distinct IDs over [0, 512); every other ID reads the poison expert
     std::mt19937 rng(0x45583154u);
@@ -4493,7 +4649,7 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
             gu_out p[max_rows + 1];
             bool pr[max_rows + 1] = {};
             for (const int32_t B : Bs) {
-                if (B >= 4 && ran[B]) {
+                if ((B >= 4 || is_kq(g.f)) && ran[B]) {  // TTTS3 item 3: the K-quants' family bodies at B = 1-5
                     pr[B] = sp4_case(c, g, cases[B], "case", p[B], &out[B]);
                 }
             }
@@ -4528,7 +4684,7 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
             if (check_gate_up(c, g.f, g.fg, g.fu, turns[ti], false, "turn", to) && gi == 0) {
                 turn_glu.push_back(to);
             }
-            if (map_covers(sp4_map, g.f) && turns[ti].rows >= 4) {
+            if (map_covers(sp4_map, g.f) && (turns[ti].rows >= 4 || is_kq(g.f))) {
                 gu_out tp;
                 sp4_case(c, g, turns[ti], "turn", tp);
             }
@@ -4537,12 +4693,12 @@ int fnfl_ex_test(int device, uint32_t rows_mask, const char * formats, const cha
     me1_resolve(c); // ME1: GPU-side resolution's two small kernels
     me3_graph_replay(c); // ME3: resolve captured once and replayed with changed routes and residency
     me3_wait_post(c);    // ME3: a replay's waits and stamp as kernels
-    me8_routes(c, gus, dns, Bs, q2d); // ME8: one router for both cards, captured once and replayed on new routes
+    me8_routes(c, gus, dns, Bs, q2d, q4);  // ME8: one router for both cards, captured once and replayed on new routes
     me10_finish(c, master, Bs);       // ME10: the one-device finish against combine + X-F's exchange
     if (!q2d && !q4) {
         me10_pair(c, gus, master, Bs); // ME10: both shards' gate/up in one launch against two
     }
-    if (!q2d && !q4 && std::find(Bs.begin(), Bs.end(), max_rows) != Bs.end()) {
+    if (!q2d && std::find(Bs.begin(), Bs.end(), max_rows) != Bs.end()) {
         fmu2_lanes(c, gus, dns, master);  // FMU2 (build item 1): the joint round's lanes in one launch, each alone
     }
     fmu2_rows_alone(c, gus, dns, master); // FMU2 (build item 2): the draft's instances, every row each row alone

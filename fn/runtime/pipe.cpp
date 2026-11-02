@@ -1,5 +1,7 @@
 #include "fn/runtime/pipe.h"
 
+#include "fn/runtime/pace.h"
+
 #include <algorithm>
 #include <functional>
 #include <map>
@@ -41,14 +43,19 @@ void core::leave(int32_t slot) {
     }
 }
 
-void core::read_start(int32_t slot) {
+void core::read_start(int32_t slot, bool small) {
     if (!has(readers_, slot)) {
         readers_.push_back(slot);
+    }
+    erase(small_, slot);
+    if (small) {
+        small_.push_back(slot);
     }
 }
 
 void core::front_done(int32_t slot) {
     erase(readers_, slot);
+    erase(small_, slot);
     if (next_reader_ >= readers_.size()) {
         next_reader_ = 0;
     }
@@ -118,7 +125,7 @@ action core::next() {
     if (!readers_.empty() && (read_turn_ || !writers)) {
         x.a    = act::front_read;
         x.slot = readers_[next_reader_ % readers_.size()];
-        x.n    = writers ? 1 : 0;
+        x.n    = writers && !has(small_, x.slot) ? 1 : 0;  // MUP1: a small read's chunk whole beside writers
         return x;
     }
     // a group to begin: idle with members (the one not begun last first)
@@ -191,6 +198,8 @@ struct fake {
         int32_t back_groups    = 0;  // the back groups released (front chunks done) and not run
         int32_t back_left      = 0;  // the back groups of the whole read not run
         bool    front_finished = false;
+        bool    small          = false;  // MUP1: its chunks run whole on both boxes beside writers
+        int32_t front_turns    = 0;      // the leader's read turns it took
     };
 
     core                                    c;
@@ -206,6 +215,7 @@ struct fake {
     int32_t     reads_since_group = 0;                // the leader's front read groups since its last group action
     int32_t     both_in_flight    = 0;  // actions taken with both groups in flight (the pipeline's overlap)
     int32_t     back_behind_max   = 0;  // the most read groups a back half waited behind
+    int32_t     small_back_max    = 0;  // MUP1: the most small-read back groups run at once on the follower
     std::string bad;
 
     void set(const std::vector<int32_t> & w) {
@@ -357,11 +367,16 @@ struct fake {
                             bad = "a front read group with no front work";
                             break;
                         }
-                        if (x.n == 0 && !writers.empty()) {
+                        if (x.n == 0 && !writers.empty() && !it->second.small) {
                             bad = "a whole front chunk while writers wait";
                             break;
                         }
+                        if (x.n != 0 && it->second.small) {
+                            bad = "a small read's front in layer groups";
+                            break;
+                        }
                         rd &          r   = it->second;
+                        ++r.front_turns;
                         const int32_t rem = r.front_groups % r.per_chunk;
                         const int32_t n   = x.n != 0 ? 1 : (rem == 0 ? r.per_chunk : rem);
                         t_lead += 0.3 * n;
@@ -371,6 +386,15 @@ struct fake {
                         const int32_t chunks_before = (before + r.per_chunk - 1) / r.per_chunk;
                         const int32_t chunks_after  = (r.front_groups + r.per_chunk - 1) / r.per_chunk;
                         r.back_groups += (chunks_before - chunks_after) * r.per_chunk;
+                        if (r.small && r.back_groups > 0) {
+                            // MUP1: the follower runs a small chunk's back half whole when its command arrives (after
+                            // what it already holds), so the next back half waits behind it
+                            follower_idle_until(t_lead);
+                            t_follow       = std::max(t_follow, t_lead) + 0.3 * r.back_groups;
+                            small_back_max = std::max(small_back_max, r.back_groups);
+                            r.back_left -= r.back_groups;
+                            r.back_groups = 0;
+                        }
                         // a read with no writer present delays no one
                         reads_since_group = writers.empty() ? 0 : reads_since_group + 1;
                         c.done(x);
@@ -556,6 +580,46 @@ bool self_test(std::string & report) {
         }
         line("readers interleaved (two reads of four chunks, with 0, 2, 4, 6 writers)", ok, why);
     }
+    // MUP1 piece 3: small reads beside 2, 4, 6 writers: each chunk's front is one leader read turn and its back half
+    // one follower run, so a writer's halves wait behind at most one small chunk's half; the reads end and their slots
+    // step; the writers keep stepping; every invariant holds
+    {
+        bool        ok = true;
+        std::string why;
+        for (int32_t n = 2; n <= 6 && ok; n += 2) {
+            fake f;
+            f.set(first(n));
+            for (int32_t r = 6; r < 8; ++r) {
+                f.readers[r].front_groups = 3 * (r - 5);  // one chunk and two
+                f.readers[r].back_left    = 3 * (r - 5);
+                f.readers[r].small        = true;
+                f.c.read_start(r, true);
+            }
+            int32_t turns[8]     = {};
+            int32_t steps_during = 0;
+            f.run(600, [&](int32_t) {
+                for (auto & [s, rr] : f.readers) {
+                    turns[s] = rr.front_turns;
+                }
+                if (!f.readers.empty()) {
+                    int32_t t = 0;
+                    for (int32_t s = 0; s < n; ++s) {
+                        t += f.steps[s];
+                    }
+                    steps_during = t;
+                }
+            });
+            ok  = f.bad.empty() && f.readers.empty() && turns[6] == 1 && turns[7] == 2 && f.small_back_max <= 3 &&
+                  f.back_behind_max == 0 && steps_during > 0 && f.steps[6] > 0 && f.steps[7] > 0;
+            why = f.bad.empty() ? std::to_string(n) + " writers: front turns " + std::to_string(turns[6]) + " and " +
+                                      std::to_string(turns[7]) + " (one a chunk); the most back groups run at once " +
+                                      std::to_string(f.small_back_max) + " (one chunk); interleaved back groups " +
+                                      std::to_string(f.back_behind_max) + "; writer steps during the reads " +
+                                      std::to_string(steps_during) :
+                                  f.bad;
+        }
+        line("small reads beside writers (MUP1: a chunk of one and of two, with 2, 4, 6 writers)", ok, why);
+    }
     // the follower's failure: a group's answers fail; its members leave and the other group goes on
     {
         fake f;
@@ -577,6 +641,10 @@ bool self_test(std::string & report) {
              f.bad.empty() ? std::to_string(f.left.size()) + " members left; the other " + std::to_string(others) +
                                  " stepped on (" + std::to_string(after - before) + " steps)" :
                              f.bad);
+    }
+    // APF1: the writer-pause book beside the pipeline (fn/runtime/pace.h's cases, a fake clock)
+    if (!pace::self_test(report)) {
+        ++failed;
     }
     report += std::string("pipe-test: ") + (failed == 0 ? "PASS" : "FAIL") + "\n";
     return failed == 0;

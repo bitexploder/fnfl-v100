@@ -82,6 +82,7 @@
 namespace fn::dense {
 
 enum class fmt : int32_t { q4_k, q5_k, q6_k, iq4_xs, iq3_s, q8_0, iq4_nl, q2_0, bf16, f32 };
+constexpr fmt fmt_q8_0f = static_cast<fmt>(int32_t(fmt::f32) + 1);  // TTTS3: Q8_0 rows as stored (dense.cu)
 enum class epi : int32_t { f32, glu_gate, glu_up, conv_silu };
 
 constexpr int32_t max_rows = 5; // SP2: the five-row verification pass
@@ -131,13 +132,15 @@ struct route_args {
     float * sg = nullptr;    // [B] sigmoid of the shared gate
 };
 
+struct stage_steps;  // TTTS6 item 2: dense_steps.h
+
 struct product_args {
     int32_t k = 0;
     int32_t n_mats = 0;
     mat mats[max_mats];
     const int8_t * x_codes = nullptr; // [B][k], for the quantized formats (act.h)
     const float * x_scales = nullptr; // [B][k / 32][2]
-    const float * x_f32 = nullptr;    // F32 [B][k], for BF16 and F32
+    const float *   x_f32      = nullptr;  // F32 [B][k], for BF16, F32 and Q8_0F
     const uint8_t * grids = nullptr;  // grid_bytes, for IQ3_S, IQ4_XS and IQ4_NL
     int8_t * glu_codes = nullptr;     // [B][m] of the glu pair (act.h)
     float * glu_scales = nullptr;     // [B][m / 32][2]
@@ -152,6 +155,13 @@ struct product_args {
     const float * hmix = nullptr;
     int32_t hmix_peer_half = 0; // the half the peer writes: 1 - card
     uint32_t * err = nullptr;   // the card's error word (xchg::err_poll_hmix)
+    // TTTS6: UD-Q4_K_XL's sites (the joint rounds, the joint draft step and catch-up): the launch (product,
+    // product_gated, product_joint) takes an instance compiled for Q8_0 only, or for Q8_0 and BF16 when a matrix is
+    // BF16, with no format switch. Its paths are the shared kernels', so its outputs are theirs bitwise. Q8_0 and BF16
+    // matrices only (else rejected). steps (item 2): the site's staging steps, required with q8 (dense_steps.h
+    // stage_steps_of, once a site); the instance stages only those.
+    bool                q8    = false;
+    const stage_steps * steps = nullptr;
 };
 
 // Sets every split left at 0: the largest divisor of a matrix's K steps that keeps the launch's units within one
@@ -233,7 +243,7 @@ struct joint_args {
     // rows of mats[i].out
     float * out[max_lane_mats][max_lanes] = {};
     // per-lane F32 activations (PLE, FMU2 build item 4): lane u's lane_rows rows of K at x_f32[u] (16-byte aligned;
-    // BF16 matrices only, a.x_f32 ignored); all null: a.x_f32's (or X-HMIX's) rows
+    // BF16 or (TTTS3) Q8_0F matrices only, a.x_f32 ignored); all null: a.x_f32's (or X-HMIX's) rows
     const float * x_f32[max_lanes] = {};
     // FMS2 item 6 (XC-1): X-A sent by the producer. Non-null: matrix 0 (the only matrix: F32 epilogue, split > 1, m =
     // 2 words_half, no lane outputs) also stores each finished value of its rows' half peer_half, as its tile's last

@@ -103,11 +103,21 @@ struct reserved_class {
     int64_t live_bytes(int32_t p, int32_t card) const;
 };
 
+// TTTS2: how the loader turns a tensor's file bytes into its resident bytes, both exact: none (a copy or the layout's
+// repack); f32_bf16, an F32 tensor whose every value is a BF16 value, held as BF16 (each value's high 16 bits, refused
+// when a low half is not zero). TTTS3: TTTS2's q8_f32 (the PLE key and value widened to F32 rows) is gone; they stay
+// Q8_0
+enum class src_conv : uint8_t { none, f32_bf16 };
+
 // Where one tensor's bytes come from: its file mapping and data offset (set by the loader at open).
 struct tensor_source {
     const mapped_file * file = nullptr;
     uint64_t offset = 0;
-    int64_t row_bytes = 0; // bytes of one GGUF row (ne0 elements)
+    int64_t             row_bytes = 0;  // bytes of one GGUF row (ne0 elements), in the file's format
+    // TTTS2: the file's format geometry (its header's block) and the conversion to the resident format (tensor_place,
+    // model::tp); 0: the resident format's (no conversion)
+    int32_t             src_blk = 0, src_bb = 0;
+    src_conv            conv      = src_conv::none;
     // TTTS1 (split-test, fn/loader fill_weights_synth): the tensor's whole GGUF bytes in host memory, read in place of
     // the mapping while set (no model data); null: the mapping
     const uint8_t *     synth     = nullptr;
@@ -158,6 +168,9 @@ class model {
     // PN1: its pin (fn/runtime/ple_host.h ple_pin) when the residency is full, null when lazy. Held type-erased because
     // fn/model sits below fn/runtime; declared after files, so it unregisters before the mapping is unmapped.
     std::shared_ptr<void> ple_pin;
+    // STALL: the lazy table's background warm (fn/runtime/ple_host.h ple_warm), null when off or pinned. Declared
+    // last of the two, so its thread stops before the pin and the mapping go
+    std::shared_ptr<void> ple_warm;
 
     // GGUF keys the state sizes need
     int32_t ple_conv_kernel = 0;
@@ -209,5 +222,13 @@ class slot_scope {
     const model & m_;
     int32_t prev_;
 };
+
+// TTTS3: the PLE key and value's placed format, and whether the taps are F32 (UD-Q4_K_XL), from the placed formats:
+// the one rule for the pass's weights (pass.cpp) and the state's replica sizes (loader::file_state_params)
+fn::ple::kv_fmt ple_kv_of(const model & m);
+bool            ple_conv32_of(const model & m);
+// TTTS6: the target's attention and GDN dense matrices all Q8_0 (UD-Q4_K_XL): the joint rounds, the joint draft step
+// and the joint catch-up then take the dense Q8_0 instances (fn::dense product_args::q8)
+bool            dense_q8_of(const model & m);
 
 } // namespace fn::model

@@ -2,6 +2,7 @@
 
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/dense/dense.h"
+#include "fn/kernels/dense/dense_steps.h"
 #include "fn/kernels/draft/draft.h"
 #include "fn/kernels/embed/embed.h"
 #include "fn/kernels/experts/experts.h"
@@ -19,6 +20,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -130,6 +132,7 @@ bool embed(pass_card & p, const int32_t * tok, int32_t rows, std::string & err) 
     a.hpost = p.emb_hpost;
     a.hx = p.emb_hx;
     a.err = p.c.rings->err(p.c.card);
+    a.q8    = p.embd_q8;
     return fn::embed::embed(rows, a, p.c.stream) ? true : fail(err, "draft embed");
 }
 
@@ -175,9 +178,11 @@ bool draft_in(pass_card & p, draft_card & d, int32_t rows, bool chained, bool ca
     return true;
 }
 
-// eh_proj on the rows' 4 streams each (Stage C amendment 1's adapter), in the draft_eh site's work region
-bool eh_proj(pass_card & p, draft_card & d, int32_t rows, std::string & err) {
+// eh_proj on the rows' 4 streams each (Stage C amendment 1's adapter), in the draft_eh site's work region; q8 (TTTS6):
+// the Q8_0 instance (the joint draft step of UD-Q4_K_XL)
+bool eh_proj(pass_card & p, draft_card & d, int32_t rows, std::string & err, bool q8 = false) {
     fn::dense::product_args a;
+    a.q8       = q8;
     a.k = 2 * D;
     a.n_mats = 1;
     a.mats[0] = qmat(d.w.eh, d.hres_d);
@@ -187,6 +192,7 @@ bool eh_proj(pass_card & p, draft_card & d, int32_t rows, std::string & err) {
     fn::dense::choose_splits(a);
     fn::dense::work_layout l;
     const int32_t site = static_cast<int32_t>(dense_site::draft_eh);
+    a.steps                     = &p.c.dense_steps[size_t(site)];  // TTTS6 item 2
     if (!fn::dense::layout_of(a, l) || !fn::dense::same_layout(l, p.c.dense_sites[site])) {
         return fail(err, "draft eh_proj: not the draft_eh site's layout");
     }
@@ -274,6 +280,7 @@ bool draft_select(pass_card & p, draft_card & d, std::string & err) {
     sa.body = ws.sel_body;
     sa.offsets = ws.sel_off;
     sa.q_ahead = 1;
+    sa.rope_off  = &p.desc->pos_off;  // MUP1 piece 5
     if (!fn::qsa::select(1, sa, p.c.stream)) {
         return fail(err, "draft select");
     }
@@ -453,8 +460,14 @@ bool pick(pass_card & p, draft_card & d, int32_t j, bool decide, const use_count
         io.n_dtok = j;
         io.proposal = p.desc->argmax + j;
         if (!decide) {
-            const fn::head::logits_args la = {
-                rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)), rg.err(r), r, d.head_w, NV, lg, d.logits_work};
+            const fn::head::logits_args la = { rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
+                                               rg.err(r),
+                                               r,
+                                               d.head_w,
+                                               NV,
+                                               lg,
+                                               d.logits_work,
+                                               d.head_q8 };
             if (!fn::head::logits(1, la, p.c.stream) || !fn::samp::pick_stage(p.samp, io, 0, p.c.stream)) {
                 return fail(err, "draft logits / sampled pick select");
             }
@@ -468,8 +481,14 @@ bool pick(pass_card & p, draft_card & d, int32_t j, bool decide, const use_count
         return true;
     }
     if (!decide) {
-        const fn::head::logits_args la = {
-            rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)), rg.err(r), r, d.head_w, NV, lg, d.logits_work};
+        const fn::head::logits_args la = { rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
+                                           rg.err(r),
+                                           r,
+                                           d.head_w,
+                                           NV,
+                                           lg,
+                                           d.logits_work,
+                                           d.head_q8 };
         fn::head::reduce_args ra = {lg, NV, 0, p.pair_own, rg.slot(1 - r, fn::xchg::msg::greedy, 0), p.greedy_work};
         ra.ids = d.head_ids;
         if (!fn::head::logits(1, la, p.c.stream) || !fn::head::greedy_reduce(1, ra, p.c.stream)) {
@@ -497,6 +516,7 @@ bool index_update(pass_card & p, draft_card & d, int32_t rows, std::string & err
     ua.rope = fn::qsa::model_rope();
     ua.ik = p.c.ws.ik;
     ua.depth = &p.desc->n_before;
+    ua.rope_off  = &p.desc->pos_off;  // MUP1 piece 5
     ua.rows = rows;
     ua.max_cells = d.max_cells;
     if (p.c.kv != nullptr) { // ME6: the host-backed tier's key window (kv_tier.h)
@@ -665,6 +685,7 @@ bool joint_attn(draft_joint & J, int32_t j, const use_counters & u, std::string 
     if (sel) {
         in.mats[3] = bmat16(d.iw.q_proj, IQ, ws.iq);
     }
+    in.q8 = J.q8;  // TTTS6
     if (!dense_run(p.c, in, U, sel ? dense_site::draft_qkv_idx : dense_site::draft_qkv, true, u, "draft.qkv", err)) {
         return false;
     }
@@ -711,6 +732,7 @@ bool joint_attn(draft_joint & J, int32_t j, const use_counters & u, std::string 
             sa.body = J.sel_body[k];
             sa.offsets = J.sel_off[k];
             sa.q_ahead = 1;
+            sa.rope_off  = &pk.desc->pos_off;  // MUP1 piece 5
             if (!fn::qsa::select(1, sa, p.c.stream)) {
                 return fail(err, "joint draft select");
             }
@@ -741,6 +763,7 @@ bool joint_attn(draft_joint & J, int32_t j, const use_counters & u, std::string 
     out.mats[0] = qmat(d.w.wo, ws.partial);
     out.x_codes = ws.mid_codes;
     out.x_scales = ws.mid_scales;
+    out.q8       = J.q8;  // TTTS6
     return dense_run(p.c, out, U, dense_site::draft_out, false, u, "draft.out", err) &&
            half_exchange(p.c, 0, U, use_slot_of(u, u.a, u.graph_a), true, err);
 }
@@ -795,13 +818,14 @@ bool joint_pick(draft_joint & J, int32_t j, bool decide, int32_t rows, const use
     const fn::xchg::rings & rg = *p.c.rings;
     if (d.sampled) {
         if (!decide) {
-            const fn::head::logits_args la = {rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
-                                              rg.err(r),
-                                              r,
-                                              d.head_w,
-                                              NV,
-                                              d.logits,
-                                              d.logits_work};
+            const fn::head::logits_args la = { rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
+                                               rg.err(r),
+                                               r,
+                                               d.head_w,
+                                               NV,
+                                               d.logits,
+                                               d.logits_work,
+                                               d.head_q8 };
             if (!fn::head::logits(J.lanes, la, p.c.stream)) {
                 return fail(err, "joint draft logits");
             }
@@ -809,8 +833,14 @@ bool joint_pick(draft_joint & J, int32_t j, bool decide, int32_t rows, const use
         return joint_pick_sampled(J, j, decide ? 1 : 0, rows, err);
     }
     if (!decide) {
-        const fn::head::logits_args la = {
-            rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)), rg.err(r), r, d.head_w, NV, d.logits, d.logits_work};
+        const fn::head::logits_args la = { rg.slot(r, fn::xchg::msg::hmix, hc_slot_of(u, u.sub)),
+                                           rg.err(r),
+                                           r,
+                                           d.head_w,
+                                           NV,
+                                           d.logits,
+                                           d.logits_work,
+                                           d.head_q8 };
         fn::head::reduce_args ra = {d.logits,     NV, 0, p.pair_own, rg.slot(1 - r, fn::xchg::msg::greedy, 0),
                                     p.greedy_work};
         ra.ids = d.head_ids;
@@ -863,7 +893,7 @@ bool joint_phase(draft_joint & J, int32_t rows, int32_t ph, use_counters & u, st
                 return false;
             }
             u.draft++;
-            return eh_proj(p, d, U, err) && hc_sublayer(p.c, d.w.hc_attn, 0, attn_input(p, d), U, u, 0, err);
+            return eh_proj(p, d, U, err, J.q8) && hc_sublayer(p.c, d.w.hc_attn, 0, attn_input(p, d), U, u, 0, err);
         case 2:
             return hc_sublayer(p.c, d.w.hc_attn, 0, attn_input(p, d), U, u, 1, err);
         case 3:
@@ -936,6 +966,8 @@ fn::dense::product_args catchup_kv(const catchup_joint & j) {
     if (d0.sparse) {
         kv.mats[2] = bmat16(d0.iw.k_proj, fn::qsa::head_dim, p0.c.ws.ik);
     }
+    kv.q8    = j.q8;  // TTTS6
+    kv.steps = j.kv_steps != nullptr ? &j.kv_steps[d0.sparse ? 1 : 0] : nullptr;
     return kv;
 }
 
@@ -1021,9 +1053,10 @@ bool catchup_recv(catchup_joint & j, const use_counters & u, std::string & err) 
     return true;
 }
 
-// lane k's eh_proj: its B_c calls (eh_proj's), gated on its descriptor's rows
-bool catchup_eh(pass_card & p, draft_card & d, std::string & err) {
+// lane k's eh_proj: its B_c calls (eh_proj's), gated on its descriptor's rows; q8: the Q8_0 instance (TTTS6)
+bool catchup_eh(pass_card & p, draft_card & d, std::string & err, bool q8) {
     fn::dense::product_args a;
+    a.q8       = q8;
     a.k = 2 * D;
     a.n_mats = 1;
     a.mats[0] = qmat(d.w.eh, d.hres_d);
@@ -1033,6 +1066,7 @@ bool catchup_eh(pass_card & p, draft_card & d, std::string & err) {
     fn::dense::choose_splits(a);
     fn::dense::work_layout l;
     const int32_t site = static_cast<int32_t>(dense_site::draft_eh);
+    a.steps                     = &p.c.dense_steps[size_t(site)];  // TTTS6 item 2
     if (!fn::dense::layout_of(a, l) || !fn::dense::same_layout(l, p.c.dense_sites[site])) {
         return fail(err, "draft eh_proj lanes: not the draft_eh site's layout");
     }
@@ -1093,6 +1127,7 @@ bool catchup_index(catchup_joint & j, std::string & err) {
         x.rope = fn::qsa::model_rope();
         x.ik = p.c.ws.ik;
         x.depth = &p.desc->n_before;
+        x.rope_off                     = &p.desc->pos_off;  // MUP1 piece 5
         x.rows = fn::draft::max_rows;
         x.max_cells = d.max_cells;
         rows[k] = &p.desc->rows;
@@ -1137,13 +1172,13 @@ bool catchup_phase(catchup_joint & j, int32_t ph, use_counters & u, std::string 
             }
             u.draft++;
             for (int32_t k = 0; k < j.lanes; ++k) {
-                if (!catchup_eh(*j.p[k], *j.d[k], err)) {
+                if (!catchup_eh(*j.p[k], *j.d[k], err, j.q8)) {
                     return false;
                 }
             }
-            return hc_sublayer_lanes(c, j.lanes, hc, 0, in, u, 0, j.runs, err);
+            return hc_sublayer_lanes(c, j.lanes, fn::draft::max_rows, hc, 0, in, u, 0, j.runs, err);
         case 2:
-            return hc_sublayer_lanes(c, j.lanes, hc, 0, in, u, 1, j.runs, err);
+            return hc_sublayer_lanes(c, j.lanes, fn::draft::max_rows, hc, 0, in, u, 1, j.runs, err);
         default: {
             const int32_t form = j.d[0]->sparse ? 1 : 0;
             if (!dense_joint_run(c, j.lanes, catchup_kv(j), *j.jr, j.kv_work[form], u, "draft.kv.joint", err) ||
@@ -1226,8 +1261,12 @@ bool draft_index_init(model & m, int32_t card, draft_card & d, std::string & err
 
 } // namespace
 
-bool read_draft_subset(const std::string & path, std::vector<int32_t> & ids, std::string & err) {
+bool read_draft_subset(const std::string & given, std::vector<int32_t> & ids, std::string & err) {
     ids.clear();
+    // a home-relative default (~/...) under $HOME
+    const char *      home = std::getenv("HOME");
+    const std::string path =
+        given.rfind("~/", 0) == 0 && home != nullptr && home[0] != '\0' ? std::string(home) + given.substr(1) : given;
     std::ifstream f(path);
     if (!f) {
         return fail(err, "cannot read the draft subset " + path);
@@ -1258,10 +1297,12 @@ bool draft_head_fill(model & m, const std::vector<int32_t> & subset, std::string
     }
     const tensor_source & src = m.sources[size_t(oi)];
     const uint8_t * vocab = src.file != nullptr ? src.file->data() + src.offset : nullptr;
-    const int64_t hb = fn::head::draft_head_bytes(NV);
-    if (vocab != nullptr && (src.row_bytes != fn::dense::row_bytes(fn::dense::fmt::q5_k, D) ||
-                             src.offset + uint64_t(src.row_bytes) * fn::head::n_vocab > src.file->size())) {
-        return fail(err, "draft head: output.weight is not Q5_K rows of 2,560 in its file");
+    const bool            q8    = std::strcmp(m.tp(oi).format, "Q8_0") == 0;  // TTTS2: UD-Q4_K_XL
+    const int64_t         hb    = fn::head::draft_head_bytes(NV, q8);
+    if (vocab != nullptr &&
+        (src.row_bytes != fn::dense::row_bytes(q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k, D) ||
+         src.offset + uint64_t(src.row_bytes) * fn::head::n_vocab > src.file->size())) {
+        return fail(err, "draft head: output.weight is not Q5_K or Q8_0 rows of 2,560 in its file");
     }
     std::vector<int32_t> ids(size_t(NV), 0);
     std::vector<uint8_t> rows(size_t(hb), 0);
@@ -1270,7 +1311,8 @@ bool draft_head_fill(model & m, const std::vector<int32_t> & subset, std::string
             return fail(err, "draft head: draft_ids");
         }
         std::fill(rows.begin(), rows.end(), uint8_t(0));
-        if (vocab != nullptr && !fn::head::pack_draft_head(vocab, size_t(src.row_bytes), ids.data(), NV, rows.data())) {
+        if (vocab != nullptr &&
+            !fn::head::pack_draft_head(vocab, size_t(src.row_bytes), ids.data(), NV, rows.data(), q8)) {
             return fail(err, "draft head: pack_draft_head");
         }
         uint8_t * w = class_part(m, "draft head copy (DR1)", "draft head rows (Q5_K, packed)", card, err);
@@ -1318,7 +1360,9 @@ bool draft_init(model & m, const pass_card & p, draft_card & d, std::string & er
         work == nullptr) {
         return false;
     }
-    d.logits_work = fn::head::logits_work_bytes(NV) > 0 ? work : nullptr;
+    const int32_t oi = model::find("output.weight");
+    d.head_q8        = oi >= 0 && std::strcmp(m.tp(oi).format, "Q8_0") == 0;  // TTTS2
+    d.logits_work    = fn::head::logits_work_bytes(NV, d.head_q8) > 0 ? work : nullptr;
     if (!draft_index_init(m, card, d, err)) {
         return false;
     }
@@ -1393,7 +1437,10 @@ step_status draft_pair_enqueue(pass_card * const p[2], draft_card * const d[2], 
     return step_status::ok;
 }
 
-size_t catchup_kv_work_bytes(bool sparse) {
+namespace {
+
+// the K/V product's shape of a draft form, its splits chosen
+fn::dense::product_args catchup_kv_shape(bool sparse) {
     fn::dense::product_args kv;
     kv.k = D;
     kv.n_mats = sparse ? 3 : 2;
@@ -1406,7 +1453,17 @@ size_t catchup_kv_work_bytes(bool sparse) {
         kv.mats[2].m = fn::qsa::head_dim;
     }
     fn::dense::choose_splits(kv);
-    return fn::dense::joint_work_bytes(kv);
+    return kv;
+}
+
+}  // namespace
+
+size_t catchup_kv_work_bytes(bool sparse) {
+    return fn::dense::joint_work_bytes(catchup_kv_shape(sparse));
+}
+
+bool catchup_kv_steps(bool sparse, fn::dense::stage_steps & out) {
+    return fn::dense::stage_steps_of(catchup_kv_shape(sparse), out);
 }
 
 use_counters catchup_joint_counters() {

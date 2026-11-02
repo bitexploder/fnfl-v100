@@ -24,6 +24,7 @@
 // the GDN selector together (fn::round::commit in the model pass, fn::round::advance in layer-test's runner).
 
 #include "fn/kernels/dense/dense.h"
+#include "fn/kernels/dense/dense_steps.h"
 #include "fn/kernels/experts/experts.h"
 #include "fn/model/model.h"
 #include "fn/xchg/xchg.h"
@@ -59,6 +60,8 @@ struct hc_module {
     // not read
     const uint8_t * q8_down = nullptr;
     const uint8_t * q8_up = nullptr;
+    // TTTS2: q8_down in hc.h's mixed layout (Q8_0 rows, BF16 inject rows; down2_q8_mix): UD-Q4_K_XL's target HC
+    bool             q8_mix  = false;
 };
 
 // a dense quantized weight on a card: n_out rows of k weights, in DP2's packed layout once pack_dense has run (the
@@ -101,6 +104,8 @@ struct layer_weights {
     int32_t ex_gu_fmt = -1;               // fn::experts::fmt
     int32_t ex_down_fmt = -1;
     int32_t ex_sh_down_fmt = -1;
+    int32_t          ex_profile =
+        -1;  // TTTS3: the compiled expert profile (fn::experts::expert_profiles) the formats resolve to
     int32_t index_owner = 0;
     int32_t router_owner = 0;
 };
@@ -179,7 +184,8 @@ struct layer_ws {
     float * mom[2];    // [B][1300]
     float * inject[2]; // [B][4]
     float * out[2];    // [B][1280]
-    uint32_t * hc_runs; // [40] HC up's run counters (hc.h up2_args::runs): zeroed by resolve_card and clear_workspaces
+    uint32_t * hc_runs;   // [lanes][40] HC up's run counters (hc.h up2_args::runs), a lane's own (TTTS3): zeroed by
+    // resolve_card and clear_workspaces (lone), the joint frame's init and clear_after_error (joint)
     float * zero;      // [B][1280] and [B][4]: hx and hpost of a teacher-forced layer input
     float * partial;   // [B][2560] the sublayer's local output contribution
     // the mixer's output in FNFL's activation format (gdn_core's or attend's), the output product's input
@@ -237,11 +243,15 @@ enum class dense_site : int32_t {
 };
 constexpr int32_t n_dense_sites = static_cast<int32_t>(dense_site::count);
 using dense_layouts = std::array<fn::dense::work_layout, n_dense_sites>;
+using dense_stagings            = std::array<fn::dense::stage_steps, n_dense_sites>;  // TTTS6 item 2: per site
 const char * dense_site_name(dense_site site);
 std::string dense_layout_text(const fn::dense::work_layout & l);
 // Each site's layout over every launch shape it serves (frame initialization); false, with err naming the site and
 // its layouts, when a site's shapes have more than one
 bool dense_site_layouts(dense_layouts & out, std::string & err);
+// TTTS6 item 2: each site's staging steps (fn::dense::stage_steps_of on its launch shape), computed once with the
+// layouts; a site's Q8_0 launches point at them
+bool         dense_site_steps(dense_stagings & out, std::string & err);
 size_t dense_site_bytes(dense_site site);
 size_t dense_work_offset(dense_site site); // 256-byte aligned regions in dense_site's order
 size_t dense_work_bytes();                 // all of them
@@ -252,7 +262,8 @@ bool dense_site_launch(void * work, const dense_layouts & layouts, dense_site si
                        int32_t rows, void * stream, std::string & err);
 layer_ws carve_layer_ws(void * base, int32_t rows = layer_max_rows);
 // FMU2: lane u's five-row view of a layer_ws carved at fn::xchg::joint_rows rows: every per-row buffer from row 5u (the
-// selection offsets from entry 6u); the HC run counters, positions, depth and committed-slot words shared
+// selection offsets from entry 6u) and (TTTS3) the lane's own HC run counters; the positions, depth and committed-slot
+// words shared (layer-test's runner writes them; the model pass reads its descriptors instead)
 layer_ws lane_ws(const layer_ws & joint, int32_t u);
 
 // The experts' decode buffers on a card (fn::experts::workspace_offsets): the GLU slots (the routed pairs and the
@@ -462,6 +473,7 @@ struct card_ctx {
     const uint8_t * grids = nullptr;
     void * dense_work = nullptr;
     dense_layouts dense_sites{}; // each site's layout (dense_site_layouts)
+    dense_stagings          dense_steps{};  // TTTS6 item 2: each site's staging steps (dense_site_steps)
     const uint8_t * dense_grids = nullptr;
     void * gdn_ws = nullptr;
     void * attn_ws = nullptr;
@@ -470,6 +482,9 @@ struct card_ctx {
     // device, so a captured step serves every depth.
     const int32_t * n_before = nullptr;
     const int32_t * pos = nullptr;
+    // MUP1 piece 5: the slot's rotary offset (the descriptor's pos_off; null in layer-test's runner: 0), read on the
+    // device by the QSA indexer's summaries and queries (pos above already holds cell + offset)
+    const int32_t *         pos_off                                = nullptr;
     // SP4 (the expert gate/up mapping): fn::experts::gate_up_args::map for the target's FFN, read at enqueue (so fixed
     // in a captured graph); 0: SP2's, 1: SP4's paired 320-thread mapping (H1), 2: H2's IQ2 body at B = 4 and 5,
     // 3: XB3 C1's (2 plus the IQ3 body at B = 4 and 5). gate_up_for reads it only at B >= 4, so two-guess serving is
@@ -560,11 +575,20 @@ float * hmix_slot(const card_ctx & c, const use_counters & u);
 // DP2's launch in site's region; acquire: the first launch of a body, reading X-HMIX of sublayer u.sub (HC3)
 bool dense_run(card_ctx & c, fn::dense::product_args a, int32_t rows, dense_site site, bool acquire,
                const use_counters & u, const char * piece, std::string & err);
-// FMS2 (build item 2, the joint catch-up): HC sublayer u.sub, part 0 or 1, of lanes 2 .. 4 on one card at B = 5 in
-// one launch (Q8_0 weights: fn::hc::down2_q8_lanes, up2_q8_lanes), lane k on c[k] (its ring and buffers, the slots of
-// u's rule) with input in[k]; runs: the lanes' up2 run counters, lane k's at k * fn::hc::n_runs_card (zeroed once)
-bool hc_sublayer_lanes(card_ctx * const c[], int32_t lanes, const hc_module & h, int32_t set, const layer_input in[],
-                       const use_counters & u, int32_t part, uint32_t * runs, std::string & err);
+// FMS2 (build item 2, the joint catch-up): HC sublayer u.sub, part 0 or 1, of lanes 2 .. 4 on one card at B = rows
+// (2 .. 5; TTTS4 item 1: the joint round's rows, the draft's joint catch-up 5) in one launch (Q8_0 weights:
+// fn::hc::down2_q8_lanes, up2_q8_lanes), lane k on c[k] (its ring and buffers, the slots of u's rule) with input in[k];
+// runs: the lanes' up2 run counters, lane k's at k * fn::hc::n_runs_card (zeroed once)
+bool    hc_sublayer_lanes(card_ctx * const     c[],
+                          int32_t              lanes,
+                          int32_t              rows,
+                          const hc_module &    h,
+                          int32_t              set,
+                          const layer_input    in[],
+                          const use_counters & u,
+                          int32_t              part,
+                          uint32_t *           runs,
+                          std::string &        err);
 // FMS2 (build item 2): the joint product of lanes 2 .. 4 (fn::dense::product_joint at five rows a lane), acquiring
 // X-HMIX of sublayer u.sub on each lane's ring (c[k]: joint_rings' lane k, whose slots lie lane_floats apart; checked),
 // with the joint error word; the lanes' rows contiguous in a's outputs (lane k's at row 5 k); work: this launch's own
@@ -615,6 +639,7 @@ struct joint_lanes {
     const fn::xchg::joint_rings * jr = nullptr;
     void * dense_work = nullptr; // joint_dense_work_bytes(), zeroed once, this card's
     dense_layouts dense_sites{}; // joint_dense_layouts (the target's six sites)
+    const fn::dense::stage_steps * dense_steps = nullptr;  // TTTS6 item 2: their staging steps (dense_site_steps)
     // FMS2 item 7: X-A and X-F in 16 bits (fn/xchg/xchg.h send_half_joint16's form), the producers' sends and
     // send_half_joint16 / recv_add_joint16; false: F32 (I3: every lane bitwise its lone round)
     bool                          x16       = false;
@@ -624,7 +649,15 @@ struct joint_lanes {
     // FMS6: the quantized dense products at U = 3 and 4 in FP16 (fn/kernels/dense/dense.h joint_args::dense_f16;
     // within its bound of FP64, not bitwise the lone launch); false: every lane bitwise its lone round
     bool dense_f16 = false;
+    // TTTS3 (TEST ONLY, rollback-test section 7b): pieces forced to their per-lane fallback (joint_lone_*), as a format
+    // without a joint form runs them: each lane's lone launches on lane 0's stream; 0 in production
+    uint32_t                      lone      = 0;
+    // TTTS6: the dense sites on the Q8_0 instances (fn/kernels/dense/dense.h product_args::q8; UD-Q4_K_XL)
+    bool                           q8          = false;
 };
+
+constexpr uint32_t joint_lone_experts = 1u;  // ffn_joint: each lane's gate/up and down alone
+constexpr uint32_t joint_lone_ple     = 2u;  // joint_ple_products: each lane's part 0 alone
 bool joint_dense_layouts(dense_layouts & out, std::string & err);
 size_t joint_dense_work_bytes();
 size_t joint_ple_work_offset(); // FMU2 build item 4: PLE's joint products' region (fn::ple::products_joint)

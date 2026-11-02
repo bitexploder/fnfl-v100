@@ -4,6 +4,9 @@
 #include "fn/model/pass.h"
 #include "fn/model/prompt.h"
 #include "fn/runtime/joint.h"
+#include "fn/runtime/nvtx.h"
+#include "fn/xchg/life.h"
+#include "fn/xchg/slow.h"
 
 #include <cuda_runtime_api.h>
 
@@ -21,6 +24,51 @@ namespace fn::runtime::stage {
 
 namespace {
 
+// VIS1 Stage B: a read command's payload: its tokens, then each image's span in span_words words (cell low and high,
+// nx, ny, digest low and high; the follower reads them without pixels: its back takes the planes only). ctrl::b is the
+// image count, ctrl::n_tokens the payload's words
+constexpr int32_t span_words = 6;
+
+std::vector<int32_t> read_payload(const int32_t *                   tokens,
+                                  int32_t                           n_tokens,
+                                  const std::vector<prompt_image> * images,
+                                  int32_t &                         n_images) {
+    std::vector<int32_t> p(tokens, tokens + (n_tokens > 0 ? n_tokens : 0));
+    n_images = images != nullptr ? static_cast<int32_t>(images->size()) : 0;
+    for (int32_t i = 0; i < n_images; ++i) {
+        const image_span s             = span_of((*images)[size_t(i)]);
+        const int32_t    w[span_words] = {
+            int32_t(uint64_t(s.cell) & 0xffffffffu), int32_t(uint64_t(s.cell) >> 32), s.nx, s.ny,
+            int32_t(s.digest & 0xffffffffu),         int32_t(s.digest >> 32)
+        };
+        p.insert(p.end(), w, w + span_words);
+    }
+    return p;
+}
+
+// the follower's side: the tokens' count and the images (spans only); false when the words do not add up
+bool payload_images(const std::vector<int32_t> & p,
+                    int32_t                      words,
+                    int32_t                      n_images,
+                    int32_t &                    n_tokens,
+                    std::vector<prompt_image> &  out) {
+    out.clear();
+    n_tokens = words - span_words * n_images;
+    if (n_images < 0 || n_tokens < 0 || int64_t(p.size()) < words) {
+        return false;
+    }
+    for (int32_t i = 0; i < n_images; ++i) {
+        const int32_t * w = p.data() + n_tokens + span_words * i;
+        prompt_image    pi;
+        pi.span.cell   = int64_t(uint64_t(uint32_t(w[0])) | (uint64_t(uint32_t(w[1])) << 32));
+        pi.span.nx     = w[2];
+        pi.span.ny     = w[3];
+        pi.span.digest = uint64_t(uint32_t(w[4])) | (uint64_t(uint32_t(w[5])) << 32);
+        out.push_back(pi);
+    }
+    return true;
+}
+
 namespace lk = fn::xchg::link;
 using clk    = std::chrono::steady_clock;
 
@@ -32,19 +80,31 @@ double since(clk::time_point t0) {
     return std::chrono::duration<double>(clk::now() - t0).count();
 }
 
-// FNFL_SPLIT_TRACE=1: one stderr line a command and a step group's phase on either side (the protocol's order)
-void trace(const char * who, const std::string & what) {
-    static const bool on = getenv("FNFL_SPLIT_TRACE") != nullptr;
-    if (on) {
-        fprintf(stderr, "FNFL split trace: %s: %s\n", who, what.c_str());
-        fflush(stderr);
-    }
-}
-
 bool fail(std::string & err, const std::string & what) {
     err = what;
     return false;
 }
+
+// SSF1: a follower command (op, slot, group; its read groups included) or read group of slow::threshold_s or more
+// while writers generate on this box: a trace line at the scope's end
+struct slow_scope {
+    const char *    what;
+    uint32_t        seq = 0;
+    int32_t         op = -1, slot = -1, group = -1;
+    clk::time_point t0 = clk::now();
+
+    ~slow_scope() {
+        const double s = since(t0);
+        if (fn::xchg::slow::due(s)) {
+            std::string d = "slot " + std::to_string(slot);
+            if (op >= 0) {
+                d = "seq " + std::to_string(seq) + " op " + std::to_string(op) + " " + d + " group " +
+                    std::to_string(group);
+            }
+            fn::xchg::slow::line(what, s, d);
+        }
+    }
+};
 
 bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     if (e != cudaSuccess) {
@@ -63,201 +123,49 @@ std::string why_of(const char * p, size_t cap) {
     return std::string(p, strnlen(p, cap));
 }
 
+// APF1: a box's pacing totals in a read's answer (ack: acct[5..7], acct_i[10..21]) and back
+int32_t clamp32(int64_t v) {
+    return static_cast<int32_t>(std::clamp<int64_t>(v, INT32_MIN, INT32_MAX));
+}
+
+void pace_to_ack(const pace::stats & p, ack & a) {
+    a.acct[5]    = p.longest_ms;
+    a.acct[6]    = p.over_ms_sum;
+    a.acct[7]    = p.budget_sum;
+    a.acct_i[10] = clamp32(p.steps);
+    a.acct_i[11] = clamp32(p.known);
+    a.acct_i[12] = clamp32(p.zero);
+    a.acct_i[13] = clamp32(p.unknown);
+    a.acct_i[14] = clamp32(p.completions);
+    a.acct_i[15] = clamp32(p.gaps);
+    a.acct_i[16] = clamp32(p.over);
+    a.acct_i[17] = clamp32(p.over_none);
+    a.acct_i[18] = clamp32(p.over_budgeted);
+    a.acct_i[19] = clamp32(p.over_minimum);
+    a.acct_i[20] = clamp32(p.over_small);
+    a.acct_i[21] = clamp32(p.over_idle);
+}
+
+void pace_from_ack(const ack & a, pace::stats & p) {
+    p.longest_ms    = a.acct[5];
+    p.over_ms_sum   = a.acct[6];
+    p.budget_sum    = a.acct[7];
+    p.steps         = a.acct_i[10];
+    p.known         = a.acct_i[11];
+    p.zero          = a.acct_i[12];
+    p.unknown       = a.acct_i[13];
+    p.completions   = a.acct_i[14];
+    p.gaps          = a.acct_i[15];
+    p.over          = a.acct_i[16];
+    p.over_none     = a.acct_i[17];
+    p.over_budgeted = a.acct_i[18];
+    p.over_minimum  = a.acct_i[19];
+    p.over_small    = a.acct_i[20];
+    p.over_idle     = a.acct_i[21];
+}
+
 bool is_eog(const std::vector<int32_t> & eog, int32_t tok) {
     return std::find(eog.begin(), eog.end(), tok) != eog.end();
-}
-
-// ---- the link's port ----
-
-class link_port_impl : public port {
-  public:
-    explicit link_port_impl(lk::link & l) : l_(l) {}
-
-    int32_t send(uint64_t tag, const void * p, size_t n, std::string & err) override { return l_.send(tag, p, n, err); }
-
-    int32_t recv(uint64_t tag, void * p, size_t n, std::string & err) override { return l_.recv(tag, p, n, err); }
-
-    bool wait(int32_t op, std::string & err, double timeout_s) override { return l_.wait(op, err, timeout_s); }
-
-    bool test(int32_t op, bool & done, std::string & err) override { return l_.test(op, done, err); }
-
-    bool map(void * p, size_t n, std::string & err) override { return l_.map(p, n, err); }
-
-    bool lost() const override { return l_.lost(); }
-
-  private:
-    lk::link & l_;
-};
-
-// ---- split-test's in-process pair ----
-
-struct loop_hub {
-    std::mutex              mu;
-    bool                    closed = false;
-    std::condition_variable cv;
-
-    struct parked {
-        uint64_t             tag;
-        std::vector<uint8_t> data;
-    };
-
-    struct rx {
-        uint64_t    tag  = 0;
-        void *      p    = nullptr;
-        size_t      n    = 0;
-        bool        done = false, ok = false;
-        std::string why;
-    };
-
-    std::deque<parked>    unexpected[2];  // sent to side s, not yet received
-    std::map<int32_t, rx> ops[2];         // side s's operations (sends complete at once)
-    std::vector<int32_t>  order[2];       // side s's posted receives, in post order
-    int32_t               next = 1;
-};
-
-class loop_port : public port {
-  public:
-    loop_port(std::shared_ptr<loop_hub> h, int32_t side) : h_(std::move(h)), s_(side) {}
-
-    int32_t send(uint64_t tag, const void * p, size_t n, std::string & err) override {
-        (void) err;
-        std::lock_guard<std::mutex> g(h_->mu);
-        const int32_t               id = h_->next++;
-        loop_hub::rx &              me = h_->ops[s_][id];
-        me.done = me.ok    = true;
-        const int32_t peer = 1 - s_;
-        for (size_t i = 0; i < h_->order[peer].size(); ++i) {
-            loop_hub::rx & r = h_->ops[peer][h_->order[peer][i]];
-            if (!r.done && r.tag == tag) {
-                if (n == r.n) {
-                    std::memcpy(r.p, p, n);
-                    r.ok = true;
-                } else {
-                    r.why = "refused: " + lk::tag_str(tag) + ": received " + std::to_string(n) + " bytes, expected " +
-                            std::to_string(r.n);
-                }
-                r.done = true;
-                h_->order[peer].erase(h_->order[peer].begin() + int64_t(i));
-                h_->cv.notify_all();
-                return id;
-            }
-        }
-        h_->unexpected[peer].push_back(
-            { tag, std::vector<uint8_t>(static_cast<const uint8_t *>(p), static_cast<const uint8_t *>(p) + n) });
-        return id;
-    }
-
-    int32_t recv(uint64_t tag, void * p, size_t n, std::string & err) override {
-        (void) err;
-        std::lock_guard<std::mutex> g(h_->mu);
-        const int32_t               id = h_->next++;
-        loop_hub::rx &              r  = h_->ops[s_][id];
-        r.tag                          = tag;
-        r.p                            = p;
-        r.n                            = n;
-        for (auto it = h_->unexpected[s_].begin(); it != h_->unexpected[s_].end(); ++it) {
-            if (it->tag == tag) {
-                if (it->data.size() == n) {
-                    std::memcpy(p, it->data.data(), n);
-                    r.ok = true;
-                } else {
-                    r.why = "refused: " + lk::tag_str(tag) + ": received " + std::to_string(it->data.size()) +
-                            " bytes, expected " + std::to_string(n);
-                }
-                r.done = true;
-                h_->unexpected[s_].erase(it);
-                return id;
-            }
-        }
-        h_->order[s_].push_back(id);
-        return id;
-    }
-
-    bool wait(int32_t op, std::string & err, double timeout_s) override {
-        std::unique_lock<std::mutex> g(h_->mu);
-        auto                         it = h_->ops[s_].find(op);
-        if (it == h_->ops[s_].end()) {
-            return fail(err, "loop port: no operation " + std::to_string(op));
-        }
-        const bool done =
-            h_->cv.wait_for(g, std::chrono::duration<double>(timeout_s), [&]() { return it->second.done; });
-        if (!done) {
-            // abandoned: a later send for its tag is parked, not delivered into this buffer
-            auto & ord = h_->order[s_];
-            ord.erase(std::remove(ord.begin(), ord.end(), op), ord.end());
-            const uint64_t tag = it->second.tag;
-            h_->ops[s_].erase(it);
-            return fail(err, "no completion in " + std::to_string(timeout_s) + " s: " + lk::tag_str(tag));
-        }
-        const bool ok = it->second.ok;
-        if (!ok) {
-            err = it->second.why;
-        }
-        h_->ops[s_].erase(it);
-        return ok;
-    }
-
-    bool test(int32_t op, bool & done, std::string & err) override {
-        done = false;
-        {
-            std::lock_guard<std::mutex> g(h_->mu);
-            auto                        it = h_->ops[s_].find(op);
-            if (it == h_->ops[s_].end()) {
-                return fail(err, "loop port: no operation " + std::to_string(op));
-            }
-            if (!it->second.done) {
-                return true;
-            }
-        }
-        done = true;
-        return wait(op, err, 0.0);
-    }
-
-    bool map(void *, size_t, std::string &) override { return true; }
-
-    bool lost() const override {
-        std::lock_guard<std::mutex> g(h_->mu);
-        return h_->closed;
-    }
-
-    void close() override {
-        std::lock_guard<std::mutex> g(h_->mu);
-        h_->closed = true;
-        h_->cv.notify_all();
-    }
-
-  private:
-    std::shared_ptr<loop_hub> h_;
-    int32_t                   s_;
-};
-
-uint64_t ctrl_tag(uint32_t seq, uint8_t part) {
-    return lk::make_tag(lk::kind::ctrl, part, seq, 0);
-}
-
-uint64_t ack_tag(uint32_t seq) {
-    return lk::make_tag(lk::kind::ack, 0, seq, 0);
-}
-
-uint64_t boundary_tag(int32_t group, uint32_t seq, int32_t card, int32_t slot) {
-    return lk::make_tag(lk::kind::boundary, uint8_t(group), seq, uint8_t(card), uint8_t(slot));
-}
-
-uint64_t step_tag(int32_t group, uint32_t seq, int32_t slot) {
-    return lk::make_tag(lk::kind::step, uint8_t(group), seq, 0, uint8_t(slot));
-}
-
-// a forced member's back logits (the drive's tests), and a probe's answer bytes
-uint64_t logits_tag(int32_t group, uint32_t seq, int32_t slot) {
-    return lk::make_tag(lk::kind::step, uint8_t(group), seq, 1, uint8_t(slot));
-}
-
-uint64_t probe_tag(uint32_t seq) {
-    return lk::make_tag(lk::kind::ack, 1, seq, 0);
-}
-
-uint64_t crossing_tag(int64_t n, int32_t piece) {
-    return lk::make_tag(lk::kind::prompt, 0, uint32_t(n), 0, uint8_t(piece));
 }
 
 // the step_info of a member from its X-STEP (the leader's record of the step the back ran)
@@ -286,22 +194,14 @@ step_info info_of(const step_out & o) {
 
 }  // namespace
 
-std::unique_ptr<port> link_port(lk::link & l) {
-    return std::make_unique<link_port_impl>(l);
-}
-
-void loop_pair(std::unique_ptr<port> & a, std::unique_ptr<port> & b) {
-    auto h = std::make_shared<loop_hub>();
-    a      = std::make_unique<loop_port>(h, 0);
-    b      = std::make_unique<loop_port>(h, 1);
-}
-
 // ---- the boundary buffers ----
 
 buffers::~buffers() {
+    // the link stopped first (its owner's teardown): no operation touches these
     for (auto & s : slot) {
         for (uint8_t * p : s) {
             if (p != nullptr) {
+                life::disown(p, "boundary buffer");
                 cudaFreeHost(p);
             }
         }
@@ -318,6 +218,7 @@ bool buffers::alloc(int32_t n_slots, port * p, std::string & err) {
                 return false;
             }
             std::memset(q, 0, n);
+            life::own(q, n, "boundary buffer");
             slot[size_t(s)][size_t(c)] = static_cast<uint8_t *>(q);
             if (p != nullptr && !p->map(q, n, err)) {
                 return false;
@@ -329,6 +230,8 @@ bool buffers::alloc(int32_t n_slots, port * p, std::string & err) {
 
 // ---- the prompt crossing ----
 
+static_assert(sizeof(crossing_head::cut) / sizeof(int32_t) == size_t(model::prompt_max_pieces), "the head's partition");
+
 bool crossing::init(port & p, bool front, int32_t k, std::string & err) {
     p_     = &p;
     front_ = front;
@@ -337,14 +240,22 @@ bool crossing::init(port & p, bool front, int32_t k, std::string & err) {
     big.rows    = model::prompt_chunk_rows;
     big.half[0] = model::prompt_half_rows;
     big.half[1] = model::prompt_chunk_rows - model::prompt_half_rows;
-    cap_        = model::prompt_path::crossing_bytes(big);
+    // MUP2: the most pieces (every piece's FFN messages carry a header): 128 of 64 rows
+    std::string e2;
+    if (!model::prompt_set_pieces(big, model::prompt_chunk_rows / model::prompt_max_pieces, e2)) {
+        return fail(err, "crossing: " + e2);
+    }
+    cap_ = model::prompt_path::crossing_bytes(big);
     for (int32_t b = 0; b < 2; ++b) {
         void * q = nullptr;
-        if (!cuda_ok(cudaHostAlloc(&q, size_t(cap_), cudaHostAllocPortable), "crossing buffer", err) ||
-            !p.map(q, size_t(cap_), err)) {
+        if (!cuda_ok(cudaHostAlloc(&q, size_t(cap_), cudaHostAllocPortable), "crossing buffer", err)) {
             return false;
         }
+        life::own(q, size_t(cap_), "crossing buffer");
         buf_[b] = static_cast<uint8_t *>(q);
+        if (!p.map(q, size_t(cap_), err)) {
+            return false;
+        }
     }
     return true;
 }
@@ -352,6 +263,7 @@ bool crossing::init(port & p, bool front, int32_t k, std::string & err) {
 crossing::~crossing() {
     for (int32_t b = 0; b < 2; ++b) {
         if (buf_[b] != nullptr) {
+            life::disown(buf_[b], "crossing buffer");
             cudaFreeHost(buf_[b]);
         }
         for (int32_t c = 0; c < 2; ++c) {
@@ -364,34 +276,157 @@ crossing::~crossing() {
 
 void crossing::expect(int32_t slot, int64_t base) {
     if (slot >= 0 && slot < max_split_slots) {
-        base_[slot]  = base;
-        sent_[slot]  = 0;
-        taken_[slot] = base;
+        retire_ahead(slot);  // PRD1 item 11: a new read: nothing of the last one stays taken ahead
+        base_[slot]       = base;
+        sent_[slot]       = 0;
+        taken_[slot]      = base;
+        plan_[slot]       = 0;
+        ahead_done_[slot] = 0;
     }
+}
+
+void crossing::plan(int32_t slot, int64_t chunks) {
+    if (slot >= 0 && slot < max_split_slots) {
+        plan_[slot] = chunks;
+    }
+}
+
+void crossing::retire_ahead(int32_t slot) {
+    if (ahead_.slot < 0 || (slot >= 0 && ahead_.slot != slot)) {
+        return;
+    }
+    std::vector<int32_t> ops = ahead_.ops;
+    if (!ahead_.head && ahead_.hop >= 0) {
+        ops.push_back(ahead_.hop);
+    }
+    if (!ops.empty()) {
+        p_->retire(ops.data(), int32_t(ops.size()));
+    }
+    ahead_ = ahead_rx();
+}
+
+bool crossing::buffer_free(int32_t b, bool wait, std::string & err) {
+    for (int32_t q = 0; q < 2 && used_[b]; ++q) {
+        if (!cuda_ok(cudaSetDevice(dev_[q]), "device", err)) {
+            return false;
+        }
+        if (wait) {
+            if (!cuda_ok(cudaEventSynchronize(static_cast<cudaEvent_t>(done_[b][q])), "crossing buffer", err)) {
+                return false;
+            }
+        } else {
+            const cudaError_t e = cudaEventQuery(static_cast<cudaEvent_t>(done_[b][q]));
+            if (e == cudaErrorNotReady) {
+                return false;
+            }
+            if (!cuda_ok(e, "crossing buffer", err)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool crossing::post_pieces(const crossing_head &  h,
+                           int64_t                n,
+                           int32_t                b,
+                           std::vector<int32_t> & ops,
+                           std::string &          err) {
+    life::reuse(buf_[b], size_t(cap_), "crossing buffer");
+    for (int32_t i = 0; i < h.pieces; ++i) {
+        const int64_t at = int64_t(i) * piece_bytes;
+        const int32_t op =
+            p_->recv(crossing_tag(n, i), buf_[b] + at, size_t(std::min<int64_t>(piece_bytes, h.bytes - at)), err);
+        if (op < 0) {
+            p_->retire(ops.data(), int32_t(ops.size()));
+            ops.clear();
+            return false;
+        }
+        ops.push_back(op);
+    }
+    return true;
+}
+
+bool crossing::poll(bool next, std::string & err) {
+    if (front_ || ahead_.slot < 0 || ahead_.posted) {
+        return true;
+    }
+    if (!ahead_.head) {
+        bool done = false;
+        if (!p_->test(ahead_.hop, done, err)) {
+            ahead_ = ahead_rx();  // the receive failed (finished): in takes the header afresh and fails there
+            return false;
+        }
+        ahead_.head = done;
+    }
+    const crossing_head & h = *ahead_.hr;
+    const int32_t         b = static_cast<int32_t>(ahead_.n & 1);
+    // a header in() will refuse is left to it (its pieces into a scratch buffer)
+    const bool sane         = h.bytes > 0 && h.bytes <= cap_ && h.pieces == (h.bytes + piece_bytes - 1) / piece_bytes;
+    if (!ahead_.head || !next || !sane || dev_[0] < 0) {
+        return true;
+    }
+    std::string e2;
+    if (!buffer_free(b, false, e2)) {
+        if (!e2.empty()) {
+            err = e2;
+            return false;
+        }
+        return true;  // its previous copy-in still runs: a later poll
+    }
+    if (!post_pieces(h, ahead_.n, b, ahead_.ops, err)) {
+        return false;
+    }
+    ahead_.posted = true;
+    return true;
 }
 
 bool crossing::drop(int32_t slot, int64_t base, int64_t count, std::string & err) {
     if (front_ || slot < 0 || slot >= max_split_slots) {
         return fail(err, "crossing drop: the follower's, a slot");
     }
-    std::vector<uint8_t> tmp;
     for (int64_t n = std::max(taken_[slot], base); n < base + count; ++n) {
-        crossing_head h;
-        const int32_t hop = p_->recv(crossing_tag(n, 255), &h, sizeof(h), err);
+        // PRD1 item 11: a crossing taken ahead is finished through its own receives (never received twice)
+        if (ahead_.slot == slot && ahead_.n == n) {
+            ahead_rx a = ahead_;
+            ahead_     = ahead_rx();
+            if ((!a.head && !p_->wait(a.hop, err, timeout_s)) || (a.posted && !wait_all(*p_, a.ops, timeout_s, err))) {
+                return false;
+            }
+            if (a.posted) {
+                taken_[slot] = n + 1;
+                continue;
+            }
+            auto tmp = std::make_shared<std::vector<uint8_t>>(size_t(std::clamp<int64_t>(a.hr->bytes, 0, piece_bytes)));
+            for (int32_t i = 0; i < a.hr->pieces; ++i) {
+                const int64_t at = int64_t(i) * piece_bytes;
+                const int32_t op = p_->recv(crossing_tag(n, i), tmp->data(),
+                                            size_t(std::clamp<int64_t>(a.hr->bytes - at, 0, piece_bytes)), tmp, err);
+                if (op < 0 || !p_->wait(op, err, timeout_s)) {
+                    return false;
+                }
+            }
+            taken_[slot] = n + 1;
+            continue;
+        }
+        // the records on the heap, kept by each receive: a wait given up never leaves one writing a freed frame
+        auto          h   = std::make_shared<crossing_head>();
+        const int32_t hop = p_->recv(crossing_tag(n, 255), h.get(), sizeof(*h), h, err);
         if (hop < 0 || !p_->wait(hop, err, timeout_s)) {
             return false;
         }
-        tmp.resize(size_t(std::min<int64_t>(h.bytes, piece_bytes)));
-        for (int32_t i = 0; i < h.pieces; ++i) {
+        auto tmp = std::make_shared<std::vector<uint8_t>>(size_t(std::clamp<int64_t>(h->bytes, 0, piece_bytes)));
+        for (int32_t i = 0; i < h->pieces; ++i) {
             const int64_t at = int64_t(i) * piece_bytes;
-            const int32_t op =
-                p_->recv(crossing_tag(n, i), tmp.data(), size_t(std::min<int64_t>(piece_bytes, h.bytes - at)), err);
+            const int32_t op = p_->recv(crossing_tag(n, i), tmp->data(),
+                                        size_t(std::clamp<int64_t>(h->bytes - at, 0, piece_bytes)), tmp, err);
             if (op < 0 || !p_->wait(op, err, timeout_s)) {
                 return false;
             }
         }
         taken_[slot] = n + 1;
     }
+    retire_ahead(slot);  // PRD1 item 11: a chunk past the sent ones is never sent
     return true;
 }
 
@@ -409,13 +444,13 @@ bool crossing::out(target & t, model::prompt_path & pp, const model::prompt_chun
         return fail(err, "crossing: " + std::to_string(bytes) + " bytes beyond the buffer's " + std::to_string(cap_));
     }
     const int32_t b = static_cast<int32_t>(n & 1);
-    // release: the buffer's previous sends completed
-    for (int32_t op : ops_[b]) {
-        if (!p_->wait(op, err, timeout_s)) {
-            return false;
-        }
+    // release: the buffer's previous sends ended (a failure retires every send of both buffers first)
+    if (!wait_all(*p_, ops_[b], timeout_s, err)) {
+        retire_sends();
+        return false;
     }
     ops_[b].clear();
+    life::reuse(buf_[b], size_t(cap_), "crossing buffer");
     if (!pp.crossing_out(c, k_, buf_[b], err)) {
         return false;
     }
@@ -425,8 +460,9 @@ bool crossing::out(target & t, model::prompt_path & pp, const model::prompt_chun
             return false;
         }
     }
-    crossing_head & h = head_;
-    h                 = crossing_head();
+    // the header's record on the heap, kept by its send
+    auto            hr = std::make_shared<crossing_head>();
+    crossing_head & h  = *hr;
     h.slot            = slot;
     h.rows            = c.rows;
     h.half[0]         = c.half[0];
@@ -435,9 +471,14 @@ bool crossing::out(target & t, model::prompt_path & pp, const model::prompt_chun
     h.seq             = c.seq;
     h.bytes           = bytes;
     h.pieces          = static_cast<int32_t>((bytes + piece_bytes - 1) / piece_bytes);
-    // the header first, waited (head_ is the next chunk's too), then the pieces from the pinned buffer
-    const int32_t hop = p_->send(crossing_tag(n, 255), &head_, sizeof(head_), err);
+    h.n_cuts           = c.n_pieces;
+    for (int32_t j = 0; j < c.n_pieces; ++j) {
+        h.cut[j] = c.piece[j];
+    }
+    // the header first, waited, then the pieces from the pinned buffer (its sends waited before its next refill)
+    const int32_t hop  = p_->send(crossing_tag(n, 255), hr.get(), sizeof(h), hr, err);
     if (hop < 0 || !p_->wait(hop, err, timeout_s)) {
+        retire_sends();
         return false;
     }
     for (int32_t i = 0; i < h.pieces; ++i) {
@@ -445,10 +486,12 @@ bool crossing::out(target & t, model::prompt_path & pp, const model::prompt_chun
         const int32_t op =
             p_->send(crossing_tag(n, i), buf_[b] + at, size_t(std::min<int64_t>(piece_bytes, bytes - at)), err);
         if (op < 0) {
+            retire_sends();
             return false;
         }
         ops_[b].push_back(op);
     }
+    owner_[b]   = slot;
     sent_[slot] = std::max<int64_t>(sent_[slot], c.index + 1);
     ++n_;
     bytes_ += bytes;
@@ -456,15 +499,30 @@ bool crossing::out(target & t, model::prompt_path & pp, const model::prompt_chun
 }
 
 bool crossing::drain(std::string & err) {
+    return drain(-1, err);
+}
+
+bool crossing::drain(int32_t slot, std::string & err) {
     for (int32_t b = 0; b < 2; ++b) {
-        for (int32_t op : ops_[b]) {
-            if (!p_->wait(op, err, timeout_s)) {
-                return false;
-            }
+        if (slot >= 0 && owner_[b] != slot) {
+            continue;
+        }
+        if (!wait_all(*p_, ops_[b], timeout_s, err)) {
+            retire_sends();
+            return false;
         }
         ops_[b].clear();
     }
     return true;
+}
+
+void crossing::retire_sends() {
+    for (int32_t b = 0; b < 2; ++b) {
+        if (!ops_[b].empty()) {
+            p_->retire(ops_[b].data(), int32_t(ops_[b].size()));
+        }
+        ops_[b].clear();
+    }
 }
 
 bool crossing::in(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err) {
@@ -474,30 +532,71 @@ bool crossing::in(target & t, model::prompt_path & pp, model::prompt_chunk & c, 
     const int32_t slot = t.slot_index();
     const int64_t n    = base_[slot] + c.index;
     const int32_t b    = static_cast<int32_t>(n & 1);
-    // the buffer's previous copy-in completed on both cards
-    for (int32_t q = 0; q < 2 && used_[b]; ++q) {
-        if (!cuda_ok(cudaSetDevice(t.card(q).c.device), "device", err) ||
-            !cuda_ok(cudaEventSynchronize(static_cast<cudaEvent_t>(done_[b][q])), "crossing buffer", err)) {
+    for (int32_t q = 0; q < 2; ++q) {
+        dev_[q] = t.card(q).c.device;
+    }
+    // PRD1 item 11: this chunk taken ahead (its header receive posted at the last chunk's copy-in, its pieces maybe
+    // posted by poll), or another of this slot's: retired (never taken twice)
+    std::shared_ptr<crossing_head> hr;
+    std::vector<int32_t>           ops;
+    bool                           posted = false, landed = false;
+    if (ahead_.slot == slot && ahead_.n == n) {
+        hr     = ahead_.hr;
+        posted = ahead_.posted;
+        // the pieces still out at entry (a completed test finishes its op)
+        for (const int32_t op : ahead_.ops) {
+            bool done = false;
+            if (!p_->test(op, done, err)) {
+                p_->retire(ahead_.ops.data(), int32_t(ahead_.ops.size()));
+                ahead_ = ahead_rx();
+                return false;
+            }
+            if (!done) {
+                ops.push_back(op);
+            }
+        }
+        landed = posted && ops.empty();
+        if (!ahead_.head && !p_->wait(ahead_.hop, err, timeout_s)) {
+            p_->retire(ops.data(), int32_t(ops.size()));
+            ahead_ = ahead_rx();
+            return false;
+        }
+        ahead_ = ahead_rx();
+    } else {
+        retire_ahead(slot);
+        hr                = std::make_shared<crossing_head>();  // kept by its receive
+        const int32_t hop = p_->recv(crossing_tag(n, 255), hr.get(), sizeof(crossing_head), hr, err);
+        if (hop < 0 || !p_->wait(hop, err, timeout_s)) {
             return false;
         }
     }
-    crossing_head h;
-    const int32_t hop = p_->recv(crossing_tag(n, 255), &h, sizeof(h), err);
-    if (hop < 0 || !p_->wait(hop, err, timeout_s)) {
-        return false;
+    crossing_head & h  = *hr;
+    taken_[slot]       = n;  // the head is taken: a mismatch below still takes the pieces, then fails
+    // MUP2: the front's partition (validated with the rest)
+    const bool cuts_ok = h.n_cuts >= 0 && h.n_cuts <= model::prompt_max_pieces;
+    if (cuts_ok) {
+        c.n_pieces = h.n_cuts;
+        for (int32_t j = 0; j < model::prompt_max_pieces; ++j) {
+            c.piece[j] = j < h.n_cuts ? h.cut[j] : 0;
+        }
     }
-    taken_[slot]     = n;  // the head is taken: a mismatch below still takes the pieces, then fails
-    const bool match = h.slot == slot && h.start == c.start && h.rows == c.rows && h.half[0] == c.half[0] &&
-                       h.half[1] == c.half[1] && h.bytes == model::prompt_path::crossing_bytes(c) && h.bytes <= cap_;
+    const bool match = cuts_ok && model::prompt_pieces_ok(c) && h.slot == slot && h.start == c.start &&
+                       h.rows == c.rows && h.half[0] == c.half[0] && h.half[1] == c.half[1] &&
+                       h.bytes == model::prompt_path::crossing_bytes(c) && h.bytes <= cap_;
     if (!match) {
-        std::vector<uint8_t> tmp(size_t(std::min<int64_t>(std::max<int64_t>(h.bytes, 0), piece_bytes)));
-        for (int32_t i = 0; i < h.pieces && h.bytes > 0; ++i) {
-            const int64_t at = int64_t(i) * piece_bytes;
-            std::string   e2;
-            const int32_t op =
-                p_->recv(crossing_tag(n, i), tmp.data(), size_t(std::min<int64_t>(piece_bytes, h.bytes - at)), e2);
-            if (op < 0 || !p_->wait(op, e2, timeout_s)) {
-                break;
+        if (posted) {
+            std::string e2;
+            wait_all(*p_, ops, timeout_s, e2);  // its pieces, posted ahead into the free buffer, end first
+        } else {
+            auto tmp = std::make_shared<std::vector<uint8_t>>(size_t(std::clamp<int64_t>(h.bytes, 0, piece_bytes)));
+            for (int32_t i = 0; i < h.pieces && h.bytes > 0; ++i) {
+                const int64_t at = int64_t(i) * piece_bytes;
+                std::string   e2;
+                const int32_t op = p_->recv(crossing_tag(n, i), tmp->data(),
+                                            size_t(std::clamp<int64_t>(h.bytes - at, 0, piece_bytes)), tmp, e2);
+                if (op < 0 || !p_->wait(op, e2, timeout_s)) {
+                    break;
+                }
             }
         }
         taken_[slot] = n + 1;
@@ -506,21 +605,29 @@ bool crossing::in(target & t, model::prompt_path & pp, model::prompt_chunk & c, 
                              ") is not this one (slot " + std::to_string(slot) + ", " + std::to_string(c.start) + "+" +
                              std::to_string(c.rows) + ")");
     }
-    std::vector<int32_t> ops;
-    for (int32_t i = 0; i < h.pieces; ++i) {
-        const int64_t at = int64_t(i) * piece_bytes;
-        const int32_t op =
-            p_->recv(crossing_tag(n, i), buf_[b] + at, size_t(std::min<int64_t>(piece_bytes, h.bytes - at)), err);
-        if (op < 0) {
-            return false;
-        }
-        ops.push_back(op);
-    }
-    for (int32_t op : ops) {
-        if (!p_->wait(op, err, timeout_s)) {
+    if (!posted) {
+        // the buffer's previous copy-in completed on both cards, then it is refilled; every piece's receive is
+        // waited or retired
+        if (!buffer_free(b, true, err) || !post_pieces(h, n, b, ops, err)) {
             return false;
         }
     }
+    // PRD1 item 11: the copy-in starts: the next chunk's header received ahead, when it is in the read's plan
+    if (c.index + 1 < plan_[slot] && ahead_.slot < 0) {
+        ahead_.slot = slot;
+        ahead_.n    = n + 1;
+        ahead_.hr   = std::make_shared<crossing_head>();
+        ahead_.hop  = p_->recv(crossing_tag(n + 1, 255), ahead_.hr.get(), sizeof(crossing_head), ahead_.hr, err);
+        if (ahead_.hop < 0) {
+            ahead_ = ahead_rx();
+            p_->retire(ops.data(), int32_t(ops.size()));
+            return false;
+        }
+    }
+    if (!wait_all(*p_, ops, timeout_s, err)) {
+        return false;
+    }
+    ahead_done_[slot] += landed ? 1 : 0;
     c.seq = h.seq;  // the front's chunk number: the messages' generations
     if (!pp.crossing_in(c, k_, buf_[b], err)) {
         return false;
@@ -590,7 +697,8 @@ std::string hello_settings(int32_t                      k,
                            bool                         kv_q8,
                            int32_t                      spec_d,
                            const std::string &          attention,
-                           const std::vector<int32_t> & eog) {
+                           const std::vector<int32_t> & eog,
+                           bool                         images) {
     std::string s = "k=" + std::to_string(k) + " slots=" + std::to_string(n_slots) + " cells=" + std::to_string(cells) +
                     " pool=" + std::to_string(pool_cells) + " kv=" + (kv_q8 ? "q8" : "bf16") +
                     " d=" + std::to_string(spec_d) + " att=" + attention + " eog=";
@@ -599,7 +707,7 @@ std::string hello_settings(int32_t                      k,
     for (size_t i = 0; i < e.size(); ++i) {
         s += (i ? "," : "") + std::to_string(e[i]);
     }
-    return s;
+    return images ? s + " images=1" : s;  // VIS1: text-only settings keep their text and hash
 }
 
 std::string hello_hash(const std::string & text) {
@@ -611,47 +719,44 @@ std::string hello_hash(const std::string & text) {
 // ---- the leader ----
 
 struct leader::pending {
-    int32_t              group = 0;
-    uint32_t             seq   = 0;
-    int32_t              n     = 0;
-    member               m[max_members];
-    int32_t              b[max_members]  = {};
-    run_status           st[max_members] = {};
-    std::string          why[max_members];
-    target::front_round  fr[max_members];
-    bool                 fronted[max_members] = {};
-    step_out             out[max_members];
-    int32_t              rops[max_members] = {};
-    std::vector<int32_t> sops;
-    bool                 sent = false;
-    clk::time_point      t0;
-    ctrl                 c;  // the group's command: its send reads it until group_end waits for the send
-    int32_t              lops[max_members] = { -1, -1, -1, -1, -1, -1, -1, -1 };  // forced members' logits receives
-    std::vector<float>   lg[max_members];                                         // and their buffers
+    int32_t                     group = 0;
+    int32_t                     n     = 0;
+    member                      m[max_members];
+    int32_t                     b[max_members]  = {};
+    run_status                  st[max_members] = {};
+    std::string                 why[max_members];
+    target::front_round         fr[max_members];
+    bool                        fronted[max_members] = {};
+    clk::time_point             t0;
+    // the wire records (the command, the answers, forced logits), shared with the transport (fn/runtime/stage_wire.h)
+    std::shared_ptr<group_wire> w = std::make_shared<group_wire>();
 };
 
 bool leader::init(engine & e, port & p, crossing & x, std::string & err) {
     e_ = &e;
     p_ = &p;
     x_ = &x;
+    ctl_.init(p);
     if (e.config().stage != 1 || int32_t(e.config().stage_buf.size()) < e.n_slots()) {
         return fail(err, "leader: the engine is not a front stage with its boundary buffers");
     }
     next_.assign(size_t(e.n_slots()), next_step());
+    samp_.assign(size_t(e.n_slots()), nullptr);
     read_acks_.assign(size_t(e.n_slots()), {});
     read_base_.assign(size_t(e.n_slots()), 0);
     read_end_.assign(size_t(e.n_slots()), -1);
+    back_acct_.assign(size_t(e.n_slots()), read_info());
     logits_.assign(size_t(e.n_slots()), {});
     return true;
 }
 
 void leader::drain_read(int32_t slot, int64_t base) {
-    if (lost_) {
+    if (ctl_.lost()) {
         return;
     }
     std::string e;
     if (!x_->drain(e)) {
-        lose(e);
+        ctl_.lose(e);
         return;
     }
     ctrl c;
@@ -661,61 +766,52 @@ void leader::drain_read(int32_t slot, int64_t base) {
     c.a    = static_cast<int32_t>(x_->sent(slot));
     ack a;
     if (command(c, nullptr, a, 3600.0) && a.status != 0) {
-        lose("the follower could not drop a failed read's crossings: " + why_of(a.why, sizeof a.why));
+        ctl_.lose("the follower could not drop a failed read's crossings: " + why_of(a.why, sizeof a.why));
     }
-}
-
-void leader::lose(const std::string & why) {
-    if (!lost_) {
-        lost_ = true;
-        why_  = why.rfind("split stage lost", 0) == 0 ? why : "split stage lost: " + why;
-        fprintf(stderr, "FNFL split: %s; every later request is refused until the leader restarts\n", why_.c_str());
-        fflush(stderr);
-    }
-}
-
-bool leader::send_ctrl(ctrl & c, const int32_t * tokens, int32_t & ack_op, ack & a) {
-    if (lost_) {
-        err_ = why_;
-        return false;
-    }
-    const uint32_t seq = seq_++;
-    trace("leader",
-          "command " + std::to_string(seq) + " op " + std::to_string(c.op) + " slot " + std::to_string(c.slot));
-    std::string e;
-    ack_op             = p_->recv(ack_tag(seq), &a, sizeof(a), e);
-    const int32_t c_op = ack_op < 0 ? -1 : p_->send(ctrl_tag(seq, 0), &c, sizeof(c), e);
-    const int32_t t_op =
-        c_op < 0 || c.n_tokens <= 0 ? 0 : p_->send(ctrl_tag(seq, 1), tokens, size_t(c.n_tokens) * 4, e);
-    if (ack_op < 0 || c_op < 0 || t_op < 0 || !p_->wait(c_op, e, ctrl_timeout_s) ||
-        (c.n_tokens > 0 && !p_->wait(t_op, e, ctrl_timeout_s))) {
-        lose(e);
-        err_ = why_;
-        return false;
-    }
-    return true;
-}
-
-bool leader::wait_ack(int32_t op, ack & a, double timeout_s) {
-    (void) a;  // received into by the operation (its receive was posted with it)
-    std::string e;
-    const auto  t0 = clk::now();
-    const bool  ok = p_->wait(op, e, timeout_s);
-    st_.back_wait_s += since(t0);
-    if (!ok) {
-        lose(e);
-        err_ = why_;
-        return false;
-    }
-    return true;
 }
 
 bool leader::command(ctrl & c, const int32_t * tokens, ack & a, double timeout_s) {
-    int32_t op = -1;
-    return send_ctrl(c, tokens, op, a) && wait_ack(op, a, timeout_s);
+    const double w0 = ctl_.wait_s;
+    const bool   ok = ctl_.command(c, tokens, a, timeout_s);
+    st_.back_wait_s += ctl_.wait_s - w0;
+    if (!ok) {
+        err_ = ctl_.why();
+    }
+    return ok;
 }
 
+std::shared_ptr<cmd> leader::send_cmd(const ctrl & c, const int32_t * tokens) {
+    std::shared_ptr<cmd> k = ctl_.send(c, tokens);
+    if (k == nullptr) {
+        err_ = ctl_.why();
+    }
+    return k;
+}
+
+bool leader::wait_cmd(cmd & k, double timeout_s) {
+    const double w0 = ctl_.wait_s;
+    const bool   ok = ctl_.wait(k, timeout_s);
+    st_.back_wait_s += ctl_.wait_s - w0;
+    if (!ok) {
+        err_ = ctl_.why();
+    }
+    return ok;
+}
+
+// MUP1 piece 2: the front first (its refusal sends nothing), then the command without waiting for its X-ACK: the slot's
+// next command collects it (read_begin's arrives in the same follower turn, so a request pays one round trip, not
+// two); commands and groups go in order on the one channel, so the back samples with the new settings either way. A
+// refusal there fails the slot's next call
 run_status leader::set_sampling(int32_t slot, const request_options & o) {
+    const run_status prior = settle(slot, true);
+    if (prior != run_status::ok) {
+        return prior;
+    }
+    const run_status rs = e_->set_sampling(slot, o);
+    if (rs != run_status::ok) {
+        err_ = e_->error();
+        return rs;
+    }
     ctrl c;
     c.op         = int32_t(op::set_sampling);
     c.slot       = slot;
@@ -726,52 +822,93 @@ run_status leader::set_sampling(int32_t slot, const request_options & o) {
     c.min_p      = o.sampling.min_p;
     c.max_tokens = o.max_tokens;
     c.n_ctx      = o.n_ctx;
-    ack a;
-    if (!command(c, nullptr, a, ctrl_timeout_s)) {
+    c.ignore_eos = o.ignore_eos ? 1 : 0;
+    std::shared_ptr<cmd> k = send_cmd(c, nullptr);
+    if (k == nullptr) {
         return run_status::error;
-    }
-    if (a.status != int32_t(run_status::ok)) {
-        err_ = "the follower: " + why_of(a.why, sizeof a.why);
-        return static_cast<run_status>(a.status);
     }
     next_[size_t(slot)].valid = false;
-    const run_status rs       = e_->set_sampling(slot, o);
-    err_                      = e_->error();
-    return rs;
+    samp_[size_t(slot)]       = std::move(k);
+    return run_status::ok;
 }
 
-run_status leader::prefill(int32_t         slot,
-                           const int32_t * tokens,
-                           int32_t         n_tokens,
-                           int32_t         n_reuse,
-                           int32_t &       n_processed) {
+// the slot's pending set_sampling X-ACK: waited for (wait) or taken when it has come; its refusal returned
+run_status leader::settle(int32_t slot, bool wait) {
+    if (slot < 0 || slot >= int32_t(samp_.size()) || samp_[size_t(slot)] == nullptr) {
+        return run_status::ok;
+    }
+    cmd & k = *samp_[size_t(slot)];
+    if (!k.answered) {
+        bool done = false;
+        if (wait ? !wait_cmd(k, ctrl_timeout_s) : !ctl_.test(k, done)) {
+            ctl_.drop(k);
+            samp_[size_t(slot)] = nullptr;
+            err_                = ctl_.why();
+            return run_status::error;
+        }
+        if (!wait && !done) {
+            return run_status::ok;
+        }
+    }
+    const ack a         = k.a;
+    samp_[size_t(slot)] = nullptr;
+    if (a.status != int32_t(run_status::ok)) {
+        err_ = "set_sampling: the follower: " + why_of(a.why, sizeof a.why);
+        return static_cast<run_status>(a.status);
+    }
+    return run_status::ok;
+}
+
+run_status leader::settle_all() {
+    run_status out = run_status::ok;
+    for (int32_t s = 0; s < int32_t(samp_.size()); ++s) {
+        const run_status rs = settle(s, true);
+        out                 = out == run_status::ok ? rs : out;
+    }
+    return out;
+}
+
+run_status leader::prefill(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const std::vector<prompt_image> * images) {
     n_processed = 0;
+    const run_status prior = settle(slot, true);  // MUP1 piece 2
+    if (prior != run_status::ok) {
+        return prior;
+    }
     ctrl c;
-    c.op       = int32_t(op::prefill);
-    c.slot     = slot;
-    c.a        = n_reuse;
-    c.n_tokens = n_tokens;
-    c.base     = base_;
-    base_ += 256;  // a read's chunks never reach 256 (plan_chunks: at most 8,192 rows a chunk)
-    ack     a;
-    int32_t op = -1;
-    if (!send_ctrl(c, tokens, op, a)) {
+    c.op                           = int32_t(op::prefill);
+    c.slot                         = slot;
+    c.a                            = n_reuse;
+    c.graphs                       = model::prompt_graphs_on() ? 1 : 0;            // APF2
+    const std::vector<int32_t> pay = read_payload(tokens, n_tokens, images, c.b);  // VIS1: the images' spans
+    c.n_tokens                     = static_cast<int32_t>(pay.size());
+    c.base                         = base_;
+    // a read's chunks never reach 256 (plan_chunks: at most 8,192 rows a chunk). PRD1 item 9: 257, odd, so
+    // consecutive reads start on alternate crossing buffers (a read's first chunk never waits on the last one's sends)
+    base_ += 257;
+    const std::shared_ptr<cmd> k = send_cmd(c, pay.data());
+    if (k == nullptr) {
         return run_status::error;
     }
+    const ack & a = k->a;
     x_->expect(slot, c.base);
     next_[size_t(slot)].valid = false;
     // the follower's answer may come first (its read failed): the front stops sending at its next chunk
     bool answered             = false;
     x_->abort                 = [&]() {
-        std::string e2;
-        if (!answered && !p_->test(op, answered, e2)) {
+        if (!answered && !ctl_.test(*k, answered)) {
             answered = true;
         }
-        return answered && a.status != int32_t(run_status::ok);
+        return answered && k->answered && a.status != int32_t(run_status::ok);
     };
-    const run_status rs = e_->prefill(slot, tokens, n_tokens, n_reuse, n_processed);
+    const run_status rs = e_->prefill(slot, tokens, n_tokens, n_reuse, n_processed, {}, images);
     x_->abort           = nullptr;
-    if (!answered && !wait_ack(op, a, 3600.0)) {
+    if (!k->answered && !wait_cmd(*k, 3600.0)) {
+        ctl_.drop(*k);
         return run_status::error;
     }
     const bool ok = rs == run_status::ok && a.status == int32_t(run_status::ok) && a.a == n_processed;
@@ -783,8 +920,8 @@ run_status leader::prefill(int32_t         slot,
     } else {
         std::string e;
         if (!x_->drain(e)) {
-            lose(e);
-            err_ = why_;
+            ctl_.lose(e);
+            err_ = ctl_.why();
             return run_status::error;
         }
     }
@@ -802,32 +939,52 @@ run_status leader::prefill(int32_t         slot,
     return run_status::ok;
 }
 
-int32_t leader::read_begin(int32_t         slot,
-                           const int32_t * tokens,
-                           int32_t         n_tokens,
-                           int32_t         n_reuse,
-                           int32_t &       n_processed) {
+int32_t leader::read_begin(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const std::vector<prompt_image> * images) {
     n_processed = 0;
     // admission: the follower first (either box's pool or context refuses)
     ctrl c;
-    c.op       = int32_t(op::read_begin);
-    c.slot     = slot;
-    c.a        = n_reuse;
-    c.n_tokens = n_tokens;
-    c.base     = base_;
-    base_ += 256;
-    ack a;
-    if (!command(c, tokens, a, ctrl_timeout_s)) {
+    c.op                           = int32_t(op::read_begin);
+    c.slot                         = slot;
+    c.a                            = n_reuse;
+    c.graphs                       = model::prompt_graphs_on() ? 1 : 0;            // APF2
+    const std::vector<int32_t> pay = read_payload(tokens, n_tokens, images, c.b);  // VIS1: the images' spans
+    c.n_tokens                     = static_cast<int32_t>(pay.size());
+    c.base                         = base_;
+    base_ += 257;  // PRD1 item 9: odd, so consecutive reads alternate crossing buffers
+    // MUP1 piece 2: the command first, then the slot's pending set_sampling X-ACK: both come in one follower turn
+    const std::shared_ptr<cmd> k = send_cmd(c, pay.data());
+    if (k == nullptr) {
         return -1;
     }
-    if (a.status != 0) {
-        err_ = "read_begin: the follower: " + why_of(a.why, sizeof a.why);
-        return a.status;
+    const run_status prior = settle(slot, true);
+    if (!k->answered && !wait_cmd(*k, ctrl_timeout_s)) {
+        ctl_.drop(*k);
+        return -1;
+    }
+    const ack a = k->a;
+    if (prior != run_status::ok || a.status != 0) {
+        const std::string why =
+            prior != run_status::ok ? err_ : "read_begin: the follower: " + why_of(a.why, sizeof a.why);
+        if (a.status == 0) {
+            // the follower admitted the read: end its prepared read (cancelled before its first chunk)
+            ctrl cc;
+            cc.op   = int32_t(op::read_cancel);
+            cc.slot = slot;
+            ack ca;
+            command(cc, nullptr, ca, ctrl_timeout_s);
+        }
+        err_ = why;
+        return a.status != 0 ? a.status : -1;
     }
     x_->expect(slot, c.base);
     read_base_[size_t(slot)]  = c.base;
     next_[size_t(slot)].valid = false;
-    const int32_t r           = e_->read_begin(slot, tokens, n_tokens, n_reuse, n_processed);
+    const int32_t r           = e_->read_begin(slot, tokens, n_tokens, n_reuse, n_processed, images);
     if (r != 0 || a.a != n_processed) {
         err_ = r != 0 ? e_->error() :
                         "read_begin: the follower processes " + std::to_string(a.a) + " tokens, the leader " +
@@ -845,22 +1002,34 @@ int32_t leader::read_begin(int32_t         slot,
         return r != 0 ? r : -1;
     }
     read_acks_[size_t(slot)].clear();
+    back_acct_[size_t(slot)] = read_info();
     return 0;
 }
 
-read_status leader::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
-    if (lost_) {
-        err_ = why_;
+void leader::back_info(int32_t slot, read_info & out) const {
+    out = slot >= 0 && size_t(slot) < back_acct_.size() ? back_acct_[size_t(slot)] : read_info();
+}
+
+read_status leader::read_step(int32_t slot, int32_t n_groups, read_mode mode, const read_budget * budget) {
+    if (ctl_.lost()) {
+        err_ = ctl_.why();
         return read_status::error;
     }
     // TTTS1: beside writers or other readers the back's chunks interleave with the step groups there, so the front's
     // end waits for their answers only in the lone mode (else yielded until they came; the drive's tests block)
     const bool block = mode == read_mode::lone || block_reads_;
     if (read_end_[size_t(slot)] >= 0) {
-        return read_finish(slot, block);
+        const read_status f = read_finish(slot, block);
+        return f == read_status::yielded ? read_status::front_done : f;
     }
-    const read_status st = e_->read_step(slot, n_groups, mode);
-    err_                 = e_->error();
+    // MUP1 piece 3, exactly (PRD1 item 7): a small read beside writers: the front runs its chunk in one group
+    // (engine::read_step) and the follower its back half whole (a = 0), at once when no earlier read waits there,
+    // with or without a budget; the leader does not wait for it. MUP2: a larger read with a budget is budgeted on the
+    // back too (a = 2), APF1: by the back's own writer-pause deadline under the P carried here
+    const bool budgeted  = mode == read_mode::writers && budget != nullptr;
+    const bool        whole     = mode == read_mode::lone || (mode == read_mode::writers && e_->small_read(slot));
+    const read_status st = e_->read_step(slot, n_groups, mode, budget);
+    err_                    = e_->error();
     auto & pend          = read_acks_[size_t(slot)];
     if (st == read_status::chunk_done || st == read_status::done || st == read_status::cancelled) {
         // the front's chunk is done and its crossing sent (or the read stopped): the follower runs the back's half,
@@ -868,63 +1037,110 @@ read_status leader::read_step(int32_t slot, int32_t n_groups, read_mode mode) {
         ctrl c;
         c.op       = int32_t(op::read_step);
         c.slot     = slot;
-        c.a        = mode == read_mode::lone ? 0 : 1;
+        c.a                    = whole ? 0 : budgeted ? 2 : 1;
+        c.pause_ms             = budgeted ? float(budget->pause_ms) : 0.0f;
         c.b        = st == read_status::cancelled ? 1 : 0;
         c.c        = int32_t(x_->sent(slot));  // a cancel: the chunks the front finished run on the back first
-        auto *  a  = new ack();
-        int32_t op = -1;
-        if (!send_ctrl(c, nullptr, op, *a)) {
-            delete a;
+        std::shared_ptr<cmd> k = send_cmd(c, nullptr);
+        if (k == nullptr) {
             return read_status::error;
         }
-        pend.push_back({ op, a });
+        pend.push_back(std::move(k));
     }
     if (st == read_status::yielded || st == read_status::chunk_done) {
         return st;
     }
     read_end_[size_t(slot)] = int32_t(st);
-    return read_finish(slot, block || st == read_status::error);
+    // PRD1 item 9: the front is free at its end: front_done while the back's halves are out (read_poll then)
+    const read_status f     = read_finish(slot, block || st == read_status::error);
+    return f == read_status::yielded ? read_status::front_done : f;
+}
+
+read_status leader::read_poll(int32_t slot) {
+    if (slot < 0 || size_t(slot) >= read_end_.size() || read_end_[size_t(slot)] < 0) {
+        err_ = "read_poll: slot " + std::to_string(slot) + "'s front has not ended";
+        return read_status::error;
+    }
+    const read_status f = read_finish(slot, ctl_.lost());
+    return f == read_status::yielded ? read_status::front_done : f;
+}
+
+bool leader::read_ready(int32_t slot) {
+    if (slot < 0 || size_t(slot) >= read_end_.size() || read_end_[size_t(slot)] < 0 || ctl_.lost()) {
+        return true;
+    }
+    for (auto & k : read_acks_[size_t(slot)]) {
+        bool done = false;
+        if (!ctl_.test(*k, done)) {
+            return true;  // lost: read_poll ends it
+        }
+        if (!done) {
+            return false;
+        }
+    }
+    return true;
 }
 
 read_status leader::read_finish(int32_t slot, bool block) {
     auto & pend = read_acks_[size_t(slot)];
-    if (!block && !lost_) {
-        for (auto & pa : pend) {
-            if (pa.first < 0) {
-                continue;  // answered at an earlier call
-            }
-            bool        done = false;
-            std::string e;
-            if (!p_->test(pa.first, done, e)) {
-                lose(e);
+    if (!block && !ctl_.lost()) {
+        for (auto & k : pend) {
+            bool done = false;
+            if (!ctl_.test(*k, done)) {
                 break;
             }
             if (!done) {
                 return read_status::yielded;
             }
-            pa.first = -1 - pa.first;  // answered (the receive finished by test)
         }
     }
     const read_status st    = static_cast<read_status>(read_end_[size_t(slot)]);
     read_end_[size_t(slot)] = -1;
     // the read's end: every back half answered
-    read_status out         = lost_ ? read_status::error : st;
+    read_status out         = ctl_.lost() ? read_status::error : st;
     std::string e;
-    if (!lost_ && !x_->drain(e)) {
-        lose(e);
+    // PRD1 item 9: only the crossing buffers this slot filled last (a later read's sends are its own)
+    if (!ctl_.lost() && !x_->drain(slot, e)) {
+        ctl_.lose(e);
         out = read_status::error;
     }
-    for (auto & [op, a] : pend) {
-        if (op >= 0 && (lost_ || !wait_ack(op, *a, 3600.0))) {  // op < 0: answered (read_finish's test)
+    for (size_t i = 0; i < pend.size(); ++i) {
+        auto &      k = pend[i];
+        const ack & a = k->a;
+        if (!k->answered && (ctl_.lost() || !wait_cmd(*k, 3600.0))) {
+            ctl_.drop(*k);  // its answer no longer wanted: retired
             out = read_status::error;
-        } else if (a->status != int32_t(out == read_status::done ? read_status::chunk_done : out) &&
-                   a->status != int32_t(out)) {
-            if (out == read_status::done || out == read_status::cancelled) {
-                err_ = "read: the follower's back half: " + why_of(a->why, sizeof a->why);
-                out  = read_status::error;
-            }
+            continue;
         }
-        delete a;
+        // MUP2 piece 4: the back's account so far (answers in chunk order: the last is the read's)
+        if (a.acct_i[0] > 0) {
+            read_info & b   = back_acct_[size_t(slot)];
+            b.unit_ms       = a.acct[0];
+            b.floor_ms      = a.acct[1];
+            b.budget_n      = a.acct[2] >= 0 ? 1 : 0;
+            b.budget_ms_sum = a.acct[2];
+            b.pause_ms       = int32_t(a.acct[3]);
+            b.service_s     = a.acct[4] / 1e3;
+            b.units_run     = a.acct_i[0];
+            b.unit_steps    = a.acct_i[1];
+            b.most_units    = a.acct_i[2];
+            b.floor_units   = a.acct_i[3];
+            b.piece_min     = a.acct_i[4];
+            b.piece_max     = a.acct_i[5];
+            b.budget_misses = a.acct_i[6];
+            b.below_floor   = a.acct_i[7] != 0;
+            // APF1: the back's pacing over the read
+            b.budget_zero    = a.acct_i[8];
+            b.budget_unknown = a.acct_i[9];
+            pace_from_ack(a, b.pace_ns);
+        }
+        // the back's answers in chunk order: chunk_done for every chunk but the last, whose answer is the read's end
+        // (PRD1 item 14: a cancel after finished chunks answers chunk_done for those, then cancelled)
+        const read_status want = i + 1 < pend.size() ? read_status::chunk_done : out;
+        if (a.status != int32_t(want) && (out == read_status::done || out == read_status::cancelled)) {
+            err_ = "read: the follower's back half: " + why_of(a.why, sizeof a.why);
+            out  = read_status::error;
+        }
     }
     pend.clear();
     if (out != read_status::done) {
@@ -937,20 +1153,32 @@ read_status leader::read_finish(int32_t slot, bool block) {
 }
 
 void leader::read_cancel(int32_t slot) {
+    settle(slot, false);    // MUP1 piece 2: taken if it came (its refusal is the request's end anyway)
     e_->read_cancel(slot);  // the front stops at its chunk's end; read_step tells the follower
 }
 
 run_status leader::truncate(int32_t slot, int32_t n_keep) {
+    const run_status prior = settle(slot, true);  // MUP1 piece 2
+    if (prior != run_status::ok) {
+        return prior;
+    }
     // the leader's cut first; the follower's with it (c.b: the leader's slot in place); a slot either box could not
     // keep in place restores at the next prefill on both, so their reads start at the same checkpoint
     next_[size_t(slot)].valid = false;
+    // TTTS8: a slot's checkpoints change on both boxes together: a box whose cut failed dropped its own (its state
+    // unknown, engine::truncate), so the other drops them too (c.c: the leader did; the ack's b: the follower did) and
+    // both read the next prompt from the same point; read_begin's count check stays the guard
+    prefiller &       pf      = e_->prefill_driver();
+    const int32_t     had     = pf.book().count_owner(slot);
     const run_status  rs      = e_->truncate(slot, n_keep);
     const std::string lerr    = e_->error();
+    const bool        dropped = had > 0 && pf.book().count_owner(slot) == 0;
     ctrl              c;
     c.op   = int32_t(op::truncate);
     c.slot = slot;
     c.a    = n_keep;
     c.b    = rs == run_status::ok && e_->in_place(slot) ? 1 : 0;
+    c.c    = dropped ? 1 : 0;
     ack a;
     if (!command(c, nullptr, a, ctrl_timeout_s)) {
         return run_status::error;
@@ -958,6 +1186,16 @@ run_status leader::truncate(int32_t slot, int32_t n_keep) {
     if (a.status != int32_t(run_status::ok)) {
         err_ = "truncate: the follower: " + why_of(a.why, sizeof a.why);
         return static_cast<run_status>(a.status);
+    }
+    if (a.b != 0 && !dropped) {
+        const int32_t n = pf.book().count_owner(slot);
+        pf.drop_owner(slot);
+        fprintf(
+            stderr,
+            "FNFL split: slot %d: truncate to %d: the follower dropped the slot's checkpoints (its cut failed); the "
+            "leader drops its %d, so both read the next prompt from token 0\n",
+            slot, n_keep, n);
+        fflush(stderr);
     }
     if (a.a == 0) {
         e_->to_restore(slot);
@@ -967,6 +1205,7 @@ run_status leader::truncate(int32_t slot, int32_t n_keep) {
 }
 
 run_status leader::release_slot(int32_t slot) {
+    settle(slot, true);  // MUP1 piece 2: the slot ends; a refused setting does not matter now
     ctrl c;
     c.op   = int32_t(op::release_slot);
     c.slot = slot;
@@ -981,6 +1220,10 @@ run_status leader::release_slot(int32_t slot) {
 }
 
 run_status leader::set_draft(int32_t d, bool sparse) {
+    const run_status prior = settle_all();  // MUP1 piece 2
+    if (prior != run_status::ok) {
+        return prior;
+    }
     ctrl c;
     c.op = int32_t(op::set_draft);
     c.a  = d;
@@ -1001,7 +1244,37 @@ run_status leader::set_draft(int32_t d, bool sparse) {
     return rs;
 }
 
+// the front first (its refusals: the slot, the range, a live read), then the back; a refusal there restores the front's
+// old offset, so the boxes never disagree
+run_status leader::set_pos_offset(int32_t slot, int32_t off) {
+    const run_status prior = settle(slot, true);  // MUP1 piece 2
+    if (prior != run_status::ok) {
+        return prior;
+    }
+    const int32_t    old = e_->pos_offset(slot);
+    const run_status rs  = e_->set_pos_offset(slot, off);
+    if (rs != run_status::ok) {
+        err_ = e_->error();
+        return rs;
+    }
+    if (slot < int32_t(next_.size())) {
+        next_[size_t(slot)].valid = false;  // a next step drafted at the old positions is not used
+    }
+    ctrl c;
+    c.op   = int32_t(op::pos_offset);
+    c.slot = slot;
+    c.a    = off;
+    ack a;
+    if (!command(c, nullptr, a, ctrl_timeout_s) || a.status != int32_t(run_status::ok)) {
+        e_->set_pos_offset(slot, old);
+        err_ = "set_pos_offset: the follower: " + why_of(a.why, sizeof a.why);
+        return a.status != int32_t(run_status::ok) ? static_cast<run_status>(a.status) : run_status::error;
+    }
+    return run_status::ok;
+}
+
 bool leader::follower_pool(pool_info & out) {
+    settle_all();  // MUP1 piece 2
     ctrl c;
     c.op = int32_t(op::pool);
     ack a;
@@ -1017,8 +1290,19 @@ bool leader::follower_pool(pool_info & out) {
     return true;
 }
 
+void joint_refusals::refuse(const char * tag, const std::string & cause, bool capture_failed, const char * tail) {
+    off                   = off || capture_failed;
+    const std::string key = std::string(tag) + cause + tail;
+    if (said.insert(key).second) {
+        fprintf(stderr, "%s: %s; %s%s\n", tag, cause.c_str(), tail,
+                capture_failed ? " (joint decode off from now on)" : " (said once a cause)");
+        fflush(stderr);
+    }
+}
+
 void leader::bye() {
-    if (lost_) {
+    settle_all();  // MUP1 piece 2: every X-ACK taken (or dropped on a lost stage) before the link closes
+    if (ctl_.lost()) {
         p_->close();
         return;
     }
@@ -1029,19 +1313,27 @@ void leader::bye() {
 }
 
 std::unique_ptr<leader::pending> leader::group_begin(const int32_t * slots, int32_t n, int32_t group) {
-    auto g                   = std::make_unique<pending>();
+    nvtx_range nr("leader.group_begin");
+    auto       g             = std::make_unique<pending>();
     g->group                 = group;
     g->n                     = n;
     g->t0                    = clk::now();
     const engine_config & cf = e_->config();
     // each member's checks and cells, and its next step as the last X-STEP left it
     std::vector<int32_t>  lanes;
+    nvtx_phase            ph("leader.enter");
     for (int32_t k = 0; k < n; ++k) {
         member & m = g->m[k];
         m.slot     = slots[k];
-        g->st[k]   = lost_ ? run_status::error : e_->split_enter(slots[k], g->b[k]);
+        g->st[k]   = ctl_.lost() ? run_status::error : settle(slots[k], false);  // MUP1 piece 2: a refused setting
         if (g->st[k] != run_status::ok) {
-            g->why[k] = lost_ ? why_ : e_->error();
+            g->why[k] = ctl_.lost() ? ctl_.why() : err_;
+            m.kind    = -1;  // not sent
+            continue;
+        }
+        g->st[k] = e_->split_enter(slots[k], g->b[k]);
+        if (g->st[k] != run_status::ok) {
+            g->why[k] = ctl_.lost() ? ctl_.why() : e_->error();
             m.kind    = -1;  // not sent
             continue;
         }
@@ -1062,10 +1354,21 @@ std::unique_ptr<leader::pending> leader::group_begin(const int32_t * slots, int3
             }
         }
     }
+    // the slots' boundary buffers are refilled by the front rounds below: the slot's previous group ended (its sends
+    // finished or retired) before the pipeline let it begin this one
+    for (int32_t k = 0; k < n; ++k) {
+        if (g->m[k].kind > int32_t(mkind::begin)) {
+            for (int32_t card = 0; card < 2; ++card) {
+                life::reuse(cf.stage_buf[size_t(g->m[k].slot)][size_t(card)], size_t(model::stage_bytes(g->m[k].rows)),
+                            "boundary buffer");
+            }
+        }
+    }
+    ph.next("leader.front");
     // the front rounds: the lanes' joint round, then every other member's round alone
     joint_frame * jf    = e_->split_joint();
     bool          joint = false;
-    if (lanes.size() >= 2 && jf != nullptr && lanes.size() <= size_t(fn::xchg::max_lanes)) {
+    if (lanes.size() >= 2 && jf != nullptr && !joint_verify_.off && lanes.size() <= size_t(fn::xchg::max_lanes)) {
         target *            tt[fn::xchg::max_lanes] = {};
         int32_t             d[fn::xchg::max_lanes] = {}, bud[fn::xchg::max_lanes] = {};
         const int32_t *     prop[fn::xchg::max_lanes] = {};
@@ -1101,7 +1404,7 @@ std::unique_ptr<leader::pending> leader::group_begin(const int32_t * slots, int3
                 }
             }
         } else {
-            fprintf(stderr, "FNFL split: %s; these slots verify alone\n", jerr.c_str());
+            joint_verify_.refuse("FNFL split", jerr, jf->capture_failed(), "these slots verify alone");
         }
     }
     for (int32_t k = 0; k < n; ++k) {
@@ -1122,6 +1425,7 @@ std::unique_ptr<leader::pending> leader::group_begin(const int32_t * slots, int3
         }
         g->fronted[k] = true;
     }
+    ph.next("leader.post");
     dispatch(*g, group);
     return g;
 }
@@ -1140,15 +1444,21 @@ std::unique_ptr<leader::pending> leader::group_begin_forced(const int32_t * slot
         m.slot     = slots[k];
         m.kind     = int32_t(mkind::forced);
         m.rows     = rows;
-        g->st[k]   = lost_ ? run_status::error : run_status::ok;
-        g->why[k]  = lost_ ? why_ : std::string();
+        g->st[k]   = ctl_.lost() ? run_status::error : run_status::ok;
+        g->why[k]  = ctl_.lost() ? ctl_.why() : std::string();
         tt.push_back(&e_->test_target(slots[k]));
     }
-    if (lost_) {
+    if (ctl_.lost()) {
         for (int32_t k = 0; k < n; ++k) {
             g->m[k].kind = -1;
         }
         return g;
+    }
+    for (int32_t k = 0; k < n; ++k) {  // refilled by the front rounds: the slot's previous group ended
+        for (int32_t card = 0; card < 2; ++card) {
+            life::reuse(e_->config().stage_buf[size_t(slots[k])][size_t(card)], size_t(model::stage_bytes(rows)),
+                        "boundary buffer");
+        }
     }
     joint_frame * jf = e_->split_joint();
     if (n >= 2 && jf != nullptr) {
@@ -1190,6 +1500,7 @@ void leader::forced_groups(const int32_t *  slots,
                            int32_t          n_groups,
                            int32_t          rows,
                            joint_step_out * res) {
+    settle_all();  // MUP1 piece 2 (the drive's tests)
     std::vector<std::unique_ptr<pending>> g;
     int32_t                               at = 0;
     for (int32_t q = 0; q < n_groups; ++q) {
@@ -1205,6 +1516,7 @@ void leader::forced_groups(const int32_t *  slots,
 
 bool leader::probe(int32_t slot, int32_t what, std::vector<uint8_t> & out) {
     out.clear();
+    settle(slot, true);  // MUP1 piece 2
     ctrl c;
     c.op   = int32_t(op::probe);
     c.slot = slot;
@@ -1217,19 +1529,25 @@ bool leader::probe(int32_t slot, int32_t what, std::vector<uint8_t> & out) {
         err_ = "probe: the follower: " + why_of(a.why, sizeof a.why);
         return false;
     }
-    const uint32_t seq = seq_ - 1;  // the command's
-    out.assign(size_t(a.a), 0);
+    const uint32_t seq = ctl_.last_seq();  // the command's
+    if (a.a == 0) {
+        return true;
+    }
+    // the answer's bytes land in a heap record its receive keeps, then are copied out
+    auto          got = std::make_shared<std::vector<uint8_t>>(size_t(a.a), 0);
     std::string   e;
-    const int32_t op = a.a > 0 ? p_->recv(probe_tag(seq), out.data(), out.size(), e) : -1;
-    if (a.a > 0 && (op < 0 || !p_->wait(op, e, ctrl_timeout_s))) {
-        lose(e);
-        err_ = why_;
+    const int32_t op = p_->recv(probe_tag(seq), got->data(), got->size(), got, e);
+    if (op < 0 || !p_->wait(op, e, ctrl_timeout_s)) {
+        ctl_.lose(e);
+        err_ = ctl_.why();
         return false;
     }
+    out = *got;
     return true;
 }
 
 run_status leader::reconfigure(ctrl c) {
+    settle_all();  // MUP1 piece 2
     c.op   = int32_t(op::reconfigure);
     c.slot = -1;
     ack a;
@@ -1244,26 +1562,80 @@ run_status leader::reconfigure(ctrl c) {
 }
 
 void leader::rebind(engine & e) {
+    settle_all();  // MUP1 piece 2
     e_ = &e;
     next_.assign(size_t(e.n_slots()), next_step());
+    samp_.assign(size_t(e.n_slots()), nullptr);
     read_acks_.assign(size_t(e.n_slots()), {});
     read_base_.assign(size_t(e.n_slots()), 0);
     read_end_.assign(size_t(e.n_slots()), -1);
+    back_acct_.assign(size_t(e.n_slots()), read_info());
     logits_.assign(size_t(e.n_slots()), {});
 }
 
-run_status leader::test_prompt(int32_t slot, const std::vector<int32_t> & tokens) {
-    target &    t = e_->test_target(slot);
-    std::string e;
-    if (!t.reset(e)) {
-        err_ = "test_prompt: the front's reset: " + e;
+// the routes' counts in test_route's order (stage_msg.h)
+using route_field                                            = int64_t model::prompt_path::route_counts::*;
+constexpr route_field       route_fields[route_count_fields] = {
+    &model::prompt_path::route_counts::dense_ladder,  &model::prompt_path::route_counts::dense_retained,
+    &model::prompt_path::route_counts::dense_split,   &model::prompt_path::route_counts::hc_ladder,
+    &model::prompt_path::route_counts::hc_retained,   &model::prompt_path::route_counts::ex_grouped,
+    &model::prompt_path::route_counts::ex_per_task,   &model::prompt_path::route_counts::exd_grouped,
+    &model::prompt_path::route_counts::exd_per_task,  &model::prompt_path::route_counts::graph_units,
+    &model::prompt_path::route_counts::eager_units,   &model::prompt_path::route_counts::graph_captures,
+    &model::prompt_path::route_counts::graph_updated, &model::prompt_path::route_counts::qsa,
+    &model::prompt_path::route_counts::gdn,           &model::prompt_path::route_counts::ple,
+};
+
+run_status leader::test_force_route(const model::prompt_route_force & f, model::prompt_path::route_counts * back) {
+    const run_status prior = settle_all();
+    if (prior != run_status::ok) {
+        return prior;
+    }
+    e_->prefill_driver().test_force_route(f);
+    ctrl c;
+    c.op   = int32_t(op::test_route);
+    c.a    = f.dense;
+    c.b    = f.hc;
+    c.c    = f.expert;
+    c.base = f.graph;
+    ack a;
+    if (!command(c, nullptr, a, ctrl_timeout_s)) {
         return run_status::error;
     }
-    t.set_prompt(tokens);
+    if (a.status != int32_t(run_status::ok)) {
+        err_ = "test_force_route: the follower: " + why_of(a.why, sizeof a.why);
+        return static_cast<run_status>(a.status);
+    }
+    if (back != nullptr) {
+        *back = model::prompt_path::route_counts{};
+        for (int32_t i = 0; i < route_count_fields; ++i) {
+            back->*route_fields[i] = a.acct_i[i];
+        }
+    }
+    return run_status::ok;
+}
+
+run_status leader::test_prompt(int32_t slot, const std::vector<int32_t> & tokens, bool keep) {
+    target &    t = e_->test_target(slot);
+    std::string e;
+    if (keep) {
+        if (!t.keep_processed(e)) {
+            err_ = "test_prompt: the front's kept tokens: " + e;
+            return run_status::error;
+        }
+        t.append(tokens);
+    } else {
+        if (!t.reset(e)) {
+            err_ = "test_prompt: the front's reset: " + e;
+            return run_status::error;
+        }
+        t.set_prompt(tokens);
+    }
     next_[size_t(slot)].valid = false;
     ctrl c;
     c.op       = int32_t(op::test_prompt);
     c.slot     = slot;
+    c.a        = keep ? 1 : 0;
     c.n_tokens = int32_t(tokens.size());
     ack a;
     if (!command(c, tokens.data(), a, ctrl_timeout_s)) {
@@ -1276,93 +1648,71 @@ run_status leader::test_prompt(int32_t slot, const std::vector<int32_t> & tokens
     return run_status::ok;
 }
 
-// the group to the follower: its command, the members' boundaries, the answers' receives (sent: all went)
-void leader::dispatch(pending & gg, int32_t group) {
-    pending *     g = &gg;
-    const int32_t n = g->n;
-    ctrl &        c = g->c;
-    c.op            = int32_t(op::step_group);
-    c.group         = group;
-    int32_t nm      = 0;
-    for (int32_t k = 0; k < n; ++k) {
-        if (g->m[k].kind >= 0) {
-            c.m[nm++] = g->m[k];
-        }
+// the group to the follower: its command, the members' boundaries, the answers' receives (fn/runtime/stage_wire.h)
+void leader::dispatch(pending & g, int32_t group) {
+    nvtx_range nr("leader.dispatch");
+    int32_t nm = 0;
+    for (int32_t k = 0; k < g.n; ++k) {
+        nm += g.m[k].kind >= 0 ? 1 : 0;
     }
-    c.n_members = nm;
     if (nm == 0) {
         return;
     }
-    if (lost_) {
-        for (int32_t k = 0; k < n; ++k) {
-            g->st[k]  = run_status::error;
-            g->why[k] = why_;
+    if (ctl_.lost()) {
+        for (int32_t k = 0; k < g.n; ++k) {
+            g.st[k]  = run_status::error;
+            g.why[k] = ctl_.why();
         }
         return;
     }
-    g->seq = seq_++;
-    trace("leader", "command " + std::to_string(g->seq) + " step group " + std::to_string(group) + ", " +
-                        std::to_string(nm) + " members");
-    std::string e;
-    bool        ok = true;
-    for (int32_t k = 0; k < n && ok; ++k) {
-        if (g->m[k].kind < 0) {
-            continue;
-        }
-        g->rops[k] = p_->recv(step_tag(group, g->seq, g->m[k].slot), &g->out[k], sizeof(step_out), e);
-        ok         = g->rops[k] >= 0;
-        if (ok && g->m[k].kind == int32_t(mkind::forced)) {
-            // a forced member's back logits: both cards' rows
-            g->lg[k].assign(size_t(2) * size_t(g->m[k].rows) * size_t(fn::head::n_vocab_card), 0.0f);
-            g->lops[k] = p_->recv(logits_tag(group, g->seq, g->m[k].slot), g->lg[k].data(), g->lg[k].size() * 4, e);
-            ok         = g->lops[k] >= 0;
-        }
-    }
-    const int32_t cop = ok ? p_->send(ctrl_tag(g->seq, 0), &c, sizeof(c), e) : -1;
-    ok                = ok && cop >= 0;
-    if (ok) {
-        g->sops.push_back(cop);
-    }
     const auto & buf = e_->config().stage_buf;
-    for (int32_t k = 0; k < n && ok; ++k) {
-        if (!g->fronted[k]) {
-            continue;
+    boundary_src src[max_members];
+    size_t       logits_n[max_members] = {};
+    for (int32_t k = 0; k < g.n; ++k) {
+        if (g.m[k].kind == int32_t(mkind::forced)) {
+            logits_n[k] = size_t(2) * size_t(g.m[k].rows) * size_t(fn::head::n_vocab_card);
         }
-        for (int32_t card = 0; card < 2 && ok; ++card) {
-            const size_t  bytes = size_t(model::stage_bytes(g->m[k].rows));
-            const int32_t op    = p_->send(boundary_tag(group, g->seq, card, g->m[k].slot),
-                                           buf[size_t(g->m[k].slot)][size_t(card)], bytes, e);
-            ok                  = op >= 0;
-            g->sops.push_back(op);
-            ++st_.boundaries;
-            st_.boundary_bytes += int64_t(bytes);
+        if (g.fronted[k]) {
+            src[k].buf[0] = buf[size_t(g.m[k].slot)][0];
+            src[k].buf[1] = buf[size_t(g.m[k].slot)][1];
+            src[k].bytes  = size_t(model::stage_bytes(g.m[k].rows));
         }
     }
-    if (!ok) {
-        lose(e);
-    }
-    g->sent = ok;
-    ++st_.groups;
-    st_.members += nm;
+    // APF1: the pacing the follower needs: P, this step's front service, the front's groups and their generations
+    ctrl & c   = g.w->c;
+    c.pause_ms = float(pace_pause_);
+    c.front_ms = float(since(g.t0) * 1e3);
+    c.live     = pace_live_ | (group >= 0 && group < 2 ? 1u << uint32_t(group) : 0u);
+    c.gen[0]   = pace_gen_[0];
+    c.gen[1]   = pace_gen_[1];
+    post_group(ctl_, g.w, group, g.m, g.n, src, logits_n, st_);
+}
+
+void leader::set_pace(int32_t pause_ms, uint32_t live, const int32_t * gen) {
+    pace_pause_  = pause_ms;
+    pace_live_   = live;
+    pace_gen_[0] = gen[0];
+    pace_gen_[1] = gen[1];
 }
 
 void leader::group_end(pending & g, joint_step_out * res) {
-    std::string e;
-    const auto  t0 = clk::now();
-    for (int32_t op : g.sops) {
-        if (g.sent && !p_->wait(op, e, step_timeout_s)) {
-            lose(e);
-            g.sent = false;
-        }
-    }
+    nvtx_range   nr("leader.group_end");
+    std::string  e;
+    const auto   t0   = clk::now();
+    group_wire & w    = *g.w;
+    last_back_ms_     = -1;  // APF1: the group's back stage, from its members' answers
+    const bool   sent = [&] {
+        nvtx_range nw("leader.send_wait");
+        return group_sends(ctl_, w, step_timeout_s);
+    }();
     for (int32_t k = 0; k < g.n; ++k) {
         res[k]     = joint_step_out();
         member & m = g.m[k];
-        if (m.kind < 0 || !g.sent) {
+        if (m.kind < 0 || !sent) {
             if (g.fronted[k]) {
                 e_->test_target(m.slot).front_abandon(g.fr[k]);
             }
-            const std::string why = !g.sent && m.kind >= 0 ? why_ : g.why[k];
+            const std::string why = !sent && m.kind >= 0 ? ctl_.why() : g.why[k];
             step_info         s;
             res[k].st = g.st[k] == run_status::ok ? run_status::error : g.st[k];
             if (g.st[k] == run_status::ok && m.kind != int32_t(mkind::forced)) {
@@ -1372,8 +1722,12 @@ void leader::group_end(pending & g, joint_step_out * res) {
             next_[size_t(m.slot)].valid = false;
             continue;
         }
-        if (!p_->wait(g.rops[k], e, step_timeout_s) || (g.lops[k] >= 0 && !p_->wait(g.lops[k], e, step_timeout_s))) {
-            lose(e);
+        bool got = false;
+        {
+            nvtx_range nw("leader.xstep_wait");
+            got = group_answer(ctl_, w, k, step_timeout_s, e);
+        }
+        if (!got) {
             if (g.fronted[k]) {
                 e_->test_target(m.slot).front_abandon(g.fr[k]);
             }
@@ -1382,13 +1736,14 @@ void leader::group_end(pending & g, joint_step_out * res) {
                 e_->split_leave(m.slot, false, s, res[k].out, res[k].n_out, res[k].end);
             }
             res[k].st                   = run_status::error;
-            res[k].why                  = why_;
+            res[k].why                  = ctl_.why();
             next_[size_t(m.slot)].valid = false;
             continue;
         }
-        const step_out & o  = g.out[k];
+        const step_out & o  = w.out[k];
         target &         t  = e_->test_target(m.slot);
         next_step &      nx = next_[size_t(m.slot)];
+        last_back_ms_       = std::max(last_back_ms_, double(o.back_ms));
         nx.valid            = o.status == int32_t(run_status::ok) && o.next_kind != 0;
         nx.kind             = o.next_kind;
         nx.d                = o.next_d;
@@ -1415,7 +1770,8 @@ void leader::group_end(pending & g, joint_step_out * res) {
             // the drive's tests: the forced rows committed as the back's, its logits kept for the caller
             const int32_t kf  = fn::round::commit_versions(static_cast<int32_t>(fn::round::kind::forced), m.rows, 0, 0);
             const bool    fok = t.front_end(g.fr[k], kf, nullptr, 0, -1, 0, e);
-            logits_[size_t(m.slot)] = std::move(g.lg[k]);
+            life::disown(w.lg[k].data(), "forced logits");  // its receive finished: the caller's now
+            logits_[size_t(m.slot)] = std::move(w.lg[k]);
             res[k].joint            = o.joint != 0;
             res[k].st               = fok ? run_status::ok : run_status::error;
             res[k].why              = fok ? std::string() : "the front's forced commit: " + e;
@@ -1438,6 +1794,7 @@ void leader::group_end(pending & g, joint_step_out * res) {
         res[k].st    = e_->split_leave(m.slot, ok, s, res[k].out, res[k].n_out, res[k].end);
         res[k].why   = res[k].st == run_status::ok ? std::string() : e_->error();
     }
+    group_close(ctl_, w);
     st_.back_wait_s += since(t0);
 }
 
@@ -1496,11 +1853,26 @@ pipeline::pipeline(leader & l) : l_(&l) {}
 
 pipeline::~pipeline() = default;
 
+uint32_t pipeline::live_mask() const {
+    uint32_t m = 0;
+    for (int32_t g = 0; g < 2; ++g) {
+        if (!core_.group(g).empty() || core_.in_flight(g)) {
+            m |= 1u << uint32_t(g);
+        }
+    }
+    return m;
+}
+
 void pipeline::end_group(int32_t g) {
     joint_step_out out[max_members];
     l_->group_end(*fl_[g], out);
+    pace_.answered(g, pace::clock_ms(), l_->last_back_ms());  // APF1: the group's observed completion
     for (size_t k = 0; k < members_[g].size(); ++k) {
-        forget(members_[g][k]);
+        // a begin that only drafted is no step (its slot steps again at its next turn); every other result queues
+        // behind the slot's earlier ones
+        if (out[k].st == run_status::ok && out[k].n_out == 0 && !out[k].end) {
+            continue;
+        }
         kept_.push_back({ members_[g][k], out[k] });
     }
     fl_[g].reset();
@@ -1512,20 +1884,13 @@ void pipeline::end_group(int32_t g) {
 }
 
 void pipeline::step(const int32_t * slots, int32_t n, joint_step_out * res, bool * done) {
-    const auto kept = [this](int32_t s) {
-        for (const auto & k : kept_) {
-            if (k.first == s) {
-                return true;
-            }
-        }
-        return false;
-    };
+    nvtx_range           nr("pipe.step");
     bool                 any_kept = false;
     std::vector<int32_t> w;
     for (int32_t k = 0; k < n; ++k) {
-        if (kept(slots[k])) {
+        if (queued(slots[k]) > 0) {
             any_kept = true;
-        } else {
+        } else if (!ended(slots[k])) {
             w.push_back(slots[k]);
         }
     }
@@ -1533,7 +1898,13 @@ void pipeline::step(const int32_t * slots, int32_t n, joint_step_out * res, bool
     while (!any_kept) {
         const pipe::action x = core_.next();
         if (x.a == pipe::act::begin) {
+            // APF1: the group's front stage (its admission, a new membership's at this safe boundary) and what its
+            // command carries to the follower
+            pace_.front_begin(x.g, x.members.data(), int32_t(x.members.size()), pace::clock_ms());
+            const int32_t gen[2] = { int32_t(pace_.group_gen(0)), int32_t(pace_.group_gen(1)) };
+            l_->set_pace(pace_.pause(), live_mask() | (1u << uint32_t(x.g)), gen);
             fl_[x.g]      = l_->group_begin(x.members.data(), int32_t(x.members.size()), x.g);
+            pace_.front_sent(x.g, pace::clock_ms());
             members_[x.g] = x.members;
             core_.done(x);
             continue;
@@ -1543,17 +1914,47 @@ void pipeline::step(const int32_t * slots, int32_t n, joint_step_out * res, bool
         }
         break;  // an end, or nothing to do (front reads are the shell's own calls)
     }
-    for (int32_t k = 0; k < n; ++k) {
-        done[k] = false;
-        for (auto it = kept_.begin(); it != kept_.end(); ++it) {
-            if (it->first == slots[k]) {
-                res[k]  = it->second;
-                done[k] = true;
-                kept_.erase(it);
-                break;
-            }
+    // APF1: a group the core emptied (its writers left, none in flight) has no timing left
+    for (int32_t g = 0; g < 2; ++g) {
+        if (core_.group(g).empty() && !core_.in_flight(g)) {
+            pace_.clear(g);
         }
     }
+    for (int32_t k = 0; k < n; ++k) {
+        done[k] = take(slots[k], res[k]);
+        if (!done[k] && ended(slots[k])) {
+            res[k]     = joint_step_out();
+            res[k].st  = run_status::bad_request;
+            res[k].why = "slot " + std::to_string(slots[k]) + ": a step after its request ended";
+            done[k]    = true;
+        }
+    }
+}
+
+bool pipeline::take(int32_t slot, joint_step_out & res) {
+    for (auto it = kept_.begin(); it != kept_.end(); ++it) {
+        if (it->first == slot) {
+            res = it->second;
+            kept_.erase(it);
+            delivered(slot, res);
+            return true;
+        }
+    }
+    return false;
+}
+
+void pipeline::delivered(int32_t slot, const joint_step_out & res) {
+    if (slot >= 0 && slot < pipe::max_writers && (res.end || res.st != run_status::ok)) {
+        ended_[slot] = true;
+    }
+}
+
+bool pipeline::ended(int32_t slot) const {
+    return slot >= 0 && slot < pipe::max_writers && ended_[slot];
+}
+
+int32_t pipeline::queued(int32_t slot) const {
+    return int32_t(std::count_if(kept_.begin(), kept_.end(), [slot](const auto & k) { return k.first == slot; }));
 }
 
 void pipeline::settle(int32_t slot) {
@@ -1572,9 +1973,85 @@ void pipeline::settle_all() {
     }
 }
 
-void pipeline::forget(int32_t slot) {
+int32_t pipeline::end_request(int32_t slot, const char * call) {
+    settle(slot);
+    pace_.slot_ended(slot);  // APF1: a new member when it next joins
+    const int32_t n = queued(slot);
     kept_.erase(std::remove_if(kept_.begin(), kept_.end(), [slot](const auto & k) { return k.first == slot; }),
                 kept_.end());
+    if (slot >= 0 && slot < pipe::max_writers) {
+        ended_[slot] = false;
+    }
+    if (n > 0) {
+        fprintf(stderr, "FNFL split: slot %d: %d finished step%s not delivered dropped at %s (its request ended)\n",
+                slot, n, n == 1 ? "" : "s", call);
+        fflush(stderr);
+    }
+    return n;
+}
+
+void pipeline::step_one(int32_t slot, joint_step_out & res) {
+    nvtx_range nr("pipe.step_one");
+    res = joint_step_out();
+    settle_all();
+    // APF1: a lone writer steps outside the pipeline (no reader beside it): the groups' timing is cleared, and the
+    // follower clears its own from this step's command
+    pace_.clear_all();
+    const int32_t gen[2] = { int32_t(pace_.group_gen(0)), int32_t(pace_.group_gen(1)) };
+    l_->set_pace(pace_.pause(), 0, gen);
+    if (take(slot, res)) {
+        return;
+    }
+    if (ended(slot)) {
+        res.st  = run_status::bad_request;
+        res.why = "slot " + std::to_string(slot) + ": a step after its request ended";
+        return;
+    }
+    l_->step_group(&slot, 1, &res);
+    delivered(slot, res);
+}
+
+run_status pipeline::set_pos_offset(int32_t slot, int32_t off) {
+    end_request(slot, "set_pos_offset");
+    return l_->set_pos_offset(slot, off);
+}
+
+run_status pipeline::set_sampling(int32_t slot, const request_options & o) {
+    nvtx_range nr("pipe.set_sampling");
+    end_request(slot, "set_sampling");
+    return l_->set_sampling(slot, o);
+}
+
+run_status pipeline::prefill(int32_t                           slot,
+                             const int32_t *                   tokens,
+                             int32_t                           n_tokens,
+                             int32_t                           n_reuse,
+                             int32_t &                         n_processed,
+                             const std::vector<prompt_image> * images) {
+    nvtx_range nr("pipe.prefill");
+    end_request(slot, "prefill");
+    return l_->prefill(slot, tokens, n_tokens, n_reuse, n_processed, images);
+}
+
+int32_t pipeline::read_begin(int32_t                           slot,
+                             const int32_t *                   tokens,
+                             int32_t                           n_tokens,
+                             int32_t                           n_reuse,
+                             int32_t &                         n_processed,
+                             const std::vector<prompt_image> * images) {
+    end_request(slot, "read_begin");
+    return l_->read_begin(slot, tokens, n_tokens, n_reuse, n_processed, images);
+}
+
+run_status pipeline::truncate(int32_t slot, int32_t n_keep) {
+    nvtx_range nr("pipe.truncate");
+    end_request(slot, "truncate");
+    return l_->truncate(slot, n_keep);
+}
+
+run_status pipeline::release_slot(int32_t slot) {
+    end_request(slot, "release");
+    return l_->release_slot(slot);
 }
 
 bool pipeline::in_flight(int32_t slot) const {
@@ -1598,8 +2075,10 @@ bool follower::init(engine & e, port & p, crossing & x, std::string & err) {
 }
 
 bool follower::reply(uint32_t seq, const ack & a) {
+    // sent from a heap copy its send keeps: the caller's record never meets the transport
+    auto          r = std::make_shared<ack>(a);
     std::string   e;
-    const int32_t op = p_->send(ack_tag(seq), &a, sizeof(a), e);
+    const int32_t op = p_->send(ack_tag(seq), r.get(), sizeof(*r), r, e);
     return op >= 0 && p_->wait(op, e, ctrl_timeout_s);
 }
 
@@ -1618,6 +2097,7 @@ void follower::discard(int32_t slot) {
 }
 
 void follower::next_of(const std::vector<int32_t> & slots, std::vector<pre> & out, std::vector<std::string> & why) {
+    nvtx_range nr("follower.next");
     out.assign(slots.size(), pre());
     why.assign(slots.size(), std::string());
     std::vector<uint64_t> r0(slots.size(), 0);
@@ -1647,7 +2127,7 @@ void follower::next_of(const std::vector<int32_t> & slots, std::vector<pre> & ou
     }
     joint_frame * jf      = e_->split_joint();
     size_t        drafted = 0;  // the lanes the joint draft took (from the front of lanes)
-    if (lanes.size() >= 2 && jf != nullptr) {
+    if (lanes.size() >= 2 && jf != nullptr && !joint_draft_.off) {
         target * dt[fn::xchg::max_lanes] = {};
         for (size_t q = 0; q < lanes.size() && q < size_t(fn::xchg::max_lanes); ++q) {
             dt[q] = &e_->test_target(slots[size_t(lanes[q])]);
@@ -1675,7 +2155,7 @@ void follower::next_of(const std::vector<int32_t> & slots, std::vector<pre> & ou
                 }
                 drafted = size_t(nm);
             } else {
-                fprintf(stderr, "FNFL joint: %s; these slots draft alone\n", derr.c_str());
+                joint_draft_.refuse("FNFL joint", derr, jf->capture_failed(), "these slots draft alone");
             }
         }
     }
@@ -1728,15 +2208,21 @@ void follower::forced_group(const ctrl & c, uint32_t seq) {
         out[size_t(k)].slot = m.slot;
         ok = m.slot >= 0 && m.slot < e_->n_slots() && m.rows == rows && m.kind == int32_t(mkind::forced);
         for (int32_t card = 0; card < 2 && ok; ++card) {
+            uint8_t * q = cf.stage_buf[size_t(m.slot)][size_t(card)];
+            life::reuse(q, size_t(model::stage_bytes(rows)), "boundary buffer");
             const int32_t op =
-                p_->recv(boundary_tag(c.group, seq, card, m.slot), cf.stage_buf[size_t(m.slot)][size_t(card)],
-                         size_t(model::stage_bytes(rows)), e);
-            ops.push_back(op);
+                p_->recv(boundary_tag(c.group, seq, card, m.slot), q, size_t(model::stage_bytes(rows)), e);
             ok = op >= 0;
+            if (ok) {
+                ops.push_back(op);
+            }
         }
     }
-    for (int32_t op : ops) {
-        ok = ok && p_->wait(op, e, step_timeout_s);
+    // every boundary's receive waited, or (a failure) retired: none writes the slot's buffer later
+    if (!ok) {
+        p_->retire(ops.data(), int32_t(ops.size()));
+    } else {
+        ok = wait_all(*p_, ops, step_timeout_s, e);
     }
     std::vector<target *> tt;
     for (int32_t k = 0; k < n && ok; ++k) {
@@ -1774,7 +2260,7 @@ void follower::forced_group(const ctrl & c, uint32_t seq) {
         if (!fine[size_t(k)]) {
             set_why(o.why, sizeof o.why, "forced: " + why[size_t(k)]);
         }
-        auto lg = std::make_unique<std::vector<float>>(size_t(2) * size_t(rows) * size_t(VC), 0.0f);
+        auto lg = std::make_shared<std::vector<float>>(size_t(2) * size_t(rows) * size_t(VC), 0.0f);
         if (fine[size_t(k)]) {
             target & t = *tt[size_t(k)];
             for (int32_t card = 0; card < 2; ++card) {
@@ -1786,11 +2272,12 @@ void follower::forced_group(const ctrl & c, uint32_t seq) {
                 }
             }
         }
-        outs_.push_back(std::make_unique<step_out>(o));
-        out_ops_.push_back(p_->send(step_tag(c.group, seq, c.m[k].slot), outs_.back().get(), sizeof(step_out), e));
-        lgs_.push_back(std::move(lg));
-        out_ops_.push_back(
-            p_->send(logits_tag(c.group, seq, c.m[k].slot), lgs_.back()->data(), lgs_.back()->size() * 4, e));
+        // each record kept by its send until the send's end
+        auto rec = std::make_shared<step_out>(o);
+        outs_.push_back(rec);
+        out_ops_.push_back(p_->send(step_tag(c.group, seq, c.m[k].slot), rec.get(), sizeof(step_out), rec, e));
+        lgs_.push_back(lg);
+        out_ops_.push_back(p_->send(logits_tag(c.group, seq, c.m[k].slot), lg->data(), lg->size() * 4, lg, e));
     }
 }
 
@@ -1800,7 +2287,11 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
         forced_group(c, seq);
         return;
     }
+    nvtx_range             nr("follower.step_group");
     const auto             t0 = clk::now();
+    for (int32_t k = 0; k < n; ++k) {
+        fn::xchg::slow::writer(c.m[k].slot, true);  // SSF1: the slow trace's gate
+    }
     const engine_config &  cf = e_->config();
     std::vector<step_out>  out(static_cast<size_t>(n));
     std::vector<step_info> s(static_cast<size_t>(n));
@@ -1809,6 +2300,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
     std::string            e;
     // the members' boundaries
     std::vector<int32_t>   ops;
+    bool                   submitted = true;
     for (int32_t k = 0; k < n; ++k) {
         const member & m     = c.m[k];
         out[size_t(k)].slot  = m.slot;
@@ -1817,16 +2309,25 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
         if (m.kind == int32_t(mkind::begin) || malformed[size_t(k)]) {
             continue;
         }
-        for (int32_t card = 0; card < 2; ++card) {
+        for (int32_t card = 0; card < 2 && submitted; ++card) {
+            // the slot's buffer: its previous group's rounds ended (this follower runs them before answering)
+            uint8_t * q = cf.stage_buf[size_t(m.slot)][size_t(card)];
+            life::reuse(q, size_t(model::stage_bytes(m.rows)), "boundary buffer");
             const int32_t op =
-                p_->recv(boundary_tag(c.group, seq, card, m.slot), cf.stage_buf[size_t(m.slot)][size_t(card)],
-                         size_t(model::stage_bytes(m.rows)), e);
-            ops.push_back(op);
+                p_->recv(boundary_tag(c.group, seq, card, m.slot), q, size_t(model::stage_bytes(m.rows)), e);
+            submitted = op >= 0;
+            if (submitted) {
+                ops.push_back(op);
+            }
         }
     }
-    bool have = true;
-    for (int32_t op : ops) {
-        have = have && op >= 0 && p_->wait(op, e, step_timeout_s);
+    // every boundary's receive waited, or (a failure) retired: none writes a slot's buffer later
+    bool have = submitted;
+    if (!submitted) {
+        p_->retire(ops.data(), int32_t(ops.size()));
+    } else {
+        nvtx_range nw("follower.boundary_wait");
+        have = wait_all(*p_, ops, step_timeout_s, e);
     }
     trace("follower", "step group " + std::to_string(c.group) + ": boundaries " + (have ? "in" : "failed: " + e));
     const auto fail_member = [&](int32_t k, run_status st, const std::string & why) {
@@ -1834,6 +2335,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
         set_why(out[size_t(k)].why, sizeof out[size_t(k)].why, why);
         failed[size_t(k)] = true;
     };
+    nvtx_phase ph("follower.enter");
     for (int32_t k = 0; k < n; ++k) {
         const member & m = c.m[k];
         if (malformed[size_t(k)]) {
@@ -1853,6 +2355,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
         s[size_t(k)].n_before   = e_->test_target(m.slot).slot().n;
         out[size_t(k)].n_before = s[size_t(k)].n_before;
     }
+    ph.next("follower.rounds");
     // the rounds: the begins (the bootstrap), the generates, the verifies (the group's joint lanes together)
     std::vector<int32_t> lanes;
     for (int32_t k = 0; k < n; ++k) {
@@ -1864,7 +2367,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
         if (m.kind == int32_t(mkind::begin)) {
             if (t.slot().u == 0) {
                 std::string why;
-                const bool  ok = runtime::step(t, b[size_t(k)], cf.spec_d, cf.eog, s[size_t(k)], why);
+                const bool  ok = runtime::step(t, b[size_t(k)], cf.spec_d, e_->eog(m.slot), s[size_t(k)], why);
                 if (!ok) {
                     fail_member(k, run_status::error, "bootstrap: " + why);
                     continue;
@@ -1887,7 +2390,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
             si.out[0]                   = r.out[0];
             si.waits                    = 1;
             si.to_one_s                 = since(t0);
-            si.end                      = is_eog(cf.eog, r.out[0]);
+            si.end                      = is_eog(e_->eog(m.slot), r.out[0]);
             si.wall_s                   = since(t0);
             out[size_t(k)].round_n_out  = 1;
             out[size_t(k)].round_out[0] = r.out[0];
@@ -1972,7 +2475,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
             o.round_out[j] = r.out[j];
         }
         std::string why;
-        if (!step_cut(t, cf.eog, r, t0, s[size_t(k)], why)) {
+        if (!step_cut(t, e_->eog(c.m[k].slot), r, t0, s[size_t(k)], why)) {
             fail_member(k, run_status::error, "cut: " + why);
             continue;
         }
@@ -1985,7 +2488,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
     }
     std::vector<round_result> cr(static_cast<size_t>(n));
     std::vector<bool>         caught(size_t(n), false);
-    if (cm.size() >= 2 && jf != nullptr) {
+    if (cm.size() >= 2 && jf != nullptr && !joint_catchup_.off) {
         target *      ct[fn::xchg::max_lanes]   = {};
         int32_t       rows[fn::xchg::max_lanes] = {};
         const int32_t nc                        = int32_t(std::min<size_t>(cm.size(), size_t(fn::xchg::max_lanes)));
@@ -2008,7 +2511,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
                     caught[size_t(k)] = true;
                 }
             } else {
-                fprintf(stderr, "FNFL joint: %s; these slots catch up alone\n", cerr.c_str());
+                joint_catchup_.refuse("FNFL joint", cerr, jf->capture_failed(), "these slots catch up alone");
             }
         }
     }
@@ -2021,9 +2524,10 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
             fail_member(k, run_status::error, "catch-up: " + why);
             continue;
         }
-        step_caught(cf.eog, cr[size_t(k)], t0, s[size_t(k)]);
+        step_caught(e_->eog(c.m[k].slot), cr[size_t(k)], t0, s[size_t(k)]);
         ran[size_t(k)] = true;
     }
+    ph.next("follower.leave");
     // every member's step recorded (the back's request lines), then the next steps' drafts
     std::vector<int32_t> next_slots, next_idx;
     for (int32_t k = 0; k < n; ++k) {
@@ -2080,6 +2584,7 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
             next_idx.push_back(k);
         }
     }
+    ph.next("follower.drafts");
     trace("follower", "step group " + std::to_string(c.group) + ": rounds done; the next drafts");
     std::vector<pre>         nx;
     std::vector<std::string> nwhy;
@@ -2099,21 +2604,92 @@ void follower::step_group(const ctrl & c, uint32_t seq) {
             std::copy(nx[i].prop, nx[i].prop + 4, o.next_prop);
         }
     }
-    // the answers (each record lives until its send completes: the next command waits for them)
+    // the answers (each record kept by its send until the send's end; the next command waits for them)
+    ph.next("follower.answer");
     for (int32_t k = 0; k < n; ++k) {
-        outs_.push_back(std::make_unique<step_out>(out[size_t(k)]));
-        const int32_t op = p_->send(step_tag(c.group, seq, c.m[k].slot), outs_.back().get(), sizeof(step_out), e);
-        out_ops_.push_back(op);
+        auto rec     = std::make_shared<step_out>(out[size_t(k)]);
+        rec->back_ms = float(since(t0) * 1e3);  // APF1: the group's back stage, its input in to its answers
+        outs_.push_back(rec);
+        out_ops_.push_back(p_->send(step_tag(c.group, seq, c.m[k].slot), rec.get(), sizeof(step_out), rec, e));
+        // SSF1: a step that ended its generation (or failed) ends the slot's writing for the trace's gate (a lone
+        // slot gets no release command)
+        if (rec->end != 0 || rec->status != int32_t(run_status::ok)) {
+            fn::xchg::slow::writer(rec->slot, false);
+        }
     }
 }
 
-void follower::read_group() {
-    iread & r = reads_.front();
+void follower::read_answer(const iread & r, ack & a) {
+    // MUP2 piece 4: the read's units account on this box so far (APF1: with its pacing)
+    read_info ri;
+    if (e_->get_read_info(r.slot, ri) && ri.units_run > 0) {
+        a.acct[0]   = ri.unit_ms;
+        a.acct[1]   = ri.floor_ms;
+        a.acct[2]   = ri.budget_n > 0 ? ri.budget_ms_sum / ri.budget_n : -1.0;
+        a.acct[3]   = ri.pause_ms;
+        a.acct[4]   = ri.service_s * 1e3;
+        a.acct_i[0] = static_cast<int32_t>(std::min<int64_t>(ri.units_run, INT32_MAX));
+        a.acct_i[1] = ri.unit_steps;
+        a.acct_i[2] = ri.most_units;
+        a.acct_i[3] = ri.floor_units;
+        a.acct_i[4] = ri.piece_min;
+        a.acct_i[5] = ri.piece_max;
+        a.acct_i[6] = ri.budget_misses;
+        a.acct_i[7] = ri.below_floor ? 1 : 0;
+        a.acct_i[8] = ri.budget_zero;
+        a.acct_i[9] = ri.budget_unknown;
+        pace_to_ack(ri.pace_ns, a);
+    }
+}
+
+void follower::poll_ahead() {
+    // PRD1 item 11: the next chunk's pieces posted once its header landed, when no other read's chunk is copied in
+    // before it: the queue's first chunk is the same slot's, and it is that chunk (not begun) or the next is too
+    const int32_t s = x_->ahead_slot();
+    if (s < 0 || reads_.empty() || reads_.front().slot != s) {
+        return;
+    }
+    read_info ri;
+    e_->get_read_info(s, ri);
+    const bool  next = !ri.in_chunk || (reads_.size() > 1 && reads_[1].slot == s);
+    std::string e;
+    if (!x_->poll(next, e)) {
+        trace("follower", "crossing ahead: " + e);  // in() takes the crossing afresh and reports its failure
+    }
+}
+
+void follower::read_group(bool idle) {
+    if (test_hold_reads) {
+        return;  // TEST: held (commands still run)
+    }
+    nvtx_range nr("follower.read_group");
+    poll_ahead();
+    iread &    r = reads_.front();
+    slow_scope sl{ "follower read group" };
+    sl.slot = r.slot;
+
+    // APF1: the read work this box inserts between the writers' back stages (each group's account until its next
+    // completion here: an overrun's reason), by its kind as the step ends
+    struct charge {
+        follower *        f;
+        double            t0;
+        pace::read_kind * k;
+
+        ~charge() { f->pace_.read_ran(t0, pace::clock_ms(), *k); }
+    };
+
+    pace::read_kind kind = idle ? pace::read_kind::idle : r.lone ? pace::read_kind::small : pace::read_kind::budgeted;
+    charge          ch{ this, pace::clock_ms(), &kind };
     if (r.cancel && !r.cancel_sent) {
         // the chunks the front finished before its cancel took effect (their crossings sent) run here first, then
         // the cancel: both boxes keep the same chunks
         read_info  ri;
         const bool live = e_->get_read_info(r.slot, ri) && ri.live;
+        // PRD1 item 14: the back's job stops after the front's chunks, at the last one's end too (cancelled, the
+        // chunk kept, no handoff: both boxes end the read alike)
+        if (live) {
+            e_->read_cancel_after(r.slot, r.want);
+        }
         if (live && (x_->taken(r.slot) < r.want || ri.in_chunk)) {
             const read_status st =
                 e_->read_step(r.slot, r.lone ? fn::n_layer : 1, r.lone ? read_mode::lone : read_mode::writers);
@@ -2121,12 +2697,17 @@ void follower::read_group() {
                 return;  // the next turn goes on
             }
             ack a;
-            // the read ended on the back with the front's chunks (done: they were all of them): the cancel's end
+            // the read ended on the back with the front's chunks: the cancel's end (PRD1 item 14: read_cancel_after
+            // stops the last chunk too, so done does not come; mapped as before should it)
             a.status = int32_t(st == read_status::done ? read_status::cancelled : st);
             if (st == read_status::error) {
                 set_why(a.why, sizeof a.why, e_->error());
             }
+            read_answer(r, a);
             const uint32_t seq = r.seq;
+            x_->retire_ahead(r.slot);  // PRD1 item 11: the read ended
+            test_note('P');
+            test_note(char('0' + r.slot));
             reads_.pop_front();
             reply(seq, a);
             return;
@@ -2134,13 +2715,34 @@ void follower::read_group() {
         e_->read_cancel(r.slot);
         r.cancel_sent = true;
     }
+    // APF1: this box's budget, its writer-pause deadline (PRD1 item 7: a small read comes as a = 0, whole; the back
+    // has no small rule of its own). The idle drain is the floor, unbudgeted
+    read_budget rb;
+    rb.floor  = idle;
+    rb.lagged = idle;  // PRD1 item 8: the idle drain launches a unit with no join (read_settle at a command)
+    if (!idle && r.budgeted && !r.lone) {
+        rb.pace_before         = pace_.totals();
+        const pace::decision d = pace_.decide(pace::clock_ms());
+        rb.budget_ms           = d.budget_ms;
+        rb.known               = d.known;
+        rb.pause_ms            = pace_.pause();
+        rb.paced               = true;
+        rb.pace_after          = pace_.totals();
+    }
     read_status st = read_status::yielded;
     if (r.lone) {
         while (st == read_status::yielded || (r.cancel && st == read_status::chunk_done)) {
             st = e_->read_step(r.slot, fn::n_layer, read_mode::lone);
         }
     } else {
-        st = e_->read_step(r.slot, 1, read_mode::writers);
+        st = e_->read_step(r.slot, 1, read_mode::writers, r.budgeted ? &rb : nullptr);
+        if (st != read_status::error) {
+            test_note('L');
+        }
+        read_info ri;
+        if (!idle && r.budgeted && e_->get_read_info(r.slot, ri) && ri.last_minimum) {
+            kind = pace::read_kind::minimum;  // only the progress unit ran, already past the budget
+        }
         if (st == read_status::yielded || (r.cancel && st == read_status::chunk_done)) {
             return;  // the chunk (or the cancel's) goes on at the next turn
         }
@@ -2150,19 +2752,64 @@ void follower::read_group() {
     if (st == read_status::error) {
         set_why(a.why, sizeof a.why, e_->error());
     }
+    read_answer(r, a);
     const uint32_t seq = r.seq;
+    if (st != read_status::chunk_done) {
+        x_->retire_ahead(r.slot);  // PRD1 item 11: the read ended
+        test_note('P');
+        test_note(char('0' + r.slot));
+    }
     reads_.pop_front();
     reply(seq, a);
+}
+
+void follower::test_note(char c) {
+    if (test_order) {
+        std::lock_guard<std::mutex> g(test_mu_);
+        test_log_ += c;
+    }
+}
+
+std::string follower::test_log() const {
+    std::lock_guard<std::mutex> g(test_mu_);
+    return test_log_;
+}
+
+bool follower::read_settle() {
+    if (!e_->read_draining()) {
+        return true;
+    }
+    const double t0    = pace::clock_ms();
+    test_in_flight_max = std::max(test_in_flight_max.load(), e_->read_in_flight());
+    ++test_settles;
+    const bool ok = e_->read_settle();
+    pace_.read_ran(t0, pace::clock_ms(), pace::read_kind::idle);  // APF1: the drain's join, before the command
+    if (!ok && !reads_.empty()) {
+        iread & r = reads_.front();
+        ack     a;
+        a.status = int32_t(read_status::error);
+        set_why(a.why, sizeof a.why, e_->error());
+        read_answer(r, a);
+        const uint32_t seq = r.seq;
+        x_->retire_ahead(r.slot);
+        test_note('P');
+        test_note(char('0' + r.slot));
+        reads_.pop_front();
+        reply(seq, a);
+    }
+    return ok;
 }
 
 bool follower::serve(std::string & why) {
     uint32_t             seq = 1;
     std::vector<int32_t> tokens;
     for (;;) {
-        // the previous answers' sends complete before their records go
-        for (int32_t op : out_ops_) {
+        // the previous answers' sends end before their records go (a failure retires the rest first)
+        {
+            nvtx_range  nw("follower.out_wait");
             std::string e;
-            if (op >= 0 && !p_->wait(op, e, step_timeout_s)) {
+            if (!wait_all(*p_, out_ops_, step_timeout_s, e)) {
+                out_ops_.clear();
                 why = e;
                 return false;
             }
@@ -2170,33 +2817,45 @@ bool follower::serve(std::string & why) {
         out_ops_.clear();
         outs_.clear();
         lgs_.clear();
-        ctrl        c;
+        // the command's record on the heap, kept by its receive (a given-up wait whose receive matched still lands
+        // in it, never in a reused frame)
+        auto        cr = std::make_shared<ctrl>();
+        ctrl &      c  = *cr;
         std::string e;
         bool        got = false;
         int32_t     cop = -1;
+        nvtx_phase  ph("follower.cmd_wait");  // then the command (until the end of this turn)
         while (!got) {
             if (cop < 0) {
-                cop = p_->recv(ctrl_tag(seq, 0), &c, sizeof(c), e);
+                cop = p_->recv(ctrl_tag(seq, 0), cr.get(), sizeof(c), cr, e);
                 if (cop < 0) {
                     why = e;
                     return false;
                 }
             }
-            if (!reads_.empty()) {
-                // read chunks wait: a layer group of one while no command has come
-                bool done = false;
-                if (!p_->test(cop, done, e)) {
-                    why = e;
-                    return false;
+            const bool waiting = !reads_.empty();
+            bool       done    = false;
+            if (waiting && !test_hold_reads && !p_->test(cop, done, e)) {
+                why = e;
+                return false;
+            }
+            // APF1 (pace::back_choice, host-checked): a command that came runs first; with none, one idle-drain unit
+            // while reads wait; else a blocking wait for the next command
+            const pace::back_next nx = pace::back_choice(done, waiting, test_hold_reads);
+            if (nx == pace::back_next::command) {
+                got = true;
+                read_settle();  // PRD1 item 8: the drain's units joined before the command, charged to the read
+                if (c.op == int32_t(op::step_group)) {
+                    test_note('C');
                 }
-                if (done) {
-                    got = true;
-                } else if (p_->lost()) {
+                continue;
+            }
+            if (nx == pace::back_next::idle_unit) {
+                if (p_->lost()) {
                     why = "the leader was lost";
                     return false;
-                } else {
-                    read_group();
                 }
+                read_group(true);  // MUP2: no command waits (the floor): one unit
                 continue;
             }
             got = p_->wait(cop, e, idle_poll_s);
@@ -2205,16 +2864,28 @@ bool follower::serve(std::string & why) {
                 why = e;
                 return false;
             }
+            if (!got) {
+                // SSF1: a whole idle wait with no command: no slot is writing now (a request can end with no slot
+                // command, e.g. a lone slot's stop string), so a stale gate prints at most this one line
+                fn::xchg::slow::set_writers(0);
+            }
         }
+        ph.next("follower.command");
+        slow_scope sc{ "follower command" };
+        sc.seq   = seq;
+        sc.op    = c.op;
+        sc.slot  = c.slot;
+        sc.group = c.op == int32_t(op::step_group) ? c.group : -1;
         trace("follower",
               "command " + std::to_string(seq) + " op " + std::to_string(c.op) + " slot " + std::to_string(c.slot));
         if (c.n_tokens > 0) {
-            tokens.assign(size_t(c.n_tokens), 0);
-            const int32_t op = p_->recv(ctrl_tag(seq, 1), tokens.data(), size_t(c.n_tokens) * 4, e);
+            auto          tr = std::make_shared<std::vector<int32_t>>(size_t(c.n_tokens), 0);  // kept by its receive
+            const int32_t op = p_->recv(ctrl_tag(seq, 1), tr->data(), size_t(c.n_tokens) * 4, tr, e);
             if (op < 0 || !p_->wait(op, e, ctrl_timeout_s)) {
                 why = e;
                 return false;
             }
+            tokens = *tr;
         }
         ack        a;
         const auto status = [&](run_status st) {
@@ -2224,9 +2895,15 @@ bool follower::serve(std::string & why) {
             }
         };
         const op   o = static_cast<op>(c.op);
+        // SSF1: the slow trace's gate: a slot generates from its first step group to its next request's command
+        if (o == op::set_sampling || o == op::prefill || o == op::read_begin || o == op::truncate ||
+            o == op::release_slot || o == op::test_prompt || o == op::pos_offset) {
+            fn::xchg::slow::writer(c.slot, false);
+            pace_.slot_ended(c.slot);  // APF1: the slot's next request is a new member
+        }
         // a step group names its slots in its members (checked by split_enter); the others name one, or none
-        const bool slotless =
-            o == op::pool || o == op::bye || o == op::set_draft || o == op::step_group || o == op::reconfigure;
+        const bool slotless = o == op::pool || o == op::bye || o == op::set_draft || o == op::step_group ||
+                              o == op::reconfigure || o == op::test_route;
         if (c.slot >= e_->n_slots() || (c.slot < 0 && !slotless)) {
             a.status = int32_t(run_status::bad_request);
             set_why(a.why, sizeof a.why, "slot " + std::to_string(c.slot));
@@ -2243,28 +2920,51 @@ bool follower::serve(std::string & why) {
                         ro.sampling.min_p = c.min_p;
                         ro.max_tokens     = c.max_tokens;
                         ro.n_ctx          = c.n_ctx;
+                        ro.ignore_eos     = c.ignore_eos != 0;
                         discard(c.slot);
                         status(e_->set_sampling(c.slot, ro));
                         break;
                     }
                 case op::prefill:
                     {
-                        int32_t np = 0;
+                        int32_t                   np = 0, nt = 0;
+                        std::vector<prompt_image> im;  // VIS1: the spans after the tokens
+                        if (c.graphs >= 0) {
+                            model::prompt_graphs(c.graphs != 0);  // APF2: the front's switch
+                        }
                         x_->expect(c.slot, c.base);
                         discard(c.slot);
-                        status(e_->prefill(c.slot, tokens.data(), c.n_tokens, c.a, np));
+                        if (!payload_images(tokens, c.n_tokens, c.b, nt, im)) {
+                            a.status = int32_t(run_status::bad_request);
+                            set_why(a.why, sizeof a.why, "prefill: the command's images do not add up");
+                            break;
+                        }
+                        status(e_->prefill(c.slot, tokens.data(), nt, c.a, np, {}, im.empty() ? nullptr : &im));
                         a.a = np;
                         break;
                     }
                 case op::read_begin:
                     {
-                        int32_t np = 0;
+                        int32_t                   np = 0, nt = 0;
+                        std::vector<prompt_image> im;  // VIS1: the spans after the tokens
+                        if (c.graphs >= 0) {
+                            model::prompt_graphs(c.graphs != 0);  // APF2: the front's switch
+                        }
                         x_->expect(c.slot, c.base);
                         discard(c.slot);
-                        a.status = e_->read_begin(c.slot, tokens.data(), c.n_tokens, c.a, np);
+                        if (!payload_images(tokens, c.n_tokens, c.b, nt, im)) {
+                            a.status = -1;
+                            set_why(a.why, sizeof a.why, "read_begin: the command's images do not add up");
+                            break;
+                        }
+                        a.status = e_->read_begin(c.slot, tokens.data(), nt, c.a, np, im.empty() ? nullptr : &im);
                         a.a      = np;
                         if (a.status != 0) {
                             set_why(a.why, sizeof a.why, e_->error());
+                        } else {
+                            read_info ri;  // PRD1 item 11: the read's plan, for the crossings taken ahead
+                            e_->get_read_info(c.slot, ri);
+                            x_->plan(c.slot, ri.chunks);
                         }
                         break;
                     }
@@ -2273,11 +2973,15 @@ bool follower::serve(std::string & why) {
                         // a back chunk (c.a 0: whole, in the lone geometry; 1: interleaved), queued behind the earlier
                         // ones and answered at its end (read_group)
                         iread r;
-                        r.slot   = c.slot;
-                        r.seq    = seq;
-                        r.lone   = c.a == 0;
-                        r.cancel = c.b != 0;
-                        r.want   = c.c;
+                        r.slot     = c.slot;
+                        r.seq      = seq;
+                        r.lone     = c.a == 0;
+                        r.cancel   = c.b != 0;
+                        r.want     = c.c;
+                        r.budgeted = c.a == 2;  // MUP2: units under this box's budget (APF1: its deadline)
+                        if (r.budgeted && pace::pause_valid(int64_t(c.pause_ms))) {
+                            pace_.set_pause(int32_t(c.pause_ms));  // APF1: the next decision takes it
+                        }
                         reads_.push_back(r);
                         if (r.lone && reads_.size() == 1) {
                             read_group();  // a lone chunk with nothing before it: at once
@@ -2296,13 +3000,34 @@ bool follower::serve(std::string & why) {
                         break;
                     }
                 case op::truncate:
-                    discard(c.slot);
-                    status(e_->truncate(c.slot, c.a));
-                    if (c.b == 0) {
-                        e_->to_restore(c.slot);
+                    {
+                        // TTTS8: the checkpoints change on both boxes together (leader::truncate)
+                        discard(c.slot);
+                        prefiller &   pf  = e_->prefill_driver();
+                        const int32_t had = pf.book().count_owner(c.slot);
+                        status(e_->truncate(c.slot, c.a));
+                        if (c.slot >= 0 && test_fail_cut.load() == c.slot) {
+                            test_fail_cut.store(-1);
+                            pf.drop_owner(c.slot);
+                            e_->to_restore(c.slot);
+                            fprintf(stderr, "FNFL split: slot %d: truncate to %d: TEST: the follower's cut failed\n",
+                                    c.slot, c.a);
+                        }
+                        a.b = had > 0 && pf.book().count_owner(c.slot) == 0 ? 1 : 0;
+                        if (c.c != 0 && a.b == 0 && had > 0) {
+                            pf.drop_owner(c.slot);
+                            fprintf(
+                                stderr,
+                                "FNFL split: slot %d: truncate to %d: the leader dropped the slot's checkpoints; the "
+                                "follower drops its %d too\n",
+                                c.slot, c.a, had);
+                        }
+                        if (c.b == 0) {
+                            e_->to_restore(c.slot);
+                        }
+                        a.a = e_->in_place(c.slot) ? 1 : 0;
+                        break;
                     }
-                    a.a = e_->in_place(c.slot) ? 1 : 0;
-                    break;
                 case op::release_slot:
                     discard(c.slot);
                     status(e_->release_slot(c.slot));
@@ -2318,10 +3043,32 @@ bool follower::serve(std::string & why) {
                         break;
                     }
                 case op::step_group:
-                    step_group(c, seq);
+                    {
+                        // APF1: the group's back stage on this box's book: its input in (the command, its drain
+                        // joined), its answers sent; P, the front's groups and the front's service carried with it.
+                        // The drive's forced groups are no writers
+                        const bool    forced = c.n_members > 0 && c.m[0].kind == int32_t(mkind::forced);
+                        const double  t0     = pace::clock_ms();
+                        const int32_t n      = std::clamp(c.n_members, 0, max_members);
+                        if (!forced) {
+                            if (pace::pause_valid(int64_t(c.pause_ms))) {
+                                pace_.set_pause(int32_t(c.pause_ms));
+                            }
+                            pace_.live_groups(c.live, c.gen, t0);
+                        }
+                        step_group(c, seq);
+                        if (!forced && c.group >= 0 && c.group < 2) {
+                            int32_t ms[max_members] = {};
+                            for (int32_t k = 0; k < n; ++k) {
+                                ms[k] = c.m[k].slot;
+                            }
+                            pace_.back_ran(c.group, c.gen[c.group], ms, n, t0, pace::clock_ms(), c.front_ms);
+                        }
+                    }
                     ++seq;
+                    test_note('Q');
                     if (!reads_.empty()) {
-                        read_group();  // a read layer group after each step group's back half
+                        read_group();  // read units after each step group's back half, under this box's budget
                     }
                     continue;          // answered by X-STEP
                 case op::drain:
@@ -2333,6 +3080,10 @@ bool follower::serve(std::string & why) {
                         }
                         break;
                     }
+                case op::pos_offset:
+                    discard(c.slot);  // MUP1: an early draft at the old positions is not used
+                    status(e_->set_pos_offset(c.slot, c.a));
+                    break;
                 case op::set_draft:
                     for (int32_t sl = 0; sl < int32_t(pre_.size()); ++sl) {
                         discard(sl);
@@ -2354,7 +3105,9 @@ bool follower::serve(std::string & why) {
                             return false;
                         }
                         if (pok && !probe_out_.empty()) {
-                            out_ops_.push_back(p_->send(probe_tag(seq), probe_out_.data(), probe_out_.size(), e));
+                            // sent from a heap copy its send keeps
+                            auto pr = std::make_shared<std::vector<uint8_t>>(probe_out_);
+                            out_ops_.push_back(p_->send(probe_tag(seq), pr->data(), pr->size(), pr, e));
                         }
                         ++seq;
                         continue;
@@ -2372,14 +3125,35 @@ bool follower::serve(std::string & why) {
                         }
                         break;
                     }
+                case op::test_route:
+                    {
+                        model::prompt_route_force f;
+                        f.dense  = c.a;
+                        f.hc     = c.b;
+                        f.expert = c.c;
+                        f.graph  = static_cast<int32_t>(c.base);
+                        e_->prefill_driver().test_force_route(f);
+                        model::prompt_route_collect(true);
+                        model::prompt_path::route_counts rc;
+                        uint32_t                         rungs = 0;
+                        model::prompt_route_totals(rc, rungs);
+                        for (int32_t i = 0; i < route_count_fields; ++i) {
+                            a.acct_i[i] = static_cast<int32_t>(rc.*route_fields[i]);
+                        }
+                        break;
+                    }
                 case op::test_prompt:
                     {
                         target &    t = e_->test_target(c.slot);
                         std::string te;
                         discard(c.slot);
-                        const bool tok = t.reset(te);
-                        if (tok) {
-                            t.set_prompt(c.n_tokens > 0 ? tokens : std::vector<int32_t>());
+                        const std::vector<int32_t> in  = c.n_tokens > 0 ? tokens : std::vector<int32_t>();
+                        // MUP2 (a 1): the processed tokens kept, the tokens appended
+                        const bool                 tok = c.a == 1 ? t.keep_processed(te) : t.reset(te);
+                        if (tok && c.a == 1) {
+                            t.append(in);
+                        } else if (tok) {
+                            t.set_prompt(in);
                         }
                         a.status = int32_t(tok ? run_status::ok : run_status::error);
                         if (!tok) {

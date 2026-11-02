@@ -18,7 +18,7 @@
 //   down:    out[t][r] = row r . act[t]; row r at w + r row_bytes; n = 640 columns; act[t]: the down format's
 //            activation (Q2_0: act_q, IQ4_NL and Q8_0: n / 32 block_q8_0, Q5_1: n / 32 block_q8_1)
 // Reference: experts_cpu_test.cpp (FP64 on the same quantized operands). Compiled with -mavx2 -mfma -mf16c (Strata's
-// GCC flags); Carlos's Ryzen 5 5600 has no AVX-512 or AVX-VNNI, so Strata's copies for those are not taken.
+// GCC flags); the development machine's Ryzen 5 5600 has no AVX-512 or AVX-VNNI, so Strata's copies for those are not taken.
 
 #include "fn/kernels/experts/experts.h"
 

@@ -4,6 +4,7 @@
 #include "fn/kernels/dense/dense.h"
 #include "fn/kernels/experts/experts.h"
 #include "fn/kernels/experts/grids.h"
+#include "fn/kernels/experts/profiles.h"
 #include "fn/kernels/gdn/gdn.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/ple/ple.h"
@@ -74,14 +75,22 @@ void card_extent(int32_t t, int32_t card, int64_t & rows, int64_t & cols) {
 }
 
 // the quantized formats DP2's products take (BF16 matrices are resolved as raw pointers)
+constexpr struct {
+    const char *   name;
+    fn::dense::fmt q;
+} dense_fmts[] = {
+    { "Q4_K",   fn::dense::fmt::q4_k   },
+    { "Q5_K",   fn::dense::fmt::q5_k   },
+    { "Q6_K",   fn::dense::fmt::q6_k   },
+    { "IQ4_XS", fn::dense::fmt::iq4_xs },
+    { "IQ3_S",  fn::dense::fmt::iq3_s  },
+    { "Q8_0",   fn::dense::fmt::q8_0   },
+    { "IQ4_NL", fn::dense::fmt::iq4_nl },
+    { "Q2_0",   fn::dense::fmt::q2_0   }
+};
+
 bool dense_fmt(const char * f, int32_t & out) {
-    using fn::dense::fmt;
-    const struct {
-        const char * name;
-        fmt q;
-    } map[] = {{"Q4_K", fmt::q4_k},   {"Q5_K", fmt::q5_k}, {"Q6_K", fmt::q6_k},     {"IQ4_XS", fmt::iq4_xs},
-               {"IQ3_S", fmt::iq3_s}, {"Q8_0", fmt::q8_0}, {"IQ4_NL", fmt::iq4_nl}, {"Q2_0", fmt::q2_0}};
-    for (const auto & e : map) {
+    for (const auto & e : dense_fmts) {
         if (std::strcmp(f, e.name) == 0) {
             out = static_cast<int32_t>(e.q);
             return true;
@@ -90,21 +99,50 @@ bool dense_fmt(const char * f, int32_t & out) {
     return false;
 }
 
+constexpr struct {
+    const char *     name;
+    fn::experts::fmt e;
+} expert_fmts[] = {
+    { "IQ2_XXS", fn::experts::fmt::iq2_xxs },
+    { "IQ2_XS",  fn::experts::fmt::iq2_xs  },
+    { "IQ2_S",   fn::experts::fmt::iq2_s   },
+    { "IQ3_XXS", fn::experts::fmt::iq3_xxs },
+    { "IQ3_S",   fn::experts::fmt::iq3_s   },
+    { "Q2_0",    fn::experts::fmt::q2_0    },
+    { "IQ4_NL",  fn::experts::fmt::iq4_nl  },
+    { "Q8_0",    fn::experts::fmt::q8_0    },
+    { "Q4_K",    fn::experts::fmt::q4_k    },
+    { "Q5_K",    fn::experts::fmt::q5_k    }, // TTTS2: UD-Q4_K_XL
+    { "Q5_1",    fn::experts::fmt::q5_1    }
+};
+
 bool expert_fmt(const char * f, int32_t & out) {
-    const struct {
-        const char * name;
-        fn::experts::fmt e;
-    } map[] = {{"IQ2_XXS", fn::experts::fmt::iq2_xxs}, {"IQ2_XS", fn::experts::fmt::iq2_xs},
-               {"IQ2_S", fn::experts::fmt::iq2_s},     {"IQ3_XXS", fn::experts::fmt::iq3_xxs},
-               {"IQ3_S", fn::experts::fmt::iq3_s},     {"Q2_0", fn::experts::fmt::q2_0},
-               {"IQ4_NL", fn::experts::fmt::iq4_nl},   {"Q8_0", fn::experts::fmt::q8_0}};
-    for (const auto & e : map) {
+    for (const auto & e : expert_fmts) {
         if (std::strcmp(f, e.name) == 0) {
             out = static_cast<int32_t>(e.e);
             return true;
         }
     }
     return false;
+}
+
+// a format's GGUF name, for the load's refusals
+const char * expert_fmt_name(int32_t f) {
+    for (const auto & e : expert_fmts) {
+        if (static_cast<int32_t>(e.e) == f) {
+            return e.name;
+        }
+    }
+    return "?";
+}
+
+const char * dense_fmt_name(int32_t f) {
+    for (const auto & e : dense_fmts) {
+        if (static_cast<int32_t>(e.q) == f) {
+            return e.name;
+        }
+    }
+    return "?";
 }
 
 struct finder {
@@ -131,7 +169,7 @@ struct finder {
         if (d.w == nullptr) {
             return false;
         }
-        const tensor_place & tp = tensors[idx];
+        const tensor_place & tp = m.tp(idx);
         if (tp.lay != layout::gguf || !dense_fmt(tp.format, d.fmt)) {
             err = tname(layer, t) + ": format " + tp.format + " is not a dense format the step runs";
             return false;
@@ -154,13 +192,14 @@ struct finder {
         if (w == nullptr) {
             return false;
         }
-        const tensor_place & tp = tensors[idx];
+        const tensor_place & tp   = m.tp(idx);
         int64_t rows = 0, cols = 0;
         card_extent(idx, card, rows, cols);
         if (tp.lay != layout::gguf || !expert_fmt(tp.format, f) ||
-            (f != static_cast<int32_t>(fn::experts::fmt::q2_0) &&
-             f != static_cast<int32_t>(fn::experts::fmt::iq4_nl)) ||
-            rows != D || cols != FFS) {
+            (f != static_cast<int32_t>(fn::experts::fmt::q2_0) && f != static_cast<int32_t>(fn::experts::fmt::iq4_nl) &&
+             f != static_cast<int32_t>(fn::experts::fmt::q8_0)) ||  // TTTS2: UD-Q4_K_XL's Q8_0
+            rows != D ||
+            cols != FFS) {
             err = tname(layer, t) + ": format " + tp.format + " or its card slice is not the shared down EX2 runs";
             return false;
         }
@@ -170,7 +209,16 @@ struct finder {
         }
         return true;
     }
+
+    // TTTS2: a Q8_0 target module (UD-Q4_K_XL) takes the Q8_0 forms, its BF16 inject rows the mixed layout (hc.h)
     bool hc(const char * down, const char * up, const char * norm, hc_module & h) const {
+        const int32_t di = model::find(tname(layer, down).c_str());
+        if (di >= 0 && std::strcmp(m.tp(di).format, "Q8_0") == 0) {
+            const std::string inj = std::string(down).replace(std::string(down).find("down"), 4, "inject");
+            const int32_t     ii  = model::find(tname(layer, inj.c_str()).c_str());
+            h.q8_mix              = ii >= 0 && std::strcmp(m.tp(ii).format, "BF16") == 0;
+            return hc_q8(down, up, norm, h.q8_mix ? fn::hc::w_down_mix_bytes : fn::hc::w_down_q8_bytes, h);
+        }
         h.w_down = reinterpret_cast<const uint16_t *>(ptr(down)); // BF16 bits (fn::hc layout)
         h.w_up = reinterpret_cast<const uint16_t *>(ptr(up));
         h.gamma = reinterpret_cast<const float *>(ptr(norm)); // F32 GGUF slice: [4][1280]
@@ -185,8 +233,8 @@ struct finder {
         if (h.q8_down == nullptr || h.q8_up == nullptr || h.gamma == nullptr) {
             return false;
         }
-        if (std::strcmp(tensors[di].format, "Q8_0") != 0 || tensors[di].lay != layout::hc_down ||
-            std::strcmp(tensors[ui].format, "Q8_0") != 0 || tensors[ui].lay != layout::hc_up ||
+        if (std::strcmp(m.tp(di).format, "Q8_0") != 0 || m.tp(di).lay != layout::hc_down ||
+            std::strcmp(m.tp(ui).format, "Q8_0") != 0 || m.tp(ui).lay != layout::hc_up ||
             m.regions[card][size_t(m.region_of[size_t(di)])].bytes < down_bytes ||
             m.regions[card][size_t(m.region_of[size_t(ui)])].bytes < fn::hc::w_up_q8_bytes) {
             err = tname(layer, down) + ": not in hc.h's Q8_0 layout";
@@ -328,11 +376,12 @@ bool hc_phase(card_ctx & c, const hc_module & h, int32_t set, const float * hres
         d2.hc_peer = rg.slot(1 - r, fn::xchg::msg::hc, s);
         d2.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
         d2.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
-        const bool ok = fn::hc::down2_q8(rows, {d2, h.q8_down}, c.stream);
+        const fn::hc::down2_q8_args a = { d2, h.q8_down };
+        const bool ok = h.q8_mix ? fn::hc::down2_q8_mix(rows, a, c.stream) : fn::hc::down2_q8(rows, a, c.stream);
         if (!ok) {
             return fail(err, "hc down2");
         }
-        note(c, "hc.down2");
+        note(c, h.q8_mix ? "hc.down2.mix" : "hc.down2");
         return true;
     }
     const fn::hc::up2_args u2 = {h.w_up,
@@ -474,6 +523,7 @@ fn::dense::mat bmat(const uint16_t * w, int32_t rows, float * out) {
 bool dense_launch(card_ctx & c, fn::dense::product_args a, int32_t rows, dense_site site, const char * piece,
                   std::string & err) {
     a.grids = c.dense_grids;
+    a.steps = &c.dense_steps[size_t(site)];  // TTTS6 item 2 (read with q8 only)
     std::string why;
     if (!dense_site_launch(c.dense_work, c.dense_sites, site, a, rows, c.stream, why)) {
         return fail(err, std::string(piece) + ": " + why);
@@ -569,6 +619,7 @@ bool qsa_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
         ua.rope = fn::qsa::model_rope();
         ua.ik = ws.ik;
         ua.depth = c.n_before;
+        ua.rope_off  = c.pos_off;  // MUP1 piece 5
         ua.rows = rows;
         ua.max_cells = st.n_cells;
         if (c.kv != nullptr) { // ME6: the host-backed tier's key window (kv_tier.h)
@@ -584,6 +635,7 @@ bool qsa_body(card_ctx & c, const layer_weights & w, const layer_state & st, int
         sa.q = ws.iq;
         sa.q_norm = w.idx_q_norm;
         sa.depth = c.n_before;
+        sa.rope_off  = c.pos_off;
         sa.max_cells = st.n_cells;
         sa.rope = fn::qsa::model_rope();
         sa.ws = fn::qsa::carve(c.qsa_ws);
@@ -827,10 +879,18 @@ bool dense_run(card_ctx & c, fn::dense::product_args a, int32_t rows, dense_site
     return dense_launch(c, a, rows, site, piece, err);
 }
 
-bool hc_sublayer_lanes(card_ctx * const c[], int32_t lanes, const hc_module & h, int32_t set, const layer_input in[],
-                       const use_counters & u, int32_t part, uint32_t * runs, std::string & err) {
-    if (lanes < 2 || lanes > fn::xchg::max_lanes || h.q8_down == nullptr || runs == nullptr) {
-        return fail(err, "hc lanes: 2 .. 4 lanes of a Q8_0 sublayer with run counters");
+bool hc_sublayer_lanes(card_ctx * const     c[],
+                       int32_t              lanes,
+                       int32_t              rows,
+                       const hc_module &    h,
+                       int32_t              set,
+                       const layer_input    in[],
+                       const use_counters & u,
+                       int32_t              part,
+                       uint32_t *           runs,
+                       std::string &        err) {
+    if (lanes < 2 || lanes > fn::xchg::max_lanes || rows < 2 || rows > layer_max_rows || h.q8_down == nullptr) {
+        return fail(err, "hc lanes: 2 .. 4 lanes of a Q8_0 sublayer at 2 .. 5 rows");
     }
     const int64_t n = u.sub;
     const int32_t s = hc_slot(u, n);
@@ -850,25 +910,26 @@ bool hc_sublayer_lanes(card_ctx * const c[], int32_t lanes, const hc_module & h,
         d2.hc_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hc, s_prev) : nullptr;
         d2.hmix_reset = s_prev >= 0 ? rg.slot(r, fn::xchg::msg::hmix, s_prev) : nullptr;
         d[k] = {d2, h.q8_down};
-        const fn::hc::up2_args u2 = {h.w_up,
-                                     ck.ws.mom[set],
-                                     rg.slot(r, fn::xchg::msg::hc, s),
-                                     ck.ws.x[set],
-                                     h.gamma,
-                                     ck.ws.inject[set],
-                                     rg.slot(r, fn::xchg::msg::hmix, s),
-                                     rg.slot(1 - r, fn::xchg::msg::hmix, s),
-                                     runs + int64_t(k) * fn::hc::n_runs_card,
-                                     rg.err(r),
-                                     r};
+        const fn::hc::up2_args u2 = { h.w_up,
+                                      ck.ws.mom[set],
+                                      rg.slot(r, fn::xchg::msg::hc, s),
+                                      ck.ws.x[set],
+                                      h.gamma,
+                                      ck.ws.inject[set],
+                                      rg.slot(r, fn::xchg::msg::hmix, s),
+                                      rg.slot(1 - r, fn::xchg::msg::hmix, s),
+                                      runs != nullptr ? runs + int64_t(k) * fn::hc::n_runs_card : ck.ws.hc_runs,
+                                      rg.err(r),
+                                      r };
         up[k] = {u2, h.q8_up};
     }
-    const bool ok =
-        part == 0 ? fn::hc::down2_q8_lanes(lanes, d, c[0]->stream) : fn::hc::up2_q8_lanes(lanes, up, c[0]->stream);
+    const bool ok = part == 1 ? fn::hc::up2_q8_lanes(lanes, rows, up, c[0]->stream) :
+                    h.q8_mix  ? fn::hc::down2_q8_mix_lanes(lanes, rows, d, c[0]->stream) :
+                                fn::hc::down2_q8_lanes(lanes, rows, d, c[0]->stream);
     if (!ok) {
         return fail(err, part == 0 ? "hc down2 lanes" : "hc up2 lanes");
     }
-    note(*c[0], part == 0 ? "hc.down2.lanes" : "hc.up2.lanes");
+    note(*c[0], part == 1 ? "hc.up2.lanes" : h.q8_mix ? "hc.down2.mix.lanes" : "hc.down2.lanes");
     return true;
 }
 
@@ -988,9 +1049,25 @@ bool resolve_weights(const model & m, int32_t layer, int32_t card, layer_weights
     } else if (out.ex_gate_up == nullptr || out.ex_down == nullptr) {
         return false;
     }
-    if (!expert_fmt(tensors[gi].format, out.ex_gu_fmt) || !expert_fmt(tensors[di].format, out.ex_down_fmt) ||
-        tensors[gi].lay != layout::ex1_gate || tensors[di].lay != layout::ex1_down) {
+    if (!expert_fmt(m.tp(gi).format, out.ex_gu_fmt) || !expert_fmt(m.tp(di).format, out.ex_down_fmt) ||
+        m.tp(gi).lay != layout::ex1_gate || m.tp(di).lay != layout::ex1_down) {
         return fail(err, tname(layer, "ffn experts") + ": not in EX1's packed layout and formats");
+    }
+    // TTTS3 item 2: the layer's expert formats resolve once, here, against the compiled profiles (profiles.h)
+    using fn::experts::fmt;
+    out.ex_profile =
+        fn::experts::profile_of(fmt(out.ex_gu_fmt), fn::dense::fmt(out.sh_gate.fmt), fn::dense::fmt(out.sh_up.fmt),
+                                fmt(out.ex_down_fmt), fmt(out.ex_sh_down_fmt));
+    if (out.ex_profile < 0) {
+        std::string known;
+        for (int32_t i = 0; i < fn::experts::n_expert_profiles; ++i) {
+            known += std::string(i > 0 ? ", " : "") + fn::experts::expert_profiles[i].name;
+        }
+        return fail(err, tname(layer, "ffn experts") + ": routed gate/up " + expert_fmt_name(out.ex_gu_fmt) +
+                             " with shared gate " + dense_fmt_name(out.sh_gate.fmt) + " and up " +
+                             dense_fmt_name(out.sh_up.fmt) + ", down " + expert_fmt_name(out.ex_down_fmt) +
+                             " with shared down " + expert_fmt_name(out.ex_sh_down_fmt) +
+                             " is in no compiled expert profile (" + known + ")");
     }
     return true;
 }
@@ -1005,7 +1082,7 @@ bool pack_dense_tensor(model & m, int32_t idx, std::string & err) {
     if (m.dense_packed[size_t(idx)] != 0) {
         return true;
     }
-    const tensor_place & tp = tensors[idx];
+    const tensor_place & tp = m.tp(idx);
     int32_t f = -1;
     if (tp.lay != layout::gguf || !dense_fmt(tp.format, f)) {
         return fail(err, std::string(tp.name) + ": format " + tp.format + " is not a dense format the step runs");
@@ -1051,7 +1128,7 @@ bool pack_shared_down(model & m, int32_t idx, std::string & err) {
     if (m.dense_packed[size_t(idx)] == 2) {
         return true;
     }
-    const tensor_place & tp = tensors[idx];
+    const tensor_place & tp = m.tp(idx);
     int32_t f = -1;
     if (m.dense_packed[size_t(idx)] != 0 || tp.lay != layout::gguf || !expert_fmt(tp.format, f)) {
         return fail(err, std::string(tp.name) + ": not a GGUF slice in a shared down format");
@@ -1153,7 +1230,7 @@ bool resolve_draft_weights(const model & m, int32_t card, draft_weights & out, s
         }
         int64_t rows = 0, cols = 0;
         card_extent(idx, card, rows, cols);
-        if (std::strcmp(tensors[idx].format, "F32") != 0 || tensors[idx].lay != layout::gguf || rows * cols != elems) {
+        if (std::strcmp(m.tp(idx).format, "F32") != 0 || m.tp(idx).lay != layout::gguf || rows * cols != elems) {
             err = tname(L, t) + ": card slice is not " + std::to_string(elems) + " F32 values";
             return nullptr;
         }
@@ -1188,9 +1265,9 @@ bool resolve_draft_weights(const model & m, int32_t card, draft_weights & out, s
     const char * rf = m.tp(gi).format;
     const bool routed = (std::strcmp(rf, "Q8_0") == 0 || std::strcmp(rf, "Q2_0") == 0) &&
                         std::strcmp(m.tp(di).format, rf) == 0;
-    if (!routed || std::strcmp(tensors[si].format, "Q8_0") != 0 || rows != D || cols != FFS ||
-        si >= (int32_t)m.dense_packed.size() || m.dense_packed[size_t(si)] != 2 ||
-        tensors[gi].lay != layout::ex1_gate || tensors[di].lay != layout::ex1_down) {
+    if (!routed || std::strcmp(m.tp(si).format, "Q8_0") != 0 || rows != D || cols != FFS ||
+        si >= (int32_t) m.dense_packed.size() || m.dense_packed[size_t(si)] != 2 || m.tp(gi).lay != layout::ex1_gate ||
+        m.tp(di).lay != layout::ex1_down) {
         return fail(err, tname(L, "ffn experts") + ": not Q8_0 or Q2_0 routed (one format), Q8_0 shared, in EX1's "
                                                     "packed layouts (pack_draft)");
     }
@@ -1272,13 +1349,15 @@ constexpr int64_t lane_sel_off_words = (layer_max_rows + 1 + 3) / 4 * 4;
 // has its own)
 template <typename Fn> void ws_items(layer_ws & w, int32_t rows, Fn && f) {
     const int64_t B = rows;
+    const int64_t lanes = (B + layer_max_rows - 1) / layer_max_rows;
     for (int32_t s = 0; s < 2; ++s) {
         f(reinterpret_cast<void **>(&w.x[s]), B * 4 * F * 4);
         f(reinterpret_cast<void **>(&w.mom[s]), B * fn::hc::n_mom * 4);
         f(reinterpret_cast<void **>(&w.inject[s]), B * 4 * 4);
         f(reinterpret_cast<void **>(&w.out[s]), B * F * 4);
     }
-    f(reinterpret_cast<void **>(&w.hc_runs), int64_t(fn::hc::n_runs_card) * 4);
+    // TTTS3: a lane's own HC up run counters (up2_q8_lanes runs the lanes' blocks concurrently), lanes x n_runs_card
+    f(reinterpret_cast<void **>(&w.hc_runs), lanes * fn::hc::n_runs_card * 4);
     f(reinterpret_cast<void **>(&w.zero), B * F * 4);
     f(reinterpret_cast<void **>(&w.partial), B * D * 4);
     f(reinterpret_cast<void **>(&w.mid_codes), (int64_t)fn::act::codes_bytes(B, GV));
@@ -1294,7 +1373,6 @@ template <typename Fn> void ws_items(layer_ws & w, int32_t rows, Fn && f) {
     f(reinterpret_cast<void **>(&w.attn), B * GV * 4);
     f(reinterpret_cast<void **>(&w.ik), B * fn::qsa::head_dim * 4);
     f(reinterpret_cast<void **>(&w.iq), B * IQ * 4);
-    const int64_t lanes = (B + layer_max_rows - 1) / layer_max_rows;
     f(reinterpret_cast<void **>(&w.sel_body),
       (B <= layer_max_rows ? B * fn::qsa::max_row_words : lanes * lane_sel_body_words) * 4);
     f(reinterpret_cast<void **>(&w.sel_off), (B <= layer_max_rows ? B + 1 : lanes * lane_sel_off_words) * 4);
@@ -1452,6 +1530,17 @@ bool dense_site_layouts(dense_layouts & out, std::string & err) {
     return true;
 }
 
+bool dense_site_steps(dense_stagings & out, std::string & err) {
+    out = dense_stagings{};
+    for (auto & [s, a] : launch_shapes()) {
+        fn::dense::choose_splits(a);
+        if (!fn::dense::stage_steps_of(a, out[size_t(s)])) {
+            return fail(err, std::string("TTTS6 site ") + dense_site_name(s) + ": no staging steps");
+        }
+    }
+    return true;
+}
+
 bool dense_site_launch(void * work, const dense_layouts & layouts, dense_site site, fn::dense::product_args a,
                        int32_t rows, void * stream, std::string & err) {
     const int32_t i = static_cast<int32_t>(site);
@@ -1513,6 +1602,7 @@ layer_ws lane_ws(const layer_ws & joint, int32_t u) {
         w.inject[s] += b * 4;
         w.out[s] += b * F;
     }
+    w.hc_runs += int64_t(u) * fn::hc::n_runs_card;  // TTTS3: each lane's own (ws_items)
     w.zero += b * F;
     w.partial += b * D;
     w.mid_codes += fn::act::codes_bytes(static_cast<int32_t>(b), GV);
@@ -1583,7 +1673,7 @@ bool resolve_card(const model & m, int32_t card, void * stream, card_ctx & out, 
     }
     out.ws = carve_layer_ws(layer);
     std::string why;
-    if (!dense_site_layouts(out.dense_sites, why)) {
+    if (!dense_site_layouts(out.dense_sites, why) || !dense_site_steps(out.dense_steps, why)) {
         return fail(err, why);
     }
     // DP2's tables from FNFL's constants (grids.h): the IQ3_S grid and the IQ4_NL values
@@ -1833,6 +1923,8 @@ bool joint_launch(joint_lanes & j, fn::dense::product_args a, fn::dense::joint_a
         return fail(err, std::string(piece) + ": the joint work layout is not site " + dense_site_name(site) + "'s");
     }
     a.work = static_cast<uint8_t *>(j.dense_work) + joint_work_offset(site);
+    a.q8         = j.q8;  // TTTS6
+    a.steps      = j.dense_steps != nullptr ? &j.dense_steps[i] : nullptr;
     ja.lanes = j.lanes;
     ja.rows      = j.rows;      // FMS13
     ja.dense_f16 = j.dense_f16; // FMS6
@@ -1955,12 +2047,14 @@ bool qsa_joint(joint_lanes & j, const layer_weights & w, const layer_state * con
             ua[k].rope = fn::qsa::model_rope();
             ua[k].ik = c.ws.ik;
             ua[k].depth = c.n_before;
+            ua[k].rope_off         = c.pos_off;  // MUP1 piece 5
             ua[k].rows             = j.rows;
             ua[k].max_cells = sk.n_cells;
             sa[k].summaries = sk.idx_summaries;
             sa[k].q = c.ws.iq;
             sa[k].q_norm = w.idx_q_norm;
             sa[k].depth = c.n_before;
+            sa[k].rope_off         = c.pos_off;
             sa[k].max_cells = sk.n_cells;
             sa[k].rope = fn::qsa::model_rope();
             sa[k].ws = fn::qsa::carve(c.qsa_ws);
@@ -2069,7 +2163,7 @@ bool ffn_joint(joint_lanes & j, const layer_weights & w, const use_counters & u,
     const auto fs = static_cast<fn::experts::fmt>(w.ex_sh_down_fmt);
     fn::experts::gate_up_lanes_args ga;
     fn::experts::down_lanes_args da;
-    bool lanes = true;
+    bool                            lanes = (j.lone & joint_lone_experts) == 0;  // TTTS3: the test's forced fallback
     const int32_t                   R     = j.rows;
     for (int32_t k = 0; k < j.lanes; ++k) {
         lanes = lanes && j.lane[k]->ex_service == nullptr;
@@ -2249,8 +2343,24 @@ bool joint_check(const joint_lanes & j, const layer_weights & w, const layer_sta
 bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input in[], int32_t sub, int32_t mode,
               const use_counters & u, std::string & err) {
     const hc_module & hm = sub == 0 ? w.hc_attn : w.hc_ffn;
-    if (hm.q8_down != nullptr) {
-        return fail(err, "joint step: Q8_0 HC weights");
+    if (hm.q8_down != nullptr && !hm.q8_mix) {
+        // TTTS2: Q8_0 weights without the mixed layout take the lanes forms, the down phase (mode 1), the up phase
+        // (mode 2) or both (3), each lane bitwise its lone launch at the round's rows (TTTS4 item 1); each lane's own
+        // run counters
+        layer_input hi[fn::xchg::max_lanes];
+        for (int32_t k = 0; k < j.lanes; ++k) {
+            hi[k] = hc_input(*j.lane[k], in[k], sub);
+        }
+        if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err)) {
+            return false;
+        }
+        for (int32_t part = 0; part < 2; ++part) {
+            if ((mode & (1 << part)) != 0 &&
+                !hc_sublayer_lanes(j.lane, j.lanes, j.rows, hm, sub, hi, u, part, nullptr, err)) {
+                return false;
+            }
+        }
+        return true;
     }
     fn::hc::sub_args ha[fn::xchg::max_lanes];
     for (int32_t k = 0; k < j.lanes; ++k) {
@@ -2258,11 +2368,15 @@ bool hc_joint(const joint_lanes & j, const layer_weights & w, const layer_input 
         const layer_input hi = hc_input(c, in[k], sub);
         ha[k] = hc_sub_args(c, hm, sub, hi.hres, hi.hpost, hi.hx, u);
     }
+    // TTTS4 item 3: the UD-Q4_K_XL target's Q8_0 sublayer (the mixed down layout) takes the same joint launch on its
+    // Q8_0 weights, each lane bitwise its lone down2_q8_mix and up2_q8 at the round's rows
+    const bool q8 = hm.q8_down != nullptr;
     if (!cuda_ok(cudaSetDevice(j.lane[0]->device), "cudaSetDevice", err) ||
-        !fn::hc::sub_joint(j.lanes, j.rows, mode, ha, j.lane[0]->stream)) {
-        return err.empty() ? fail(err, "hc sub_joint") : false;
+        !(q8 ? fn::hc::sub_joint_q8(j.lanes, j.rows, mode, ha, hm.q8_down, hm.q8_up, j.lane[0]->stream) :
+               fn::hc::sub_joint(j.lanes, j.rows, mode, ha, j.lane[0]->stream))) {
+        return err.empty() ? fail(err, q8 ? "hc sub_joint_q8" : "hc sub_joint") : false;
     }
-    note(*j.lane[0], "hc.sub_joint");
+    note(*j.lane[0], q8 ? "hc.sub_joint.q8" : "hc.sub_joint");
     return true;
 }
 

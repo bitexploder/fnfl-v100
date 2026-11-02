@@ -5,7 +5,8 @@
 namespace fn::experts::detail {
 
 bool gate_up_q4_k(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st) {
-    return gate_up_for<fmt::q4_k>(fg, fu, rows, a, st);
+    // TTTS3 item 3: map 3 (the default) runs the family body (experts_gu_body_q4_k.cu); maps 0-2 ME1's gate_up_kernel
+    return a.map == 3 ? gate_up_body_q4_k(fg, fu, rows, a, st) : gate_up_for<fmt::q4_k>(fg, fu, rows, a, st);
 }
 
 } // namespace fn::experts::detail

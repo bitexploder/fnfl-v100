@@ -50,10 +50,15 @@ add_dependencies(fnfl-kernels-draft fnfl-check-includes)
 add_library(fnfl-model STATIC
     model/draft.cpp
     model/draft.h
+    model/graph_rec.cpp
+    model/graph_rec.h
     model/kv_pool.cpp
     model/kv_pool.h
     model/kv_tier.cpp
     model/kv_tier.h
+    model/ladder.cpp
+    model/ladder.h
+    model/ladder_table.inc
     model/layer.cpp
     model/layer.h
     model/model.cpp
@@ -69,14 +74,24 @@ add_library(fnfl-model STATIC
     model/state.h)
 fnfl_target_flags(fnfl-model)
 target_link_libraries(fnfl-model PUBLIC fnfl-kernels-act fnfl-kernels-dense fnfl-kernels-gdn fnfl-kernels-hc
-    fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts fnfl-kernels-embed fnfl-kernels-ple fnfl-kernels-head
-    fnfl-kernels-samp fnfl-kernels-round fnfl-kernels-draft fnfl-grids fnfl-xchg CUDA::cudart)
+    fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts fnfl-kernels-experts-ladder fnfl-kernels-embed
+    fnfl-kernels-ple fnfl-kernels-head fnfl-kernels-samp fnfl-kernels-round fnfl-kernels-draft fnfl-grids fnfl-xchg
+    CUDA::cudart)
+# APF2: the prompt unit graphs' capture-once replay (model/graph_rec.h): the runtime's stream operations wrapped in
+# every link of fnfl-model, and graph_rec.o pulled from the archive before the kernel libraries name the wraps
+target_link_options(fnfl-model INTERFACE
+    "LINKER:--wrap=cudaLaunchKernel,--wrap=cudaLaunchCooperativeKernel,--wrap=cudaMemcpyAsync"
+    "LINKER:--wrap=cudaMemcpyPeerAsync,--wrap=cudaMemcpy2DAsync,--wrap=cudaMemsetAsync,--wrap=cudaMemset2DAsync"
+    "LINKER:--wrap=cudaEventRecord,--wrap=cudaStreamWaitEvent,--undefined=__wrap_cudaLaunchKernel")
 add_dependencies(fnfl-model fnfl-check-includes)
 
 # the runtime: request flow per slot; it holds the loaded model (R1)
 add_library(fnfl-runtime STATIC
+    runtime/image_rows.cpp
+    runtime/image_rows.h
     runtime/joint.cpp
     runtime/joint.h
+    runtime/nvtx.h
     runtime/layer_run.cpp
     runtime/layer_run.h
     runtime/page_cache.cpp
@@ -86,19 +101,26 @@ add_library(fnfl-runtime STATIC
     runtime/prefill.cpp
     runtime/prefill.h
     runtime/runtime.cpp
-    runtime/slots_test.cpp
-    runtime/slots_test.h
     runtime/runtime.h
     runtime/target.cpp
     runtime/target.h
     runtime/versions.cpp
     runtime/versions.h
+    runtime/vision_service.cpp
+    runtime/vision_service.h
     runtime/stage.cpp
     runtime/stage.h
+    runtime/stage_msg.h
+    runtime/stage_wire.cpp
+    runtime/stage_wire.h
+    runtime/pace.cpp
+    runtime/pace.h
+    runtime/pace_test.cpp
     runtime/pipe.cpp
     runtime/pipe.h)
 fnfl_target_flags(fnfl-runtime)
-target_link_libraries(fnfl-runtime PUBLIC fnfl-model fnfl-borrowed fnfl-quant fnfl-kernels-embed fnfl-link)
+target_link_libraries(fnfl-runtime PUBLIC fnfl-model fnfl-vision fnfl-borrowed fnfl-quant fnfl-kernels-embed fnfl-link
+    CUDA::nvtx3)  # TTTS7: the host phases' ranges (header-only NVTX 3)
 
 # borrowed llama.cpp and ggml CPU code, behind plain interfaces: the GGUF reader only. No GPU code
 add_library(fnfl-borrowed STATIC
@@ -131,11 +153,50 @@ find_package(PkgConfig REQUIRED)
 find_package(Threads REQUIRED)
 pkg_check_modules(UCX REQUIRED IMPORTED_TARGET ucx)
 add_library(fnfl-link STATIC
+    xchg/life.cpp
+    xchg/life.h
     xchg/link.cpp
-    xchg/link.h)
+    xchg/link.h
+    xchg/link_fault.h
+    xchg/slow.cpp
+    xchg/slow.h)
 fnfl_target_flags(fnfl-link)
 target_link_libraries(fnfl-link PUBLIC PkgConfig::UCX Threads::Threads)
 add_dependencies(fnfl-link fnfl-check-includes)
+
+# TTTSBS: the host safety build (no CUDA, no card), outside the default build: the split's buffer lifetimes on the
+# failure paths (safety-test), the link-test's host-buffer mode and pipe-test, with the lifetime ledger and the link's
+# test hooks compiled in (FNFL_LIFETIME, FNFL_TEST_HOOKS; never in serving). FNFL_SANITIZE on its own build directory:
+# address (ASan + UBSan, use-after-scope and use-after-return instrumented) or thread (TSan)
+set(FNFL_SANITIZE "" CACHE STRING "fnfl-safety's sanitizer: address, thread or empty")
+add_executable(fnfl-safety EXCLUDE_FROM_ALL
+    tools/fnfl_safety.cpp
+    xchg/life.cpp
+    xchg/link.cpp
+    xchg/link_test.cpp
+    xchg/slow.cpp
+    runtime/pace.cpp
+    runtime/pace_test.cpp
+    runtime/pipe.cpp
+    runtime/safety_test.cpp
+    runtime/safety_test.h
+    runtime/stage_wire.cpp)
+fnfl_target_flags(fnfl-safety)
+target_compile_definitions(fnfl-safety PRIVATE FNFL_LIFETIME=1 FNFL_TEST_HOOKS=1 FNFL_LINK_TEST_HOST_ONLY=1)
+target_link_libraries(fnfl-safety PRIVATE PkgConfig::UCX Threads::Threads)
+add_dependencies(fnfl-safety fnfl-check-includes)
+if (FNFL_SANITIZE STREQUAL "address")
+    set(FNFL_SAN_FLAGS -fsanitize=address,undefined -fno-sanitize-recover=undefined -fsanitize-address-use-after-scope
+        -fno-omit-frame-pointer -g)
+elseif (FNFL_SANITIZE STREQUAL "thread")
+    set(FNFL_SAN_FLAGS -fsanitize=thread -fno-omit-frame-pointer -g)
+elseif (NOT FNFL_SANITIZE STREQUAL "")
+    message(FATAL_ERROR "FNFL_SANITIZE is address, thread or empty, not ${FNFL_SANITIZE}")
+endif()
+if (FNFL_SAN_FLAGS)
+    target_compile_options(fnfl-safety PRIVATE ${FNFL_SAN_FLAGS})
+    target_link_options(fnfl-safety PRIVATE ${FNFL_SAN_FLAGS})
+endif()
 
 # FNFL's decode activation format and its quantize kernel (C2). Math flags are declared: no fast math; the divisions
 # are __fdiv_rn and the output is bitwise against the CPU reference (fn/quant/act_ref)
@@ -224,8 +285,9 @@ target_compile_options(fnfl-kernels-qsa-attn PRIVATE
 target_link_libraries(fnfl-kernels-qsa-attn PUBLIC fnfl-kernels-qsa CUDA::cudart)
 add_dependencies(fnfl-kernels-qsa-attn fnfl-check-includes)
 
-# the routed-expert kernels (EX1) and their machine-rate calibration. Math flags are declared: no fast math; the
-# GLU's expf and the GLU epilogue's quantize division are the precise forms (fn::act's rule, bitwise to act_ref)
+# the routed-expert kernels (EX1; their machine-rate calibration is fnfl-bench's, TFC). Math flags are declared: no
+# fast math; the GLU's expf and the GLU epilogue's quantize division are the precise forms (fn::act's rule, bitwise
+# to act_ref)
 add_library(fnfl-kernels-experts STATIC
     kernels/dense/dense_dec.cuh
     kernels/experts/experts.cu
@@ -242,12 +304,13 @@ add_library(fnfl-kernels-experts STATIC
     kernels/experts/experts_gu_q2_0.cu
     kernels/experts/experts_gu_q4_k.cu
     kernels/experts/experts_gu_q5_k.cu
+    kernels/experts/experts_gu_body_q4_k.cu
+    kernels/experts/experts_gu_body_q5_k.cu
     kernels/experts/experts_inst.h
     kernels/experts/experts_meta.cuh
-    kernels/experts/experts_calib.cu
-    kernels/experts/experts_calib.h
     kernels/experts/experts_prompt.cu
     kernels/experts/experts_prompt.h
+    kernels/experts/experts_prompt_dev.cuh
     kernels/experts/experts_share.cu
     kernels/experts/experts_share.h
     kernels/experts/experts_cpu.cpp
@@ -266,6 +329,21 @@ target_compile_options(fnfl-kernels-experts PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
 add_dependencies(fnfl-kernels-experts fnfl-check-includes)
 
+# APF2: the ladder's grouped experts (experts_ladder.h). Relocatable device code for the launcher's device launch
+# (cudaStreamTailLaunch), device-linked inside this library, so no other target's code or link changes
+add_library(fnfl-kernels-experts-ladder STATIC
+    kernels/experts/experts_ladder.cu
+    kernels/experts/experts_ladder.h)
+fnfl_target_flags(fnfl-kernels-experts-ladder)
+# the device runtime the device-linked code names (every final link: the drive's and the server's shared library)
+find_library(FNFL_CUDADEVRT cudadevrt HINTS ${CUDAToolkit_LIBRARY_DIR} REQUIRED)
+target_link_libraries(fnfl-kernels-experts-ladder PUBLIC fnfl-kernels-experts ${FNFL_CUDADEVRT})
+set_target_properties(fnfl-kernels-experts-ladder PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON)
+target_compile_options(fnfl-kernels-experts-ladder PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
+add_dependencies(fnfl-kernels-experts-ladder fnfl-check-includes)
+
 # the dense quantized products (DP1, DP2). Math flags are declared: no fast math; the GLU's and the router's expf,
 # the GLU epilogue's quantize divisions and the GDN convolution epilogue's expf and division (LP1, gdn_conv.cuh) are
 # the precise forms (fn::act's rule, bitwise to act_ref)
@@ -274,10 +352,19 @@ add_library(fnfl-kernels-dense STATIC
     kernels/gdn/gdn_conv.cuh
     kernels/dense/dense.cu
     kernels/dense/dense.h
+    kernels/dense/dense_steps.h
     kernels/dense/dense_dec.cuh
     kernels/dense/dense_prompt.cu
     kernels/dense/dense_prompt.h
-    kernels/dense/iq3s.cuh)
+    kernels/dense/dense_prompt_dec.cuh
+    kernels/dense/dense_ladder.cu
+    kernels/dense/dense_ladder.cuh
+    kernels/dense/dense_ladder.h
+    kernels/dense/dense_ladder_inst.cuh
+    kernels/dense/dense_ladder_iq.cu
+    kernels/dense/iq3s.cuh
+    kernels/tc/ladder.h
+    kernels/tc/tc_ladder.cuh)
 fnfl_target_flags(fnfl-kernels-dense)
 target_compile_options(fnfl-kernels-dense PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
@@ -388,95 +475,98 @@ add_library(fnfl-loader STATIC
     runtime/service_loop.cpp
     runtime/service_loop.h)
 fnfl_target_flags(fnfl-loader)
-target_link_libraries(fnfl-loader PUBLIC fnfl-model fnfl-runtime fnfl-borrowed fnfl-kernels-experts fnfl-kernels-hc
+target_link_libraries(fnfl-loader PUBLIC fnfl-model fnfl-runtime fnfl-vision-cpu fnfl-borrowed fnfl-kernels-experts
+    fnfl-kernels-hc
     fnfl-xchg CUDA::cudart)
 add_dependencies(fnfl-loader fnfl-check-includes)
+
+# PRD1: the build stamp (fnfl_build_commit: the source commit and a dirty flag), generated on every build by
+# tools/stamp.cmake (a target that always runs; the file is rewritten only when its text changes)
+set(FNFL_STAMP_CPP ${CMAKE_CURRENT_BINARY_DIR}/fnfl_stamp.cpp)
+add_custom_target(fnfl-stamp-gen ALL
+    COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR} -DOUT=${FNFL_STAMP_CPP} -P
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/stamp.cmake
+    BYPRODUCTS ${FNFL_STAMP_CPP}
+    COMMENT "FNFL: the build stamp"
+    VERBATIM)
+add_library(fnfl-stamp STATIC ${FNFL_STAMP_CPP})
+fnfl_target_flags(fnfl-stamp)
+add_dependencies(fnfl-stamp fnfl-stamp-gen)
 
 # the server's adapter to the runtime (fn/fnfl.h)
 add_library(fnfl-glue STATIC
     fnfl.h
     glue/fnfl_glue.cpp)
 fnfl_target_flags(fnfl-glue)
-target_link_libraries(fnfl-glue PUBLIC fnfl-loader fnfl-runtime fnfl-borrowed)
+target_link_libraries(fnfl-glue PUBLIC fnfl-loader fnfl-runtime fnfl-borrowed fnfl-stamp)
 
 add_dependencies(fnfl-runtime  fnfl-check-includes)
 add_dependencies(fnfl-borrowed fnfl-check-includes)
 add_dependencies(fnfl-glue     fnfl-check-includes)
 
-# XP1: the cross-card coordination prototype's kernels (load stand-ins, timing helpers). Math flags are declared: no
-# fast math (the stand-ins' output function is __fmul_rn then __fadd_rn)
-add_library(fnfl-proto-xp1 STATIC
-    proto/xp1/standin.cu
-    proto/xp1/standin.h
+# XP1's timing helpers (round stamps, clock probes, the L2 flush), used by model-bench and draft-bench. Math flags are
+# declared: no fast math
+add_library(fnfl-proto-timing STATIC
     proto/xp1/timing.cu
     proto/xp1/timing.h)
+fnfl_target_flags(fnfl-proto-timing)
+target_compile_options(fnfl-proto-timing PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
+target_link_libraries(fnfl-proto-timing PUBLIC fnfl-xchg CUDA::cudart)
+add_dependencies(fnfl-proto-timing fnfl-check-includes)
+
+# XP1: the cross-card coordination prototype's load stand-ins (fnfl-bench only, TFC). Math flags are declared: no fast
+# math (the stand-ins' output function is __fmul_rn then __fadd_rn)
+add_library(fnfl-proto-xp1 STATIC EXCLUDE_FROM_ALL
+    proto/xp1/standin.cu
+    proto/xp1/standin.h)
 fnfl_target_flags(fnfl-proto-xp1)
 target_compile_options(fnfl-proto-xp1 PRIVATE
     "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
-target_link_libraries(fnfl-proto-xp1 PUBLIC fnfl-xchg CUDA::cudart)
+target_link_libraries(fnfl-proto-xp1 PUBLIC fnfl-proto-timing fnfl-xchg CUDA::cudart)
 add_dependencies(fnfl-proto-xp1 fnfl-check-includes)
 
-# the driver: FNFL pieces with no server and no HTTP
-add_executable(fnfl-drive
-    tools/fnfl_drive.cpp
+# TFC item 4: the checks' units, shared by fnfl-drive (the default correctness driver) and fnfl-bench
+add_library(fnfl-drive-checks OBJECT
+    tools/cases.cpp
+    tools/cases.h
     tools/test_dump.cpp
     tools/test_dump.h
-    kernels/act/act_bench.cpp
     kernels/act/act_test.cpp
     kernels/act/act_test.h
     kernels/hc/hc_test.cpp
     kernels/hc/hc_test.h
-    kernels/hc/hc_bench.cpp
-    kernels/hc/hc_bench.h
     kernels/qsa/qsa_test.cpp
     kernels/qsa/qsa_test.h
     kernels/qsa/qsaj_test.cpp
     kernels/qsa/qsaj_test.h
-    kernels/qsa/qsa_bench.cpp
-    kernels/qsa/qsa_bench.h
-    kernels/qsa/qa2_bench.cu
-    kernels/qsa/qa2_bench.h
     kernels/qsa/qa2_test.cpp
     kernels/qsa/qa2_test.h
-    kernels/draft/draft_bench.cu
-    kernels/draft/draft_bench.h
     kernels/draft/draft_test.cpp
     kernels/draft/draft_test.h
     kernels/experts/experts_cpu_test.cpp
     kernels/experts/experts_cpu_test.h
     kernels/experts/experts_test.cpp
     kernels/experts/experts_test.h
-    kernels/experts/experts_bench.cpp
-    kernels/experts/experts_bench.h
-    kernels/experts/experts_prompt_bench.cpp
-    kernels/experts/experts_prompt_bench.h
     kernels/experts/experts_prompt_test.cpp
     kernels/experts/experts_prompt_test.h
     kernels/experts/grids_test.cpp
     kernels/experts/grids_test.h
     kernels/experts/grids_dev_test.cu
-    kernels/gdn/gdn_bench.cu
-    kernels/gdn/gdn_bench.h
     kernels/gdn/gdn_ref.cu
     kernels/gdn/gdn_ref.h
     kernels/gdn/gdn_test.cpp
     kernels/gdn/gdn_test.h
     kernels/gdn/gdnj_test.cpp
     kernels/gdn/gdnj_test.h
-    kernels/ple/ple_bench.cpp
-    kernels/ple/ple_bench.h
     kernels/ple/ple_test.cpp
     kernels/ple/ple_test.h
     runtime/ple_pin_test.cpp
     runtime/ple_pin_test.h
     quant/quant_test.cpp
     quant/quant_test.h
-    kernels/dense/dense_bench.cpp
-    kernels/dense/dense_bench.h
     kernels/dense/dense_cold.cu
     kernels/dense/dense_cold.h
-    kernels/dense/layer_stand.cu
-    kernels/dense/layer_stand.h
     kernels/dense/dense_test.cpp
     kernels/dense/dense_test.h
     kernels/dense/dense_joint_test.cpp
@@ -495,12 +585,8 @@ add_executable(fnfl-drive
     kernels/draft/draft_prompt_test.cpp
     kernels/draft/draft_prompt_test.h
     tools/prompt_test_util.h
-    kernels/head/head_bench.cpp
-    kernels/head/head_bench.h
     kernels/head/head_test.cpp
     kernels/head/head_test.h
-    kernels/samp/samp_bench.cpp
-    kernels/samp/samp_bench.h
     kernels/samp/samp_harness.cpp
     kernels/samp/samp_harness.h
     kernels/samp/samp_joint_test.cpp
@@ -517,7 +603,6 @@ add_executable(fnfl-drive
     xchg/xchg2_test.h
     xchg/x16_test.cpp
     xchg/x16_test.h
-    runtime/layer_bench.cpp
     runtime/layer_test.cpp
     runtime/layer_test.h
     runtime/prefill_cmds.cpp
@@ -529,6 +614,10 @@ add_executable(fnfl-drive
     runtime/admission_test.h
     model/kv_tier_test.cpp
     model/kv_tier_test.h
+    model/ladder_test.cpp
+    model/ladder_test.h
+    tools/prompt_tune.cpp
+    tools/prompt_tune.h
     runtime/rollback_test.cpp
     runtime/mx7_check.cpp
     runtime/mx7_check.h
@@ -547,6 +636,59 @@ add_executable(fnfl-drive
     runtime/draft_cmds.cpp
     runtime/target_cmds.cpp
     runtime/target_cmds.h
+    runtime/slots_test.cpp
+    runtime/slots_test.h
+    runtime/vision_service_test.cpp
+    runtime/vision_service_test.h
+    runtime/vis_kl.cpp
+    runtime/vis_kl.h)
+fnfl_target_flags(fnfl-drive-checks)
+target_link_libraries(fnfl-drive-checks PUBLIC fnfl-glue fnfl-loader fnfl-runtime fnfl-borrowed fnfl-quant
+    fnfl-kernels-act fnfl-kernels-gdn fnfl-kernels-hc fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts
+    fnfl-kernels-dense fnfl-xchg fnfl-proto-timing fnfl-kernels-embed fnfl-kernels-ple fnfl-kernels-head
+    fnfl-kernels-draft fnfl-kernels-samp fnfl-link CUDA::cudart)
+add_dependencies(fnfl-drive-checks fnfl-check-includes)
+# TFC: the check inventory's fixture defaults name this source tree (the grid header)
+set_source_files_properties(tools/cases.cpp PROPERTIES COMPILE_DEFINITIONS "FNFL_SOURCE_DIR=\"${PROJECT_SOURCE_DIR}\"")
+
+# the driver: FNFL's checks and model commands with no server and no HTTP
+add_executable(fnfl-drive tools/fnfl_drive.cpp)
+fnfl_target_flags(fnfl-drive)
+target_link_libraries(fnfl-drive PRIVATE fnfl-drive-checks)
+add_dependencies(fnfl-drive fnfl-check-includes)
+
+# TFC item 4: the optional tools, outside the default build (cmake --build DIR --target fnfl-bench): fnfl-drive's
+# commands plus the benches, EX1's machine-rate calibration and the XP1/PX1 prototypes, with fnfl-drive's arguments
+add_executable(fnfl-bench EXCLUDE_FROM_ALL
+    tools/fnfl_drive.cpp
+    kernels/experts/experts_calib.cu
+    kernels/experts/experts_calib.h
+    kernels/act/act_bench.cpp
+    kernels/hc/hc_bench.cpp
+    kernels/hc/hc_bench.h
+    kernels/qsa/qsa_bench.cpp
+    kernels/qsa/qsa_bench.h
+    kernels/qsa/qa2_bench.cu
+    kernels/qsa/qa2_bench.h
+    kernels/draft/draft_bench.cu
+    kernels/draft/draft_bench.h
+    kernels/experts/experts_bench.cpp
+    kernels/experts/experts_bench.h
+    kernels/experts/experts_prompt_bench.cpp
+    kernels/experts/experts_prompt_bench.h
+    kernels/gdn/gdn_bench.cu
+    kernels/gdn/gdn_bench.h
+    kernels/ple/ple_bench.cpp
+    kernels/ple/ple_bench.h
+    kernels/dense/dense_bench.cpp
+    kernels/dense/dense_bench.h
+    kernels/dense/layer_stand.cu
+    kernels/dense/layer_stand.h
+    kernels/head/head_bench.cpp
+    kernels/head/head_bench.h
+    kernels/samp/samp_bench.cpp
+    kernels/samp/samp_bench.h
+    runtime/layer_bench.cpp
     proto/px1/px1_link.cu
     proto/px1/px1_link.h
     proto/xp1/hx7.cpp
@@ -557,7 +699,13 @@ add_executable(fnfl-drive
     proto/xp1/xp1_bench.h
     proto/xp1/xp1_test.cpp
     proto/xp1/xp1_test.h)
-fnfl_target_flags(fnfl-drive)
+fnfl_target_flags(fnfl-bench)
+target_compile_definitions(fnfl-bench PRIVATE FNFL_DRIVE_BENCH=1)
+# EX1's calibration keeps fnfl-kernels-experts' declared math flags: no fast math
+set_source_files_properties(kernels/experts/experts_calib.cu PROPERTIES COMPILE_OPTIONS
+    "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
+target_link_libraries(fnfl-bench PRIVATE fnfl-drive-checks fnfl-proto-xp1)
+add_dependencies(fnfl-bench fnfl-check-includes)
 # PX1's link bench moves bits only. Math flags are declared: no fast math
 set_source_files_properties(proto/px1/px1_link.cu PROPERTIES COMPILE_OPTIONS
     "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
@@ -585,8 +733,71 @@ set_source_files_properties(kernels/gdn/gdn_bench.cu PROPERTIES COMPILE_OPTIONS
 # DR1's draft-kernel bench: its fill kernels (scaffolding). Math flags are declared: no fast math
 set_source_files_properties(kernels/draft/draft_bench.cu PROPERTIES COMPILE_OPTIONS
     "-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true")
-target_link_libraries(fnfl-drive PRIVATE fnfl-glue fnfl-loader fnfl-runtime fnfl-borrowed fnfl-quant fnfl-kernels-act
-    fnfl-kernels-gdn fnfl-kernels-hc fnfl-kernels-qsa fnfl-kernels-qsa-attn fnfl-kernels-experts fnfl-kernels-dense
-    fnfl-xchg fnfl-proto-xp1 fnfl-kernels-embed fnfl-kernels-ple fnfl-kernels-head fnfl-kernels-draft fnfl-kernels-samp
-    fnfl-link CUDA::cudart)
-add_dependencies(fnfl-drive fnfl-check-includes)
+
+# VIS1: the vision module (fn/vision/), separate from the text model. fnfl-vision-cpu is its host half: the bounded
+# JPEG and PNG decode (fn/borrowed/image_decode, stb_image), the preprocessing, the projector profile and its weights'
+# host side. fnfl-vision adds the encoder's kernels and the encoder over the prompt path's products (fnfl-kernels-dense).
+# Math flags are declared: no fast math; sqrtf, the divisions, tanhf, exp2f and sincosf are the precise forms
+add_library(fnfl-vision-cpu STATIC
+    borrowed/image_decode.cpp
+    borrowed/image_decode.h
+    vision/image.cpp
+    vision/image.h
+    vision/profile.h
+    vision/sizes.cpp
+    vision/sizes.h
+    vision/weights.cpp
+    vision/weights.h)
+fnfl_target_flags(fnfl-vision-cpu)
+target_include_directories(fnfl-vision-cpu SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(fnfl-vision-cpu PUBLIC fnfl-borrowed)
+add_dependencies(fnfl-vision-cpu fnfl-check-includes)
+
+add_library(fnfl-vision STATIC
+    vision/encoder.cpp
+    vision/encoder.h
+    vision/kernels.cu
+    vision/kernels.h
+    vision/weights_dev.cpp)
+fnfl_target_flags(fnfl-vision)
+target_compile_options(fnfl-vision PRIVATE
+    "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo;--ftz=false;--prec-div=true;--prec-sqrt=true;--fmad=true>")
+target_link_libraries(fnfl-vision PUBLIC fnfl-vision-cpu fnfl-kernels-dense CUDA::cudart)
+add_dependencies(fnfl-vision fnfl-check-includes)
+
+# VIS1's tests: fnfl-vision-test (host and GPU commands) and fnfl-vision-host (host only, no CUDA), which takes
+# FNFL_SANITIZE's flags like fnfl-safety for the decoders under the sanitizers
+add_executable(fnfl-vision-test
+    runtime/image_rows.cpp
+    runtime/image_rows_test.cpp
+    runtime/image_rows_test.h
+    tools/fnfl_vision.cpp
+    vision/vision_ref.cpp
+    vision/vision_ref.h
+    vision/vision_test.h
+    vision/vision_test_gpu.cpp
+    vision/vision_test_host.cpp)
+fnfl_target_flags(fnfl-vision-test)
+target_link_libraries(fnfl-vision-test PRIVATE fnfl-vision Threads::Threads)
+add_dependencies(fnfl-vision-test fnfl-check-includes)
+
+add_executable(fnfl-vision-host
+    borrowed/image_decode.cpp
+    runtime/image_rows.cpp
+    runtime/image_rows_test.cpp
+    runtime/image_rows_test.h
+    tools/fnfl_vision.cpp
+    vision/image.cpp
+    vision/vision_ref.cpp
+    vision/vision_test_host.cpp
+    vision/sizes.cpp
+    vision/weights.cpp)
+fnfl_target_flags(fnfl-vision-host)
+target_compile_definitions(fnfl-vision-host PRIVATE FNFL_VISION_HOST_ONLY=1)
+target_include_directories(fnfl-vision-host SYSTEM PRIVATE ${PROJECT_SOURCE_DIR}/vendor)
+target_link_libraries(fnfl-vision-host PRIVATE fnfl-borrowed Threads::Threads)
+add_dependencies(fnfl-vision-host fnfl-check-includes)
+if (FNFL_SAN_FLAGS)
+    target_compile_options(fnfl-vision-host PRIVATE ${FNFL_SAN_FLAGS})
+    target_link_options(fnfl-vision-host PRIVATE ${FNFL_SAN_FLAGS})
+endif()

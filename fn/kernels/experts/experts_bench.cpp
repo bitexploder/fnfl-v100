@@ -12,6 +12,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/act_ref.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -51,11 +52,7 @@ constexpr double dram_gbps = 1021.6;       // HX12
 constexpr double tail_us = 0.83;           // HX12: the GLU and weighted sums finish across blocks (S26)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ex-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "ex-bench", what);
 }
 
 std::string utc_now() {
@@ -213,6 +210,7 @@ struct bench {
     dev_mem wts{size_t(max_rows) * NU * 4};
     dev_mem sg{size_t(max_rows) * 4};
     dev_mem out{size_t(max_rows) * D * 4};
+    dev_mem out_l{ size_t(max_lanes) * max_rows * D * 4 };  // TTTS3 Part A: the down lanes' own outputs
     dev_mem status{16};
     dev_mem flush{size_t(flush_used)};
     dev_mem evict{16};
@@ -302,6 +300,41 @@ struct bench {
         return false;
     }
 
+    // TTTS3 Part A: decode i's arguments on shared copy c (a lanes unit's lanes share the unit's copy: one layer's
+    // shared expert), the launch's map ex_map
+    gate_up_args gu_args(fmt f, dfmt fg, dfmt fu, int32_t B, int32_t i, int32_t c) {
+        gate_up_args a = { routed.at(rkey(f, false))->p,
+                           sh_gu.at(int32_t(fg))->p + size_t(c) * sh_gu_bytes.at(int32_t(fg)),
+                           sh_gu.at(int32_t(fu))->p + size_t(c) * sh_gu_bytes.at(int32_t(fu)),
+                           grids.p,
+                           x_in(B),
+                           ids_of(i, B),
+                           meta_of(i),
+                           glu_out(i),
+                           nullptr,
+                           status.as<uint32_t>() };
+        a.cw           = class_weights(f, fg, fu);
+        a.map          = ex_map;
+        return a;
+    }
+
+    down_args dn_args(fmt f, fmt fs, int32_t B, int32_t i, int32_t c) {
+        const dfmt              fsd = fs == fmt::q2_0 ? dfmt::q2_0 : fs == fmt::q8_0 ? dfmt::q8_0 : dfmt::iq4_nl;
+        const fn::act::out_view g   = glu_out(i);
+        return {
+            routed.at(rkey(f, true))->p,
+            sh_dn.at(int32_t(fsd))->p + size_t(c) * sh_dn_bytes.at(int32_t(fsd)),
+            grids.p,
+            { g.codes, g.scales, g.rows, g.k },
+            ids_of(i, B),
+            meta_of(i),
+            wts.as<float>(),
+            sg.as<float>(),
+            out.as<float>()  /* lanes: replaced by each lane's own */,
+            status.as<uint32_t>()
+        };
+    }
+
     // the decodes' routing at B into ids (each decode's B x 10 block at [decode][max_rows][10])
     bool set_routes(int32_t point_layer, int32_t B) {
         const int32_t layer = route_layer(point_layer);
@@ -357,6 +390,20 @@ struct bench {
             const fmt f = i < 8 ? static_cast<fmt>(i) : fmt::q8_0;
             const bool down = f == fmt::q2_0 || f == fmt::iq4_nl || i == 8;
             synth s;
+            std::vector<uint8_t> h;
+            if (!load_synth(f, cache, s, false, down) || !pack_card(s, 0, map, 1, h)) {
+                fprintf(stderr, "ex-bench: synthetic %s%s failed\n", fmt_name(f), down ? " down" : "");
+                return false;
+            }
+            routed[rkey(f, down)] = std::make_unique<dev_mem>(h.size());
+            if (!routed[rkey(f, down)]->put(h.data(), h.size())) {
+                return false;
+            }
+        }
+        // TTTS3 Part A: the Q4 routed formats (Q4_K and Q5_K gate/up, Q5_1 down), from the same cache
+        for (const fmt f : { fmt::q4_k, fmt::q5_k, fmt::q5_1 }) {
+            const bool           down = f == fmt::q5_1;
+            synth                s;
             std::vector<uint8_t> h;
             if (!load_synth(f, cache, s, false, down) || !pack_card(s, 0, map, 1, h)) {
                 fprintf(stderr, "ex-bench: synthetic %s%s failed\n", fmt_name(f), down ? " down" : "");
@@ -1351,6 +1398,300 @@ int32_t run_cr3seq(bench & bn, const std::string & points) {
 // XB2 step 5 (EL1's el1prof): xb2prof:POINTS (B = 3 names), each listed point's gate/up once a decode, decodes d_first
 // .. d_first + n_dec - 1, each after its meta launch, point after point in experts_inst.h's order, no warm-up; for
 // ncu's count. A "# xb2prof:" line a launch names its point, decode and the routing's 30 IDs.
+// ---- TTTS3 Part A: the Q4 expert kernels alone and in lanes, base (map 0, lone launches) against candidate ----------
+
+// one point's line: print_point's fields under TTTS3's ticket, with GB/s (weight bytes over the median)
+void print_point3(const std::string & point,
+                  const std::string & formats,
+                  int32_t             layer,
+                  int32_t             B,
+                  double              u,
+                  double              bytes,
+                  const stats &       warm,
+                  const stats &       cold,
+                  const std::string & form) {
+    const double floor = ramp_us + bytes / (dram_gbps * 1e3) + tail_us;
+    printf(
+        "{\"ticket\": \"TTTS3\", \"point\": \"%s\", \"formats\": \"%s\", \"form\": \"%s\", \"routing\": \"HX7 "
+        "capture-58581 layer %d, decodes %d..%d\", \"rows\": %d, \"u_sum\": %.2f, \"weight_bytes\": %.0f, "
+        "\"floor_us\": %.3f, \"warm_median_us\": %.3f, \"warm_p90_us\": %.3f, \"hw_pct_warm\": %.1f, "
+        "\"gbps_warm\": %.1f, \"cold_median_us\": %.3f, \"cold_p90_us\": %.3f, \"hw_pct_cold\": %.1f, "
+        "\"gbps_cold\": %.1f, \"t_start\": \"%s\", \"t_end\": \"%s\"",
+        point.c_str(), formats.c_str(), form.c_str(), route_layer(layer), d_first, d_first + n_dec - 1, B, u, bytes,
+        floor, warm.median, warm.p90, 100.0 * floor / warm.median, bytes / (warm.median * 1e3), cold.median, cold.p90,
+        100.0 * floor / cold.median, bytes / (cold.median * 1e3), warm.t0.c_str(), cold.t1.c_str());
+    print_us("warm_us", warm.us);
+    print_us("cold_us", cold.us);
+    printf("}\n");
+    fflush(stdout);
+}
+
+// the mean over a cycle of decodes of the U lanes' summed distinct experts (lane l of unit k: decode k U + l)
+double lanes_u(bench & bn, int32_t layer, int32_t B, int32_t U) {
+    double u = 0.0;
+    for (int32_t k = 0; k < n_dec; ++k) {
+        for (int32_t l = 0; l < U; ++l) {
+            u += distinct(rows_of(bn.routes[route_layer(layer)], (k * U + l) % n_dec, B));
+        }
+    }
+    return u / n_dec;
+}
+
+// gate/up: unit k, one launch: lone (decode k) or lanes (U lanes, decodes k U + l, the unit's shared copy) at map m
+bool gu3_unit(bench & bn, fmt f, dfmt fg, dfmt fu, int32_t B, int32_t U, bool lanes, int32_t m, int32_t k) {
+    bn.ex_map = m;
+    if (U == 1) {
+        return gate_up(f, fg, fu, B, bn.gu_args(f, fg, fu, B, k, k % n_sh_copies), bn.st) || bench::err("gate_up");
+    }
+    gate_up_lanes_args la{};
+    for (int32_t l = 0; l < U; ++l) {
+        la.s[l] = bn.gu_args(f, fg, fu, B, (k * U + l) % n_dec, k % n_sh_copies);
+    }
+    if (lanes) {
+        return gate_up_lanes(f, fg, fu, U, B, la, bn.st) || bench::err("gate_up_lanes");
+    }
+    bool ok = true;
+    for (int32_t l = 0; l < U && ok; ++l) {
+        ok = gate_up(f, fg, fu, B, la.s[l], bn.st) || bench::err("gate_up");
+    }
+    return ok;
+}
+
+// down: as gu3_unit, each lane its own output; the meta and GLU of every decode written beforehand (as gate/up does
+// in the model), so a unit is the down launches alone
+bool dn3_unit(bench & bn, fmt f, fmt fs, int32_t B, int32_t U, bool lanes, int32_t k) {
+    down_lanes_args la{};
+    for (int32_t l = 0; l < U; ++l) {
+        la.s[l]     = bn.dn_args(f, fs, B, (k * U + l) % n_dec, k % n_sh_copies);
+        la.s[l].out = bn.out_l.as<float>() + size_t(l) * max_rows * D;
+    }
+    if (U == 1) {
+        la.s[0] = bn.dn_args(f, fs, B, k, k % n_sh_copies);
+        return down(f, fs, B, la.s[0], bn.st) || bench::err("down");
+    }
+    if (lanes) {
+        return down_lanes(f, fs, U, B, la, bn.st) || bench::err("down_lanes");
+    }
+    bool ok = true;
+    for (int32_t l = 0; l < U && ok; ++l) {
+        ok = down(f, fs, B, la.s[l], bn.st) || bench::err("down");
+    }
+    return ok;
+}
+
+// the routing at B and every decode's GLU and meta from layer's first gate/up instance (gf, gg, gu)
+bool down3_inputs(bench & bn, int32_t layer, int32_t B, fmt gf, dfmt gg, dfmt gu) {
+    bool ok   = bn.set_routes(layer, B);
+    bn.ex_map = 3;
+    for (int32_t d = 0; d < n_dec && ok; ++d) {
+        ok = bn.gate_up_unit(gf, gg, gu, B, d);
+    }
+    return ok && cuda_ok(cudaStreamSynchronize(bn.st), "down inputs");
+}
+
+struct gu3_point {
+    fmt     f;
+    dfmt    fg, fu;
+    int32_t layer;
+};
+
+struct dn3_point {
+    fmt     f, fs;
+    int32_t layer;
+    fmt     gf;
+    dfmt    gg, gu;
+};
+
+// the Part A points (TTTS3's ticket), all at B = 3; prof: each kernel launched once after cold() for ncu (Q4_K
+// gate/up alone and lanes U = 4, Q5_1 down alone and lanes U = 4, IQ3_XXS gate/up alone), nothing timed; dry: each
+// point's unit launched twice, untimed (the harness's setup check before the measurement)
+int ttts3_points(bench & bn, bool prof, bool dry = false) {
+    constexpr int32_t      B = 3;
+    std::vector<gu3_point> gq;
+    for (int32_t i = 0; i < n_q4_gate_up_inst; ++i) {
+        gu3_point g{};
+        q4_gate_up_inst(i, g.f, g.fg, g.fu, g.layer);
+        gq.push_back(g);
+    }
+    std::vector<dn3_point> dq;
+    for (int32_t i = 0; i < n_q4_down_inst; ++i) {
+        dn3_point d{};
+        q4_down_inst(i, d.f, d.fs, d.layer);
+        dq.push_back(d);
+    }
+    // a Q4 down's GLU comes from the Q4_K gate/up (its first instance); the references' from their deployed layer's
+    for (dn3_point & d : dq) {
+        d.gf = gq[0].f, d.gg = gq[0].fg, d.gu = gq[0].fu;
+    }
+    const gu3_point g_iq3xxs = { fmt::iq3_xxs, dfmt::iq4_xs, dfmt::q6_k, 35 },
+                    g_iq3s   = { fmt::iq3_s, dfmt::iq3_s, dfmt::iq3_s, 8 };
+    const auto      gu_name  = [](const gu3_point & g) {
+        return "gu_" + lower(fmt_name(g.f)) + "_" + lower(fn::dense::fmt_name(g.fg)) + "_" +
+               lower(fn::dense::fmt_name(g.fu));
+    };
+    const auto dn_name = [](const dn3_point & d) {
+        return "dn_" + lower(fmt_name(d.f)) + "_" + lower(fmt_name(d.fs));
+    };
+    int32_t n_points = 0;
+    bool    ok       = true;
+    if (prof) {
+        printf(
+            "# ttts3prof: B = %d, routing HX7 capture-58581, cold() before each launch; launches in order: Q4_K "
+            "gate/up alone (map 3), Q4_K gate/up lanes U = 4 (map 3), Q5_1 down alone, Q5_1 down lanes U = 4, "
+            "IQ3_XXS gate/up alone\n",
+            B);
+        const gu3_point & g  = gq[0];
+        const dn3_point * d5 = nullptr;
+        for (const dn3_point & d : dq) {
+            d5 = d.f == fmt::q5_1 ? &d : d5;
+        }
+        ok = d5 != nullptr && bn.set_routes(g.layer, B) && bn.cold() &&
+             gu3_unit(bn, g.f, g.fg, g.fu, B, 1, false, 3, 0) && bn.cold() &&
+             gu3_unit(bn, g.f, g.fg, g.fu, B, 4, true, 3, 1) && cuda_ok(cudaStreamSynchronize(bn.st), "gu") &&
+             down3_inputs(bn, d5->layer, B, d5->gf, d5->gg, d5->gu) && bn.cold() &&
+             dn3_unit(bn, d5->f, d5->fs, B, 1, false, 0) && bn.cold() && dn3_unit(bn, d5->f, d5->fs, B, 4, true, 1) &&
+             bn.set_routes(g_iq3xxs.layer, B) && bn.cold() &&
+             gu3_unit(bn, g_iq3xxs.f, g_iq3xxs.fg, g_iq3xxs.fu, B, 1, false, 3, 0) &&
+             cuda_ok(cudaStreamSynchronize(bn.st), "ttts3prof");
+        printf("# ex-bench: ttts3prof %s, end %s\n", ok ? "done" : "FAILED", utc_now().c_str());
+        return ok ? 0 : 1;
+    }
+    const auto time3 = [&](const std::string & point, const std::string & formats, int32_t layer, double u,
+                           double bytes, const std::string & form, const std::function<bool(int32_t)> & unit) {
+        if (dry) {
+            const bool good = unit(0) && unit(1) && cuda_ok(cudaStreamSynchronize(bn.st), "dry");
+            printf("# ttts3dry: %s (%s, %s): %s\n", point.c_str(), formats.c_str(), form.c_str(),
+                   good ? "launched" : "FAILED");
+            n_points += good ? 1 : 0;
+            return good;
+        }
+        stats warm, cold;
+        if (!time_warm(bn, unit, warm) || !time_cold(bn, unit, cold)) {
+            fprintf(stderr, "ex-bench: %s failed\n", point.c_str());
+            return false;
+        }
+        print_point3(point, formats, layer, B, u, bytes, warm, cold, form);
+        ++n_points;
+        return true;
+    };
+    // gate/up alone: the Q4 formats at map 0 (base) and 3 (candidate); the IQ3 references as deployed (map 3)
+    for (const gu3_point & g : gq) {
+        ok                      = ok && bn.set_routes(g.layer, B);
+        const double      u     = bn.mean_u(g.layer, B);
+        const double      bytes = u * double(gate_up_bytes(g.f)) + double(bn.sh_gu_bytes[int32_t(g.fg)]) +
+                                  double(bn.sh_gu_bytes[int32_t(g.fu)]);
+        const std::string formats =
+            std::string(fmt_name(g.f)) + " + shared " + fn::dense::fmt_name(g.fg) + "/" + fn::dense::fmt_name(g.fu);
+        for (const int32_t m : { 0, 3 }) {
+            ok = ok && time3(gu_name(g) + "_B3_m" + std::to_string(m), formats, g.layer, u, bytes,
+                             m == 0 ? "base: map 0 (ME1's per-triple kernel)" : "candidate: map 3 (the family body)",
+                             [&, m](int32_t k) { return gu3_unit(bn, g.f, g.fg, g.fu, B, 1, false, m, k); });
+        }
+    }
+    for (const gu3_point & g : { g_iq3xxs, g_iq3s }) {
+        ok                      = ok && bn.set_routes(g.layer, B);
+        const double      u     = bn.mean_u(g.layer, B);
+        const double      bytes = u * double(gate_up_bytes(g.f)) + double(bn.sh_gu_bytes[int32_t(g.fg)]) +
+                                  double(bn.sh_gu_bytes[int32_t(g.fu)]);
+        const std::string formats =
+            std::string(fmt_name(g.f)) + " + shared " + fn::dense::fmt_name(g.fg) + "/" + fn::dense::fmt_name(g.fu);
+        ok = ok && time3(gu_name(g) + "_B3", formats, g.layer, u, bytes, "reference: as deployed (map 3)",
+                         [&](int32_t k) { return gu3_unit(bn, g.f, g.fg, g.fu, B, 1, false, 3, k); });
+    }
+    // gate/up lanes, Q4_K: candidate one lanes launch (map 3) against base U lone launches (map 0)
+    {
+        const gu3_point & g = gq[0];
+        ok                  = ok && bn.set_routes(g.layer, B);
+        const std::string formats =
+            std::string(fmt_name(g.f)) + " + shared " + fn::dense::fmt_name(g.fg) + "/" + fn::dense::fmt_name(g.fu);
+        for (const int32_t U : { 2, 4 }) {
+            gate_up_lanes_args la{};
+            for (int32_t l = 0; l < U; ++l) {
+                bn.ex_map = 3;
+                la.s[l]   = bn.gu_args(g.f, g.fg, g.fu, B, l, 0);
+            }
+            if (ok && !gate_up_lanes_supported(g.f, g.fg, g.fu, U, B, la)) {
+                fprintf(stderr, "ex-bench: gate_up_lanes does not take %s at U %d\n", formats.c_str(), U);
+                ok = false;
+            }
+            const double      u     = lanes_u(bn, g.layer, B, U);
+            const double      bytes = u * double(gate_up_bytes(g.f)) + double(bn.sh_gu_bytes[int32_t(g.fg)]) +
+                                      double(bn.sh_gu_bytes[int32_t(g.fu)]);
+            const std::string pt    = "gul_" + gu_name(g).substr(3) + "_U" + std::to_string(U) + "_B3";
+            ok = ok &&
+                 time3(pt, formats, g.layer, u, bytes, "candidate: one gate_up_lanes launch (map 3)",
+                       [&, U](int32_t k) { return gu3_unit(bn, g.f, g.fg, g.fu, B, U, true, 3, k); }) &&
+                 time3(pt + "_base", formats, g.layer, u, bytes, "base: U lone gate_up launches back to back (map 0)",
+                       [&, U](int32_t k) { return gu3_unit(bn, g.f, g.fg, g.fu, B, U, false, 0, k); });
+        }
+    }
+    // down alone: the Q4 formats; the references IQ4_NL (IQ4_NL) and Q2_0 (IQ4_NL) at their deployed layers
+    std::vector<dn3_point> dref;
+    for (int32_t i = 0; i < n_down_inst; ++i) {
+        dn3_point d{};
+        down_inst(i, d.f, d.fs, d.layer);
+        if (!((d.f == fmt::iq4_nl && d.fs == fmt::iq4_nl) || (d.f == fmt::q2_0 && d.fs == fmt::iq4_nl))) {
+            continue;
+        }
+        for (int32_t j = 0; j < n_gate_up_inst; ++j) {  // the first gate/up instance deployed at the layer
+            int32_t lj = 0;
+            fmt     a{};
+            dfmt    b{}, c{};
+            gate_up_inst(j, a, b, c, lj);
+            if (j == 0 || lj == d.layer) {
+                d.gf = a, d.gg = b, d.gu = c;
+            }
+            if (lj == d.layer) {
+                break;
+            }
+        }
+        dref.push_back(d);
+    }
+    for (const bool ref : { false, true }) {
+        for (const dn3_point & d : ref ? dref : dq) {
+            ok                        = ok && down3_inputs(bn, d.layer, B, d.gf, d.gg, d.gu);
+            const double      u       = bn.mean_u(d.layer, B);
+            const double      bytes   = u * double(down_bytes(d.f)) + double(down_bytes(d.fs));
+            const std::string formats = std::string(fmt_name(d.f)) + " + shared " + fmt_name(d.fs);
+            ok                        = ok && time3(dn_name(d) + "_B3", formats, d.layer, u, bytes,
+                                                    ref ? "reference: as deployed (meta written beforehand)" :
+                                                          "lone down (unchanged by TTTS3; meta written beforehand)",
+                                                    [&](int32_t k) { return dn3_unit(bn, d.f, d.fs, B, 1, false, k); });
+        }
+    }
+    // down lanes, Q5_1 and Q8_0: candidate one down_lanes launch against base U lone downs
+    for (const dn3_point & d : dq) {
+        ok                        = ok && down3_inputs(bn, d.layer, B, d.gf, d.gg, d.gu);
+        const std::string formats = std::string(fmt_name(d.f)) + " + shared " + fmt_name(d.fs);
+        for (const int32_t U : { 2, 4 }) {
+            down_lanes_args la{};
+            for (int32_t l = 0; l < U; ++l) {
+                la.s[l]     = bn.dn_args(d.f, d.fs, B, l, 0);
+                la.s[l].out = bn.out_l.as<float>() + size_t(l) * max_rows * D;
+            }
+            if (ok && !down_lanes_supported(d.f, d.fs, U, B, la)) {
+                fprintf(stderr, "ex-bench: down_lanes does not take %s at U %d\n", formats.c_str(), U);
+                ok = false;
+            }
+            const double      u     = lanes_u(bn, d.layer, B, U);
+            const double      bytes = u * double(down_bytes(d.f)) + double(down_bytes(d.fs));
+            const std::string pt    = "dnl_" + dn_name(d).substr(3) + "_U" + std::to_string(U) + "_B3";
+            ok = ok &&
+                 time3(pt, formats, d.layer, u, bytes, "candidate: one down_lanes launch (no send)",
+                       [&, U](int32_t k) { return dn3_unit(bn, d.f, d.fs, B, U, true, k); }) &&
+                 time3(pt + "_base", formats, d.layer, u, bytes, "base: U lone down launches back to back",
+                       [&, U](int32_t k) { return dn3_unit(bn, d.f, d.fs, B, U, false, k); });
+        }
+    }
+    uint32_t st = 0;
+    if (ok && (!cuda_ok(cudaMemcpy(&st, bn.status.p, 4, cudaMemcpyDeviceToHost), "status") || st != 0)) {
+        fprintf(stderr, "ex-bench: status %u\n", st);
+        ok = false;
+    }
+    printf("# ex-bench: ttts3, %d points, %s, end %s\n", n_points, ok ? "done" : "FAILED", utc_now().c_str());
+    return ok ? 0 : 1;
+}
+
 int xb2_prof(bench & bn, const std::string & points) {
     const std::string list = "," + points + ",";
     int32_t n_launch = 0;
@@ -1502,8 +1843,14 @@ int fnfl_ex_bench(int device, const char * mode, const char * cache_dir, const c
     if (sel.compare(0, 8, "sp4prof:") == 0) {
         return sp4_prof(bn, sel.substr(8));
     }
+    if (sel == "ttts3prof") {  // TTTS3 Part A's ncu pass: the five kernels, each launched once
+        return ttts3_points(bn, true);
+    }
     if (!bn.warm_up()) {
         return 1;
+    }
+    if (only == "ttts3" || only == "ttts3dry") {  // TTTS3 Part A: the Q4 expert points at B = 3 (dry: untimed)
+        return ttts3_points(bn, false, only == "ttts3dry");
     }
     if (only.compare(0, 7, "cr3seq:") == 0) {
         // CR3: the units after one layer's traffic (run_cr3seq)

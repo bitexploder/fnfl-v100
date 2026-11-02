@@ -3,6 +3,7 @@
 #include "fn/kernels/dense/dense_cold.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -15,6 +16,7 @@
 #include <ctime>
 #include <functional>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <thread>
@@ -33,11 +35,7 @@ constexpr int32_t M = fn::hc::n_mom;
 constexpr int32_t R = fn::hc::max_rows;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "hc-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "hc-bench", what);
 }
 
 std::string utc_now() {
@@ -325,6 +323,9 @@ struct card2 {
     const bool q8;
     dev_buf<uint8_t> q_down{q8 ? static_cast<size_t>(n_sub) * fn::hc::w_down_q8_bytes : 0};
     dev_buf<uint8_t> q_up{q8 ? static_cast<size_t>(n_sub) * fn::hc::w_up_q8_bytes : 0};
+    // TTTS4 kernel points: the mixed down layout's sets (hc.h w_down_mix_bytes, 114 MB a card), ttts4 mode only
+    const bool        mix;
+    dev_buf<uint8_t>  qm_down{ mix ? static_cast<size_t>(n_sub) * fn::hc::w_down_mix_bytes : 0 };
     // HC4 cold mode (R17, v-bench's method): a 12 MB L2 flush and the instruction-cache evictor before a cold launch
     dev_buf<uint8_t> flush{size_t(flush_bytes)};
     dev_buf<float> evict{16};
@@ -335,7 +336,7 @@ struct card2 {
 
     bool cold() const { return fn::dense::cold_flush(flush.p, flush_bytes, st) && fn::dense::cold_icache(evict.p, st); }
 
-    card2(int32_t d, bool with_q8) : dev(d), guard(d), q8(with_q8) {
+    card2(int32_t d, bool with_q8, bool with_mix = false) : dev(d), guard(d), q8(with_q8), mix(with_mix) {
         if (!cuda_ok(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream") ||
             !cuda_ok(cudaEventCreate(&e0), "event") || !cuda_ok(cudaEventCreate(&e1), "event")) {
             st = nullptr;
@@ -357,6 +358,19 @@ struct card2 {
 
     card2(const card2 &) = delete;
     card2 & operator=(const card2 &) = delete;
+};
+
+// TTTS4 kernel points: lane k's own buffers on one card (its outputs, moments, sinks, pre-filled X-HC copy and run
+// counters; the inputs and weights are the card's), on its device (the guard sets it before the members are allocated)
+struct lane2 {
+    int32_t        dev;
+    device_guard   guard;
+    dev_buf<float> x{ card2::n_x }, mom{ size_t(R) * M }, inject{ size_t(R) * 4 };
+    dev_buf<float> sink_hc{ size_t(R) * M }, pre_hc{ size_t(R) * M }, own_hmix{ card2::n_hmix },
+        sink_hmix{ card2::n_hmix };
+    dev_buf<uint32_t> runs{ size_t(fn::hc::n_runs_card) };
+
+    explicit lane2(int32_t d) : dev(d), guard(d) {}
 };
 
 struct bench2 {
@@ -889,8 +903,9 @@ int fnfl_hc_bench(int device) {
 
 int fnfl_hc2_bench(int dev0, int dev1, const char * mode) {
     const std::string m = mode;
-    if (m != "all" && m != "ncu" && m != "nsys" && m != "q8" && m != "cold" && m != "ncu-up" && m != "ncu-fused") {
-        fprintf(stderr, "hc2-bench: MODE is all, ncu, ncu-up, ncu-fused, nsys, q8 or cold\n");
+    if (m != "all" && m != "ncu" && m != "nsys" && m != "q8" && m != "cold" && m != "ncu-up" && m != "ncu-fused" &&
+        m != "ttts4") {
+        fprintf(stderr, "hc2-bench: MODE is all, ncu, ncu-up, ncu-fused, nsys, q8, cold or ttts4\n");
         return 2;
     }
     if (!fn::xchg::enable_peer_access(dev0, dev1)) {
@@ -911,7 +926,8 @@ int fnfl_hc2_bench(int dev0, int dev1, const char * mode) {
     using fn::hc::up_arm;
     bool ok = true;
     {
-        card2 k0(dev0, m == "q8"), k1(dev1, m == "q8");
+        const bool      t4 = m == "ttts4";
+        card2           k0(dev0, m == "q8" || t4, t4), k1(dev1, m == "q8" || t4, t4);
         card2 * c[2] = {&k0, &k1};
         fn::xchg::rings rg(dev0, dev1);
         bench2 bn = {{&k0, &k1}, &rg};
@@ -929,6 +945,9 @@ int fnfl_hc2_bench(int dev0, int dev1, const char * mode) {
                  (!k.q8 ||
                   (fill_q8(k.q_down, fn::hc::w_down_q8_bytes, int64_t(S) * fn::hc::n_rows_down * F, rng, 0.07f, k.st) &&
                    fill_q8(k.q_up, fn::hc::w_up_q8_bytes, int64_t(F) * S * fn::hc::n_down, rng, 0.25f, k.st)));
+            // TTTS4: the mixed layout's Q8_0 planes as fill_q8's, its BF16 inject rows the scale fill's bits (finite)
+            ok = ok && (!k.mix || fill_q8(k.qm_down, fn::hc::w_down_mix_bytes, int64_t(S) * fn::hc::n_down * F, rng,
+                                          0.07f, k.st));
         }
         // hpost is replicated: the same values on both cards
         std::vector<float> post(size_t(R) * S);
@@ -943,6 +962,128 @@ int fnfl_hc2_bench(int dev0, int dev1, const char * mode) {
                  cuda_ok(cudaDeviceSynchronize(), "hpost"); // a pageable copy may return before the DMA lands
         }
         ok = ok && prefill(bn);
+        // TTTS4 kernel points: four lanes, each its own ring set and buffers on both cards
+        using fn::xchg::msg;
+        constexpr int32_t                             n_lanes = fn::xchg::max_lanes;
+        std::vector<std::unique_ptr<fn::xchg::rings>> lrg;
+        std::vector<std::unique_ptr<lane2>>           lb[2];
+        for (int32_t k = 0; k < (t4 ? n_lanes : 0) && ok; ++k) {
+            lrg.push_back(std::make_unique<fn::xchg::rings>(dev0, dev1));
+            ok = lrg.back()->ok();
+            for (int32_t r = 0; r < 2 && ok; ++r) {
+                lb[r].push_back(std::make_unique<lane2>(c[r]->dev));
+                ok = lb[r].back()->runs.p != nullptr &&
+                     cuda_ok(cudaMemset(lb[r].back()->runs.p, 0, size_t(fn::hc::n_runs_card) * sizeof(uint32_t)),
+                             "lane runs");
+            }
+        }
+        // lane k's down on card r for sublayer n (set n's weights): the mixed layout (mix) or the draft's Q8_0 layout;
+        // pre: sends to a sink on the peer, no resets (hc2-bench's pre-filled points)
+        const auto lane_down = [&](int32_t r, int32_t k, int32_t n, bool pre, bool mix) {
+            card2 &                  ck   = *c[r];
+            lane2 &                  l    = *lb[r][size_t(k)];
+            const fn::hc::down_args  da   = { nullptr, ck.hres.p, ck.hx.p, ck.hpost.p, ck.gamma.p, l.x.p, l.mom.p };
+            const int32_t            prev = slot_of((n + n_sub - 1) % n_sub);
+            fn::xchg::rings &        rk   = *lrg[size_t(k)];
+            const fn::hc::down2_args d2 = { da,
+                                            pre ? lb[1 - r][size_t(k)]->sink_hc.p : rk.slot(1 - r, msg::hc, slot_of(n)),
+                                            pre ? nullptr : rk.slot(r, msg::hc, prev),
+                                            pre ? nullptr : rk.slot(r, msg::hmix, prev) };
+            const uint8_t *          w  = mix ? ck.qm_down.p + static_cast<size_t>(n) * fn::hc::w_down_mix_bytes :
+                                                ck.q_down.p + static_cast<size_t>(n) * fn::hc::w_down_q8_bytes;
+            return fn::hc::down2_q8_args{ d2, w };
+        };
+        // lane k's up on card r for sublayer n; pre: X-HC from its pre-filled copy, sends to a sink on the peer
+        const auto lane_up = [&](int32_t r, int32_t k, int32_t n, bool pre) {
+            card2 &                ck = *c[r];
+            lane2 &                l  = *lb[r][size_t(k)];
+            fn::xchg::rings &      rk = *lrg[size_t(k)];
+            const fn::hc::up2_args ua = { nullptr,
+                                          l.mom.p,
+                                          pre ? l.pre_hc.p : rk.slot(r, msg::hc, slot_of(n)),
+                                          l.x.p,
+                                          ck.gamma.p,
+                                          l.inject.p,
+                                          pre ? l.own_hmix.p : rk.slot(r, msg::hmix, slot_of(n)),
+                                          pre ? lb[1 - r][size_t(k)]->sink_hmix.p :
+                                                rk.slot(1 - r, msg::hmix, slot_of(n)),
+                                          l.runs.p,
+                                          rk.err(r),
+                                          r };
+            return fn::hc::up2_q8_args{ ua, ck.q_up.p + static_cast<size_t>(n) * fn::hc::w_up_q8_bytes };
+        };
+        const auto down_lanes = [&](int32_t rows, int32_t r, int32_t n, bool pre, bool mix) {
+            fn::hc::down2_q8_args d[n_lanes];
+            for (int32_t k = 0; k < n_lanes; ++k) {
+                d[k] = lane_down(r, k, n, pre, mix);
+            }
+            return bench2::report(mix ? fn::hc::down2_q8_mix_lanes(n_lanes, rows, d, c[r]->st) :
+                                        fn::hc::down2_q8_lanes(n_lanes, rows, d, c[r]->st),
+                                  mix ? "down2_q8_mix_lanes" : "down2_q8_lanes");
+        };
+        const auto up_lanes = [&](int32_t rows, int32_t r, int32_t n, bool pre) {
+            fn::hc::up2_q8_args u[n_lanes];
+            for (int32_t k = 0; k < n_lanes; ++k) {
+                u[k] = lane_up(r, k, n, pre);
+            }
+            return bench2::report(fn::hc::up2_q8_lanes(n_lanes, rows, u, c[r]->st), "up2_q8_lanes");
+        };
+        // item 3: every lane's sublayer in one launch a card (mode 3), the lanes' own slots, resets of the previous
+        const auto joint = [&](int32_t rows, int32_t r, int32_t n) {
+            card2 &          ck         = *c[r];
+            const int32_t    prev       = slot_of((n + n_sub - 1) % n_sub);
+            fn::hc::sub_args a[n_lanes] = {};
+            for (int32_t k = 0; k < n_lanes; ++k) {
+                lane2 &           l  = *lb[r][size_t(k)];
+                fn::xchg::rings & rk = *lrg[size_t(k)];
+                a[k].hres            = ck.hres.p;
+                a[k].hx              = ck.hx.p;
+                a[k].hpost           = ck.hpost.p;
+                a[k].gamma           = ck.gamma.p;
+                a[k].x               = l.x.p;
+                a[k].inject          = l.inject.p;
+                a[k].hc_ring         = rk.slot(r, msg::hc, slot_of(n));
+                a[k].hc_peer         = rk.slot(1 - r, msg::hc, slot_of(n));
+                a[k].hc_reset        = rk.slot(r, msg::hc, prev);
+                a[k].hmix_reset      = rk.slot(r, msg::hmix, prev);
+                a[k].hmix_own        = rk.slot(r, msg::hmix, slot_of(n));
+                a[k].hmix_peer       = rk.slot(1 - r, msg::hmix, slot_of(n));
+                a[k].err             = rk.err(r);
+                a[k].card            = r;
+            }
+            return bench2::report(
+                fn::hc::sub_joint_q8(n_lanes, rows, 3, a,
+                                     ck.qm_down.p + static_cast<size_t>(n) * fn::hc::w_down_mix_bytes,
+                                     ck.q_up.p + static_cast<size_t>(n) * fn::hc::w_up_q8_bytes, ck.st),
+                "sub_joint_q8");
+        };
+        // the lanes' pre-filled X-HC copies (prefill's, a lane at a time): the mixed down at max_rows on both cards,
+        // then each card's landed slot copied; every lane ring reset after
+        for (int32_t r = 0; r < 2 && ok && t4; ++r) {
+            ok = cuda_ok(cudaSetDevice(c[r]->dev), "cudaSetDevice") && down_lanes(R, r, 1, false, true) &&
+                 cuda_ok(cudaStreamSynchronize(c[r]->st), "lanes prefill down");
+        }
+        for (int32_t k = 0; k < (t4 ? n_lanes : 0) && ok; ++k) {
+            for (int32_t r = 0; r < 2 && ok; ++r) {
+                ok = cuda_ok(cudaSetDevice(c[r]->dev), "cudaSetDevice") &&
+                     cuda_ok(cudaMemcpy(lb[r][size_t(k)]->pre_hc.p, lrg[size_t(k)]->slot(r, msg::hc, slot_of(1)),
+                                        size_t(R) * M * sizeof(float), cudaMemcpyDeviceToDevice),
+                             "lane pre_hc");
+            }
+            ok = ok && lrg[size_t(k)]->reset_all();
+        }
+        // every lane ring's error words zero (time_point2 reads the main ring's only)
+        const auto lanes_clean = [&](const char * point) {
+            bool clean = true;
+            for (size_t k = 0; k < lrg.size() && clean; ++k) {
+                uint32_t e[2] = { ~0u, ~0u };
+                clean         = lrg[k]->read_err(0, e[0]) && lrg[k]->read_err(1, e[1]) && e[0] == 0u && e[1] == 0u;
+                if (!clean) {
+                    fprintf(stderr, "hc-bench: %s: lane %zu error words 0x%x 0x%x\n", point, k, e[0], e[1]);
+                }
+            }
+            return clean;
+        };
         ok = ok && busy_both(c, m == "ncu" ? 0.5 : warm_s);
 
         const bool both[2] = {true, true};
@@ -953,7 +1094,45 @@ int fnfl_hc2_bench(int dev0, int dev1, const char * mode) {
                 return bn.down(rows, r, n, false) && bn.up(rows, r, n, a, false) && bn.ready(rows, r, n, false);
             };
         };
-        if (m == "ncu") {
+        if (t4) {
+            // TTTS4's kernel points ("Profile and plan"), exactly these, once each: U = 4 lanes, inputs at R = 3, both
+            // cards, warm then cold; base: the B = 5 launch 9494d87 makes (that instance's SASS identical here),
+            // ttts4: B = 3 (item 1), and for the sublayer item 3's sub_joint_q8
+            constexpr int32_t rows = 3;
+
+            struct t4_point {
+                const char *                          name, *what, *arm;
+                std::function<bool(int32_t, int32_t)> unit;
+            };
+
+            const std::vector<t4_point> pts = {
+                { "t4_pre_down_mix_lanes_base_B5",  "down2_q8_mix_lanes U4 at B = 5 (base), sends to sinks",                      "-",
+                 [&](int32_t r,                                                                                                                       int32_t n) { return down_lanes(R, r, n, true, true); }                              },
+                { "t4_pre_down_mix_lanes_ttts4_B3", "down2_q8_mix_lanes U4 at B = 3 (ttts4), sends to sinks",                     "-",
+                 [&](int32_t r,                                                                                                                       int32_t n) { return down_lanes(rows, r, n, true, true); }                           },
+                { "t4_pre_up_lanes_base_B5",        "up2_q8_lanes U4 at B = 5 (base), X-HC pre-filled, sends to sinks",           "0",
+                 [&](int32_t r,                                                                                                                       int32_t n) { return up_lanes(R, r, n, true); }                                      },
+                { "t4_pre_up_lanes_ttts4_B3",       "up2_q8_lanes U4 at B = 3 (ttts4), X-HC pre-filled, sends to sinks",          "0",
+                 [&](int32_t r,                                                                                                                       int32_t n) { return up_lanes(rows, r, n, true); }                                   },
+                { "t4_pre_down_lanes_base_B5",      "down2_q8_lanes U4 at B = 5 (base, the draft's form), sends to sinks",
+                 "-",                                                                                                                  [&](int32_t r, int32_t n) { return down_lanes(R, r, n, true, false); }                             },
+                { "t4_pre_down_lanes_ttts4_B3",     "down2_q8_lanes U4 at B = 3 (ttts4, the draft's form), sends to sinks",
+                 "-",                                                                                                                  [&](int32_t r, int32_t n) { return down_lanes(rows, r, n, true, false); }                          },
+                { "t4_sub_lanes_base_B5",           "sublayer U4: down2_q8_mix_lanes + up2_q8_lanes at B = 5 (base), both cards",
+                 "0",                                                                                                                  [&](int32_t r, int32_t n) { return down_lanes(R, r, n, false, true) && up_lanes(R, r, n, false); } },
+                { "t4_sub_joint_q8_ttts4_R3",       "sublayer U4: sub_joint_q8 mode 3 at R = 3 (ttts4, item 3), both cards",
+                 "J",                                                                                                                  [&](int32_t r, int32_t n) { return joint(rows, r, n); }                                            },
+            };
+            for (const bool cold : { false, true }) {
+                for (const t4_point & pt : pts) {
+                    const std::string p = std::string(cold ? "cold_" : "") + pt.name;
+                    ok = ok &&
+                         (cold ? time_point2_cold(bn, p.c_str(), pt.what, pt.arm, rows, both, pt.unit) :
+                                 time_point2(bn, p.c_str(), pt.what, pt.arm, rows, both, n_warm, n_timed, pt.unit)) &&
+                         lanes_clean(p.c_str());
+                }
+            }
+        } else if (m == "ncu") {
             // card 0's pre-filled arm A hc_up at B = 3: 64 launches a replay, one warm replay and one profiled
             ok = ok &&
                  time_point2(bn, "ncu_pre_up_armA_B3", "hc_up2 arm A, pre-filled X-HC (card 0 only)", "A", 3, card0, 1,

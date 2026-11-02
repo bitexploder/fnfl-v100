@@ -196,6 +196,16 @@ size_t validate_utf8(const std::string& text);
  * - "prompt": [[12, 34, 56], [78, 90, 12]]
  * - "prompt": [[12, 34, "string", 56, 78], [12, 34, 56], { "prompt_string": "string" }]
  */
+// VIS1 Stage B: a rendered chat prompt with media markers as the reference engine tokenizes it (ggml-vfast 66e11c3
+// tools/mtmd/mtmd.cpp mtmd_tokenizer, Qwen3-VL): BOS first when the vocabulary adds one, each text piece on its own
+// (special tokens parsed), each image "<|vision_start|>", nx ny image tokens (grids[i]: nx, ny), "<|vision_end|>".
+// cells: each image's first cell. Throws when the markers and images differ in number
+llama_tokens tokenize_with_images(const llama_vocab *                              vocab,
+                                  const std::string &                              prompt,
+                                  const std::vector<std::pair<int32_t, int32_t>> & grids,
+                                  llama_token                                      image_token,
+                                  std::vector<int64_t> &                           cells);
+
 std::vector<server_tokens> tokenize_input_prompts(
                                         const llama_vocab * vocab,
                                         const json & json_prompt,
@@ -217,15 +227,28 @@ struct server_chat_params {
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
     bool force_pure_content = false;
+    // VIS1 Stage B: the engine reads images (FNFL with --mmproj): image_url parts with data URLs become media markers
+    bool                               allow_image        = false;
 };
+
+// VIS1 Stage B: the marker an image part leaves in the rendered prompt (the reference server's form)
+const char * get_media_marker();
+
+// VIS1 Stage B: images a request at most (fn/vision's limits; more is a 400)
+constexpr int32_t max_request_images   = 8;
+// VIS1 Stage B: the request body limit with --mmproj (the ticket's "about 213 MB": eight 20 MB images in base64,
+// 8 x 26,666,668 bytes, plus 8 MiB for the rest of the request); without it httplib's default (100 MB) stands
+constexpr size_t  max_image_body_bytes = size_t(max_request_images) * ((20000000 + 2) / 3 * 4) + 8 * 1024 * 1024;
 
 // used by /completions endpoint
 json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
-json oaicompat_chat_params_parse(
-    json & body, /* openai api json semantics */
-    const server_chat_params & opt);
+// VIS1 Stage B: out_files (null: images refused) receives each image part's bytes in order, its part replaced by the
+// media marker; data URLs only (data:image/...;base64,...)
+json oaicompat_chat_params_parse(json &                     body, /* openai api json semantics */
+                                 const server_chat_params & opt,
+                                 std::vector<raw_buffer> *  out_files = nullptr);
 
 //
 // stats and metrics

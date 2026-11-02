@@ -2,6 +2,7 @@
 
 #include "fn/kernels/act/act.h"
 #include "fn/quant/act_ref.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -16,11 +17,7 @@
 namespace {
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "act-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "act-test", what);
 }
 
 // owns one device allocation

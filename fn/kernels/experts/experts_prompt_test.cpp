@@ -1,10 +1,12 @@
 #include "fn/kernels/experts/experts_prompt_test.h"
 
+#include "fn/kernels/experts/experts_ladder.h"
 #include "fn/kernels/experts/experts_prompt.h"
 #include "fn/kernels/experts/experts_share.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/tools/test_dump.h"
 
 #include <cuda_runtime.h>
@@ -408,11 +410,7 @@ namespace fn::experts {
 namespace {
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ep-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "ep-test", what);
 }
 
 // owns one device allocation of n bytes
@@ -639,6 +637,69 @@ bool run_down(ctx & x, const case_in & c, fmt f, const dev_mem & w, const dev_me
            fn::tools::test_dump(t + "-out", res.out.data(), res.out.size() * 4);
 }
 
+// APF2: ep_group's grouped list (list li, tasks of at most rows): every expert's pairs in ceil(n / rows) contiguous
+// runs of near-equal size, expert-major, and the list's count
+bool ladder_list_ok(ctx & x, route_dev & rd, const dev_mem & lt, int32_t li, int32_t rows) {
+    std::vector<int32_t> off(NE + 1), cnt(8), tl(size_t(ep_max_ltasks) * 4);
+    if (!rd.offsets.get(off.data(), off.size() * 4, x.st) || !rd.counters.get(cnt.data(), 32, x.st) ||
+        !lt.get(tl.data(), tl.size() * 4, x.st)) {
+        return false;
+    }
+    int32_t at = 0;
+    bool    ok = cnt[1] == 0;
+    for (int32_t e = 0; e < NE && ok; ++e) {
+        const int32_t n = off[size_t(e) + 1] - off[size_t(e)], np = (n + rows - 1) / rows;
+        int32_t       first = off[size_t(e)];
+        for (int32_t k = 0; k < np && ok; ++k, ++at) {
+            const int32_t * q = tl.data() + size_t(at) * 4;
+            ok                = q[0] == e && q[1] == first && q[2] >= n / np && q[2] <= rows && q[2] >= 1;
+            first += q[2];
+        }
+        ok = ok && first == off[size_t(e) + 1];
+    }
+    return ok && cnt[2 + li] == at;
+}
+
+// the ladder's grouped gate/up on tile t (ep_group's list 0), its F16 and F32 GLU in sorted order
+bool ladder_gate_up(ctx & x, int32_t R, fmt gu, int32_t t, const dev_mem & ids, route_dev & rd, const dev_mem & lt,
+                    const dev_mem & w, const dev_mem & xh, const dev_mem & glu, const dev_mem & glu_f32,
+                    std::vector<uint16_t> & g16, std::vector<float> & g32, bool & list_ok) {
+    ep_lists ls;
+    ls.tasks[0] = lt.as<int32_t>();
+    ls.rows[0]  = el_rows(t);
+    const ep_gate_up_args a = { w.p, x.grids->p, xh.as<uint16_t>(), rd.view(), glu.as<uint16_t>(), glu_f32.as<float>() };
+    if (!glu.fill(0xff, x.st) || !glu_f32.fill(0xff, x.st) ||
+        !ep_group(R, ep_task_rows(gu), ids.as<int32_t>(), rd.view(), nullptr, x.st, ls) ||
+        !ep_gate_up_ladder(gu, t, R, a, lt.as<int32_t>(), rd.counters.as<int32_t>() + 2, x.st) || !x.sync("ladder gu")) {
+        return false;
+    }
+    list_ok = ladder_list_ok(x, rd, lt, 0, el_rows(t));
+    g16.assign(glu.n / 2, 0);
+    g32.assign(glu_f32.n / 4, 0.0f);
+    return glu.get(g16.data(), glu.n, x.st) && glu_f32.get(g32.data(), glu_f32.n, x.st);
+}
+
+// the ladder's grouped down on tile t (ep_group's list 1) from gin, F32 partials in sorted order
+bool ladder_down(ctx & x, int32_t R, fmt gu, fmt dn, int32_t t, const dev_mem & ids, route_dev & rd,
+                 const dev_mem & lt, const dev_mem & wd, const dev_mem & gin, dev_mem & part, std::vector<float> & out,
+                 bool & list_ok) {
+    ep_lists ls;
+    ls.tasks[1]          = lt.as<int32_t>();
+    ls.rows[1]           = el_rows(t);
+    const ep_down_args a = { wd.p, x.grids->p, gin.as<uint16_t>(), rd.view(), part.as<float>() };
+    if (!part.fill(0xff, x.st) || !ep_group(R, ep_task_rows(gu), ids.as<int32_t>(), rd.view(), nullptr, x.st, ls) ||
+        !ep_down_ladder(dn, t, R, a, lt.as<int32_t>(), rd.counters.as<int32_t>() + 3, x.st) || !x.sync("ladder dn")) {
+        return false;
+    }
+    list_ok = ladder_list_ok(x, rd, lt, 1, el_rows(t));
+    out.assign(part.n / 4, 0.0f);
+    return part.get(out.data(), part.n, x.st);
+}
+
+std::string tile_name(int32_t t) {
+    return "t" + std::to_string(el_rows(t)) + "x128";
+}
+
 void report(const char * what, const std::string & t, const err_acc & ours, ctx & x) {
     printf("ep-test: %s %-40s ours %.6e (max|ref| %.3e)", t.c_str(), what, ours.rel(), ours.max_ref);
     const bool pass = ours.rel() <= 1e-3;
@@ -737,6 +798,40 @@ void run_case(ctx & x, const case_in & c, const std::vector<fmt> & gus, const st
             }
         }
         report("GLU (F32 before rounding)", tg, eg, x);
+        // APF2: the ladder's grouped gate/up on every tile: the FP64 bound, the F16 GLU the F32 rounded, a rerun
+        // bitwise, the task list
+        if (el_takes_gate_up(gu)) {
+            dev_mem lt(size_t(ep_max_ltasks) * 16);
+            for (int32_t t = 0; t < el_n_tiles; ++t) {
+                const std::string     tl = tg + " ladder " + tile_name(t);
+                std::vector<uint16_t> l16[2];
+                std::vector<float>    l32[2];
+                bool                  lok = false;
+                for (int32_t run = 0; run < 2; ++run) {
+                    if (!x.check(ladder_gate_up(x, R, gu, t, ids, rd, lt, w, xh, glu, glu_f32, l16[run], l32[run], lok),
+                                 tl + ": enqueued and read")) {
+                        return;
+                    }
+                }
+                bool r16 = true;
+                err_acc el;
+                for (size_t i = 0; i < l16[0].size(); ++i) {
+                    r16 = r16 && l16[0][i] == fn::quant::f32_to_f16(l32[0][i]);
+                }
+                for (int32_t i = 0; i < c.n_sp(); ++i) {
+                    const int32_t p = c.sp_pair(i);
+                    for (int32_t ch = 0; ch < n_ff_card; ++ch) {
+                        el.add(l32[0][size_t(pos[size_t(p)]) * n_ff_card + ch], ref[size_t(i) * n_ff_card + ch]);
+                    }
+                }
+                x.check(lok, tl + ": the grouped list covers every expert's pairs in runs of at most " +
+                                 std::to_string(el_rows(t)));
+                x.check(r16, tl + ": F16 GLU = the F32 GLU rounded to nearest, every pair");
+                x.check(l16[0] == l16[1] && std::memcmp(l32[0].data(), l32[1].data(), l32[0].size() * 4) == 0,
+                        tl + ": second run bitwise identical");
+                report("GLU (F32 before rounding)", tl, el, x);
+            }
+        }
 
         // down: the reference's F16 GLU as input (sorted order)
         const std::vector<uint16_t> din = down_input(c, ref);
@@ -821,6 +916,33 @@ void run_case(ctx & x, const case_in & c, const std::vector<fmt> & gus, const st
             }
             report("down partials (every 4th column)", td, ep_, x);
             report("weighted sum", td, es, x);
+            // APF2: the ladder's grouped down on every tile: the FP64 bound on the partials, a rerun bitwise
+            if (el_takes_down(dn)) {
+                dev_mem lt(size_t(ep_max_ltasks) * 16);
+                for (int32_t t = 0; t < el_n_tiles; ++t) {
+                    const std::string  tl = td + " ladder " + tile_name(t);
+                    std::vector<float> lp[2];
+                    bool               lok = false;
+                    for (int32_t run = 0; run < 2; ++run) {
+                        if (!x.check(ladder_down(x, R, gu, dn, t, ids, rd, lt, wd, gin, part, lp[run], lok),
+                                     tl + ": enqueued and read")) {
+                            return;
+                        }
+                    }
+                    err_acc el;
+                    for (int32_t i = 0; i < nsp; ++i) {
+                        const int32_t p = c.sp_pair(i);
+                        for (int32_t n = 0; n < D; n += 4) {
+                            el.add(lp[0][size_t(pos[size_t(p)]) * D + size_t(n)], p4[size_t(i) * (D / 4) + n / 4]);
+                        }
+                    }
+                    x.check(lok, tl + ": the grouped list covers every expert's pairs in runs of at most " +
+                                     std::to_string(el_rows(t)));
+                    x.check(std::memcmp(lp[0].data(), lp[1].data(), lp[0].size() * 4) == 0,
+                            tl + ": second run bitwise identical");
+                    report("down partials (every 4th column)", tl, el, x);
+                }
+            }
         }
     }
 }
@@ -1117,6 +1239,101 @@ void share_case(ctx & x, const ep_fn4 & fr, fmt gu, const case_cfg & cfg) {
     x.check(gather && add, tag(c) + ": MX7 es_gather and es_add");
 }
 
+// APF2: the ladder's grouped gate/up and down on every tile against the per-task kernels on the same inputs (a route
+// with hot, cold and empty experts): the GLU and the partials within the FP64 contract's bound of the per-task
+// kernels' (each holds it against FP64 on the FN4 windows, run_case), the lists, a rerun bitwise
+void ladder_case(ctx & x, fmt gu, fmt dn, const case_in & c, const std::string & what) {
+    const int32_t     R = c.cfg.rows, pairs = R * NU;
+    const std::string t = what + " " + fmt_name(gu) + "/" + fmt_name(dn);
+    dev_mem ids(c.ids.size() * 4), xh(c.xh.size() * 2), glu(size_t(pairs) * n_ff_card * 2),
+        glu_f32(size_t(pairs) * n_ff_card * 4), part(size_t(pairs) * D * 4), lt(size_t(ep_max_ltasks) * 16);
+    route_dev            rd;
+    std::vector<uint8_t> wh, dh;
+    if (!ids.put(c.ids.data(), ids.n, x.st) || !xh.put(c.xh.data(), xh.n, x.st) ||
+        !packed(x.syn[static_cast<int32_t>(gu)], c.cfg.card, wh) ||
+        !packed(x.syn[static_cast<int32_t>(dn)], c.cfg.card, dh)) {
+        x.ok = false;
+        return;
+    }
+    dev_mem w(wh.size()), wd(dh.size());
+    if (!w.put(wh.data(), wh.size(), x.st) || !wd.put(dh.data(), dh.size(), x.st)) {
+        x.ok = false;
+        return;
+    }
+    // the per-task kernels: GLU, then the down from it
+    std::vector<uint16_t> r16;
+    std::vector<float>    r32, rp;
+    {
+        const ep_gate_up_args a = { w.p,       x.grids->p,         xh.as<uint16_t>(),
+                                    rd.view(), glu.as<uint16_t>(), glu_f32.as<float>() };
+        const ep_down_args    da = { wd.p, x.grids->p, glu.as<uint16_t>(), rd.view(), part.as<float>() };
+        if (!x.check(ep_group(R, ep_task_rows(gu), ids.as<int32_t>(), rd.view(), nullptr, x.st) &&
+                         ep_gate_up(gu, R, a, x.st) && ep_down(dn, R, da, x.st) && x.sync("per-task"),
+                     t + ": per-task enqueued")) {
+            return;
+        }
+        r16.assign(size_t(pairs) * n_ff_card, 0);
+        r32.assign(size_t(pairs) * n_ff_card, 0.0f);
+        rp.assign(size_t(pairs) * D, 0.0f);
+        if (!glu.get(r16.data(), glu.n, x.st) || !glu_f32.get(r32.data(), glu_f32.n, x.st) ||
+            !part.get(rp.data(), part.n, x.st)) {
+            x.ok = false;
+            return;
+        }
+    }
+    dev_mem gin(size_t(pairs) * n_ff_card * 2);  // the per-task GLU, the down's common input
+    if (!gin.put(r16.data(), gin.n, x.st)) {
+        x.ok = false;
+        return;
+    }
+    for (int32_t tile = 0; tile < el_n_tiles; ++tile) {
+        const std::string     tl = t + " " + tile_name(tile);
+        std::vector<uint16_t> l16[2];
+        std::vector<float>    l32[2], lp[2];
+        bool                  gok = false, dok = false;
+        for (int32_t run = 0; run < 2; ++run) {
+            if (!x.check(ladder_gate_up(x, R, gu, tile, ids, rd, lt, w, xh, glu, glu_f32, l16[run], l32[run], gok) &&
+                             ladder_down(x, R, gu, dn, tile, ids, rd, lt, wd, gin, part, lp[run], dok),
+                         tl + ": enqueued and read")) {
+                return;
+            }
+        }
+        err_acc eg, ed;
+        for (size_t i = 0; i < r32.size(); ++i) {
+            eg.add(l32[0][i], r32[i]);
+        }
+        for (size_t i = 0; i < rp.size(); ++i) {
+            ed.add(lp[0][i], rp[i]);
+        }
+        x.check(gok && dok, tl + ": the grouped lists cover every expert's pairs in runs of at most " +
+                                std::to_string(el_rows(tile)));
+        x.check(l16[0] == l16[1] && std::memcmp(l32[0].data(), l32[1].data(), l32[0].size() * 4) == 0 &&
+                    std::memcmp(lp[0].data(), lp[1].data(), lp[0].size() * 4) == 0,
+                tl + ": second run bitwise identical");
+        report("GLU against the per-task kernel's", tl, eg, x);
+        report("down partials against the per-task kernel's", tl, ed, x);
+    }
+}
+
+// APF1 Part 4: a skewed route: four hot experts (0..3) in every row, the other six slots spread over experts 4..403
+// (experts 404..511 empty); random FP16 activations
+case_in skewed_inputs(int32_t rows) {
+    case_in c;
+    c.cfg = case_cfg{ rows, 0, 0, rows, 0 };
+    std::mt19937                    rng(0x47525031u + static_cast<uint32_t>(rows));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int32_t r = 0; r < rows; ++r) {
+        for (int32_t k = 0; k < NU; ++k) {
+            c.ids.push_back(k < 4 ? k : 4 + (r * 37 + k * 61) % 400);
+        }
+    }
+    c.xh.resize(size_t(rows) * D);
+    for (uint16_t & v : c.xh) {
+        v = fn::quant::f32_to_f16(nd(rng));
+    }
+    return c;
+}
+
 bool parse_formats(const char * s, std::vector<fmt> & gus, std::vector<fmt> & dns) {
     const std::string str(s);
     for (int32_t i = 0; i < n_fmt; ++i) {
@@ -1197,6 +1414,18 @@ int fnfl_ep_test(int device, const char * rows, const char * formats, const char
                 grouped_case(x, fr, g, d, cfg);
             }
         }
+    }
+    // APF2: the ladder's grouped gate/up and down (Q4_K / Q5_K with Q5_1 / Q8_0, loaded here when not listed) on a
+    // skewed route (hot, cold and empty experts) against the per-task kernels
+    for (const fmt f : { fmt::q4_k, fmt::q5_k, fmt::q5_1, fmt::q8_0 }) {
+        if (x.syn.count(static_cast<int32_t>(f)) == 0 &&
+            !load_synth(f, syn_dir, x.syn[static_cast<int32_t>(f)], true, f == fmt::q8_0)) {
+            return 1;
+        }
+    }
+    for (const int32_t r : x.full ? std::vector<int32_t>{ 64, 512, 4096 } : std::vector<int32_t>{ 64 }) {
+        ladder_case(x, fmt::q4_k, fmt::q5_1, skewed_inputs(r), "ladder skewed R " + std::to_string(r));
+        ladder_case(x, fmt::q5_k, fmt::q8_0, skewed_inputs(r), "ladder skewed R " + std::to_string(r));
     }
     // MX7: the share's kernels at every listed row count
     for (const case_cfg & cfg : k_cases) {

@@ -17,6 +17,7 @@
 #include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -48,11 +49,7 @@ constexpr double tol = 2e-5;                   // SM1's listed CDF boundary (sam
 using clk = std::chrono::steady_clock;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "spec: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "spec", what);
 }
 
 bool fail_msg(std::string & err, const std::string & what) {

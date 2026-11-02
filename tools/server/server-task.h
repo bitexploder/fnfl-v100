@@ -3,6 +3,7 @@
 #include "common.h"
 #include "llama.h"
 
+#include <memory>
 #include <string>
 #include <unordered_set>
 #include <list>
@@ -120,6 +121,8 @@ struct task_result_state {
         bool filter_tool_calls = false);
 };
 
+struct fnfl_image;  // VIS1 Stage B: an engine-prepared image (fn/fnfl.h)
+
 struct server_task {
     int id = -1; // to be filled by server_queue
 
@@ -133,6 +136,8 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    // VIS1 Stage B: the prompt's images: each one's first cell in tokens and its prepared image (fn/fnfl.h)
+    std::vector<std::pair<int64_t, std::shared_ptr<fnfl_image>>> images;
 
     server_task_type type;
 
@@ -151,6 +156,7 @@ struct server_task {
     struct tu_policy_set {
         int32_t slice_ms = -1;
         int32_t group    = -1;
+        int32_t writer_pause_ms = -1;  // APF1: 10 .. 1,000
     };
     tu_policy_set tu_set;
 

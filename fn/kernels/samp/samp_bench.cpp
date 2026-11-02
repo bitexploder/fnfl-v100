@@ -3,6 +3,7 @@
 #include "fn/kernels/samp/samp.h"
 #include "fn/kernels/samp/samp_harness.h"
 #include "fn/kernels/samp/samp_ref.h"
+#include "fn/tools/cases.h"
 
 #include <cuda_runtime.h>
 
@@ -73,7 +74,7 @@ int fnfl_samp_bench(int dev0, int dev1, const char * out_path) {
         return 1;
     }
     std::vector<std::vector<float>> rows;
-    if (!read_rows("/home/jeremy/src/flashnext/work/TG1/raw/ref-decode/logits.bin.gz", 4, rows)) {
+    if (!read_rows(fn::cases::fixture_path("tg1-logits").c_str(), 4, rows)) {
         fprintf(stderr, "samp-bench: TG1's recorded logits\n");
         return 1;
     }

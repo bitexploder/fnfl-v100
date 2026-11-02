@@ -16,8 +16,10 @@
 // not correctness.
 // The output buffer is the round's upload slot: the caller refills it only after the round completes (FC-PLE1, FC-RD2).
 
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <thread>
 
 namespace fn::runtime {
 
@@ -92,6 +94,66 @@ class ple_pin {
     bool populated_ = false;
     bool pinned_ = false;
 };
+
+// STALL: lazy residency's background warm. A cold page of the lazy table costs a prompt's gather a disk read on the
+// leader thread (a 2,048-row read waited 0.5-0.9 s after the page cache lost the table), so once the load is done a
+// thread reads the whole page range in (MADV_POPULATE_READ, in pieces so stop() returns promptly), then mlocks it when
+// the box keeps at least lock_margin bytes available beside it (MemAvailable - range), then counts its residency
+// (mincore) and prints one line. The server starts at once; the gathers stay correct throughout (only faster). A
+// refused lock (RLIMIT_MEMLOCK) leaves the pages populated, unlocked. The owner stops it before the mapping goes.
+class ple_warm {
+  public:
+    static constexpr uint64_t lock_margin = uint64_t(16) << 30;
+    static constexpr uint64_t piece_bytes = uint64_t(64) << 20;
+
+    struct report {
+        uint64_t bytes = 0;             // the page-aligned range
+        int64_t  pages = 0;             // its pages
+        int64_t  resident = -1;         // resident pages at the end (mincore); -1 unread
+        bool     populated = false;     // every piece populated
+        bool     locked = false;        // mlock held
+        bool     stopped = false;       // stop() came first
+        int64_t  mem_total = -1;        // /proc/meminfo MemTotal, bytes
+        int64_t  mem_available = -1;    // MemAvailable just before the lock decision, bytes
+        uint64_t memlock_limit = 0;     // RLIMIT_MEMLOCK's soft limit (RLIM_INFINITY: unlimited)
+        double   populate_s = 0;
+        double   lock_s = 0;
+        double   total_s = 0;
+        std::string err;                // the first failed call (populate or lock), empty when none
+    };
+
+    ple_warm() = default;
+    ~ple_warm();
+    ple_warm(const ple_warm &) = delete;
+    ple_warm & operator=(const ple_warm &) = delete;
+
+    // starts the thread over [table, table + bytes) (a read-only file mapping); log: print the start and end lines
+    // to stderr ("FNFL: PLE warm: ..."). lock: allow the mlock (the margin rule still applies). False when started
+    // twice or the range is empty
+    bool start(const uint8_t * table, uint64_t bytes, bool log, bool lock = true);
+    // the thread asked to end at its next piece and joined; a lock already held stays until the destructor
+    void stop();
+    bool done() const { return done_.load(std::memory_order_acquire); }
+    // valid once done()
+    const report & result() const { return r_; }
+    // the end line's text (also printed when log)
+    std::string line() const;
+
+  private:
+    void run();
+
+    uint8_t *         a_ = nullptr; // the page-aligned range (mutable for the system calls; nothing writes it)
+    uint64_t          n_ = 0;
+    bool              log_ = false;
+    bool              lock_ = true;
+    std::thread       th_;
+    std::atomic<bool> stop_{ false };
+    std::atomic<bool> done_{ false };
+    report            r_;
+};
+
+// mincore's count of resident pages in the page-aligned range around [p, p + n); -1 on error
+int64_t ple_resident_pages(const uint8_t * p, uint64_t n);
 
 // /proc/vmstat's nr_foll_pin_acquired - nr_foll_pin_released (pages pinned with FOLL_PIN, system-wide); -1 unreadable
 int64_t ple_foll_pinned_pages();

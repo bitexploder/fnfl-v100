@@ -29,7 +29,7 @@
             "LLAMA_BUILD_SERVER": "ON",
             "LLAMA_BUILD_UI": "OFF",
             "LLAMA_USE_PREBUILT_UI": "ON",
-            "LLAMA_UI_ARCHIVE": "/home/jeremy/src/flashnext/third_party/llama-ui/dist-f3a8be05.tar.gz",
+            "LLAMA_UI_ARCHIVE": "$env{HOME}/src/flashnext/third_party/llama-ui/dist-f3a8be05.tar.gz",
             "LLAMA_UI_ARCHIVE_SHA256": "f3a8be05b1589733c88772cd7ccde901a5f76cc96b8e51e881b59c506bc55159",
             "FETCHCONTENT_FULLY_DISCONNECTED": "ON"
         }

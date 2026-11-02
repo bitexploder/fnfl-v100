@@ -11,4 +11,11 @@
 //   throughput: per deployed class (gate/up, down), 64 windows of 8 experts at B = 1 from a 512-expert layer backing,
 //               the pool on CPUs 1..5 (a CPU-only diagnostic line, not a measurement).
 // Prints "ex-cpu-test: FMT B=1..5 PASS" per format and "ex-cpu-test: PASS"; returns 0.
-int fnfl_ex_cpu_test(const char * dir);
+// TFC: cases is "all" or a comma list of fnfl_ex_cpu_case_names(), run in that list's order: formats (the round trips,
+// FP64, ME4's native views and the host drain) and throughput need the synthetic experts in dir; extents, mx7-f16,
+// loan, short-read, refill-batches, refill-state, service-loop, affinity, prompt-plan, slots, miss-split and admission
+// are host checks of their own that read nothing from dir. Returns 2 on an unknown case name.
+int fnfl_ex_cpu_test(const char * dir, const char * cases);
+
+// the case names above, comma-separated
+const char * fnfl_ex_cpu_case_names();

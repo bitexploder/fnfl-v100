@@ -12,6 +12,7 @@
 #include "fn/quant/formats.h"
 #include "fn/quant/synth.h"
 #include "fn/runtime/versions.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -46,11 +47,7 @@ constexpr int64_t hv = fn::gdn::hist_version_floats;
 constexpr int64_t pv = fn::ple::hist_version_floats;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "state-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "state-test", what);
 }
 
 uint64_t mix(uint64_t z) {

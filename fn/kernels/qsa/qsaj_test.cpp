@@ -4,6 +4,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/state.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -33,11 +34,7 @@ constexpr int32_t sel_slot = 0; // the X-SELECT slot every run uses
 constexpr uint8_t sentinel_byte = 0x7b;  // FMS13: rows rr .. 4 of each output before a launch at rr rows
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "qsaj-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "qsaj-test", what);
 }
 
 // one device allocation and its initial bytes (uploaded by fresh)

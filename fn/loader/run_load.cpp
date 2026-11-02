@@ -5,6 +5,9 @@
 #include "fn/model/kv_pool.h"
 #include "fn/model/kv_tier.h"
 #include "fn/model/state.h"
+#include "fn/vision/image.h"
+#include "fn/vision/profile.h"
+#include "fn/vision/sizes.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime_api.h>
@@ -33,6 +36,13 @@ double since(std::chrono::steady_clock::time_point t0) {
 }
 
 } // namespace
+
+void file_state_params(const model::model & m, model::state_params & sp) {
+    const int32_t t_out = model::model::find("output.weight");
+    sp.head_q8          = t_out >= 0 && std::strcmp(m.tp(t_out).format, "Q8_0") == 0;  // TTTS2
+    sp.ple_kv           = model::ple_kv_of(m);                                         // TTTS3
+    sp.ple_conv32       = model::ple_conv32_of(m);
+}
 
 bool fill_ex1_grids(const model::model & m, std::string & err) {
     const model::reserved_class * ws = m.state_class("kernel workspaces and constants");
@@ -68,7 +78,7 @@ bool reserve_class(model::model & m, const model::buffer_class & plan, int64_t &
     // ME1: on one device the prefill checkpoints are held in pinned host memory (completed copies, PF1's restore by
     // cudaMemcpyDefault); with the host-backed KV tier the target and draft KV too (mapped)
     const bool host = model::host_class(plan.name, m.single, m.kv_host);
-    const bool mapped = plan.name != "prefill checkpoints (PF1)";
+    const bool mapped = plan.name != "prefill checkpoints (PF1)" && plan.name != "vision staging (VIS1)";
     for (int32_t c = 0; c < 2; ++c) {
         const int64_t bytes = plan.allocation(c);
         if (!(host ? rc->buf[c].allocate_host(m.device[c], (size_t)bytes, err, mapped)
@@ -120,8 +130,36 @@ int64_t host_available_bytes() {
 
 } // namespace
 
-bool reserve_state(model::model & m, const model::state_params & sp, int32_t n_slots, int64_t & host_bytes,
-                   std::string & err, int32_t pool_cells) {
+bool reserve_vision(model::model &               m,
+                    const model::vision_params & vp,
+                    bool                         borrow,
+                    int64_t &                    host_bytes,
+                    std::string &                err) {
+    const model::reserved_class * arena = borrow ? m.state_class("other-reader arena (MU1)") : nullptr;
+    for (const model::buffer_class & plan : model::vision_classes(vp)) {
+        std::unique_ptr<model::reserved_class> rc;
+        if (arena != nullptr && plan.name == "vision work (VIS1)" && plan.allocation(0) <= arena->plan.allocation(0) &&
+            plan.allocation(1) <= arena->plan.allocation(1)) {
+            rc       = std::make_unique<model::reserved_class>();
+            rc->plan = plan;
+            for (int32_t c = 0; c < 2; ++c) {
+                rc->buf[c].view(m.device[c], arena->buf[c].data(), size_t(plan.allocation(c)));
+            }
+        } else if (!reserve_class(m, plan, host_bytes, rc, err)) {
+            return false;
+        }
+        m.state.push_back(std::move(rc));
+    }
+    return true;
+}
+
+bool reserve_state(model::model &               m,
+                   const model::state_params &  sp,
+                   int32_t                      n_slots,
+                   int64_t &                    host_bytes,
+                   std::string &                err,
+                   int32_t                      pool_cells,
+                   const model::vision_params * vision) {
     // TTTS1: a split stage (a window) serves up to 8 slots; one box up to 4
     const int32_t max_slots = m.win.whole() ? 4 : 8;
     if (n_slots < 1 || n_slots > max_slots) {
@@ -225,6 +263,16 @@ bool reserve_state(model::model & m, const model::state_params & sp, int32_t n_s
         }
         m.state.push_back(std::move(rc));
     }
+    if (vision != nullptr) {
+        // VIS1 Stage B: on the split's front the work class views the other-reader arena (the split reads in lane 0
+        // only), one lane; elsewhere its own reservation, two lanes with the other-reader lane
+        const bool           borrow = pooled && !sp.win.whole() && !vision->planes_only;  // the back keeps its lane
+        model::vision_params vp     = *vision;
+        vp.lanes                    = pooled && !borrow ? 2 : 1;
+        if (!reserve_vision(m, vp, borrow, host_bytes, err)) {
+            return false;
+        }
+    }
     for (int32_t c = 0; c < 2; ++c) {
         if (!cuda_ok(cudaSetDevice(m.device[c]), "cudaSetDevice", err) ||
             !cuda_ok(cudaDeviceSynchronize(), "zeroing the state", err)) {
@@ -296,7 +344,18 @@ bool load_for_run(const load_params & p, int32_t n_cells, model::model & m, run_
     sp.single = m.single;
     sp.kv_q8 = p.kv_q8;
     sp.win             = m.win;  // TTTS1
-    if (!reserve_state(m, sp, p.n_slots, rep.host_state_bytes, err, p.pool_cells)) {
+    file_state_params(m, sp);
+    model::vision_params vp;     // VIS1 Stage B
+    const bool           vis = (!p.mmproj.empty() && m.win.ple()) || (p.image_planes && !m.win.ple());
+    if (vis && m.win.ple()) {
+        vp.weights[0]  = int64_t(vision::weight_bytes(0, vision::vision_split, true, false));
+        vp.weights[1]  = int64_t(vision::weight_bytes(vision::vision_split, vision::blocks, false, true));
+        vp.scratch     = int64_t(vision::plan_scratch(vision::max_patches).total);
+        vp.patch_stage = int64_t(vision::patch_stage_bytes(vision::max_patches));
+    }
+    vp.planes_only = vis && !m.win.ple();
+    vp.token_row   = vis && m.win.whole();  // one box drafts over the rows it supplies
+    if (!reserve_state(m, sp, p.n_slots, rep.host_state_bytes, err, p.pool_cells, vis ? &vp : nullptr)) {
         return false;
     }
     if (!fill_ex1_grids(m, err)) {

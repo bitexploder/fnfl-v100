@@ -1,12 +1,12 @@
 #pragma once
 
 // The round's device frame on one card (TG1, SR1; FC-RD1, FC-RD2, FC-ST2): the round descriptor and its copy from
-// mapped host memory, the start of both cards together (RT-9), the commit of the versioned state by selection and the
+// mapped host memory, the start flag (RT-9), the commit of the versioned state by selection and the
 // round's completion record for the host. No model math: copies, a poll, timer reads, one word of commit.
 //
 // Per card r, a round's graph runs, on one stream:
-//   begin   polls the start flag in mapped host memory until it reaches the round's number (the host sets it after
-//           launching both cards' graphs, so both cards start together), then copies descriptor slot round % ring from
+//   begin   polls the start flag in mapped host memory until it reaches the round's number (TTTS7: the host
+//           sets it after writing the slot, before both launches), then copies descriptor slot round % ring from
 //           mapped host memory into the device descriptor, which every later node reads. The round's number is the
 //           card's own counter (state::next_round), so one captured graph serves every round.
 //   stamp   writes %globaltimer into state::t_start (the start skew between the cards, and the pass time).
@@ -93,7 +93,9 @@ struct desc {
                               // recoverable error on one card or both); 0 in every other use
     int32_t hsrc;             // draft kinds (DR1): the target batch row of the round's first row; row i takes the
                               // hidden carry's row hsrc + i - 1, or the retained carry when that is -1 (draft.h)
-    int32_t pad[4];
+    int32_t pos_off;          // MUP1 piece 5: the slot's rotary position offset (pos holds cell + pos_off; the QSA
+                              // indexer's summaries and queries read it here); text: 0
+    int32_t pad[3];
 };
 static_assert(sizeof(desc) % 16 == 0, "descriptor slots stay 16-byte aligned");
 constexpr int32_t desc_words = static_cast<int32_t>(sizeof(desc) / 4);

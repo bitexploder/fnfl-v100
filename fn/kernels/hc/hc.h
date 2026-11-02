@@ -319,14 +319,46 @@ bool down2_q8(int32_t rows, const down2_q8_args & a, void * stream);
 bool up2_q8(int32_t rows, const up2_q8_args & a, void * stream);
 bool head_down2_q8(int32_t rows, const down2_q8_args & a, void * stream);
 
-// FMS2 (build item 2, the joint catch-up): down2_q8 and up2_q8 at B = 5 for lanes 2 .. 4 in one launch each, the
-// grid (72, lanes): lane u's blocks are the lone launch's on a[u] (its slots, buffers and error word; the weights may
-// be one copy), the same device code, so lane u's outputs are bitwise down2_q8 / up2_q8 (5, a[u]) alone, and a row
-// below 5 is bitwise its lone launch at any B that holds it (each row's arithmetic is the row's own: hc-test's rows
-// alone). up2: each lane its own run counters (refused otherwise). False, with nothing enqueued, for lanes outside
-// 2 .. 4 or an argument down2_q8 / up2_q8 rejects.
-bool down2_q8_lanes(int32_t lanes, const down2_q8_args * a, void * stream);
-bool up2_q8_lanes(int32_t lanes, const up2_q8_args * a, void * stream);
+// FMS2 (build item 2, the joint catch-up): down2_q8 and up2_q8 for lanes 2 .. 4 in one launch each, the grid
+// (72, lanes): lane u's blocks are the lone launch's on a[u] (its slots, buffers and error word; the weights may be one
+// copy), the same device code. TTTS4 item 1: at B = rows (2 .. 5: the round's rows; the draft's joint catch-up passes
+// 5), so lane u's outputs are bitwise down2_q8 / up2_q8 (rows, a[u]) alone, rows rows .. 4 untouched as the lone launch
+// leaves them. up2: each lane its own run counters (refused otherwise). False, with nothing enqueued, for lanes outside
+// 2 .. 4, rows outside 2 .. 5 or an argument down2_q8 / up2_q8 rejects.
+bool down2_q8_lanes(int32_t lanes, int32_t rows, const down2_q8_args * a, void * stream);
+bool up2_q8_lanes(int32_t lanes, int32_t rows, const up2_q8_args * a, void * stream);
 bool head_up2_q8(int32_t rows, const up2_q8_args & a, void * stream);
+// TTTS3 (the joint head, UD-Q4_K_XL): head_down2_q8 and head_up2_q8 in lanes: grid (72, lanes), lane u's blocks the
+// lone head launch's at B = rows (2 .. 5, the round's rows, as head_sub_joint) on a[u], so each lane is bitwise its lone
+// launch at B = rows, rows rows .. 4 untouched as the lone launch leaves them (the up writes the hidden carry, slot
+// state); up: each lane its own run counters (refused otherwise)
+bool head_down2_q8_lanes(int32_t lanes, int32_t rows, const down2_q8_args * a, void * stream);
+bool head_up2_q8_lanes(int32_t lanes, int32_t rows, const up2_q8_args * a, void * stream);
+
+// ---- TTTS2: the target's Q8_0 down with BF16 inject rows (UD-Q4_K_XL) ----
+// The file's hc_*_down is Q8_0 and its hc_*_inject F32, every value a BF16 (TTTS2 inventory), which Q8_0 cannot hold
+// in general. down2_q8_mix is down2_q8 on a mixed layout: the 320 low-rank rows a stream in the head Q8_0 layout above
+// (w_down_head_q8_bytes), then the inject rows BF16, inj[s][k][i] (k = 0..3, i = 0..1279; GGUF inject row k, element
+// s*2560 + r*1280 + i). Each Q8_0 row's arithmetic is down2_q8's and each inject row's is down2's, so with Q8_0 scales
+// that are powers of two the outputs are bitwise down2 on the same weights (hc-test); otherwise the contract is
+// down2_q8's. down2_q8_mix_lanes is down2_q8_lanes' form of it (the same grid and rows, each lane bitwise its lone
+// launch at B = rows).
+constexpr int64_t w_down_mix_bytes = w_down_head_q8_bytes + int64_t(4) * n_inject * n_own * 2;  // 1,781,760
+bool              down2_q8_mix(int32_t rows, const down2_q8_args & a, void * stream);
+bool              down2_q8_mix_lanes(int32_t lanes, int32_t rows, const down2_q8_args * a, void * stream);
+
+// ---- TTTS4 item 3: the joint sublayer launch (sub_joint) on the target's Q8_0 weights ----
+// sub_joint with w_down the mixed layout above (w_down_mix_bytes) and w_up up2_q8's Q8_0 layout, both 16-byte aligned;
+// a[k].w_down and a[k].w_up are not read. The same grid, phases, slots and joint X-HC layout as sub_joint; each Q8_0
+// weight is decoded exactly to d * q as dot8q decodes it and enters the same FMAs in the same order, each inject row's
+// BF16 as down2's, so every output of lane k (x, inject, both forms of mixed in both cards' X-HMIX slots, its resets,
+// its error word) is bitwise down2_q8_mix (rows, lane k) then up2_q8 (rows, lane k) alone. Refusals as sub_joint's.
+bool sub_joint_q8(int32_t          lanes,
+                  int32_t          rows,
+                  int32_t          mode,
+                  const sub_args * a,
+                  const uint8_t *  w_down,
+                  const uint8_t *  w_up,
+                  void *           stream);
 
 } // namespace fn::hc

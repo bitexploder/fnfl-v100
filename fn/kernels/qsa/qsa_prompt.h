@@ -1,7 +1,8 @@
 #pragma once
 
 // QSA over prompt rows (PB1; FC-PF3's FC-QSA1 and FC-QSA2 rows), on one card. Rows of a half at positions pos0 .. pos0 +
-// rows - 1 (rows <= 4,096), every cell's state written before the rows that read it run.
+// rows - 1 (rows <= 4,096), every cell's state written before the rows that read it run. MUP1 piece 5: the rotary
+// positions are the rows' cells plus the slot's offset (rope_off), or supplied planes for the attention's q and k.
 //
 // The index (index owner; qsa.cu, built with -use_fast_math as the decode scorer):
 //   qsp_keys:    the raw index keys bf16(ik) (round to nearest even) at the rows' cells.
@@ -74,6 +75,10 @@ struct qsp_index_args {
     const float * q_norm    = nullptr;
     rope_params   rope      = {};
     int32_t       rows = 0, pos0 = 0, max_cells = 0;
+    int32_t       rope_off = 0;  // MUP1 piece 5: the slot's rotary offset (queries at pos0 + t + rope_off)
+    // VIS1 Stage B: optional device [rows][4], the half's rows' rope planes: row t's queries are roped at them (IMROPE's
+    // plane a pair) instead of at pos0 + t + rope_off (null: text)
+    const int32_t * planes = nullptr;
     prompt_ws     ws;
     uint32_t *    body    = nullptr;  // the half's bodies (layout above)
     int32_t *     offsets = nullptr;  // [prompt_slabs][129]
@@ -91,6 +96,10 @@ struct qsp_kv_args {
     uint16_t *    v_cache = nullptr;
     uint16_t * k_scale = nullptr; // KV8: both set, the caches are q8 (int8 codes) and these the layer's scales
     uint16_t * v_scale = nullptr;
+    // MUP1 piece 5: row t's rotary position: planes (device [rows][4], VIS1's supplied rows; fn/kernels/qsa/imrope.cuh)
+    // when set, else every plane pos0 + rope_off + t (text: the slot's offset, 0 today); its cell stays pos0 + t
+    int32_t         rope_off = 0;
+    const int32_t * planes   = nullptr;
 };
 
 bool qsp_kv(const qsp_kv_args & a, void * stream);
@@ -108,6 +117,8 @@ struct qsp_attend_args {
     float *          out   = nullptr;  // optional F32 [rows][3072]
     uint16_t *       out16 = nullptr;  // FP16 [rows][3072]
     uint32_t *       err   = nullptr;
+    int32_t          rope_off = 0;        // MUP1 piece 5: as qsp_kv_args (the query's rotary position)
+    const int32_t *  planes   = nullptr;
 };
 
 bool qsp_attend(const qsp_attend_args & a, void * stream);

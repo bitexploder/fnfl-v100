@@ -40,14 +40,32 @@ std::vector<std::string> ple_table_lines(const run_load_report & rep);
 // the EX1 grid table (fn::experts::grid_table) into the "EX1 grid table" part of both cards
 bool fill_ex1_grids(const model::model & m, std::string & err);
 
+// TTTS3: the state's file-dependent settings from the placed formats (head_q8, ple_kv, ple_conv32), one rule for the
+// run load, the dry load and load-plan
+void file_state_params(const model::model & m, model::state_params & sp);
+
 // every state class of sp (fn/model/state.h) reserved and zeroed (the host classes too, their bytes added to
 // host_bytes); MU1, n_slots > 1: slot 0's slot classes in m.state, slot s's in m.slot_state[s - 1], the pooled ones as
 // views of the KV pool (created here, its fixed tails zeroed, no page mapped), and the other-reader lane's classes.
 // KV8: pool_cells (n_slots > 1) the pool's physical cells (0: sp.n_cells; kv_pool::init).
 // MXMU1, two slots on one card with the host-backed tier: every slot class reserved per slot (no pool, no lane),
 // refused before any allocation when MemAvailable cannot hold every slot's pinned history
-bool reserve_state(model::model & m, const model::state_params & sp, int32_t n_slots, int64_t & host_bytes,
-                   std::string & err, int32_t pool_cells = 0);
+// VIS1 Stage B: the vision classes (model::vision_classes) for vp; borrow: the work class a view of the other-reader
+// arena when that is reserved and large enough (the split's front), else its own reservation (vis-test calls it alone)
+bool reserve_vision(model::model &               m,
+                    const model::vision_params & vp,
+                    bool                         borrow,
+                    int64_t &                    host_bytes,
+                    std::string &                err);
+// VIS1 Stage B: vision (non-null, a projector on a box that embeds) reserves the vision classes too
+// (model::vision_classes; lanes set here: two with the other-reader lane)
+bool reserve_state(model::model &               m,
+                   const model::state_params &  sp,
+                   int32_t                      n_slots,
+                   int64_t &                    host_bytes,
+                   std::string &                err,
+                   int32_t                      pool_cells = 0,
+                   const model::vision_params * vision     = nullptr);
 // KV8: every state class released (the slots' and the pool too), on drained devices, so reserve_state can lay the
 // state out again (one loaded model's bf16 and q8 passes); the weights and the rings stay, and the caller fills the
 // EX1 grid table again (fill_ex1_grids) after the new reservation

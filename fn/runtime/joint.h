@@ -53,6 +53,8 @@ class joint_frame {
     bool router_tc() const { return router_tc_; }
     bool dense_f16() const { return dense_f16_; }
 
+    bool q8() const { return q8_; }  // TTTS6: the dense sites on the Q8_0 instances (model::dense_q8_of)
+
     // One joint round of n (2..4) members t[k], each a verify of d[k] proposals prop[k] under budget[k] (FMS13: d in
     // 1 .. 4, the same for every member; lanes of R = d + 1 rows): the graphs (captured on the membership's first
     // round at that R), every member staged, both cards' graphs launched, every
@@ -100,6 +102,9 @@ class joint_frame {
                 std::string    why[],
                 std::string &  err);
     void test_set_x16(bool on);
+    // TTTS3 (TEST ONLY, rollback-test section 7b): the verify rounds' pieces forced to their per-lane fallback
+    // (model::joint_lone_*; 0 none), the verify graphs dropped (captured again at use)
+    void test_set_lone(uint32_t pieces);
 
     // FMU2 (build item 2): one joint draft step of n (2..4) members t[k], each a draft step of d (1..4) chained steps
     // from its draft_n() as row k of one step (fn/model/draft.h draft_joint): the graphs (captured on the
@@ -135,14 +140,20 @@ class joint_frame {
     int64_t graph_bytes(int32_t card) const;
     int32_t captures() const { return captures_; }
     int64_t rounds() const { return rounds_; }
-    // the last verify (FMS2: or joint catch-up) did not launch because its membership's graphs failed to capture
+
+    // the last verify (FMS2: or joint catch-up; TTTS3: or joint draft) did not launch because its membership's graphs
+    // failed to capture
     bool capture_failed() const { return capture_failed_; }
+
+    // PRD1 item 4 (TEST ONLY): the next n verify-graph captures fail as a failed capture does, eager mode too
+    void    test_fail_captures(int32_t n) { test_fail_captures_ = n; }
     // the last capture's free memory left on each card (cudaMemGetInfo after its upload), and its graph's nodes
     int64_t free_after_capture(int32_t card) const { return free_after_[card]; }
     int64_t last_nodes(int32_t card) const { return nodes_[card]; }
     int32_t last_lanes() const { return last_lanes_; }
 
   private:
+    int32_t test_fail_captures_ = 0;
     struct graph_pair {
         std::vector<int32_t> key;  // per lane: slot, variant, expert map; FMS13: then R (verify graphs)
         void * graph[2] = {nullptr, nullptr};
@@ -189,6 +200,8 @@ class joint_frame {
     void * kw_[2] = {nullptr, nullptr};    // FMS2: the lanes' kernel workspaces (model::joint_kernel_ws_bytes)
     model::layer_ws lws_[2];
     model::dense_layouts layouts_{};
+    model::dense_stagings  steps_{};           // TTTS6 item 2: the sites' staging steps, computed once here
+    fn::dense::stage_steps kv_steps_[2] = {};  // TTTS6 item 2: the catch-up K/V's, dense and sparse forms
     uint64_t ple_use_[fn::xchg::max_lanes] = {}; // each lane ring's PLE uses (its X-PLE-STATS slot sequence)
     std::vector<graph_pair> cache_;
     std::vector<graph_pair> dcache_; // the joint draft's graphs (key: per lane its slot, then d, the draft form and
@@ -212,6 +225,8 @@ class joint_frame {
     bool                    x16_                   = false;
     bool router_tc_ = false;
     bool dense_f16_ = false;
+    bool                    q8_                    = false;  // TTTS6
+    uint32_t                lone_                  = 0;   // TTTS3: test_set_lone
     bool refused_noted_[model::layer_max_rows + 1] = {};  // FMS13: x16 / group refused at this R, named once
 };
 

@@ -1,6 +1,7 @@
 #include "fn/kernels/ple/ple_test.h"
 
 #include "fn/borrowed/gguf_tensors.h"
+#include "fn/kernels/dense/dense_prompt.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/embed/embed.h"
 #include "fn/kernels/ple/ple.h"
@@ -1045,12 +1046,486 @@ bool embed_checks(pair_ctx & p, const files & f, bool san, embed_result & er) {
            p.rg->reset_all();
 }
 
+// ---- TTTS3 item 5: the key and value as the file's Q8_0 against the same rows widened to F32 --------------------
+
+// a device buffer, freed with the test
+struct dmem {
+    void * p                       = nullptr;
+    dmem()                         = default;
+    dmem(const dmem &)             = delete;
+    dmem & operator=(const dmem &) = delete;
+
+    ~dmem() { cudaFree(p); }
+
+    bool alloc(size_t n, const char * what) { return ok_cuda(cudaMalloc(&p, n), what); }
+
+    template <typename T> T * as() const { return static_cast<T *>(p); }
+};
+
+// UD-Q4_K_XL's layer 1 key and value: card r's rows (key s*2560 + r*1280 + i, stream-major; value r*1280 + i) as the
+// file's Q8_0 blocks, and widened to F32 exactly (TTTS2's loader rule: (float) q x d)
+struct q8_card {
+    std::vector<uint8_t> key, value;  // [5120][2720], [1280][2720]
+    std::vector<float>   key_f, value_f;
+};
+
+constexpr int64_t q8_row = int64_t(D / 32) * 34;
+
+void widen_q8(const uint8_t * src, int64_t rows, float * dst) {
+    for (int64_t b = 0; b < rows * (D / 32); ++b) {
+        uint16_t dh = 0;
+        std::memcpy(&dh, src + 34 * b, 2);
+        const float d = fn::quant::f16_to_f32(dh);
+        for (int32_t i = 0; i < 32; ++i) {
+            dst[32 * b + i] = static_cast<float>(static_cast<int8_t>(src[34 * b + 2 + i])) * d;
+        }
+    }
+}
+
+bool read_q8_cards(const files & f, q8_card (&c)[2]) {
+    std::vector<uint8_t> key(size_t(4) * D * q8_row), value(size_t(D) * q8_row);
+    if (!read_tensor(f, "blk.1.ple_key.weight", "q8_0", key.size(), key.data()) ||
+        !read_tensor(f, "blk.1.ple_value.weight", "q8_0", value.size(), value.data())) {
+        return false;
+    }
+    for (int32_t r = 0; r < 2; ++r) {
+        c[r].key.resize(size_t(CH) * q8_row);
+        c[r].value.resize(size_t(F) * q8_row);
+        for (int32_t s = 0; s < S; ++s) {
+            std::memcpy(c[r].key.data() + size_t(s) * F * q8_row, key.data() + (size_t(s) * D + size_t(r) * F) * q8_row,
+                        size_t(F) * q8_row);
+        }
+        std::memcpy(c[r].value.data(), value.data() + size_t(r) * F * q8_row, size_t(F) * q8_row);
+        c[r].key_f.resize(size_t(CH) * D);
+        c[r].value_f.resize(size_t(F) * D);
+        widen_q8(c[r].key.data(), CH, c[r].key_f.data());
+        widen_q8(c[r].value.data(), F, c[r].value_f.data());
+    }
+    return true;
+}
+
+// TTTS3 (ple-test q8, no model load): on one device, card 0's products with the key and value as stored (Q8_0) against
+// the same rows widened to F32 (TTTS2's form): lone at B = 1..5, bitwise; the joint products at U = 2..4 and R = 2..5,
+// each lane bitwise its lone Q8_0 products; the prompt products (dense::pd_bf16, card 1's rows as the replica) at
+// several row counts, bitwise
+bool embed_q8_cases(int dev, const files & f);
+
+int ple_q8_test(int dev, const char * model) {
+    printf("ple-test q8: device %d, model %s\n", dev, model);
+    files   f;
+    q8_card qc[2];
+    if (!open_files(model, f) || !read_q8_cards(f, qc) || !ok_cuda(cudaSetDevice(dev), "device")) {
+        return 1;
+    }
+    cudaStream_t st = nullptr;
+    if (!ok_cuda(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream")) {
+        return 1;
+    }
+    constexpr int32_t U = fn::dense::max_lanes, PR = 300;  // lanes; the prompt's most rows
+    dmem              kq[2], vq[2], kf[2], vf[2], e, ws[U + 1], work, pout_q, pout_f, pe;
+    bool              ok = true;
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        ok = kq[r].alloc(qc[r].key.size(), "key q8") && vq[r].alloc(qc[r].value.size(), "value q8") &&
+             kf[r].alloc(qc[r].key_f.size() * 4, "key f32") && vf[r].alloc(qc[r].value_f.size() * 4, "value f32") &&
+             ok_cuda(cudaMemcpy(kq[r].p, qc[r].key.data(), qc[r].key.size(), cudaMemcpyHostToDevice), "up") &&
+             ok_cuda(cudaMemcpy(vq[r].p, qc[r].value.data(), qc[r].value.size(), cudaMemcpyHostToDevice), "up") &&
+             ok_cuda(cudaMemcpy(kf[r].p, qc[r].key_f.data(), qc[r].key_f.size() * 4, cudaMemcpyHostToDevice), "up") &&
+             ok_cuda(cudaMemcpy(vf[r].p, qc[r].value_f.data(), qc[r].value_f.size() * 4, cudaMemcpyHostToDevice), "up");
+    }
+    // activations: lane u's rows at e + u * R * D (seeded; a zero, a negative zero and large values among them)
+    std::vector<float> eh(size_t(U) * R * D);
+    rng                g(0x51u);
+    for (float & x : eh) {
+        x = g.uni(-3.0f, 3.0f);
+    }
+    eh[7] = 0.0f;
+    eh[8] = -0.0f;
+    eh[9] = 1.0e4f;
+    std::vector<float> ph(size_t(PR) * D);
+    for (float & x : ph) {
+        x = g.uni(-3.0f, 3.0f);
+    }
+    for (int32_t u = 0; u <= U && ok; ++u) {
+        ok = ws[u].alloc(pl::workspace_bytes(), "ws") && pl::prepare(ws[u].as<uint8_t>());
+    }
+    ok = ok && e.alloc(eh.size() * 4, "e") &&
+         ok_cuda(cudaMemcpy(e.p, eh.data(), eh.size() * 4, cudaMemcpyHostToDevice), "e up") &&
+         work.alloc(std::max<size_t>(pl::joint_products_work_bytes(), 16), "joint work") &&
+         ok_cuda(cudaMemset(work.p, 0, std::max<size_t>(pl::joint_products_work_bytes(), 16)), "work zero") &&
+         pe.alloc(ph.size() * 4, "prompt e") &&
+         ok_cuda(cudaMemcpy(pe.p, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice), "prompt e up") &&
+         pout_q.alloc(size_t(PR) * 4 * D * 4, "prompt out") && pout_f.alloc(size_t(PR) * 4 * D * 4, "prompt out") &&
+         ok_cuda(cudaDeviceSynchronize(), "uploads");  // the legacy-stream uploads done before st's launches
+    if (!ok) {
+        cudaStreamDestroy(st);
+        return 1;
+    }
+    const auto args = [&](int32_t u, bool q8, int32_t w) {
+        pl::step_args a;
+        a.w.key   = (q8 ? kq[0] : kf[0]).as<uint8_t>();
+        a.w.value = (q8 ? vq[0] : vf[0]).as<uint8_t>();
+        a.w.kv    = q8 ? pl::kv_fmt::q8_0 : pl::kv_fmt::f32;
+        a.e       = e.as<float>() + size_t(u) * R * D;
+        a.ws      = ws[w].as<uint8_t>();
+        return a;
+    };
+    // a workspace's key [R][5120] and value [R][1280] for rows rows
+    const auto take = [&](int32_t w, int32_t rows, std::vector<float> & out) {
+        const pl::ws_view v = pl::carve(ws[w].as<uint8_t>());
+        out.assign(size_t(rows) * (CH + F), 0.0f);
+        return ok_cuda(cudaStreamSynchronize(st), "sync") &&
+               ok_cuda(cudaMemcpy(out.data(), v.key, size_t(rows) * CH * 4, cudaMemcpyDeviceToHost), "key") &&
+               ok_cuda(
+                   cudaMemcpy(out.data() + size_t(rows) * CH, v.value, size_t(rows) * F * 4, cudaMemcpyDeviceToHost),
+                   "value");
+    };
+    const auto same = [](const std::vector<float> & a, const std::vector<float> & b) {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+    };
+    bool    pass       = true;
+    // lone, B = 1..5, every lane's rows
+    int64_t lone_cases = 0, lone_bad = 0;
+    for (int32_t B = 1; B <= R && ok; ++B) {
+        for (int32_t u = 0; u < U && ok; ++u) {
+            std::vector<float> q, w32;
+            ok = pl::products(B, args(u, true, 0), st) && take(0, B, q) && pl::products(B, args(u, false, 0), st) &&
+                 take(0, B, w32);
+            lone_cases += 1;
+            lone_bad += ok && same(q, w32) ? 0 : 1;
+        }
+    }
+    printf(
+        "ple-test q8: lone products B = 1..5 (%lld cases, key [B][5120] and value [B][1280]), Q8_0 against the "
+        "rows widened to F32: %lld differ\n",
+        static_cast<long long>(lone_cases), static_cast<long long>(lone_bad));
+    pass                = pass && lone_cases == 20 && lone_bad == 0;
+    // joint: U = 2..4 lanes of R = 2..5 rows, each lane against its own lone Q8_0 products
+    int64_t joint_cases = 0, joint_bad = 0;
+    for (int32_t lanes = 2; lanes <= U && ok; ++lanes) {
+        for (int32_t rows = 2; rows <= R && ok; ++rows) {
+            pl::step_args         a[U];
+            const pl::step_args * ap[U] = {};
+            for (int32_t u = 0; u < lanes; ++u) {
+                a[u]  = args(u, true, u + 1);
+                ap[u] = &a[u];
+            }
+            ok = pl::products_joint(lanes, rows, ap, work.as<uint8_t>(), st);
+            for (int32_t u = 0; u < lanes && ok; ++u) {
+                std::vector<float> jq, lq;
+                ok = take(u + 1, rows, jq) && pl::products(rows, args(u, true, 0), st) && take(0, rows, lq);
+                joint_cases += 1;
+                joint_bad += ok && same(jq, lq) ? 0 : 1;
+            }
+        }
+    }
+    printf(
+        "ple-test q8: joint products U = 2..4, R = 2..5 (%lld lanes): each lane against its lone Q8_0 products: "
+        "%lld differ\n",
+        static_cast<long long>(joint_cases), static_cast<long long>(joint_bad));
+    pass = pass && joint_cases == 36 && joint_bad == 0;
+    // the F32 rows have no joint form (refused, nothing enqueued)
+    {
+        pl::step_args         a[2]  = { args(0, false, 1), args(1, false, 2) };
+        const pl::step_args * ap[2] = { &a[0], &a[1] };
+        const bool            took  = pl::products_joint(2, 2, ap, work.as<uint8_t>(), st);
+        printf("ple-test q8: joint products of F32 rows refused: %s\n", took ? "NO" : "yes");
+        pass = pass && !took;
+    }
+    // the prompt products (pd_bf16): key [n][4 D] over both cards' rows (card 1's as the replica) and value [n][D]
+    int64_t pr_cases = 0, pr_bad = 0;
+    for (const int32_t n : { 1, 3, 64, 100, PR }) {
+        for (int32_t which = 0; which < 2 && ok; ++which) {
+            const bool         key = which == 0;
+            fn::dense::pb_args b;
+            b.period = D;
+            b.half   = F;
+            b.n      = key ? 4 * D : D;
+            b.k      = D;
+            b.rows   = n;
+            b.x      = pe.as<float>();
+            b.ldx    = D;
+            b.ld_out = b.n;
+            std::vector<float> oq(size_t(n) * b.n), of(size_t(n) * b.n);
+            fn::dense::pb_args bq = b, bf = b;
+            bq.w_lo = (key ? kq[0] : vq[0]).as<uint16_t>();
+            bq.w_hi = (key ? kq[1] : vq[1]).as<uint16_t>();
+            bq.q8   = true;
+            bq.out  = pout_q.as<float>();
+            bf.w_lo = (key ? kf[0] : vf[0]).as<uint16_t>();
+            bf.w_hi = (key ? kf[1] : vf[1]).as<uint16_t>();
+            bf.f32  = true;
+            bf.out  = pout_f.as<float>();
+            ok      = fn::dense::pd_bf16(bq, st) && fn::dense::pd_bf16(bf, st) &&
+                      ok_cuda(cudaStreamSynchronize(st), "sync") &&
+                      ok_cuda(cudaMemcpy(oq.data(), pout_q.p, oq.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                      ok_cuda(cudaMemcpy(of.data(), pout_f.p, of.size() * 4, cudaMemcpyDeviceToHost), "out");
+            pr_cases += 1;
+            pr_bad += ok && same(oq, of) ? 0 : 1;
+        }
+    }
+    printf(
+        "ple-test q8: prompt products (pd_bf16, key and value at 1, 3, 64, 100 and 300 rows; card 1's rows the "
+        "replica): Q8_0 against the rows widened to F32: %lld of %lld differ\n",
+        static_cast<long long>(pr_bad), static_cast<long long>(pr_cases));
+    pass                    = pass && pr_cases == 10 && pr_bad == 0;
+    const int64_t f32_bytes = pl::kv_row_bytes(pl::kv_fmt::f32) * (CH + F),
+                  q8_bytes  = pl::kv_row_bytes(pl::kv_fmt::q8_0) * (CH + F);
+    printf("ple-test q8: a card's key and value: %lld bytes as Q8_0, %lld widened to F32\n",
+           static_cast<long long>(q8_bytes), static_cast<long long>(f32_bytes));
+    cudaStreamDestroy(st);
+    if (!ok) {
+        printf("ple-test q8: FAIL (a run did not complete)\n");
+        return 1;
+    }
+    pass = embed_q8_cases(dev, f) && pass;  // TTTS3 item 7
+    printf("ple-test q8: %s\n", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
+// ---- TTTS3 item 7: TTTS2's Q8_0 embed and embed_rows on UD-Q4_K_XL's token_embd -------------------------------
+
+// card r's Q8_0 slice of a token_embd row (40 blocks), each value d x q in F32 (fn/quant's decode_q8_0 rule)
+void decode_embd_q8(const uint8_t * src, float * dst) {
+    for (int32_t b = 0; b < fn::embed::n_own / 32; ++b) {
+        uint16_t dh = 0;
+        std::memcpy(&dh, src + 34 * b, 2);
+        const float d = fn::quant::f16_to_f32(dh);
+        for (int32_t i = 0; i < 32; ++i) {
+            dst[32 * b + i] = d * static_cast<float>(static_cast<int8_t>(src[34 * b + 2 + i]));
+        }
+    }
+}
+
+bool same_bits(const float * a, const float * b, size_t n) {
+    return std::memcmp(a, b, n * 4) == 0;
+}
+
+// TTTS3 (ple-test q8): embed (B = 1..5) and embed_rows (1, 7 and 300 rows) with the Q8_0 table, card by card on one
+// device: every written value bitwise the CPU decode of the token's real row, hpost and hx zero, the peer's columns of
+// full and the streams untouched, the error word zero; then an ID outside [0, V) sets err_token and writes nothing for
+// its row. The tokens: 0, V - 1 and 62 more spread over the vocabulary (each row read from the file)
+bool embed_q8_cases(int dev, const files & f) {
+    namespace em               = fn::embed;
+    constexpr int32_t        V = em::n_vocab, RB = em::q8_row_bytes, full_row = 2 * RB;
+    size_t                   d = 0;
+    const fnfl_gguf_tensor * t = find(f, "token_embd.weight", d);
+    if (t == nullptr || t->type_name != "q8_0" || t->bytes != uint64_t(V) * full_row) {
+        fprintf(stderr, "ple-test q8: token_embd.weight: missing, not q8_0 or not %d rows of %d bytes\n", V, full_row);
+        return false;
+    }
+    std::vector<int32_t> ids = { 0, V - 1 };
+    rng                  g(0x7e8du);
+    while (ids.size() < 64) {
+        ids.push_back(g.below(V));
+    }
+    std::vector<std::vector<uint8_t>> rows(ids.size(), std::vector<uint8_t>(full_row));
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (!read_at(f.dirs[d].path, t->offset + uint64_t(ids[i]) * full_row, rows[i].data(), full_row)) {
+            fprintf(stderr, "ple-test q8: token_embd row %d unreadable\n", ids[i]);
+            return false;
+        }
+    }
+    constexpr int32_t PR = 300;
+    dmem              table, tok, hres, hpost, hx, own, full, strm, err;
+    cudaStream_t      st = nullptr;
+    bool ok = ok_cuda(cudaSetDevice(dev), "device") && table.alloc(size_t(V) * RB, "table") &&
+              tok.alloc(size_t(PR) * 4, "tok") && hres.alloc(size_t(em::max_rows) * 4 * em::n_own * 4, "hres") &&
+              hpost.alloc(size_t(em::max_rows) * 16, "hpost") && hx.alloc(size_t(em::max_rows) * em::n_own * 4, "hx") &&
+              own.alloc(size_t(PR) * em::n_own * 4, "own") && full.alloc(size_t(PR) * 2 * em::n_own * 4, "full") &&
+              strm.alloc(size_t(PR) * 4 * 2 * em::n_own * 4, "streams") && err.alloc(4, "err") &&
+              ok_cuda(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+    int64_t cases = 0, bad = 0;
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        // the card's table: the chosen rows' card slices, every other row zero
+        ok = ok_cuda(cudaMemsetAsync(table.p, 0, size_t(V) * RB, st), "table");
+        std::vector<std::vector<float>> want(ids.size(), std::vector<float>(em::n_own));
+        for (size_t i = 0; i < ids.size() && ok; ++i) {
+            decode_embd_q8(rows[i].data() + size_t(r) * RB, want[i].data());
+            ok = ok_cuda(cudaMemcpyAsync(table.as<uint8_t>() + size_t(ids[i]) * RB, rows[i].data() + size_t(r) * RB, RB,
+                                         cudaMemcpyHostToDevice, st),
+                         "row");
+        }
+        // embed at B = 1..5 (the rows: ids i, i + 1, ..; the first case starts at V - 1's index so it is covered)
+        for (int32_t B = 1; B <= em::max_rows && ok; ++B) {
+            std::vector<int32_t> tk(static_cast<size_t>(B));
+            std::vector<size_t>  at(static_cast<size_t>(B));
+            for (int32_t b = 0; b < B; ++b) {
+                at[size_t(b)] = (size_t(B) * 7 + size_t(b)) % ids.size();
+                tk[size_t(b)] = ids[at[size_t(b)]];
+            }
+            if (B == 1) {
+                at[0] = 1;
+                tk[0] = ids[1];
+            }
+            em::args a;
+            a.table = table.as<uint8_t>();
+            a.tok   = tok.as<int32_t>();
+            a.hres  = hres.as<float>();
+            a.hpost = hpost.as<float>();
+            a.hx    = hx.as<float>();
+            a.err   = err.as<uint32_t>();
+            a.q8    = true;
+            std::vector<float> oh(size_t(B) * 4 * em::n_own), op(size_t(B) * 4), ox(size_t(B) * em::n_own);
+            uint32_t           e = ~0u;
+            ok        = ok_cuda(cudaMemcpyAsync(tok.p, tk.data(), size_t(B) * 4, cudaMemcpyHostToDevice, st), "tok") &&
+                        ok_cuda(cudaMemsetAsync(hres.p, 0xff, oh.size() * 4, st), "poison") &&
+                        ok_cuda(cudaMemsetAsync(hpost.p, 0xff, op.size() * 4, st), "poison") &&
+                        ok_cuda(cudaMemsetAsync(hx.p, 0xff, ox.size() * 4, st), "poison") &&
+                        ok_cuda(cudaMemsetAsync(err.p, 0, 4, st), "err") && em::embed(B, a, st) &&
+                        ok_cuda(cudaStreamSynchronize(st), "embed") &&
+                        ok_cuda(cudaMemcpy(oh.data(), hres.p, oh.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                        ok_cuda(cudaMemcpy(op.data(), hpost.p, op.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                        ok_cuda(cudaMemcpy(ox.data(), hx.p, ox.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                        ok_cuda(cudaMemcpy(&e, err.p, 4, cudaMemcpyDeviceToHost), "err");
+            bool good = ok && e == 0u;
+            for (int32_t b = 0; b < B && good; ++b) {
+                for (int32_t s = 0; s < 4; ++s) {
+                    good = good && same_bits(oh.data() + (size_t(b) * 4 + s) * em::n_own, want[at[size_t(b)]].data(),
+                                             em::n_own);
+                }
+            }
+            const std::vector<float> zp(op.size(), 0.0f), zx(ox.size(), 0.0f);
+            good = good && same_bits(op.data(), zp.data(), op.size()) && same_bits(ox.data(), zx.data(), ox.size());
+            cases += 1;
+            bad += good ? 0 : 1;
+            if (!good) {
+                printf("ple-test q8: card %d %s: DIFFERS (error word 0x%x)\n", r,
+                       ("embed B" + std::to_string(B)).c_str(), e);
+            }
+        }
+        // embed_rows at 1, 7 and 300 rows (row j: ids[(j * 5 + r) % 64])
+        for (const int32_t n : { 1, 7, PR }) {
+            if (!ok) {
+                break;
+            }
+            std::vector<int32_t> tk(static_cast<size_t>(n));
+            std::vector<size_t>  at(static_cast<size_t>(n));
+            for (int32_t j = 0; j < n; ++j) {
+                at[size_t(j)] = (size_t(j) * 5 + size_t(r)) % ids.size();
+                tk[size_t(j)] = ids[at[size_t(j)]];
+            }
+            em::rows_args a;
+            a.table               = table.as<uint8_t>();
+            a.tok                 = tok.as<int32_t>();
+            a.rows                = n;
+            a.card                = r;
+            a.own                 = own.as<float>();
+            a.full                = full.as<float>();
+            a.streams             = strm.as<float>();
+            a.err                 = err.as<uint32_t>();
+            a.q8                  = true;
+            const size_t       nf = size_t(n) * 2 * em::n_own;
+            std::vector<float> oo(size_t(n) * em::n_own), of(nf), os(nf * 4);
+            uint32_t           e = ~0u;
+            ok = ok_cuda(cudaMemcpyAsync(tok.p, tk.data(), size_t(n) * 4, cudaMemcpyHostToDevice, st), "tok") &&
+                 ok_cuda(cudaMemsetAsync(own.p, 0xff, oo.size() * 4, st), "poison") &&
+                 ok_cuda(cudaMemsetAsync(full.p, 0xff, of.size() * 4, st), "poison") &&
+                 ok_cuda(cudaMemsetAsync(strm.p, 0xff, os.size() * 4, st), "poison") &&
+                 ok_cuda(cudaMemsetAsync(err.p, 0, 4, st), "err") && em::embed_rows(a, st) &&
+                 ok_cuda(cudaStreamSynchronize(st), "embed_rows") &&
+                 ok_cuda(cudaMemcpy(oo.data(), own.p, oo.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                 ok_cuda(cudaMemcpy(of.data(), full.p, of.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                 ok_cuda(cudaMemcpy(os.data(), strm.p, os.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                 ok_cuda(cudaMemcpy(&e, err.p, 4, cudaMemcpyDeviceToHost), "err");
+            bool                     good = ok && e == 0u;
+            const std::vector<float> poison(em::n_own, [] {
+                float          x = 0.0f;
+                const uint32_t u = ~0u;
+                std::memcpy(&x, &u, 4);
+                return x;
+            }());
+            for (int32_t j = 0; j < n && good; ++j) {
+                const float * w      = want[at[size_t(j)]].data();
+                const size_t  own_at = size_t(r) * em::n_own, peer_at = size_t(1 - r) * em::n_own;
+                good = same_bits(oo.data() + size_t(j) * em::n_own, w, em::n_own) &&
+                       same_bits(of.data() + size_t(j) * 2 * em::n_own + own_at, w, em::n_own) &&
+                       same_bits(of.data() + size_t(j) * 2 * em::n_own + peer_at, poison.data(), em::n_own);
+                for (int32_t s = 0; s < 4 && good; ++s) {
+                    const float * sr = os.data() + (size_t(j) * 4 + s) * 2 * em::n_own;
+                    good = same_bits(sr + own_at, w, em::n_own) && same_bits(sr + peer_at, poison.data(), em::n_own);
+                }
+            }
+            cases += 1;
+            bad += good ? 0 : 1;
+            if (!good) {
+                printf("ple-test q8: card %d %s: DIFFERS (error word 0x%x)\n", r,
+                       ("embed_rows " + std::to_string(n)).c_str(), e);
+            }
+        }
+        // an ID outside [0, V) at row 1 of 3 (embed) and of 7 (embed_rows): err_token, its row unwritten
+        if (ok) {
+            const std::vector<int32_t> tk = { ids[2], V, ids[3], ids[4], ids[5], ids[6], ids[7] };
+            em::args                   a;
+            a.table = table.as<uint8_t>();
+            a.tok   = tok.as<int32_t>();
+            a.hres  = hres.as<float>();
+            a.hpost = hpost.as<float>();
+            a.hx    = hx.as<float>();
+            a.err   = err.as<uint32_t>();
+            a.q8    = true;
+            std::vector<float> oh(size_t(3) * 4 * em::n_own);
+            uint32_t           e = 0u;
+            ok = ok_cuda(cudaMemcpyAsync(tok.p, tk.data(), tk.size() * 4, cudaMemcpyHostToDevice, st), "tok") &&
+                 ok_cuda(cudaMemsetAsync(hres.p, 0xff, oh.size() * 4, st), "poison") &&
+                 ok_cuda(cudaMemsetAsync(err.p, 0, 4, st), "err") && em::embed(3, a, st) &&
+                 ok_cuda(cudaStreamSynchronize(st), "embed") &&
+                 ok_cuda(cudaMemcpy(oh.data(), hres.p, oh.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                 ok_cuda(cudaMemcpy(&e, err.p, 4, cudaMemcpyDeviceToHost), "err");
+            std::vector<uint32_t> row1(size_t(4) * em::n_own);
+            std::memcpy(row1.data(), oh.data() + size_t(4) * em::n_own, row1.size() * 4);
+            bool          good = ok && e == em::err_token &&
+                                 std::all_of(row1.begin(), row1.end(), [](uint32_t u) { return u == ~0u; }) &&
+                                 same_bits(oh.data(), want[2].data(), em::n_own);
+            em::rows_args ra;
+            ra.table   = table.as<uint8_t>();
+            ra.tok     = tok.as<int32_t>();
+            ra.rows    = 7;
+            ra.card    = r;
+            ra.own     = own.as<float>();
+            ra.full    = full.as<float>();
+            ra.streams = strm.as<float>();
+            ra.err     = err.as<uint32_t>();
+            ra.q8      = true;
+            std::vector<float> oo(size_t(7) * em::n_own);
+            e  = 0u;
+            ok = ok && ok_cuda(cudaMemsetAsync(own.p, 0xff, oo.size() * 4, st), "poison") &&
+                 ok_cuda(cudaMemsetAsync(err.p, 0, 4, st), "err") && em::embed_rows(ra, st) &&
+                 ok_cuda(cudaStreamSynchronize(st), "embed_rows") &&
+                 ok_cuda(cudaMemcpy(oo.data(), own.p, oo.size() * 4, cudaMemcpyDeviceToHost), "out") &&
+                 ok_cuda(cudaMemcpy(&e, err.p, 4, cudaMemcpyDeviceToHost), "err");
+            std::vector<uint32_t> orow(em::n_own);
+            std::memcpy(orow.data(), oo.data() + em::n_own, orow.size() * 4);
+            good = good && ok && e == em::err_token &&
+                   std::all_of(orow.begin(), orow.end(), [](uint32_t u) { return u == ~0u; }) &&
+                   same_bits(oo.data() + size_t(6) * em::n_own, want[7].data(), em::n_own);
+            cases += 1;
+            bad += good ? 0 : 1;
+            if (!good) {
+                printf("ple-test q8: card %d %s: DIFFERS (error word 0x%x)\n", r, "an ID outside [0, V)", e);
+            }
+        }
+    }
+    if (st != nullptr) {
+        cudaStreamDestroy(st);
+    }
+    printf(
+        "ple-test q8: embed and embed_rows on the Q8_0 token_embd (%zu real rows, IDs 0 and %d among them; embed "
+        "B = 1..5, embed_rows 1, 7 and 300 rows, both cards' slices; an ID outside [0, V) each): every value bitwise "
+        "the CPU decode, hpost and hx zero, the peer's columns untouched, the error words as expected: %lld of %lld "
+        "cases differ\n",
+        ids.size(), V - 1, static_cast<long long>(bad), static_cast<long long>(cases));
+    return ok && cases == 18 && bad == 0;
+}
+
 } // namespace
 
 int fnfl_ple_test(const char * mode, int dev0, int dev1, const char * model) {
+    if (strcmp(mode, "q8") == 0) {  // TTTS3 item 5
+        return ple_q8_test(dev0, model);
+    }
     const bool san = strcmp(mode, "san") == 0;
     if (!san && strcmp(mode, "all") != 0) {
-        fprintf(stderr, "ple-test: mode is all or san\n");
+        fprintf(stderr, "ple-test: mode is all, san or q8\n");
         return 2;
     }
     const bool loopback = dev0 == dev1;

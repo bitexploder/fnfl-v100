@@ -181,6 +181,7 @@ bool load(const fnfl_target_args & a, int32_t n_cells, md::model & m, const char
         lp.win.hi   = a.split_role == 1 ? a.split_k - 1 : fn::n_layer - 1;
         lp.win.head = a.split_role == 2;
     }
+    lp.image_planes = a.image_planes && a.split_role == 2;  // VIS1 Stage B
     fn::loader::run_load_report lr;
     std::string err;
     if (!fn::loader::load_for_run(lp, n_cells, m, lr, err)) {
@@ -247,6 +248,7 @@ bool load_dry(const fnfl_target_args & a, int32_t n_cells, md::model & m) {
     sp.single = m.single;
     sp.kv_q8 = a.kv_q8; // KV8
     sp.win             = m.win;   // TTTS1
+    fn::loader::file_state_params(m, sp);  // TTTS3: the Q4 file's head and PLE state, as the run load's
     int64_t host_bytes = 0;
     if (!fn::loader::reserve_state(m, sp, a.n_slots, host_bytes, err, a.pool_cells)) {
         fprintf(stderr, "model-dry: %s\n", err.c_str());
@@ -715,6 +717,7 @@ bool bf16_then_q8(const fnfl_target_args & a, md::model & m, const std::vector<i
     sp.ple_ngram = m.ple_ngram;
     sp.kv_q8 = true;
     sp.win             = m.win;  // TTTS1
+    fn::loader::file_state_params(m, sp);  // TTTS3: the Q4 file's head and PLE state, as the run load's
     int64_t host_bytes = 0;
     if (!fn::loader::reserve_state(m, sp, 1, host_bytes, err) || !fn::loader::fill_ex1_grids(m, err)) {
         fprintf(stderr, "model-test: the q8 reservation: %s\n", err.c_str());

@@ -4181,6 +4181,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fnfl.ple_table = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // FNFL (STALL): the lazy PLE table read in on a background thread once loaded
+    add_opt(common_arg(
+        {"--fnfl-ple-warm"}, "on|off",
+        "FNFL (STALL): with --fnfl-ple-table lazy, read the whole PLE table into the page cache on a background thread "
+        "once the model is loaded, and mlock it when the box keeps 16 GiB available beside it; the server does not "
+        "wait (default: on)",
+        [](common_params & params, const std::string & value) {
+            if (value != "on" && value != "off") {
+                throw std::invalid_argument("--fnfl-ple-warm is on or off");
+            }
+            params.fnfl.ple_warm = value == "on";
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
     // FNFL (ME1): single-card serving with the expert cache
     add_opt(common_arg(
         {"--fnfl-single-card"}, "N",
@@ -4346,6 +4359,40 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.fnfl.spec_d = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    // FNFL (MUP1 piece 3): small reads beside writers in one step
+    add_opt(
+        common_arg(
+            { "--fnfl-small-read-rows" }, "N",
+            "FNFL: beside generating slots, a read of at most N rows runs each box's layers as one group, its end and "
+            "finish in the same step (0: off; default: 512)",
+            [](common_params & params, int value) {
+                if (value < 0 || value > 8192) {
+                    throw std::invalid_argument("--fnfl-small-read-rows is 0..8192");
+                }
+                params.fnfl.small_read_rows = value;
+            })
+            .set_examples({ LLAMA_EXAMPLE_SERVER }));
+    // FNFL (APF1): the writers' pause target beside any read
+    add_opt(common_arg(
+                { "--fnfl-writer-pause-ms" }, "P",
+                "FNFL: beside generating slots, each box runs read units only before the latest start that keeps every "
+                "writer group's next completed step within P ms of its last one; a best-effort target, not a bound (a "
+                "minimum unit or a small read run whole can pass it); an integer from 10 to 1000 (default: 100; live "
+                "through POST /props tu.writer_pause_ms)",
+                [](common_params & params, const std::string & value) {
+                    // digits only (no sign, space or fraction), at most four
+                    bool      ok = !value.empty() && value.size() <= 4;
+                    long long p  = 0;
+                    for (char c : value) {
+                        ok = ok && c >= '0' && c <= '9';
+                        p  = p * 10 + (c - '0');
+                    }
+                    if (!ok || p < 10 || p > 1000) {
+                        throw std::invalid_argument("--fnfl-writer-pause-ms is an integer from 10 to 1000");
+                    }
+                    params.fnfl.writer_pause_ms = int32_t(p);
+                })
+                .set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--fnfl-draft-attention"}, "dense|sparse",
         "FNFL (SP2's switch, expires at its disposition): the MTP draft's attention, dense over every cell or sparse "

@@ -442,7 +442,12 @@ enum common_reasoning_format {
 struct common_params_fnfl {
     std::string          draft_subset;           // empty: the engine's default
     std::string          ple_table;              // lazy or full; empty: the engine's default (lazy)
+    bool                 ple_warm = true;        // STALL: --fnfl-ple-warm on|off
     int32_t              spec_d         = 2;     // SP2: the drafts a speculative step proposes, 1..4
+    int32_t              small_read_rows = 512;   // MUP1: beside writers a read of at most N rows runs in one step
+    // APF1 (--fnfl-writer-pause-ms P, 10 .. 1,000; live through POST /props tu.writer_pause_ms): beside writers each
+    // box runs read units only before the latest start that keeps every writer group's next step within P ms
+    int32_t              writer_pause_ms = 100;
     std::string          draft_attention;        // SP2's switch: dense or sparse; empty: dense
     bool                 check_state    = false; // TEST: compare the engine's tokens with the slot's after every call
     std::vector<int32_t> test_eog;               // TEST: more end-of-generation IDs

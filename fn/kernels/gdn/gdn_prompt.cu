@@ -907,7 +907,7 @@ bool resources(const void * f, int32_t dyn, prompt_resources & r) {
 bool gdn_prompt_conv(const prompt_args & a, void * stream) {
     const bool in16 = a.qkv16 != nullptr && a.ld16 >= n_channel;
     if (!common_ok(a, stream) || (a.qkv == nullptr && !in16) || a.conv_out == nullptr || a.conv_w == nullptr ||
-        a.hist == nullptr || a.v_in < 0 || a.v_out < 1 || a.v_in >= a.v_out || a.v_out > 4) {
+        a.hist == nullptr || a.v_in < 0 || a.v_in > 4 || a.v_out < 1 || a.v_in == a.v_out || a.v_out > 4) {
         return fail("conv");
     }
     if (a.fuse_norm) {
@@ -917,6 +917,10 @@ bool gdn_prompt_conv(const prompt_args & a, void * stream) {
         conv_kernel<<<blocks(int64_t(a.rows) * n_channel, 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(a);
     }
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool gdn_prompt_attributes() {
+    return smem_once(wy_attr);
 }
 
 bool gdn_prompt_prep(const prompt_args & a, void * stream) {
@@ -935,7 +939,7 @@ bool gdn_prompt_prep(const prompt_args & a, void * stream) {
 bool gdn_prompt_recur(const prompt_args & a, void * stream) {
     if (!common_ok(a, stream) || a.conv_out == nullptr || a.g == nullptr || a.beta == nullptr ||
         (a.o == nullptr && (a.o16 == nullptr || a.err == nullptr)) || a.state == nullptr || a.wy == nullptr ||
-        a.gsel == nullptr || (a.v_in == 0 && a.rec == nullptr) || a.v_in < 0 || a.v_out < 1 || a.v_in >= a.v_out ||
+        a.gsel == nullptr || (a.v_in == 0 && a.rec == nullptr) || a.v_in < 0 || a.v_in > 4 || a.v_out < 1 || a.v_in == a.v_out ||
         a.v_out > 4 || !smem_once(wy_attr)) {
         return fail("recur");
     }

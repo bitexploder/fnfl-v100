@@ -38,32 +38,41 @@ bool cuda_ok(cudaError_t e, const char * what, std::string & err) {
     return true;
 }
 
-// One tensor's card slice: the rows (in every matrix) times the columns of placement.h, in the mapping.
+// One tensor's card slice: the rows (in every matrix) times the columns of placement.h, in the mapping. The file's
+// geometry (blk, bb: its format's block) addresses the mapping; row_out is a selected row's bytes in the resident
+// format (TTTS2: the two differ for a converted tensor, model::src_conv)
 struct slice_info {
     const uint8_t * base = nullptr; // the tensor's data
     int64_t row_bytes = 0;          // one GGUF row
     int64_t matrix_bytes = 0;       // ne1 rows
     int64_t n_matrix = 0;           // ne2
     int64_t n_sel = 0;              // selected rows a matrix
-    int64_t row_out = 0;            // bytes of one selected row's columns
+    int64_t              row_out      = 0;              // resident bytes of one selected row's columns
     const model::range * rows = nullptr;
     int32_t n_rows = 0;
     const model::range * cols = nullptr;
     int32_t n_cols = 0;
     int32_t blk = 1, bb = 1;
+    model::src_conv      conv = model::src_conv::none;
 
     int64_t n_slice_rows() const { return n_matrix * n_sel; }
-    int64_t bytes() const { return n_slice_rows() * row_out; }
+
+    // the file bytes of row r's column range c (r an ne1 index in matrix mi)
+    const uint8_t * at(int64_t mi, int64_t r, int32_t c) const {
+        return base + mi * matrix_bytes + r * row_bytes + cols[c].first / blk * bb;
+    }
 };
 
 slice_info info_of(const model::model & m, int32_t t, int32_t card) {
     const model::tensor_place & tp = m.tp(t);
     const model::card_place & cp = tp.card[card];
+    const model::tensor_source & src = m.sources[t];
     slice_info s;
-    s.blk = tp.block_elems;
-    s.bb = tp.block_bytes;
-    s.base      = m.sources[t].synth != nullptr ? m.sources[t].synth : m.sources[t].file->data() + m.sources[t].offset;
-    s.row_bytes = tp.ne[0] / tp.block_elems * tp.block_bytes;
+    s.blk          = src.src_blk > 0 ? src.src_blk : tp.block_elems;
+    s.bb           = src.src_blk > 0 ? src.src_bb : tp.block_bytes;
+    s.conv         = src.conv;
+    s.base         = src.synth != nullptr ? src.synth : src.file->data() + src.offset;
+    s.row_bytes    = tp.ne[0] / s.blk * s.bb;
     s.matrix_bytes = s.row_bytes * tp.ne[1];
     s.n_matrix = tp.ne[2];
     s.rows = cp.row_count > 0 ? &model::ranges[cp.row_first] : nullptr;
@@ -74,9 +83,31 @@ slice_info info_of(const model::model & m, int32_t t, int32_t card) {
         s.n_sel += s.rows[i].count;
     }
     for (int32_t i = 0; i < s.n_cols; ++i) {
-        s.row_out += s.cols[i].count / s.blk * s.bb;
+        s.row_out += s.cols[i].count / tp.block_elems * tp.block_bytes;
     }
     return s;
+}
+
+// TTTS2: one run of a converted tensor's file bytes (whole values or blocks) to its resident bytes at dst; the bytes
+// written, -1 when a value has no exact resident form (f32_bf16: a low half not zero)
+int64_t convert_run(model::src_conv c, const uint8_t * src, int64_t len, uint8_t * dst) {
+    switch (c) {
+        case model::src_conv::none:
+            std::memcpy(dst, src, size_t(len));
+            return len;
+        case model::src_conv::f32_bf16:
+            for (int64_t i = 0; i < len / 4; ++i) {
+                uint32_t v;
+                std::memcpy(&v, src + 4 * i, 4);
+                if ((v & 0xffffu) != 0) {
+                    return -1;
+                }
+                const uint16_t hi = static_cast<uint16_t>(v >> 16);
+                std::memcpy(dst + 2 * i, &hi, 2);
+            }
+            return len / 2;
+    }
+    return -1;
 }
 
 // Calls fn(src, len) for the slice rows [q0, q1) in slice order (matrix, row range and row, column range), merging
@@ -139,17 +170,33 @@ constexpr int64_t hc_feat = fn::n_embd / 2; // 1,280 own features a stream
 constexpr int32_t hc_streams = fn::n_hc;
 constexpr int64_t hc_low = fn::n_hc_lowrank; // 320
 
-// the HC layouts' row count a stream: 324 with an inject tensor, 320 without
-int64_t hc_rows(const model::region_place & rg) {
-    return rg.members[1] >= 0 ? hc_low + 4 : hc_low;
-}
-
 // DR1: the draft's HC tensors are Q8_0 (GGUF blocks of 32 values: an FP16 scale, then 32 int8 codes); the HC layouts
 // hold them planar (hc.h): every code of the region, then every scale, each in the BF16 layout's element order
 constexpr int64_t q8_block = 32, q8_block_bytes = 34;
 
-bool hc_q8(const model::region_place & rg) {
-    return std::strcmp(model::tensors[rg.members[0]].format, "Q8_0") == 0;
+bool hc_q8(const model::model & m, const model::region_place & rg) {
+    return std::strcmp(m.tp(rg.members[0]).format, "Q8_0") == 0;
+}
+
+// TTTS2: a Q8_0 HC down region whose inject tensor is BF16 (UD-Q4_K_XL: Q8_0 down, F32 inject narrowed to BF16):
+// hc.h's mixed layout, the down rows' planar Q8_0 (320 rows a stream, the head layout), then the inject rows BF16
+// [s][k][i] (k = 0..3)
+bool hc_mixed(const model::model & m, const model::region_place & rg) {
+    return rg.lay == layout::hc_down && rg.members[1] >= 0 && hc_q8(m, rg) &&
+           std::strcmp(m.tp(rg.members[1]).format, "BF16") == 0;
+}
+
+// the HC layouts' row count a stream in the code plane: 324 with an inject tensor of the down's format, 320 without
+// (or with a mixed region's BF16 inject)
+int64_t hc_rows(const model::model & m, const model::region_place & rg) {
+    return rg.members[1] >= 0 && !hc_mixed(m, rg) ? hc_low + 4 : hc_low;
+}
+
+// row j of an HC slice's column range c (one stream's 1,280 features, or an up row's 320) to its resident BF16
+// bytes at dst (n values): a copy, or (f32_bf16) the exact narrowing
+bool hc_row_bf16(const slice_info & s, int64_t j, int32_t c, int64_t n, uint8_t * dst) {
+    const int64_t src_len = s.conv == model::src_conv::f32_bf16 ? n * 4 : n * 2;
+    return convert_run(s.conv, s.at(0, j, c), src_len, dst) == n * 2;
 }
 
 // one row of n Q8_0 blocks (GGUF bytes at src) to the planar codes at q and scales at d
@@ -237,38 +284,46 @@ bool fill_unit(const model::model & m, int32_t card, const unit & u, uint8_t * h
         case layout::gguf: {
             const slice_info s = info_of(m, rg.members[0], card);
             uint8_t * d = h;
+            bool             ok = true;
             walk(s, u.a, u.b, [&](const uint8_t * p, int64_t len) {
-                std::memcpy(d, p, (size_t)len);
-                d += len;
+                const int64_t n = ok ? convert_run(s.conv, p, len, d) : -1;
+                ok              = n >= 0;
+                d += ok ? n : 0;
             });
-            return d - h == u.bytes;
+            return ok && d - h == u.bytes;
         }
         case layout::hc_down: {
-            const int64_t R = hc_rows(rg);
-            const bool q8 = hc_q8(rg);
-            const int64_t n_codes = hc_streams * R * hc_feat;
-            for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
-                const slice_info s = info_of(m, rg.members[mi], card);
-                const int64_t row0 = mi == 0 ? 0 : hc_low;
-                for (int64_t j = 0; j < m.tp(rg.members[mi]).ne[1]; ++j) {
-                    for (int32_t c = 0; c < hc_streams; ++c) {
-                        const int64_t row = c * R + row0 + j;
-                        if (q8) {
-                            q8_split(s.base + j * s.row_bytes + s.cols[c].first / q8_block * q8_block_bytes,
-                                     hc_feat / q8_block, h + row * hc_feat,
-                                     h + n_codes + row * (hc_feat / q8_block) * 2);
-                        } else {
-                            const uint8_t * src = s.base + j * s.row_bytes + s.cols[c].first * 2;
-                            std::memcpy(h + row * hc_feat * 2, src, hc_feat * 2);
+                const int64_t R       = hc_rows(m, rg);
+                const bool    q8      = hc_q8(m, rg);
+                const bool    mixed   = hc_mixed(m, rg);
+                const int64_t n_codes = hc_streams * R * hc_feat;
+                for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
+                    const slice_info s    = info_of(m, rg.members[mi], card);
+                    const int64_t    row0 = mi == 0 ? 0 : hc_low;
+                    for (int64_t j = 0; j < m.tp(rg.members[mi]).ne[1]; ++j) {
+                        for (int32_t c = 0; c < hc_streams; ++c) {
+                            if (mixed && mi == 1) {  // TTTS2: the BF16 inject rows after the Q8_0 planes, [s][k][i]
+                                uint8_t * dst = h + n_codes + n_codes / q8_block * 2 + (c * 4 + j) * hc_feat * 2;
+                                if (!hc_row_bf16(s, j, c, hc_feat, dst)) {
+                                    return false;
+                                }
+                                continue;
+                            }
+                            const int64_t row = c * R + row0 + j;
+                            if (q8) {
+                                q8_split(s.at(0, j, c), hc_feat / q8_block, h + row * hc_feat,
+                                         h + n_codes + row * (hc_feat / q8_block) * 2);
+                            } else if (!hc_row_bf16(s, j, c, hc_feat, h + row * hc_feat * 2)) {
+                                return false;
+                            }
                         }
                     }
-                }
             }
             return true;
         }
         case layout::hc_up: {
             const slice_info s = info_of(m, rg.members[0], card);
-            const bool q8 = hc_q8(rg);
+            const bool       q8      = hc_q8(m, rg);
             const int64_t n_codes = hc_feat * hc_streams * hc_low;
             for (int32_t c = 0; c < hc_streams; ++c) {
                 for (int64_t f = 0; f < hc_feat; ++f) {
@@ -322,8 +377,8 @@ int32_t layout_rank(layout l) {
     return l == layout::hc_inject || l == layout::ex1_up ? 1 : 0;
 }
 
-bool check_shapes(int32_t t, std::string & err) {
-    const model::tensor_place & tp = model::tensors[t];
+bool check_shapes(const model::model & m, int32_t t, std::string & err) {
+    const model::tensor_place & tp  = m.tp(t);
     const auto bad = [&](const char * why) {
         err = std::string(tp.name) + ": " + why;
         return false;
@@ -384,11 +439,11 @@ bool check_shapes(int32_t t, std::string & err) {
 
 // ME1: a region of one GGUF-layout tensor that both cards hold whole, the same rows and columns (the routers, the
 // shared-expert gates and the norms: never repacked in place, so one copy serves both logical cards)
-bool replicated(const model::region_place & rg) {
+bool replicated(const model::model & m, const model::region_place & rg) {
     if (rg.lay != layout::gguf || rg.members[1] >= 0) {
         return false;
     }
-    const model::tensor_place & tp = model::tensors[rg.members[0]];
+    const model::tensor_place & tp = m.tp(rg.members[0]);
     const model::card_place & a = tp.card[0];
     const model::card_place & b = tp.card[1];
     if (a.row_count == 0 || a.row_count != b.row_count || a.col_count != b.col_count || a.bytes != b.bytes) {
@@ -475,7 +530,7 @@ bool plan_regions(model::model & m, std::string & err) {
             // ME1: the cache's experts and card 1's replicated copies on one device take no device bytes
             rg.cached = m.expert_cache && (rg.lay == layout::ex1_gate || rg.lay == layout::ex1_down) &&
                         model::components[m.tp(rg.members[0]).component].layer < fn::n_layer;
-            rg.alias = m.single && card == 1 && replicated(rg);
+            rg.alias  = m.single && card == 1 && replicated(m, rg);
             rg.absent = !holds(m.win, m.tp(rg.members[0]));
             if (rg.cached || rg.alias || rg.absent) {
                 rg.offset = rg.alias ? m.regions[0][r].offset : -1;
@@ -533,6 +588,120 @@ bool resolve_draft_expert(model::model & m, int32_t t, const fnfl_gguf_tensor & 
     return true;
 }
 
+// TTTS2: a GGUF type name as the placement's static name (its format strings), nullptr when not one FNFL places
+const char * format_name(const std::string & g) {
+    static const char * const names[] = {
+        "F32",    "F16",    "BF16",  "Q8_0",    "Q4_K",    "Q5_K",   "Q6_K",  "Q5_1",
+        "IQ4_NL", "IQ4_XS", "IQ3_S", "IQ3_XXS", "IQ2_XXS", "IQ2_XS", "IQ2_S", "Q2_0"
+    };
+    for (const char * n : names) {
+        if (strcasecmp(n, g.c_str()) == 0) {
+            return n;
+        }
+    }
+    return nullptr;
+}
+
+// TTTS2: the placement entry of target tensor t for this file's format g (the placement's ranges, its layout and
+// region; the file decides the format). Unchanged when g is the placed format. Otherwise the resident format is the
+// file's, except two exact conversions the resident kernels need (model::src_conv): an F32 tensor placed BF16 (the
+// routers, the shared gates, GDN alpha and beta, HC inject) stays BF16 (every value must be BF16); a Q8_0 tensor placed
+// BF16 in the GGUF layout (PLE key and value) is held as F32 rows. The HC layouts take Q8_0 or BF16 (an HC inject F32
+// as BF16), EX1's its formats; the host table no change. Each card's bytes follow from the ranges and the resident
+// format (EX1: 512 packed experts), the cards' totals moved by the difference.
+bool resolve_format(model::model & m, int32_t t, const fnfl_gguf_tensor & g, std::string & err) {
+    model::tensor_place &  tp  = m.place[size_t(t)];
+    model::tensor_source & src = m.sources[size_t(t)];
+    src.src_blk                = g.block_elems;
+    src.src_bb                 = g.block_bytes;
+    src.conv                   = model::src_conv::none;
+    const char * gf            = format_name(g.type_name);
+    if (gf != nullptr && std::strcmp(gf, tp.format) == 0) {
+        return true;
+    }
+    const auto refuse = [&](const char * why) {
+        err = "GGUF tensor '" + g.name + "' (" + g.type_name + ", placed " + tp.format + "): " + why;
+        return false;
+    };
+    if (gf == nullptr || g.block_elems <= 0 || g.block_bytes <= 0 || g.ne[0] != tp.ne[0] || g.ne[1] != tp.ne[1] ||
+        g.ne[2] != tp.ne[2] || g.ne[3] != 1 || tp.ne[0] % g.block_elems != 0 ||
+        (int64_t) g.bytes != tp.ne[0] / g.block_elems * g.block_bytes * tp.ne[1] * tp.ne[2]) {
+        return refuse("not the placed shape, or a format FNFL does not place");
+    }
+    const bool   f32 = std::strcmp(gf, "F32") == 0, q8 = std::strcmp(gf, "Q8_0") == 0;
+    const bool   placed_bf16 = std::strcmp(tp.format, "BF16") == 0;
+    const char * res         = gf;
+    int32_t      rblk = g.block_elems, rbb = g.block_bytes;
+    switch (tp.lay) {
+        case layout::host:
+            return refuse("the host table's format is fixed");
+        case layout::gguf:
+            if (f32 && placed_bf16) {
+                res = "BF16", rblk = 1, rbb = 2, src.conv = model::src_conv::f32_bf16;
+            }  // TTTS3: Q8_0 placed BF16 (UD-Q4_K_XL's PLE key and value, the only ones) stays Q8_0 as stored
+            break;
+        case layout::hc_down:
+        case layout::hc_up:
+            if (!q8 && std::strcmp(gf, "BF16") != 0) {
+                return refuse("an HC layout holds Q8_0 or BF16");
+            }
+            break;
+        case layout::hc_inject:
+            if (f32) {
+                res = "BF16", rblk = 1, rbb = 2, src.conv = model::src_conv::f32_bf16;
+            } else if (!q8 && std::strcmp(gf, "BF16") != 0) {
+                return refuse("an HC inject is BF16, Q8_0 or F32 (as BF16)");
+            }
+            break;
+        case layout::ex1_gate:
+        case layout::ex1_up:
+        case layout::ex1_down:
+            {
+                experts::fmt f{};
+                if (!ex1_fmt(gf, f)) {
+                    return refuse("not an EX1 expert format");
+                }
+                break;
+            }
+    }
+    tp.format       = res;
+    tp.block_elems  = rblk;
+    tp.block_bytes  = rbb;
+    tp.stored_bytes = (int64_t) g.bytes;  // the file's: what the loader reads (and synth writes)
+    for (int32_t card = 0; card < 2; ++card) {
+        model::card_place & cp = tp.card[card];
+        if (cp.row_count == 0) {
+            continue;
+        }
+        int64_t bytes = 0;
+        if (tp.lay == layout::ex1_gate || tp.lay == layout::ex1_up || tp.lay == layout::ex1_down) {
+            experts::fmt f{};
+            ex1_fmt(res, f);
+            bytes =
+                fn::n_expert * (tp.lay == layout::ex1_down ? experts::down_bytes(f) : experts::gate_up_bytes(f) / 2);
+        } else {
+            int64_t sel = 0, cols = 0;
+            for (int32_t i = 0; i < cp.row_count; ++i) {
+                sel += model::ranges[cp.row_first + i].count;
+            }
+            for (int32_t i = 0; i < cp.col_count; ++i) {
+                const model::range & r = model::ranges[cp.col_first + i];
+                if (r.first % g.block_elems != 0 || r.count % g.block_elems != 0 || r.count % rblk != 0) {
+                    return refuse("a card's columns are not on the format's block boundaries");
+                }
+                cols += r.count;
+            }
+            bytes = tp.ne[2] * sel * (cols / rblk * rbb);
+        }
+        if (bytes <= 0) {
+            return refuse("no packed size for its layout");
+        }
+        m.placed_card_bytes[card] += bytes - cp.bytes;
+        cp.bytes = bytes;
+    }
+    return true;
+}
+
 } // namespace
 
 bool open_model(const load_params & p, model::model & m, load_times & t, std::string & err) {
@@ -544,7 +713,7 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
     m.kv_host = p.kv_host;
     m.kv_window = p.kv_window;
     m.win          = p.win;
-    if (!m.win.valid() || (!m.win.whole() && (m.single || m.expert_cache || m.kv_host))) {
+    if (!m.win.valid() || (!m.win.whole() && ((m.single && !p.weights_only) || m.expert_cache || m.kv_host))) {
         err = "TTTS1: a window (layers " + std::to_string(m.win.lo) + " .. " + std::to_string(m.win.hi) +
               ") is resident TP on two devices only, inside 0 .. 47";
         return false;
@@ -590,24 +759,34 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
                 err = "GGUF tensor '" + g.name + "' in '" + path + "' has no placement";
                 return false;
             }
+            if (seen[it->second]) {
+                err = "GGUF tensor '" + g.name + "' appears twice";
+                return false;
+            }
             if (draft_file && draft_expert_tensor(g.name)) {
                 if (!resolve_draft_expert(m, it->second, g, err)) {
                     return false;
                 }
                 draft_formats += draft_formats.empty() ? g.type_name : "," + g.type_name;
+            } else if (!draft_file && !resolve_format(m, it->second, g, err)) {  // TTTS2: the file's formats
+                return false;
             }
             const model::tensor_place & tp = m.tp(it->second);
-            if (seen[it->second] || strcasecmp(g.type_name.c_str(), tp.format) != 0 ||
-                g.block_elems != tp.block_elems || g.block_bytes != tp.block_bytes || g.ne[0] != tp.ne[0] ||
-                g.ne[1] != tp.ne[1] || g.ne[2] != tp.ne[2] || g.ne[3] != 1 || (int64_t)g.bytes != tp.stored_bytes) {
+            model::tensor_source &      s    = m.sources[it->second];
+            const bool                  conv = s.conv != model::src_conv::none;
+            if ((!conv && (strcasecmp(g.type_name.c_str(), tp.format) != 0 || g.block_elems != tp.block_elems ||
+                           g.block_bytes != tp.block_bytes)) ||
+                g.ne[0] != tp.ne[0] || g.ne[1] != tp.ne[1] || g.ne[2] != tp.ne[2] || g.ne[3] != 1 ||
+                (int64_t) g.bytes != tp.stored_bytes) {
                 err = "GGUF tensor '" + g.name + "' (" + g.type_name + ") does not match its placement";
                 return false;
             }
             seen[it->second] = true;
-            model::tensor_source & s = m.sources[it->second];
             s.file = f.get();
             s.offset = g.offset;
-            s.row_bytes = tp.ne[0] / tp.block_elems * tp.block_bytes;
+            s.src_blk        = g.block_elems;
+            s.src_bb         = g.block_bytes;
+            s.row_bytes      = tp.ne[0] / g.block_elems * g.block_bytes;
             if (tp.lay == layout::host) {
                 m.ple_table = f->data() + g.offset;
                 m.ple_bytes = g.bytes;
@@ -636,7 +815,7 @@ bool open_model(const load_params & p, model::model & m, load_times & t, std::st
             err = std::string("placed tensor '") + model::tensors[t2].name + "' is in no file";
             return false;
         }
-        if (!check_shapes(t2, err)) {
+        if (!check_shapes(m, t2, err)) {
             return false;
         }
     }
@@ -814,17 +993,19 @@ std::string router_f16_line(const model::model & m) {
     int64_t total = 0, below = 0, beyond = 0;
     int32_t ts = 0;
     for (int32_t t = 0; t < model::n_tensors; ++t) {
-        const model::tensor_place & p = model::tensors[t];
+        const model::tensor_place & p = m.tp(t);
         if (!router_tensor(p.name) || std::strcmp(p.format, "BF16") != 0 || size_t(t) >= m.sources.size() ||
             m.sources[size_t(t)].file == nullptr) {
             continue;
         }
         const model::tensor_source & s = m.sources[size_t(t)];
         const uint8_t * b = s.file->data() + s.offset;
-        const int64_t n = p.stored_bytes / 2;
+        // TTTS2: an F32 router narrowed to BF16 (f32_bf16) reads each value's high half
+        const bool                   wide = s.conv == model::src_conv::f32_bf16;
+        const int64_t                n    = p.stored_bytes / (wide ? 4 : 2);
         for (int64_t i = 0; i < n; ++i) {
             uint16_t v;
-            std::memcpy(&v, b + 2 * i, 2);
+            std::memcpy(&v, b + (wide ? 4 * i + 2 : 2 * i), 2);
             const int32_t c = f16_inexact(v);
             below += c == 1 ? 1 : 0;
             beyond += c == 2 ? 1 : 0;
@@ -1081,7 +1262,16 @@ bool hash_gguf_slices(const model::model & m, int32_t threads, std::vector<card_
         for (size_t j; (j = next.fetch_add(1)) < jobs.size();) {
             const slice_info s = info_of(m, jobs[j].first, jobs[j].second);
             sha256 h;
-            walk(s, 0, s.n_slice_rows(), [&](const uint8_t * p, int64_t len) { h.update(p, (size_t)len); });
+            std::vector<uint8_t> conv;  // TTTS2: a converted tensor's resident bytes (the check compares those)
+            walk(s, 0, s.n_slice_rows(), [&](const uint8_t * p, int64_t len) {
+                if (s.conv == model::src_conv::none) {
+                    h.update(p, (size_t) len);
+                    return;
+                }
+                conv.resize(size_t(len) * 4);
+                const int64_t n = convert_run(s.conv, p, len, conv.data());
+                h.update(conv.data(), size_t(std::max<int64_t>(n, 0)));
+            });
             out[jobs[j].first][jobs[j].second] = h.finish();
         }
     };
@@ -1319,40 +1509,45 @@ bool check_all(const load_params & p, const model::model & m, const std::vector<
                     switch (rg.lay) {
                         case layout::gguf: hs[0].update(buf, (size_t)u.bytes); break;
                         case layout::hc_down: {
-                            const int64_t R = hc_rows(rg);
-                            const bool q8 = hc_q8(rg);
-                            const int64_t n_codes = hc_streams * R * hc_feat, nb = hc_feat / q8_block;
-                            uint8_t blk[hc_feat / q8_block * q8_block_bytes];
-                            for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
-                                const int64_t row0 = mi == 0 ? 0 : hc_low;
-                                for (int64_t r = 0; r < m.tp(rg.members[mi]).ne[1]; ++r) {
-                                    for (int32_t c = 0; c < hc_streams; ++c) {
-                                        const int64_t row = c * R + row0 + r;
-                                        if (q8) {
-                                            q8_join(buf + row * hc_feat, buf + n_codes + row * nb * 2, nb, blk);
-                                            hs[mi].update(blk, sizeof(blk));
-                                        } else {
-                                            hs[mi].update(buf + row * hc_feat * 2, hc_feat * 2);
+                                const int64_t R       = hc_rows(m, rg);
+                                const bool    q8      = hc_q8(m, rg);
+                                const bool    mixed   = hc_mixed(m, rg);
+                                const int64_t n_codes = hc_streams * R * hc_feat, nb = hc_feat / q8_block;
+                                uint8_t       blk[hc_feat / q8_block * q8_block_bytes];
+                                for (int32_t mi = 0; mi < 2 && rg.members[mi] >= 0; ++mi) {
+                                    const int64_t row0 = mi == 0 ? 0 : hc_low;
+                                    for (int64_t r = 0; r < m.tp(rg.members[mi]).ne[1]; ++r) {
+                                        for (int32_t c = 0; c < hc_streams; ++c) {
+                                            const int64_t row = c * R + row0 + r;
+                                            if (mixed && mi == 1) {  // TTTS2: the BF16 inject plane
+                                                hs[mi].update(
+                                                    buf + n_codes + n_codes / q8_block * 2 + (c * 4 + r) * hc_feat * 2,
+                                                    hc_feat * 2);
+                                            } else if (q8) {
+                                                q8_join(buf + row * hc_feat, buf + n_codes + row * nb * 2, nb, blk);
+                                                hs[mi].update(blk, sizeof(blk));
+                                            } else {
+                                                hs[mi].update(buf + row * hc_feat * 2, hc_feat * 2);
+                                            }
                                         }
                                     }
-                                }
                             }
                             break;
                         }
                         case layout::hc_up: {
-                            const bool q8 = hc_q8(rg);
-                            const int64_t n_codes = hc_feat * hc_streams * hc_low, nb = hc_low / q8_block;
-                            uint8_t blk[hc_low / q8_block * q8_block_bytes];
-                            for (int32_t c = 0; c < hc_streams; ++c) {
-                                for (int64_t f = 0; f < hc_feat; ++f) {
-                                    const int64_t row = f * hc_streams + c;
-                                    if (q8) {
-                                        q8_join(buf + row * hc_low, buf + n_codes + row * nb * 2, nb, blk);
-                                        hs[0].update(blk, sizeof(blk));
-                                    } else {
-                                        hs[0].update(buf + row * hc_low * 2, hc_low * 2);
+                                const bool    q8      = hc_q8(m, rg);
+                                const int64_t n_codes = hc_feat * hc_streams * hc_low, nb = hc_low / q8_block;
+                                uint8_t       blk[hc_low / q8_block * q8_block_bytes];
+                                for (int32_t c = 0; c < hc_streams; ++c) {
+                                    for (int64_t f = 0; f < hc_feat; ++f) {
+                                        const int64_t row = f * hc_streams + c;
+                                        if (q8) {
+                                            q8_join(buf + row * hc_low, buf + n_codes + row * nb * 2, nb, blk);
+                                            hs[0].update(blk, sizeof(blk));
+                                        } else {
+                                            hs[0].update(buf + row * hc_low * 2, hc_low * 2);
+                                        }
                                     }
-                                }
                             }
                             break;
                         }

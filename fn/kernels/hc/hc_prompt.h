@@ -41,6 +41,8 @@
 //            loose tolerance for layout, indexing and range errors, on synthetic, range-stress and PB1's saved real
 //            rows; the FP16 copy and a rerun bitwise; acceptance is NC1 section 6 at model level.
 
+#include "fn/kernels/tc/ladder.h"
+
 #include <cstddef>
 #include <cstdint>
 
@@ -62,6 +64,10 @@ struct hcp_weights {
     const uint8_t *  q8_down   = nullptr;
     const uint8_t *  q8_up     = nullptr;
     const float *    gamma_own = nullptr;
+    // TTTS2 (UD-Q4_K_XL), replicated: down[] and up[] are the halves in hc.h's Q8_0 layouts instead (down the mixed
+    // layout, w_down_mix_bytes: Q8_0 low-rank rows, BF16 inject rows; up the Q8_0 up layout); hct_convert decodes
+    // each value exactly (d x q, or the BF16) before its row's scaling, so only the FP16 rounding differs from BF16's
+    bool             q8        = false;
 };
 
 struct hcp_args {
@@ -118,6 +124,52 @@ bool hct_convert(const hcp_weights & a, const hct_weights & w, void * stream);
 // mixed16, err), from w (converted from a's weights) and scratch; cb the folded exchange (cb.own null: none)
 bool hct_mix(const hcp_args & a, const hct_combine & cb, const hct_weights & w, uint8_t * scratch, void * stream);
 
+// APF1 Part 4, the fused route: the products' FP16 coefficients formed in the tensor core's operand loader from a.w's
+// halves (BF16, or the q8 layouts) and the prepared row scales, value for value as hct_convert forms them, so every
+// output is bitwise hct_convert + hct_mix's; no conversion pass. The prepared scales (hct_scales: hct_convert's
+// down_s and up_s, bitwise, without the coefficients) are built once at load per sublayer. Chunks of at most
+// hct_small_rows rows take 64-row tiles (more CTAs on the 80 SMs; the same K order, so the same outputs)
+constexpr int32_t hct_small_rows = 64;
+
+int64_t     hct_scale_bytes();
+hct_weights hct_carve_scales(uint8_t * region);  // down_s and up_s only (down, up null)
+bool        hct_scales(const hcp_weights & a, const hct_weights & scales, void * stream);
+bool        hct_mix_fused(const hcp_args &    a,
+                          const hct_combine & cb,
+                          const hct_weights & scales,
+                          uint8_t *           scratch,
+                          void *              stream);
+
+// APF2, the kernel-size ladder: hct_mix_fused with each product on a ladder tile (fn/kernels/tc/ladder.h) or its
+// retained tile. The down: 4 streams x 320 low rows, K 2,560 (the four streams one launch); the up: 10,240 columns,
+// K 320. The same loaders, operands and epilogues: a tile's outputs are the retained route's but for the F32 sum's
+// order (another tile's K order is the same, a split count's is its own; the family's FP64 bound holds each)
+constexpr int32_t hcl_down_n = 320;  // a stream's columns
+constexpr int32_t hcl_down_k = 2560;
+constexpr int32_t hcl_up_n   = 10240;
+constexpr int32_t hcl_up_k   = 320;
+
+struct hct_route {
+    int32_t down_tile = -1, down_splits = 1;  // tile -1: the retained tile (hct_down_kernel's), splits 1
+    int32_t up_tile = -1, up_splits = 1;
+};
+
+// the output tiles of product (0 down, 1 up) of rows on tile t (the split workspace's counters it takes)
+int32_t hcl_tile_count(int32_t product, int32_t rows, int32_t t);
+// hct_mix_fused on route r; ws the split workspace (unused at splits 1). False, with nothing enqueued, on
+// hct_mix_fused's checks, a tile or split count outside the list (1 .. min(16, K / 32)) or a workspace too small
+bool hct_mix_ladder(const hcp_args &      a,
+                    const hct_combine &   cb,
+                    const hct_weights &   scales,
+                    uint8_t *             scratch,
+                    const hct_route &     r,
+                    const fn::tc::lad_ws & ws,
+                    void *                stream);
+// the ladder instances' shared memory opt-in on the current device (once a card, before any stream capture)
+bool hcl_attributes();
+// product (0 down, 1 up) on tile t, the Q8_0 (q8) or BF16 halves' instance
+bool hcl_resources(bool q8, int32_t product, int32_t t, fn::tc::lad_resources & r);
+
 bool hcp_down(const hcp_args & a, void * stream);
 bool hcp_mid(const hcp_args & a, void * stream);
 bool hcp_up(const hcp_args & a, void * stream);
@@ -127,7 +179,8 @@ struct hcp_resources {
 };
 
 // 0: down (BF16), 1: down (Q8_0), 2: mid, 3: up (BF16), 4: up (Q8_0); PB3: 5 split, 6 tensor down, 7 tensor mid,
-// 8 tensor up, 9 convert
+// 8 tensor up, 9 convert; APF1 Part 4 fused: 10 split (BF16), 11 split (Q8_0), 12 down (BF16), 13 down (Q8_0),
+// 14 down (Q8_0, small tile), 15 up (BF16), 16 up (Q8_0), 17 up (Q8_0, small tile)
 bool hcp_kernel_resources(int32_t which, hcp_resources & r);
 
 }  // namespace fn::hc

@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""fnfl-bench: FNFL's bench runner, like vLLM's `vllm bench serve`. Host side only.
+  fnfl-bench serve    [flags]   load the model (fnfl-serve.sh), run the synthetic bench, stop the server
+  fnfl-bench vllm     [flags]   vLLM's synthetic serving bench against the running server
+  fnfl-bench pelicans [flags]   N users draw an SVG pelican on a bicycle at once
+  fnfl-bench storm    [flags]   writers stream poetry; a long read drops in beside them
+  fnfl-bench agents   [flags]   pi agent lanes on six seeded easy tasks
+fnfl-bench BENCH --help lists a bench's flags. The synthetic bench needs numpy: when this Python has none, the script
+runs itself again under `uv run --with numpy`."""
+import os
+import shutil
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from fnfl_bench import cli  # noqa: E402
+
+if __name__ == "__main__":
+    if cli.needs_numpy(sys.argv[1:]):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            uv = shutil.which("uv", path=os.environ.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin"))
+            if os.environ.get("FNFL_BENCH_UV") or uv is None:
+                sys.exit("fnfl-bench: this bench needs numpy (pip install numpy, or install uv)")
+            os.environ["FNFL_BENCH_UV"] = "1"
+            os.execv(uv, [uv, "run", "--quiet", "--no-project", "--with", "numpy", "python3", os.path.abspath(__file__)]
+                     + sys.argv[1:])
+    sys.exit(cli.main())

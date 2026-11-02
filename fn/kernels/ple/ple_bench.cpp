@@ -9,6 +9,7 @@
 #include "fn/model/model.h"
 #include "fn/runtime/page_cache.h"
 #include "fn/runtime/ple_host.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -52,11 +53,7 @@ constexpr int64_t value_bytes = int64_t(F) * D * 2;
 constexpr int64_t pw_bytes = key_bytes + value_bytes; // 32,768,000
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ple-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "ple-bench", what);
 }
 
 std::string utc_now() {

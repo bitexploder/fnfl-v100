@@ -6,6 +6,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -383,6 +384,129 @@ int unit(const char * dir, int device) {
     return check.failed == 0 ? 0 : 1;
 }
 
+// ple_warm's end, polled (the 64 MiB file reads in well under the limit; a hang fails the check)
+bool wait_done(const fn::runtime::ple_warm & w) {
+    for (int i = 0; i < 6000 && !w.done(); ++i) {
+        usleep(10000);
+    }
+    return w.done();
+}
+
+// STALL: the lazy table's background warm on a cold file: every page resident, the lock as the limit allows, the
+// bytes unchanged, stop() ends it, a second start refused
+int warm(const char * dir) {
+    namespace rt = fn::runtime;
+    struct rlimit rl = {};
+    getrlimit(RLIMIT_MEMLOCK, &rl);
+    const uint64_t page = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    const uint64_t n = probe_bytes;
+    const int64_t pages = static_cast<int64_t>(n / page);
+    const uint64_t skew = 1000; // the table starts off a page boundary, as in shard 2
+    const bool can_lock = rl.rlim_cur == RLIM_INFINITY || rl.rlim_cur >= n;
+    printf("ple-pin-test: warm: %llu-byte file (%lld pages), RLIMIT_MEMLOCK soft %s\n",
+           static_cast<unsigned long long>(n), static_cast<long long>(pages),
+           rl.rlim_cur == RLIM_INFINITY ? "unlimited" : std::to_string(rl.rlim_cur).c_str());
+    checker check;
+    std::string path;
+    if (!make_file(dir, n, path)) {
+        return 1;
+    }
+    const uint8_t * p = map_file(path, n);
+    if (p == nullptr) {
+        fprintf(stderr, "ple-pin-test: cannot map '%s'\n", path.c_str());
+        unlink(path.c_str());
+        return 1;
+    }
+    check(resident_pages(p, n) == 0, "warm: the mapping starts cold", std::to_string(resident_pages(p, n)));
+    check(rt::ple_resident_pages(p, n) == 0, "warm: ple_resident_pages agrees cold");
+    {
+        rt::ple_warm w;
+        check(!w.start(nullptr, 0, false) && !w.start(p, 0, false), "warm: an empty range is refused");
+        check(w.start(p + skew, n - skew, false), "warm: start");
+        check(!w.start(p + skew, n - skew, false), "warm: a second start is refused");
+        check(wait_done(w), "warm: the thread ends");
+        const rt::ple_warm::report & r = w.result();
+        printf("ple-pin-test: warm: %s\n", w.line().c_str());
+        check(r.populated && !r.stopped && r.bytes == n && r.pages == pages, "warm: populated, the whole range",
+              std::to_string(r.bytes) + " bytes, " + std::to_string(r.pages) + " pages");
+        check(r.resident == pages && resident_pages(p, n) == pages, "warm: every page resident",
+              std::to_string(r.resident) + " / " + std::to_string(pages));
+        check(w.line().find("resident 100%") != std::string::npos, "warm: the line says resident 100%");
+        // the 64 MiB file is far below the 16 GiB margin, so the lock follows the limit alone
+        const bool room = r.mem_available >= 0 && uint64_t(r.mem_available) >= n + rt::ple_warm::lock_margin;
+        check(r.locked == (can_lock && room), "warm: locked exactly when the limit and the margin allow",
+              std::string(r.locked ? "locked" : "not locked") + (r.err.empty() ? "" : ", " + r.err));
+        check(r.mem_total > 0 && r.mem_available > 0, "warm: MemTotal and MemAvailable read");
+        check(bytes_equal(p, n), "warm: the bytes equal the file's");
+        if (r.locked) {
+            drop_cache(path);
+            check(resident_pages(p, n) == pages, "warm: locked pages stay after FADV_DONTNEED");
+        }
+        w.stop(); // after the end: returns at once
+        check(w.done(), "warm: stop after the end");
+    }
+    // stop: a cold mapping again, stopped at once; the thread ends and reports it (or finished first)
+    // reason: munmap takes the mapping's address as a mutable pointer
+    munmap(const_cast<uint8_t *>(p), n);
+    drop_cache(path);
+    p = map_file(path, n);
+    if (p != nullptr) {
+        rt::ple_warm w;
+        const bool st = w.start(p, n, false, false);
+        w.stop();
+        const rt::ple_warm::report & r = w.result();
+        check(st && w.done() && (r.stopped || r.populated) && !r.locked, "warm: stop ends the thread",
+              std::string(r.stopped ? "stopped" : "finished first") + ", " + w.line());
+        // reason: munmap takes the mapping's address as a mutable pointer
+        munmap(const_cast<uint8_t *>(p), n);
+    }
+    unlink(path.c_str());
+    printf("ple-pin-test: %s (%d failed)\n", check.failed == 0 ? "PASS" : "FAIL", check.failed);
+    return check.failed == 0 ? 0 : 1;
+}
+
+// STALL: the warm on a real file's range (the PLE table: its shard, byte offset and size), its residency (mincore)
+// before and after, with the server's own log lines; 0 when every page ends resident
+int warm_file(const char * path, uint64_t off, uint64_t bytes) {
+    const int fd = ::open(path, O_RDONLY);
+    struct stat st = {};
+    if (fd < 0 || fstat(fd, &st) != 0 || off + bytes > uint64_t(st.st_size) || bytes == 0) {
+        fprintf(stderr, "ple-pin-test: warm-file: cannot open '%s' or the range is outside it\n", path);
+        if (fd >= 0) {
+            close(fd);
+        }
+        return 1;
+    }
+    void * m = mmap(nullptr, size_t(st.st_size), PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) {
+        fprintf(stderr, "ple-pin-test: warm-file: mmap: %s\n", std::strerror(errno));
+        return 1;
+    }
+    const uint8_t * t = static_cast<const uint8_t *>(m) + off;
+    printf("ple-pin-test: warm-file: %s bytes %llu..%llu: resident before %lld pages\n", path,
+           static_cast<unsigned long long>(off), static_cast<unsigned long long>(off + bytes),
+           static_cast<long long>(fn::runtime::ple_resident_pages(t, bytes)));
+    fflush(stdout);
+    int rc = 1;
+    {
+        fn::runtime::ple_warm w;
+        if (w.start(t, bytes, true)) {
+            while (!w.done()) {
+                usleep(100000);
+            }
+            const fn::runtime::ple_warm::report & r = w.result();
+            const int64_t now = fn::runtime::ple_resident_pages(t, bytes);
+            printf("ple-pin-test: warm-file: resident after %lld of %lld pages (mincore again: %lld)\n",
+                   static_cast<long long>(r.resident), static_cast<long long>(r.pages), static_cast<long long>(now));
+            rc = r.resident == r.pages && now == r.pages ? 0 : 1;
+        }
+    }
+    munmap(m, size_t(st.st_size));
+    printf("ple-pin-test: warm-file: %s\n", rc == 0 ? "PASS" : "FAIL");
+    return rc;
+}
+
 } // namespace
 
 int fnfl_ple_pin_test(const char * mode, const char * dir, int device) {
@@ -392,6 +516,13 @@ int fnfl_ple_pin_test(const char * mode, const char * dir, int device) {
     if (std::strcmp(mode, "unit") == 0) {
         return unit(dir, device);
     }
-    fprintf(stderr, "ple-pin-test: mode is probe or unit\n");
+    if (std::strcmp(mode, "warm") == 0) {
+        return warm(dir);
+    }
+    fprintf(stderr, "ple-pin-test: mode is probe, unit or warm\n");
     return 2;
+}
+
+int fnfl_ple_warm_file(const char * path, uint64_t off, uint64_t bytes) {
+    return warm_file(path, off, bytes);
 }

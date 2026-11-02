@@ -19,3 +19,6 @@ int fnfl_hc2_test(int dev0, int dev1, uint32_t rows_mask);
 // refusals.
 // Prints "hcj-test: PASS" and returns 0 when every case passes. DEV0 == DEV1: loopback, for Compute Sanitizer.
 int fnfl_hcj_test(int dev0, int dev1);
+
+// TTTS3 item 7: TTTS2's mixed down on UD-Q4_K_XL's real HC modules (model: its first shard), lone and in lanes
+int fnfl_hcmix_test(int dev0, int dev1, const char * model);

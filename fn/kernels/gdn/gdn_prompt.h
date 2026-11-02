@@ -6,7 +6,9 @@
 // v_out, at the run's end; nothing is written per row (FC-PF3). ME11: the recurrent state's logical versions are banks
 // (fn::round::gdn_bank_of): v_in = 0 is the committed bank with the selector's k records replayed onto it, element by
 // element as gdn_core does (gdn.h), and v_out >= 1 the other bank; a second half (v_in = v_out's bank) works in place,
-// each scan thread loading and storing the same cells.
+// each scan thread loading and storing the same cells. MUP2: a chunk's pieces read and write 0 -> 1, then alternate
+// 1 -> 2 and 2 -> 1 (fn::model::prompt_piece_v_in): v_in and v_out differ (the convolution history's slots), in either
+// order.
 //   gdn_prompt_conv:  the causal convolution with SiLU (gdn_conv.cuh's per-row arithmetic: one FMUL, three FMAs, x / (1
 //                     + expf(-x))) over the run, from version v_in's 3-tap history; the run's last 3 inputs to v_out.
 //                     PB3: the input F32 or the product's FP16 output (its values, as F32, are the history's too).
@@ -84,6 +86,8 @@ int64_t prompt_wy_bytes(int32_t rows);
 
 bool gdn_prompt_conv(const prompt_args & a, void * stream);
 bool gdn_prompt_prep(const prompt_args & a, void * stream);
+// gdn_prompt_prep's shared memory opt-in on the current device, ahead of a launch (APF1 Part 4: before any capture)
+bool gdn_prompt_attributes();
 bool gdn_prompt_recur(const prompt_args & a, void * stream);
 bool gdn_prompt_gate(const prompt_args & a, void * stream);
 

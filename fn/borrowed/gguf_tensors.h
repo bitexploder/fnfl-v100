@@ -39,5 +39,11 @@ bool fnfl_gguf_read_float(const std::string & path, const std::string & key, dou
 // Every element of an integer array key of one GGUF file; false when it is absent or not integers.
 bool fnfl_gguf_read_ints(const std::string & path, const std::string & key, std::vector<int64_t> & out);
 
+// VIS1 (the vision file's keys): a string key; a bool key or bool array; a float array (F32 or F64). False when the
+// key is absent or has another type.
+bool fnfl_gguf_read_string(const std::string & path, const std::string & key, std::string & out);
+bool fnfl_gguf_read_bools(const std::string & path, const std::string & key, std::vector<bool> & out);
+bool fnfl_gguf_read_floats(const std::string & path, const std::string & key, std::vector<double> & out);
+
 // The paths of every shard of a split model, from its first shard's split.count (one path when it is not split).
 bool fnfl_gguf_shard_paths(const std::string & first, std::vector<std::string> & paths, std::string & err);

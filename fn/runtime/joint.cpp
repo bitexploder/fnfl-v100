@@ -4,6 +4,7 @@
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/round/round.h"
 #include "fn/model/layer.h"
+#include "fn/runtime/nvtx.h"
 
 #include <cuda_runtime.h>
 
@@ -98,14 +99,18 @@ bool joint_frame::init(model::model & m,
     x16_       = x16;
     router_tc_ = router_tc;
     dense_f16_ = dense_f16;
+    q8_        = model::dense_q8_of(m);  // TTTS6
     st_[0] = streams[0];
     st_[1] = streams[1];
     cache_max_ = std::clamp(cache, 1, 8);
     if (m.single || m.kv_host || st_[0] == nullptr || st_[1] == nullptr || st_[0] == st_[1]) {
         return fail(err, "joint frame: resident TP on two cards with the engine's streams only");
     }
-    if (!model::joint_dense_layouts(layouts_, err)) {
+    if (!model::joint_dense_layouts(layouts_, err) || !model::dense_site_steps(steps_, err)) {
         return false;
+    }
+    if (!model::catchup_kv_steps(false, kv_steps_[0]) || !model::catchup_kv_steps(true, kv_steps_[1])) {
+        return fail(err, "joint frame: the catch-up K/V's staging steps");
     }
     auto rings = std::make_unique<fn::xchg::joint_rings>(m.device[0], m.device[1]);
     if (!rings->ok()) {
@@ -198,6 +203,7 @@ bool joint_frame::lanes(target * const                                   t[],
     jp.j.jr = rings_.get();
     jp.j.dense_work = work_[c];
     jp.j.dense_sites = layouts_;
+    jp.j.dense_steps = steps_.data();  // TTTS6 item 2
     // FMS13: the 16-bit exchange exists at five rows only; at R < 5 it is refused (named once a row count) and the
     // round runs the default F32 exchange
     const bool five  = rows == model::layer_max_rows;
@@ -209,6 +215,8 @@ bool joint_frame::lanes(target * const                                   t[],
     jp.j.x16       = x16_ && five;
     jp.j.router_tc = router_tc_;
     jp.j.dense_f16 = dense_f16_;
+    jp.j.lone      = lone_;
+    jp.j.q8        = q8_;  // TTTS6
     return true;
 }
 
@@ -335,8 +343,13 @@ bool joint_frame::clear_after_error(std::string & err) {
         return fail(err, "joint rings reset");
     }
     for (int32_t c = 0; c < 2; ++c) {
+        // TTTS3: the lanes' HC up run counters and the joint catch-up's, which every complete launch leaves at zero
+        // (clear_workspaces' rule for the lone ones)
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
-            !cuda_ok(cudaMemset(kw_[c], 0, model::joint_kernel_ws_bytes()), "joint kernel workspaces", err)) {
+            !cuda_ok(cudaMemset(kw_[c], 0, model::joint_kernel_ws_bytes()), "joint kernel workspaces", err) ||
+            !cuda_ok(cudaMemset(lws_[c].hc_runs, 0, size_t(fn::xchg::max_lanes) * fn::hc::n_runs_card * 4),
+                     "joint hc run counters", err) ||
+            !cuda_ok(cudaMemset(cu_[c], 0, cu_runs_bytes), "joint catch-up run counters", err)) {
             return false;
         }
     }
@@ -349,6 +362,12 @@ bool joint_frame::clear_after_error(std::string & err) {
 // key ends with R, so one process holds graphs at several R (rollback-test's section 7 runs d = 1 .. 4)
 bool joint_frame::verify_graphs(target * const t[], int32_t n, int32_t rows, graph_pair *& g, std::string & err) {
     g = nullptr;
+    if (test_fail_captures_ > 0) {
+        --test_fail_captures_;
+        capture_failed_ = true;
+        err             = "TEST: the verify graphs' capture failed";
+        return false;
+    }
     if (eager_) {
         return true;
     }
@@ -387,6 +406,7 @@ bool joint_frame::verify_graphs(target * const t[], int32_t n, int32_t rows, gra
 bool joint_frame::verify(target * const t[], int32_t n, const int32_t d[], const int32_t * const prop[],
                          const int32_t budget[], round_result r[], bool ok[], std::string why[], bool & staged,
                          std::string & err) {
+    nvtx_phase ph("joint.verify.stage");
     staged = false;
     capture_failed_ = false;
     if (!ready() || n < 2 || n > fn::xchg::max_lanes) {
@@ -416,12 +436,18 @@ bool joint_frame::verify(target * const t[], int32_t n, const int32_t d[], const
         }
     }
     staged = true;
+    ph.next("joint.verify.launch");
     // eager: each member's start flag set at its staging (round_stage), before the phased enqueue
     if (eager_ && !enqueue_eager(t, n, rows, err)) {
         for (int32_t k = 0; k < n; ++k) {
             t[k]->joint_abandon();
         }
         return false;
+    }
+    // TTTS7: every member's start flag before the launches (each slot written at its staging); the rounds' counters
+    // after (joint_release)
+    for (int32_t k = 0; k < n && !eager_; ++k) {
+        t[k]->joint_start(sr[k]);
     }
     for (int32_t c = 0; c < 2 && !eager_; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
@@ -433,12 +459,12 @@ bool joint_frame::verify(target * const t[], int32_t n, const int32_t d[], const
             return false;
         }
     }
-    // both cards' work is enqueued: every member released together (RT-9)
     for (int32_t k = 0; k < n; ++k) {
         t[k]->joint_release(sr[k]);
         ++ple_use_[k];
     }
     bool clean = true;
+    ph.next("joint.verify.end");
     for (int32_t k = 0; k < n; ++k) {
         ok[k] = t[k]->joint_verify_end(d[k], prop[k], sr[k], r[k], why[k]);
         clean = clean && ok[k] && !r[k].recovered;
@@ -466,6 +492,7 @@ bool joint_frame::front_verify(target * const        t[],
                                std::string           why[],
                                bool &                staged,
                                std::string &         err) {
+    nvtx_phase ph("joint.front_verify.stage");
     staged          = false;
     capture_failed_ = false;
     if (!ready() || n < 2 || n > fn::xchg::max_lanes) {
@@ -494,11 +521,17 @@ bool joint_frame::front_verify(target * const        t[],
         }
     }
     staged = true;
+    ph.next("joint.front_verify.launch");
     if (eager_ && !enqueue_eager(t, n, rows, err)) {
         for (int32_t k = 0; k < n; ++k) {
             t[k]->front_abandon(fr[k]);
         }
         return false;
+    }
+    // TTTS7: every member's start flag before the launches (each slot written at its staging); the rounds' counters
+    // after (joint_release)
+    for (int32_t k = 0; k < n && !eager_; ++k) {
+        t[k]->joint_start(fr[k].sr);
     }
     for (int32_t c = 0; c < 2 && !eager_; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
@@ -515,6 +548,7 @@ bool joint_frame::front_verify(target * const        t[],
         ++ple_use_[k];
     }
     bool clean = true;
+    ph.next("joint.front_verify.end");
     for (int32_t k = 0; k < n; ++k) {
         ok[k] = t[k]->front_wait(fr[k], r[k], why[k]);
         clean = clean && ok[k];
@@ -538,6 +572,7 @@ bool joint_frame::front_forced(target * const      t[],
                                std::string         why[],
                                bool &              staged,
                                std::string &       err) {
+    nvtx_phase ph("joint.front_forced.stage");
     staged          = false;
     capture_failed_ = false;
     if (!ready() || n < 2 || n > fn::xchg::max_lanes || rows < 2 || rows > model::layer_max_rows) {
@@ -563,11 +598,17 @@ bool joint_frame::front_forced(target * const      t[],
         }
     }
     staged = true;
+    ph.next("joint.front_forced.launch");
     if (eager_ && !enqueue_eager(t, n, rows, err)) {
         for (int32_t k = 0; k < n; ++k) {
             t[k]->front_abandon(fr[k]);
         }
         return false;
+    }
+    // TTTS7: every member's start flag before the launches (each slot written at its staging); the rounds' counters
+    // after (joint_release)
+    for (int32_t k = 0; k < n && !eager_; ++k) {
+        t[k]->joint_start(fr[k].sr);
     }
     for (int32_t c = 0; c < 2 && !eager_; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
@@ -584,6 +625,7 @@ bool joint_frame::front_forced(target * const      t[],
         ++ple_use_[k];
     }
     bool clean = true;
+    ph.next("joint.front_forced.end");
     for (int32_t k = 0; k < n; ++k) {
         ok[k] = t[k]->front_wait(fr[k], r[k], why[k]);
         clean = clean && ok[k];
@@ -611,6 +653,17 @@ void joint_frame::test_set_x16(bool on) {
     x16_ = on;
 }
 
+void joint_frame::test_set_lone(uint32_t pieces) {
+    if (pieces == lone_) {
+        return;
+    }
+    for (graph_pair & g : cache_) {
+        drop(g);
+    }
+    cache_.clear();
+    lone_ = pieces;
+}
+
 bool joint_frame::forced(target * const t[],
                          int32_t        n,
                          int32_t        rows,
@@ -618,6 +671,7 @@ bool joint_frame::forced(target * const t[],
                          bool           ok[],
                          std::string    why[],
                          std::string &  err) {
+    nvtx_phase ph("joint.forced.stage");
     capture_failed_ = false;
     if (!ready() || n < 2 || n > fn::xchg::max_lanes || rows < 2 || rows > model::layer_max_rows) {
         return fail(err, "joint forced: no frame, members outside 2 .. 4 or rows outside 2 .. 5");
@@ -633,8 +687,14 @@ bool joint_frame::forced(target * const t[],
             return false;
         }
     }
+    ph.next("joint.forced.launch");
     if (eager_ && !enqueue_eager(t, n, rows, err)) {
         return false;
+    }
+    // TTTS7: every member's start flag before the launches (each slot written at its staging); the rounds' counters
+    // after (joint_release)
+    for (int32_t k = 0; k < n && !eager_; ++k) {
+        t[k]->joint_start(sr[k]);
     }
     for (int32_t c = 0; c < 2 && !eager_; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
@@ -648,6 +708,7 @@ bool joint_frame::forced(target * const t[],
         ++ple_use_[k];
     }
     bool clean = true;
+    ph.next("joint.forced.end");
     for (int32_t k = 0; k < n; ++k) {
         ok[k] = t[k]->joint_forced_end(rows, sr[k], r[k], why[k]);
         clean = clean && ok[k] && !r[k].recovered;
@@ -685,6 +746,7 @@ void joint_frame::draft_lanes(target * const t[], int32_t n, int32_t c, model::d
         j.sel_body[k] = w.sel_body;
         j.sel_off[k] = w.sel_off;
     }
+    j.q8    = q8_;  // TTTS6
     j.tok = reinterpret_cast<int32_t *>(b + jd_tok);
     j.carry = reinterpret_cast<float *>(b + jd_carry);
     j.h = reinterpret_cast<float *>(b + jd_h);
@@ -757,6 +819,7 @@ bool joint_frame::capture_draft(target * const t[], int32_t n, int32_t d, const 
 
 bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r[], bool ok[], std::string why[],
                         std::string & err) {
+    nvtx_phase ph("joint.draft.stage");
     if (!ready() || n < 2 || n > fn::xchg::max_lanes || d < 1 || d > model::draft_max_steps || !draft_fits(t, n)) {
         return fail(err, "joint draft: no frame, members outside 2 .. 4, d outside 1 .. 4, mixed pick kinds or mixed "
                          "draft forms");
@@ -768,6 +831,7 @@ bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r
     key.push_back(d);
     key.push_back(t[0]->draft_sparse() ? 1 : 0);
     key.push_back(t[0]->draft_pick_sampled() ? 1 : 0); // FMU4: the pick kind
+    capture_failed_ = false;  // TTTS3: as verify's and catch-up's, so the split latches a failed draft capture
     graph_pair * g = eager_ ? nullptr : cached(dcache_, key);
     if (g == nullptr && !eager_) {
         if (static_cast<int32_t>(dcache_.size()) >= cache_max_) {
@@ -780,6 +844,7 @@ bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r
         if (!capture_draft(t, n, d, key, dcache_.back(), err)) {
             drop(dcache_.back());
             dcache_.pop_back();
+            capture_failed_ = true;
             return false;
         }
         g = &dcache_.back();
@@ -795,6 +860,7 @@ bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r
             return false;
         }
     }
+    ph.next("joint.draft.launch");
     std::string lerr;
     bool launched = true;
     if (eager_) {
@@ -805,6 +871,10 @@ bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r
         model::draft_joint * const jj[2] = {&j[0], &j[1]};
         launched = model::draft_joint_pair_enqueue(jj, d, t[0]->eager_counters(), lerr) == model::step_status::ok;
     } else {
+        // TTTS7: every member's start flag before the launches (each slot written at its staging)
+        for (int32_t k = 0; k < n; ++k) {
+            t[k]->joint_start(sr[k]);
+        }
         for (int32_t c = 0; c < 2 && launched; ++c) {
             launched =
                 cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", lerr) &&
@@ -820,6 +890,7 @@ bool joint_frame::draft(target * const t[], int32_t n, int32_t d, round_result r
     for (int32_t k = 0; k < n; ++k) {
         t[k]->joint_release(sr[k]);
     }
+    ph.next("joint.draft.end");
     for (int32_t k = 0; k < n; ++k) {
         if (!launched) {
             ok[k] = false; // part of the step enqueued: every member's step fails
@@ -867,6 +938,8 @@ bool joint_frame::catchup_lanes(target * const t[], int32_t n, int32_t c,
         j.kv_work[f] = b + cu_kv_at(f);
         j.kv_work_bytes[f] = model::catchup_kv_work_bytes(f == 1);
     }
+    j.q8       = q8_;  // TTTS6
+    j.kv_steps = kv_steps_;
     return true;
 }
 
@@ -937,6 +1010,7 @@ bool joint_frame::capture_catchup(target * const t[], int32_t n, const std::vect
 
 bool joint_frame::catchup(target * const t[], int32_t n, const int32_t rows[], round_result r[], bool ok[],
                           std::string why[], std::string & err) {
+    nvtx_phase ph("joint.catchup.stage");
     capture_failed_ = false;
     if (!ready() || n < 2 || n > fn::xchg::max_lanes || !catchup_fits(t, n)) {
         return fail(err, "joint catch-up: no frame, members outside 2 .. 4, or mixed draft forms");
@@ -980,6 +1054,7 @@ bool joint_frame::catchup(target * const t[], int32_t n, const int32_t rows[], r
             return false;
         }
     }
+    ph.next("joint.catchup.launch");
     std::string lerr;
     bool launched = true;
     if (eager_) {
@@ -1000,6 +1075,10 @@ bool joint_frame::catchup(target * const t[], int32_t n, const int32_t rows[], r
         model::catchup_joint * const jj[2] = {&j[0], &j[1]};
         launched = model::catchup_joint_pair_enqueue(jj, u, lerr) == model::step_status::ok;
     } else {
+        // TTTS7: every member's start flag before the launches (each slot written at its staging)
+        for (int32_t k = 0; k < n; ++k) {
+            t[k]->joint_start(sr[k]);
+        }
         for (int32_t c = 0; c < 2 && launched; ++c) {
             launched =
                 cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", lerr) &&
@@ -1016,6 +1095,7 @@ bool joint_frame::catchup(target * const t[], int32_t n, const int32_t rows[], r
         t[k]->joint_release(sr[k]);
     }
     bool clean = true;
+    ph.next("joint.catchup.end");
     for (int32_t k = 0; k < n; ++k) {
         if (!launched) {
             ok[k] = false; // part of the catch-up enqueued: every member's catch-up fails

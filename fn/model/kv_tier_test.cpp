@@ -8,6 +8,7 @@
 #include "fn/model/model.h"
 #include "fn/model/state.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -42,11 +43,7 @@ int32_t key_layer(int32_t c, int32_t k) {
 }
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "kv-tier-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "kv-tier-test", what);
 }
 
 struct rng {

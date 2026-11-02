@@ -15,6 +15,7 @@
 // the head mixer's stream output x [B][4][1280], layer 47's output streams combined (x = hres + hpost * hx), which
 // nothing else writes; it survives into the next round.
 
+#include "fn/kernels/hc/hc.h"
 #include "fn/kernels/ple/ple.h"
 #include "fn/kernels/round/round.h"
 #include "fn/kernels/samp/samp.h"
@@ -100,6 +101,8 @@ struct pass_card {
     // the head (FC-HEAD1..3)
     hc_module head;                  // w_down [4][320][1280], w_up, gamma
     const uint8_t * out_w = nullptr; // output.weight's card rows, DP2's packed layout
+    bool                out_q8      = false;   // TTTS2: output.weight Q8_0 (UD-Q4_K_XL), else Q5_K
+    bool                embd_q8     = false;   // TTTS2: token_embd Q8_0 (UD-Q4_K_XL), else IQ3_S
     float * carry = nullptr;         // [5][4][1280] the hidden carry (FC-HEAD3)
     float * head_mom = nullptr;      // [5][1300]
     uint32_t * pair_own = nullptr;   // [5][2]
@@ -128,6 +131,9 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
 
 // DP2's packed layout for every dense weight of the pass (the 48 layers' and output.weight), once per loaded model
 bool pack_dense_all(model & m, std::string & err);
+
+// TTTS2: the Q8_0 head HC (UD-Q4_K_XL), part 0 head_down2_q8, 1 head_up2_q8, in h's slots (head_sub's arguments)
+bool head_q8_sub(const pass_card & p, const fn::hc::sub_args & h, int32_t rows, int32_t part, void * stream);
 
 // One card's pass of B rows, for a graph capture: begin, stamp, embed, layers lo .. hi with PLE after layer 0, the head,
 // logits, the decision (V1's greedy, or the sampler's stages, o.sampling), commit, finish. u counts the exchange uses

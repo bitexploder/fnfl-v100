@@ -7,6 +7,7 @@
 #include "fn/model/state.h"
 #include "fn/quant/act_ref.h"
 #include "fn/quant/kv_q8_ref.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/tools/test_dump.h"
 
 #include <cuda_runtime.h>
@@ -60,11 +61,7 @@ constexpr int32_t SS = fn::model::kv_q8_scale_stride; // KV8: the scale rows' st
 constexpr int32_t q8_col = 4 * 5;                     // KV8: QSA layer 5's 4 scales in a row
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "qa2-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "qa2-test", what);
 }
 
 template <typename T> struct dev_buf {

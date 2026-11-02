@@ -1,4 +1,5 @@
 #include "fn/kernels/draft/draft_prompt.h"
+#include "fn/kernels/qsa/imrope.cuh"
 #include "fn/model/shapes.h"
 
 #include <cuda_fp16.h>
@@ -139,7 +140,8 @@ __global__ void __launch_bounds__(256) prepare_kernel(const kvp_args a) {
     }
     const int64_t cell = int64_t(a.pos0) + t;
     float         y[8];
-    norm_rope_pos(y, a.kv_k + int64_t(t) * HD, a.k_norm, a.pos0 + t, a.theta_scale, lane);
+    norm_rope_pos(y, a.kv_k + int64_t(t) * HD, a.k_norm,
+                  fn::qsa::prompt_rope_pos(a.planes, a.pos0 + a.rope_off, t, lane), a.theta_scale, lane);
     reinterpret_cast<uint4 *>(a.k_cache + cell * HD)[lane] =
         make_uint4(h2(y[0], y[1]), h2(y[2], y[3]), h2(y[4], y[5]), h2(y[6], y[7]));
     const float4 v0 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane);

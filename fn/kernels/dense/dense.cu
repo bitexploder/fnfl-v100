@@ -1,8 +1,8 @@
-#include "fn/kernels/dense/dense.h"
-
 #include "fn/kernels/act/act_warp.cuh"
+#include "fn/kernels/dense/dense.h"
 #include "fn/kernels/dense/dense_dec.cuh"
 #include "fn/kernels/dense/dense_mma.cuh"
+#include "fn/kernels/dense/dense_steps.h"
 #include "fn/kernels/dense/iq3s.cuh"
 #include "fn/kernels/gdn/gdn_conv.cuh"
 #include "fn/kernels/round/version.h"
@@ -32,6 +32,18 @@ constexpr float route_floor = 6.103515625e-5f; // the weights' sum is clamped be
 int32_t n_steps(int32_t k) {
     return (k + step_k - 1) / step_k;
 }
+
+// TTTS6: the formats an instance compiles: all (the shared kernels), Q8_0 only, or Q8_0 and BF16 (UD-Q4_K_XL's sites,
+// product_args::q8). A format outside the set has no code in the instance; the paths it keeps are the shared ones.
+enum class fset : int32_t { all, q8, q8_bf16 };
+
+template <fset S> __host__ __device__ constexpr bool has_fmt(fmt f) {
+    return S == fset::all || f == fmt::q8_0 || (S == fset::q8_bf16 && f == fmt::bf16);
+}
+
+// TTTS6 item 2: the instances other than fset::all stage only block b's K steps [lo[b], hi[b]) (dense.h stage_steps)
+static_assert(sizeof(stage_steps::lo) == n_sm && sizeof(stage_steps::hi) == n_sm, "stage_steps: a byte a block");
+constexpr int32_t runs_step = step_k / 32;  // staged runs of 32 values a step
 
 // ---- device helpers ---------------------------------------------------------------------------------------------
 // a line into L2 ahead of its use (PTX prefetch.global.L2: no register, no wait)
@@ -679,6 +691,124 @@ __device__ __forceinline__ void run_wide(const launch_desc & L, const mat_desc &
     finish<B>(L, md, tile, kp, tile_bf, rl, ql, v, v4, lane);
 }
 
+// ---- TTTS3: Q8_0 rows as the file stores them (dense.h fmt_q8_0f) ---------------------------------------------------
+// GGUF blocks of 34 bytes (the F16 d, then 32 int8 codes; pack copies them) against F32 activations: PLE's key and
+// value (UD-Q4_K_XL). A launch holding a Q8_0F matrix holds only Q8_0F matrices with the F32 epilogue: no router, no
+// X-HMIX, no glu or conv_silu (describe), in its own kernels, so the other formats' kernels are unchanged;
+// product_joint takes them too. fmt_q8_0f is a value of fmt outside its enumerator list, declared on one line of
+// dense.h: an enumerator, or a comment block there, moved an IQ3_S expert kernel's SASS (the experts include dense.h;
+// the item 2 gate).
+// The F32 path's lane slices (wide_w<f32>): sub-step s holds weights 128 s .. 128 s + 127 of a row, its blocks 4 s ..
+// 4 s + 3; lane l takes weights 4 l .. 4 l + 3, block 4 s + l / 8's codes 4 (l % 8) .. 4 (l % 8) + 3, and that block's
+// d. A slot holds a row's d bits and its four codes (16-bit loads: a block is 34 bytes, so a code run is 2-byte
+// aligned). Weight i is d x q, exact in F32 (an int8 times an 11-bit significand): TTTS2's widened F32 value.
+constexpr int32_t q8f_block = 34;
+
+struct q8f_slot {
+    uint32_t d, c;
+};
+
+__device__ __forceinline__ q8f_slot ld_q8f(const uint8_t * row, int32_t s, int32_t lane) {
+    const uint8_t *        b = row + (4 * s + (lane >> 3)) * q8f_block;
+    const unsigned short * c = reinterpret_cast<const unsigned short *>(b + 2 + 4 * (lane & 7));
+    return { __ldg(reinterpret_cast<const unsigned short *>(b)), uint32_t(__ldg(c)) | (uint32_t(__ldg(c + 1)) << 16) };
+}
+
+__device__ __forceinline__ float q8f_w(const q8f_slot & v, int32_t i) {
+    return static_cast<float>(static_cast<int8_t>(v.c >> (8 * i))) *
+           __half2float(__ushort_as_half(static_cast<unsigned short>(v.d)));
+}
+
+// WR weight rows from row0 (rb bytes apart, the first n_rows real) against NB activation rows over sub-steps [s0, s1):
+// acc[r][b] is run_wide<f32>'s chain of (r, b), the same lane slice, sub-steps and FMA order; x(b, s) is row b's
+// 16-byte aligned lane slice of sub-step s. The loads are issued one sub-step ahead, as run_wide's.
+template <int WR, int NB, class X>
+__device__ __forceinline__ void q8f_dots(const uint8_t * row0,
+                                         int64_t         rb,
+                                         int32_t         n_rows,
+                                         int32_t         s0,
+                                         int32_t         s1,
+                                         int32_t         lane,
+                                         const X &       x,
+                                         float (&acc)[WR][NB]) {
+    q8f_slot   ra[WR], rv[WR];
+    const auto ld = [&](q8f_slot(&v)[WR], int32_t s) {
+#pragma unroll
+        for (int32_t r = 0; r < WR; ++r) {
+            v[r] = r < n_rows ? ld_q8f(row0 + r * rb, s, lane) : q8f_slot{ 0u, 0u };
+        }
+    };
+#pragma unroll
+    for (int32_t r = 0; r < WR; ++r) {
+#pragma unroll
+        for (int32_t b = 0; b < NB; ++b) {
+            acc[r][b] = 0.0f;
+        }
+    }
+    const auto fma_step = [&](const q8f_slot(&v)[WR], int32_t s) {
+#pragma unroll
+        for (int32_t b = 0; b < NB; ++b) {
+            const float4 x0    = __ldg(reinterpret_cast<const float4 *>(x(b, s)));
+            const float  xv[4] = { x0.x, x0.y, x0.z, x0.w };
+#pragma unroll
+            for (int32_t r = 0; r < WR; ++r) {
+#pragma unroll
+                for (int32_t i = 0; i < 4; ++i) {
+                    acc[r][b] = fmaf(q8f_w(v[r], i), xv[i], acc[r][b]);
+                }
+            }
+        }
+    };
+    ld(ra, s0);
+    int32_t s = s0;
+#pragma unroll 1
+    for (; s + 3 <= s1; s += 2) {
+        ld(rv, s + 1);
+        fma_step(ra, s);
+        ld(ra, s + 2);
+        fma_step(rv, s + 1);
+    }
+    if (s + 2 == s1) {
+        ld(rv, s + 1);
+        fma_step(ra, s);
+        fma_step(rv, s + 1);
+    } else {
+        fma_step(ra, s);
+    }
+}
+
+// the lone product's unit: run_wide<f32>'s tile of 4 rows, its sub-steps, tree and finish
+template <int B>
+__device__ __forceinline__ void run_q8f(const launch_desc & L, const mat_desc & md, int32_t tile, int32_t kp) {
+    const int32_t lane = lane_id();
+    const int32_t k    = L.k;
+    const int64_t rb   = int64_t(k / 32) * q8f_block;
+    const int32_t s0 = kp * md.sp * 2, s1 = s0 + md.sp * 2;  // sub-steps of 128
+    const int32_t n_rows = min(tile_bf, md.m - tile_bf * tile);
+    float         acc[tile_bf][B];
+    q8f_dots<tile_bf, B>(
+        md.w + int64_t(tile_bf) * tile * rb, rb, n_rows, s0, s1, lane,
+        [&](int32_t b, int32_t s) { return L.xf + b * k + 128 * s + 4 * lane; }, acc);
+    const int32_t rl = lane >> 2, ql = lane & 3;
+    float         v = 0.0f, v4 = 0.0f;
+#pragma unroll
+    for (int32_t r = 0; r < tile_bf; ++r) {
+#pragma unroll
+        for (int32_t b = 0; b < B; ++b) {
+            float a = acc[r][b];
+#pragma unroll
+            for (int32_t off = 16; off > 0; off >>= 1) {
+                a += __shfl_xor_sync(0xffffffffu, a, off);
+            }
+            v = (rl == r && ql == b) ? a : v;
+            if (B == 5 && b == 4) {
+                v4 = rl == r ? a : v4;
+            }
+        }
+    }
+    finish<B>(L, md, tile, kp, tile_bf, rl, ql, v, v4, lane);
+}
+
 // this warp's units of matrix mi: u = gw + 1,152 j in [unit_base, the next matrix's), gw = warp * 72 + block (so
 // consecutive units go to different SMs). gw is read afresh here, not held across the format switch.
 template <fmt F, int B>
@@ -741,7 +871,8 @@ template <bool W32> __device__ __forceinline__ void prefetch_first_unit(const la
 // W32 (DR1): the instantiation with the F32 path, launched only when a matrix is F32 (the draft's router), so the
 // target's launches keep the kernels without it (their code and registers as before DR1)
 // FMS2 (build item 2): product_kernel's body, shared with the gated launch (product_gated_kernel)
-template <int B, bool W32> __device__ __forceinline__ void product_body(const launch_desc & L) {
+template <int B, bool W32, fset S = fset::all>
+__device__ __forceinline__ void product_body(const launch_desc & L, const stage_steps * M = nullptr) {
     extern __shared__ uint4 smem4[];
     uint8_t * sm = reinterpret_cast<uint8_t *>(smem4);
     const int32_t nblk = L.k / 32;
@@ -754,8 +885,8 @@ template <int B, bool W32> __device__ __forceinline__ void product_body(const la
     // stage: row b's codes into the swizzled chunks, and per run {d, s} with the exact code sums of its halves; with
     // X-HMIX, the peer half's runs are polled (xchg.cuh hmix_run)
     if (L.need_xq) {
-        for (int32_t i = tid; i < B * nblk; i += n_threads) {
-            const int32_t b = i / nblk, j = i - b * nblk;
+        // run j of row b, i = b nblk + j
+        const auto stage = [&](int32_t b, int32_t j, int32_t i) {
             uint4 c0, c1;
             float2 sc;
             if (L.hmix != nullptr) {
@@ -777,12 +908,24 @@ template <int B, bool W32> __device__ __forceinline__ void product_body(const la
             xs[swz(2 * j + 1)] = c1;
             meta[i] =
                 make_float4(sc.x, sc.y, __int_as_float(slo), __int_as_float(shi)); // the sums' bits in float slots
+        };
+        if constexpr (S == fset::all) {
+            for (int32_t i = tid; i < B * nblk; i += n_threads) {
+                const int32_t b = i / nblk, j = i - b * nblk;
+                stage(b, j, i);
+            }
+        } else {  // TTTS6 item 2: the block's steps only
+            const int32_t j0 = runs_step * M->lo[blockIdx.x], nj = min(nblk, runs_step * M->hi[blockIdx.x]) - j0;
+            for (int32_t i = tid; i < B * nj; i += n_threads) {
+                const int32_t b = i / nj, j = j0 + i - b * nj;
+                stage(b, j, b * nblk + j);
+            }
         }
     }
     if (L.hmix != nullptr && L.need_xf) { // the F32 row's peer half, read after the barrier through L1 (xchg.h)
         fn::xchg::hmix_acquire_f32(L.hmix, L.hmix_peer, B, tid, n_threads, L.err);
     }
-    if (L.need_grid) {
+    if (has_fmt<S>(fmt::iq3_s) && L.need_grid) {
         for (int32_t i = tid; i < iq3s_grid_bytes / 16; i += n_threads) {
             reinterpret_cast<uint4 *>(grid)[i] = __ldg(reinterpret_cast<const uint4 *>(L.grids) + i);
         }
@@ -791,39 +934,47 @@ template <int B, bool W32> __device__ __forceinline__ void product_body(const la
     const act x = {sm, meta, L.k};
     // matrix by matrix: the format switch is taken once per matrix; each format's path loops over its own units
     for (int32_t mi = 0; mi < L.n_mats; ++mi) {
-        switch (static_cast<fmt>(L.mats[mi].f)) {
-            case fmt::q4_k:
-                run_units<fmt::q4_k, B>(L, mi, x, grid);
-                break;
-            case fmt::q5_k:
-                run_units<fmt::q5_k, B>(L, mi, x, grid);
-                break;
-            case fmt::q6_k:
-                run_units<fmt::q6_k, B>(L, mi, x, grid);
-                break;
-            case fmt::iq4_xs:
-                run_units<fmt::iq4_xs, B>(L, mi, x, grid);
-                break;
-            case fmt::iq3_s:
-                run_units<fmt::iq3_s, B>(L, mi, x, grid);
-                break;
-            case fmt::q8_0:
-                run_units<fmt::q8_0, B>(L, mi, x, grid);
-                break;
-            case fmt::iq4_nl:
-                run_units<fmt::iq4_nl, B>(L, mi, x, grid);
-                break;
-            case fmt::q2_0:
-                run_units<fmt::q2_0, B>(L, mi, x, grid);
-                break;
-            case fmt::bf16:
+        if constexpr (S != fset::all) {  // TTTS6: no format switch; BF16 by test only in the Q8_0 and BF16 set
+            if (S == fset::q8_bf16 && static_cast<fmt>(L.mats[mi].f) == fmt::bf16) {
                 run_units<fmt::bf16, B>(L, mi, x, grid);
-                break;
-            case fmt::f32:
-                if constexpr (W32) {
-                    run_units<fmt::f32, B>(L, mi, x, grid);
-                }
-                break;
+            } else {
+                run_units<fmt::q8_0, B>(L, mi, x, grid);
+            }
+        } else {
+            switch (static_cast<fmt>(L.mats[mi].f)) {
+                case fmt::q4_k:
+                    run_units<fmt::q4_k, B>(L, mi, x, grid);
+                    break;
+                case fmt::q5_k:
+                    run_units<fmt::q5_k, B>(L, mi, x, grid);
+                    break;
+                case fmt::q6_k:
+                    run_units<fmt::q6_k, B>(L, mi, x, grid);
+                    break;
+                case fmt::iq4_xs:
+                    run_units<fmt::iq4_xs, B>(L, mi, x, grid);
+                    break;
+                case fmt::iq3_s:
+                    run_units<fmt::iq3_s, B>(L, mi, x, grid);
+                    break;
+                case fmt::q8_0:
+                    run_units<fmt::q8_0, B>(L, mi, x, grid);
+                    break;
+                case fmt::iq4_nl:
+                    run_units<fmt::iq4_nl, B>(L, mi, x, grid);
+                    break;
+                case fmt::q2_0:
+                    run_units<fmt::q2_0, B>(L, mi, x, grid);
+                    break;
+                case fmt::bf16:
+                    run_units<fmt::bf16, B>(L, mi, x, grid);
+                    break;
+                case fmt::f32:
+                    if constexpr (W32) {
+                        run_units<fmt::f32, B>(L, mi, x, grid);
+                    }
+                    break;
+            }
         }
     }
     // The router (DP2 Amendment 3): the launch's last block to finish runs the epilogue. Hand-off: every thread's
@@ -854,6 +1005,29 @@ __global__ void __launch_bounds__(n_threads, 1) product_kernel(const __grid_cons
     product_body<B, W32>(L);
 }
 
+// TTTS6: the lone launch of UD-Q4_K_XL's joint draft step (product_args::q8): Q8_0 only, or Q8_0 and BF16
+template <int B, fset S>
+__global__ void __launch_bounds__(n_threads, 1) product_fs_kernel(const __grid_constant__ launch_desc L,
+                                                                  const __grid_constant__ stage_steps M) {
+    product_body<B, false, S>(L, &M);
+}
+
+// TTTS3: the lone launch of Q8_0F matrices (describe: those only, F32 epilogues), run_units' unit walk
+template <int B>
+__global__ void __launch_bounds__(n_threads, 1) product_q8f_kernel(const __grid_constant__ launch_desc L) {
+    const int32_t gw = static_cast<int32_t>(threadIdx.x >> 5) * n_sm + static_cast<int32_t>(blockIdx.x);
+    for (int32_t mi = 0; mi < L.n_mats; ++mi) {
+        const mat_desc & md = L.mats[mi];
+        const int32_t    u0 = md.unit_base, u1 = mi + 1 < L.n_mats ? L.mats[mi + 1].unit_base : L.n_units;
+#pragma unroll 1
+        for (int32_t u = u0 + (gw - u0 % n_grid_warps + n_grid_warps) % n_grid_warps; u < u1; u += n_grid_warps) {
+            const int32_t rel  = u - u0;
+            const int32_t tile = rel / md.split, kp = rel - tile * md.split;
+            run_q8f<B>(L, md, tile, kp);
+        }
+    }
+}
+
 // FMS2 (build item 2, the joint catch-up's eh_proj): the lone launch, whose blocks all return at once when
 // *gate <= at (a device word, read once a block, so every block takes the same branch)
 template <int B>
@@ -863,6 +1037,18 @@ __global__ void __launch_bounds__(n_threads, 1) product_gated_kernel(const __gri
         return;
     }
     product_body<B, false>(L);
+}
+
+// TTTS6: the gated launch's Q8_0 instance (product_args::q8)
+template <int B, fset S>
+__global__ void __launch_bounds__(n_threads, 1) product_gated_fs_kernel(const __grid_constant__ launch_desc L,
+                                                                        const int32_t *                     gate,
+                                                                        int32_t                             at,
+                                                                        const __grid_constant__ stage_steps M) {
+    if (*gate <= at) {
+        return;
+    }
+    product_body<B, false, S>(L, &M);
 }
 
 // ---- FMU2: the joint product (dense.h) ------------------------------------------------------------------------------
@@ -1722,9 +1908,81 @@ __device__ __forceinline__ void run_units_joint(const joint_desc & J,
     }
 }
 
-// F16 (FMS6, U = 3 and 4; FMS13: U LR >= 12): the quantized products on mma_step_f16
-template <int U, int LR, bool F16>
-__global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_constant__ joint_desc J) {
+// TTTS3: Q8_0F weights in a joint launch, lane by lane (run_wide_per_lane's form at every U): lane u's LR rows against
+// the unit's tile, each (weight row, activation row) chain run_q8f<LR>'s (the same lane slice, sub-steps, FMA order and
+// tree). The weights are read once from memory and again from L2 for each further lane; holding every lane's rows in
+// one pass spilled from 9 rows. WR of the tile's rows a pass: 2 at LR 4 and 5 (the whole tile spilled there), else 4.
+// Lane u's rows are its J.xf buffer or rows 5 u .. of L.xf.
+template <int U, int LR>
+__device__ __forceinline__ void run_q8f_joint(const joint_desc & J, const mat_desc & md, int32_t tile, int32_t kp) {
+    constexpr int32_t   WR   = LR >= 4 ? 2 : tile_bf;
+    const launch_desc & L    = J.L;
+    const int32_t       lane = lane_id();
+    const int32_t       k    = L.k;
+    const int64_t       rb   = int64_t(k / 32) * q8f_block;
+    const int32_t       s0 = kp * md.sp * 2, s1 = s0 + md.sp * 2;  // sub-steps of 128
+    const int32_t       n_rows = min(tile_bf, md.m - tile_bf * tile);
+    const int32_t       rl = lane >> 2, ql = lane & 3, row = tile_bf * tile + rl;
+#pragma unroll 1
+    for (int32_t u = 0; u < U; ++u) {
+        const float * xf = J.xf[0] != nullptr ? J.xf[u] : L.xf + u * lane_rows * k;
+        // lane (rl, ql) puts (rl, ql) and, ql 0, (rl, 4)
+        float         v = 0.0f, v4 = 0.0f;
+#pragma unroll 1
+        for (int32_t r0 = 0; r0 < tile_bf; r0 += WR) {
+            float acc[WR][LR];
+            q8f_dots<WR, LR>(
+                md.w + (int64_t(tile_bf) * tile + r0) * rb, rb, n_rows - r0, s0, s1, lane,
+                [&](int32_t b, int32_t s) { return xf + b * k + 128 * s + 4 * lane; }, acc);
+#pragma unroll
+            for (int32_t r = 0; r < WR; ++r) {
+#pragma unroll
+                for (int32_t b = 0; b < LR; ++b) {
+                    float a = acc[r][b];
+#pragma unroll
+                    for (int32_t off = 16; off > 0; off >>= 1) {
+                        a += __shfl_xor_sync(0xffffffffu, a, off);
+                    }
+                    v = (rl == r0 + r && ql == b) ? a : v;
+                    if (b == 4) {
+                        v4 = rl == r0 + r ? a : v4;
+                    }
+                }
+            }
+        }
+        if (rl < tile_bf && row < md.m) {
+            if (ql < LR) {
+                joint_put<U, LR>(J, md, tile, kp, rl, row, LR * u + ql, v);
+            }
+            if (LR == lane_rows && ql == 0) {
+                joint_put<U, LR>(J, md, tile, kp, rl, row, LR * u + 4, v4);
+            }
+        }
+    }
+    joint_arrive<U, LR>(J, md, tile, tile_bf, lane);
+}
+
+// TTTS3: the joint launch of Q8_0F matrices (product_joint: those only, F32 epilogues, no X-HMIX, router or peer),
+// run_units_joint's unit walk
+template <int U, int LR>
+__global__ void __launch_bounds__(n_threads, 1) joint_q8f_kernel(const __grid_constant__ joint_desc J) {
+    const launch_desc & L  = J.L;
+    const int32_t       gw = static_cast<int32_t>(threadIdx.x >> 5) * n_sm + static_cast<int32_t>(blockIdx.x);
+    for (int32_t mi = 0; mi < L.n_mats; ++mi) {
+        const mat_desc & md = L.mats[mi];
+        const int32_t    u0 = md.unit_base, u1 = mi + 1 < L.n_mats ? L.mats[mi + 1].unit_base : L.n_units;
+#pragma unroll 1
+        for (int32_t u = u0 + (gw - u0 % n_grid_warps + n_grid_warps) % n_grid_warps; u < u1; u += n_grid_warps) {
+            const int32_t rel  = u - u0;
+            const int32_t tile = rel / md.split, kp = rel - tile * md.split;
+            run_q8f_joint<U, LR>(J, md, tile, kp);
+        }
+    }
+}
+
+// F16 (FMS6, U = 3 and 4; FMS13: U LR >= 12): the quantized products on mma_step_f16. S (TTTS6): the formats compiled
+template <int U, int LR, bool F16, fset S>
+__device__ __forceinline__ void joint_body(const joint_desc & J, const stage_steps * M) {
     constexpr int32_t       R = LR * U;
     const launch_desc & L = J.L;
     extern __shared__ uint4 smem4[];
@@ -1737,8 +1995,8 @@ __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_consta
         prefetch_first_unit<false>(L);
     }
     if (L.need_xq) {
-        for (int32_t i = tid; i < R * nblk; i += n_threads) {
-            const int32_t b = i / nblk, j = i - b * nblk;
+        // run j of row b, i = b nblk + j
+        const auto stage = [&](int32_t b, int32_t j, int32_t i) {
             uint4 c0, c1;
             float2 sc;
             if (L.hmix != nullptr) {
@@ -1769,6 +2027,18 @@ __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_consta
                 xs[swz(2 * j + 1)] = make_uint4(c1.x ^ flip.x, c1.y ^ flip.y, c1.z ^ flip.z, c1.w ^ flip.w);
             }
             meta[i] = make_float4(sc.x, sc.y, __int_as_float(slo), __int_as_float(shi));
+        };
+        if constexpr (S == fset::all) {
+            for (int32_t i = tid; i < R * nblk; i += n_threads) {
+                const int32_t b = i / nblk, j = i - b * nblk;
+                stage(b, j, i);
+            }
+        } else {  // TTTS6 item 2: the block's steps only
+            const int32_t j0 = runs_step * M->lo[blockIdx.x], nj = min(nblk, runs_step * M->hi[blockIdx.x]) - j0;
+            for (int32_t i = tid; i < R * nj; i += n_threads) {
+                const int32_t b = i / nj, j = j0 + i - b * nj;
+                stage(b, j, b * nblk + j);
+            }
         }
     }
     if (L.hmix != nullptr && L.need_xf) {
@@ -1776,7 +2046,7 @@ __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_consta
             fn::xchg::hmix_acquire_f32(L.hmix + u * J.hmix_lane, L.hmix_peer, LR, tid, n_threads, L.err);
         }
     }
-    if (L.need_grid) {
+    if (has_fmt<S>(fmt::iq3_s) && L.need_grid) {
         for (int32_t i = tid; i < iq3s_grid_bytes / 16; i += n_threads) {
             reinterpret_cast<uint4 *>(grid)[i] = __ldg(reinterpret_cast<const uint4 *>(L.grids) + i);
         }
@@ -1784,36 +2054,44 @@ __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_consta
     __syncthreads();
     const act x = {sm, meta, L.k};
     for (int32_t mi = 0; mi < L.n_mats; ++mi) {
-        switch (static_cast<fmt>(L.mats[mi].f)) {
-            case fmt::q4_k:
-                run_units_joint<fmt::q4_k, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::q5_k:
-                run_units_joint<fmt::q5_k, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::q6_k:
-                run_units_joint<fmt::q6_k, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::iq4_xs:
-                run_units_joint<fmt::iq4_xs, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::iq3_s:
-                run_units_joint<fmt::iq3_s, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::q8_0:
-                run_units_joint<fmt::q8_0, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::iq4_nl:
-                run_units_joint<fmt::iq4_nl, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::q2_0:
-                run_units_joint<fmt::q2_0, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::bf16:
+        if constexpr (S != fset::all) {  // TTTS6: no format switch; BF16 by test only in the Q8_0 and BF16 set
+            if (S == fset::q8_bf16 && static_cast<fmt>(L.mats[mi].f) == fmt::bf16) {
                 run_units_joint<fmt::bf16, U, LR, F16>(J, mi, x, grid);
-                break;
-            case fmt::f32: // rejected by product_joint
-                break;
+            } else {
+                run_units_joint<fmt::q8_0, U, LR, F16>(J, mi, x, grid);
+            }
+        } else {
+            switch (static_cast<fmt>(L.mats[mi].f)) {
+                case fmt::q4_k:
+                    run_units_joint<fmt::q4_k, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::q5_k:
+                    run_units_joint<fmt::q5_k, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::q6_k:
+                    run_units_joint<fmt::q6_k, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::iq4_xs:
+                    run_units_joint<fmt::iq4_xs, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::iq3_s:
+                    run_units_joint<fmt::iq3_s, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::q8_0:
+                    run_units_joint<fmt::q8_0, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::iq4_nl:
+                    run_units_joint<fmt::iq4_nl, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::q2_0:
+                    run_units_joint<fmt::q2_0, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::bf16:
+                    run_units_joint<fmt::bf16, U, LR, F16>(J, mi, x, grid);
+                    break;
+                case fmt::f32:  // rejected by product_joint
+                    break;
+            }
         }
     }
     // the router: product_kernel's hand-off; the last block's warps take rows w, w + 16 with the staging's shared
@@ -1849,6 +2127,18 @@ __global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_consta
             }
         }
     }
+}
+
+template <int U, int LR, bool F16>
+__global__ void __launch_bounds__(n_threads, 1) joint_kernel(const __grid_constant__ joint_desc J) {
+    joint_body<U, LR, F16, fset::all>(J, nullptr);
+}
+
+// TTTS6: the joint launch of UD-Q4_K_XL's sites (product_args::q8): Q8_0 only, or Q8_0 and BF16
+template <int U, int LR, bool F16, fset S>
+__global__ void __launch_bounds__(n_threads, 1) joint_fs_kernel(const __grid_constant__ joint_desc  J,
+                                                                const __grid_constant__ stage_steps M) {
+    joint_body<U, LR, F16, S>(J, &M);
 }
 
 // ---- FMS5: the router on the tensor cores (dense.h joint_args::router_tc) -------------------------------------------
@@ -2051,11 +2341,11 @@ __global__ void __launch_bounds__(n_threads, 1) router_tc_kernel(const __grid_co
 
 // ---- host ------------------------------------------------------------------------------------------------------
 bool is_q(fmt f) {
-    return f != fmt::bf16 && f != fmt::f32;
+    return f != fmt::bf16 && f != fmt::f32 && f != fmt_q8_0f;
 }
 
 bool known(fmt f) {
-    return static_cast<int32_t>(f) >= 0 && static_cast<int32_t>(f) <= static_cast<int32_t>(fmt::f32);
+    return static_cast<int32_t>(f) >= 0 && static_cast<int32_t>(f) <= static_cast<int32_t>(fmt_q8_0f);  // TTTS3
 }
 
 // the route epilogue's shared memory: a row's e values and candidates for each of B rows
@@ -2163,6 +2453,15 @@ bool describe(int32_t rows, const product_args & a, launch_desc & L) {
         L.need_grid |= m.f == fmt::iq3_s ? 1 : 0;
         L.need_kv |= (m.f == fmt::iq4_xs || m.f == fmt::iq4_nl) ? 1 : 0;
     }
+    int32_t n_q8f = 0;  // TTTS3 (dense.h fmt_q8_0f): a launch of Q8_0F matrices only, F32 epilogues
+    for (int32_t i = 0; i < a.n_mats; ++i) {
+        n_q8f += a.mats[i].f == fmt_q8_0f ? 1 : 0;
+    }
+    for (int32_t i = 0; n_q8f > 0 && i < a.n_mats; ++i) {
+        if (n_q8f != a.n_mats || a.mats[i].e != epi::f32 || has_route(a) || a.hmix != nullptr) {
+            return reject("Q8_0F: a launch of Q8_0F matrices only, each with the F32 epilogue, no router or X-HMIX", i);
+        }
+    }
     work_layout wl; // the partials' and counters' offsets (one rule with work_bytes)
     if (!layout_of(a, wl)) {
         return reject("work layout", -1);
@@ -2253,7 +2552,72 @@ static_assert(size_t(4) * max_k * 3 / 2 + iq3s_grid_bytes + size_t(4) * route_ro
                       48 * 1024,
               "the product's dynamic shared memory");
 
-template <int B> bool launch(launch_desc & L, cudaStream_t st) {
+// TTTS6 item 2: each block's step hull over the launch's quantized matrices (the layout's tile size tile_q): unit u
+// runs on block u mod 72 (u = gw + 1,152 j, gw = warp 72 + block; describe's units, matrix by matrix in launch order)
+// and a unit of part kp reads steps kp sp .. kp sp + sp - 1. Block b's units of a matrix are r = r0 + 72 t from its
+// first unit; their parts r mod split repeat within split of them.
+stage_steps steps_of(const work_layout & l) {
+    stage_steps   M;
+    int32_t       lo[n_sm], hi[n_sm];
+    const int32_t steps = n_steps(l.k);
+    for (int32_t b = 0; b < n_sm; ++b) {
+        lo[b] = INT32_MAX;
+        hi[b] = 0;
+    }
+    int32_t base = 0;
+    for (int32_t mi = 0; mi < l.n_mats; ++mi) {
+        const mat_layout & md = l.mats[mi];
+        const int32_t      n = md.tiles * md.split, sp = steps / md.split;
+        for (int32_t b = 0; md.tile_rows == tile_q && b < n_sm; ++b) {  // BF16 and F32 read the F32 rows instead
+            const int32_t r0 = ((b - base) % n_sm + n_sm) % n_sm;
+            for (int32_t t = 0; t < md.split && r0 + n_sm * t < n; ++t) {
+                const int32_t kp = (r0 + n_sm * t) % md.split;
+                lo[b]            = std::min(lo[b], kp * sp);
+                hi[b]            = std::max(hi[b], std::min(steps, kp * sp + sp));
+            }
+        }
+        base += n;
+    }
+    for (int32_t b = 0; b < n_sm; ++b) {
+        M.lo[b] = static_cast<uint8_t>(hi[b] > 0 ? lo[b] : 0);
+        M.hi[b] = static_cast<uint8_t>(hi[b]);
+    }
+    M.k       = l.k;
+    M.n_units = base;
+    return M;
+}
+
+static_assert((max_k + step_k - 1) / step_k <= UINT8_MAX, "stage_steps' steps in a byte");
+
+// TTTS6: the instance a launch takes: all, or with a.q8 the Q8_0 set or the Q8_0 and BF16 set; false for a q8 launch
+// with another format
+bool fset_of(const product_args & a, fset & s) {
+    s = fset::all;
+    if (!a.q8) {
+        return true;
+    }
+    bool bf = false;
+    for (int32_t i = 0; i < a.n_mats && i < max_mats; ++i) {
+        if (a.mats[i].f == fmt::bf16) {
+            bf = true;
+        } else if (a.mats[i].f != fmt::q8_0) {
+            return reject("q8: the Q8_0 instance takes Q8_0 and BF16 matrices only", i);
+        }
+    }
+    if (a.steps == nullptr) {
+        return reject("q8: the site's staging steps (stage_steps_of) missing", -1);
+    }
+    s = bf ? fset::q8_bf16 : fset::q8;
+    return true;
+}
+
+// TTTS6 item 2: a q8 launch's steps name its own shape
+bool steps_match(const product_args & a, const launch_desc & L) {
+    return !a.q8 || (a.steps->k == L.k && a.steps->n_units == L.n_units) ||
+           reject("q8: the staging steps are another shape's", -1);
+}
+
+template <int B> bool launch(launch_desc & L, fset fs, const stage_steps * M, cudaStream_t st) {
     size_t smem = (L.need_xq ? size_t(B) * L.k * 3 / 2 : 0) + (L.need_grid ? iq3s_grid_bytes : 0);
     L.smem_route = static_cast<int32_t>(smem); // a multiple of 16: K % 32 == 0
     smem += L.route_cnt != nullptr ? route_smem(B) : 0;
@@ -2261,7 +2625,13 @@ template <int B> bool launch(launch_desc & L, cudaStream_t st) {
     for (int32_t i = 0; i < L.n_mats; ++i) {
         w32 = w32 || static_cast<fmt>(L.mats[i].f) == fmt::f32;
     }
-    if (w32) {
+    if (static_cast<fmt>(L.mats[0].f) == fmt_q8_0f) {  // TTTS3: describe holds such a launch to Q8_0F matrices
+        product_q8f_kernel<B><<<n_sm, n_threads, 0, st>>>(L);
+    } else if (fs == fset::q8) {                       // TTTS6
+        product_fs_kernel<B, fset::q8><<<n_sm, n_threads, smem, st>>>(L, *M);
+    } else if (fs == fset::q8_bf16) {
+        product_fs_kernel<B, fset::q8_bf16><<<n_sm, n_threads, smem, st>>>(L, *M);
+    } else if (w32) {
         product_kernel<B, true><<<n_sm, n_threads, smem, st>>>(L);
     } else {
         product_kernel<B, false><<<n_sm, n_threads, smem, st>>>(L);
@@ -2273,21 +2643,34 @@ template <int B> bool launch(launch_desc & L, cudaStream_t st) {
 
 bool product_gated(int32_t rows, const product_args & a, const int32_t * gate, int32_t at, void * stream) {
     launch_desc L;
-    if (rows != 4 || gate == nullptr || stream == nullptr || !describe(rows, a, L) || L.route_cnt != nullptr) {
+    fset        fs = fset::all;
+    if (rows != 4 || gate == nullptr || stream == nullptr || !fset_of(a, fs) || !describe(rows, a, L) ||
+        !steps_match(a, L) || L.route_cnt != nullptr) {
         return false;
     }
     for (int32_t i = 0; i < L.n_mats; ++i) {
-        if (static_cast<fmt>(L.mats[i].f) == fmt::f32) {
+        if (static_cast<fmt>(L.mats[i].f) == fmt::f32 || static_cast<fmt>(L.mats[i].f) == fmt_q8_0f) {
             return false;
         }
     }
     const size_t smem = (L.need_xq ? size_t(4) * L.k * 3 / 2 : 0) + (L.need_grid ? iq3s_grid_bytes : 0);
     L.smem_route = static_cast<int32_t>(smem);
-    product_gated_kernel<4><<<n_sm, n_threads, smem, static_cast<cudaStream_t>(stream)>>>(L, gate, at);
+    if (fs == fset::q8) {  // TTTS6
+        product_gated_fs_kernel<4, fset::q8>
+            <<<n_sm, n_threads, smem, static_cast<cudaStream_t>(stream)>>>(L, gate, at, *a.steps);
+    } else if (fs == fset::q8_bf16) {
+        product_gated_fs_kernel<4, fset::q8_bf16>
+            <<<n_sm, n_threads, smem, static_cast<cudaStream_t>(stream)>>>(L, gate, at, *a.steps);
+    } else {
+        product_gated_kernel<4><<<n_sm, n_threads, smem, static_cast<cudaStream_t>(stream)>>>(L, gate, at);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 
 const char * fmt_name(fmt f) {
+    if (f == fmt_q8_0f) {  // TTTS3
+        return "Q8_0F";
+    }
     switch (f) {
         case fmt::q4_k:
             return "Q4_K";
@@ -2322,6 +2705,9 @@ int64_t row_bytes(fmt f, int32_t k) {
     }
     if (f == fmt::f32) {
         return int64_t(4) * k;
+    }
+    if (f == fmt_q8_0f) {  // TTTS3: the file's Q8_0 blocks
+        return k % 32 == 0 ? int64_t(k / 32) * q8f_block : 0;
     }
     if (f == fmt::q2_0) {
         return k % 64 == 0 ? int64_t(k / 64) * 18 : 0;
@@ -2586,6 +2972,16 @@ bool same_layout(const work_layout & x, const work_layout & y) {
     return true;
 }
 
+bool stage_steps_of(const product_args & a, stage_steps & out) {
+    out = stage_steps();
+    work_layout l;
+    if (!layout_of(a, l)) {
+        return false;
+    }
+    out = steps_of(l);
+    return true;
+}
+
 size_t work_bytes(const product_args & a) {
     work_layout l;
     if (!layout_of(a, l)) {
@@ -2596,21 +2992,22 @@ size_t work_bytes(const product_args & a) {
 
 bool product(int32_t rows, const product_args & a, void * stream) {
     launch_desc L;
-    if (!describe(rows, a, L)) {
+    fset        fs = fset::all;
+    if (!fset_of(a, fs) || !describe(rows, a, L) || !steps_match(a, L)) {
         return false;
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
     switch (rows) {
         case 1:
-            return launch<1>(L, st);
+            return launch<1>(L, fs, a.steps, st);
         case 2:
-            return launch<2>(L, st);
+            return launch<2>(L, fs, a.steps, st);
         case 3:
-            return launch<3>(L, st);
+            return launch<3>(L, fs, a.steps, st);
         case 4:
-            return launch<4>(L, st);
+            return launch<4>(L, fs, a.steps, st);
         default:
-            return launch<5>(L, st);
+            return launch<5>(L, fs, a.steps, st);
     }
 }
 
@@ -2665,7 +3062,8 @@ static_assert(size_t(max_joint_rows) * max_k_b5 * 3 / 2 + iq3s_grid_bytes <= 96 
                   size_t(max_joint_rows) * route_row_bytes <= 96 * 1024,
               "the joint product's dynamic shared memory (the V100's 96 KB opt-in)");
 
-template <int U, int LR, bool F16> bool launch_joint_k(const joint_desc & J, cudaStream_t st) {
+template <int U, int LR, bool F16, fset S>
+bool launch_joint_k(const joint_desc & J, const stage_steps * M, cudaStream_t st) {
     constexpr int32_t   R    = LR * U;
     const launch_desc & L = J.L;
     size_t smem = (L.need_xq ? size_t(R) * L.k * 3 / 2 : 0) + (L.need_grid ? iq3s_grid_bytes : 0);
@@ -2675,23 +3073,46 @@ template <int U, int LR, bool F16> bool launch_joint_k(const joint_desc & J, cud
     if (smem > 96 * 1024) {
         return reject("joint: dynamic shared memory past 96 KB", -1);
     }
-    if (smem > 48 * 1024 && cudaFuncSetAttribute(joint_kernel<U, LR, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                 static_cast<int>(smem)) != cudaSuccess) {
-        return false;
+    if constexpr (S == fset::all) {
+        if (smem > 48 * 1024 &&
+            cudaFuncSetAttribute(joint_kernel<U, LR, F16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)) != cudaSuccess) {
+            return false;
+        }
+        joint_kernel<U, LR, F16><<<n_sm, n_threads, smem, st>>>(J);
+    } else {  // TTTS6
+        if (smem > 48 * 1024 &&
+            cudaFuncSetAttribute(joint_fs_kernel<U, LR, F16, S>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(smem)) != cudaSuccess) {
+            return false;
+        }
+        joint_fs_kernel<U, LR, F16, S><<<n_sm, n_threads, smem, st>>>(J, *M);
     }
-    joint_kernel<U, LR, F16><<<n_sm, n_threads, smem, st>>>(J);
     return cudaGetLastError() == cudaSuccess;
+}
+
+template <int U, int LR, bool F16>
+bool launch_joint_fs(const joint_desc & J, fset fs, const stage_steps * M, cudaStream_t st) {
+    switch (fs) {
+        case fset::q8:
+            return launch_joint_k<U, LR, F16, fset::q8>(J, M, st);
+        case fset::q8_bf16:
+            return launch_joint_k<U, LR, F16, fset::q8_bf16>(J, M, st);
+        default:
+            return launch_joint_k<U, LR, F16, fset::all>(J, M, st);
+    }
 }
 
 // FMS6: f16 takes the FP16 step at U = 3 and 4; U = 2 keeps the integer step (FMS3 item 1). FMS13: keyed on the rows,
 // the FP16 step at 12 rows or more (12 take 16's two n-tiles), the integer step at up to 10
-template <int U, int LR> bool launch_joint(const joint_desc & J, bool f16, cudaStream_t st) {
+template <int U, int LR>
+bool launch_joint(const joint_desc & J, bool f16, fset fs, const stage_steps * M, cudaStream_t st) {
     if constexpr (U * LR >= 12) {
         if (f16) {
-            return launch_joint_k<U, LR, true>(J, st);
+            return launch_joint_fs<U, LR, true>(J, fs, M, st);
         }
     }
-    return launch_joint_k<U, LR, false>(J, st);
+    return launch_joint_fs<U, LR, false>(J, fs, M, st);
 }
 
 // FMS5: the staging, the halves' reduction and, after them, the route epilogue's rows
@@ -2709,17 +3130,43 @@ template <int U, int LR> bool launch_router_tc(const joint_desc & J, cudaStream_
 }
 
 // FMS13: the launches at U lanes of LR rows
-template <int U> bool launch_joint_u(const joint_desc & J, int32_t rows, bool router_tc, bool f16, cudaStream_t st) {
+template <int U>
+bool launch_joint_u(const joint_desc &  J,
+                    int32_t             rows,
+                    bool                router_tc,
+                    bool                f16,
+                    fset                fs,
+                    const stage_steps * M,
+                    cudaStream_t        st) {
     switch (rows) {
         case 2:
-            return router_tc ? launch_router_tc<U, 2>(J, st) : launch_joint<U, 2>(J, f16, st);
+            return router_tc ? launch_router_tc<U, 2>(J, st) : launch_joint<U, 2>(J, f16, fs, M, st);
         case 3:
-            return router_tc ? launch_router_tc<U, 3>(J, st) : launch_joint<U, 3>(J, f16, st);
+            return router_tc ? launch_router_tc<U, 3>(J, st) : launch_joint<U, 3>(J, f16, fs, M, st);
         case 4:
-            return router_tc ? launch_router_tc<U, 4>(J, st) : launch_joint<U, 4>(J, f16, st);
+            return router_tc ? launch_router_tc<U, 4>(J, st) : launch_joint<U, 4>(J, f16, fs, M, st);
         default:
-            return router_tc ? launch_router_tc<U, lane_rows>(J, st) : launch_joint<U, lane_rows>(J, f16, st);
+            return router_tc ? launch_router_tc<U, lane_rows>(J, st) : launch_joint<U, lane_rows>(J, f16, fs, M, st);
     }
+}
+
+// TTTS3: the Q8_0F launch at U lanes of LR rows
+template <int U> bool launch_joint_q8f_u(const joint_desc & J, int32_t rows, cudaStream_t st) {
+    switch (rows) {
+        case 2:
+            joint_q8f_kernel<U, 2><<<n_sm, n_threads, 0, st>>>(J);
+            break;
+        case 3:
+            joint_q8f_kernel<U, 3><<<n_sm, n_threads, 0, st>>>(J);
+            break;
+        case 4:
+            joint_q8f_kernel<U, 4><<<n_sm, n_threads, 0, st>>>(J);
+            break;
+        default:
+            joint_q8f_kernel<U, lane_rows><<<n_sm, n_threads, 0, st>>>(J);
+            break;
+    }
+    return cudaGetLastError() == cudaSuccess;
 }
 
 } // namespace
@@ -2747,14 +3194,18 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
         }
     }
     for (int32_t i = 0; lane_x && i < a.n_mats; ++i) {
-        if (a.mats[i].f != fmt::bf16 || a.hmix != nullptr) {
-            return reject("joint: per-lane activations need BF16 matrices and no X-HMIX", i);
+        if ((a.mats[i].f != fmt::bf16 && a.mats[i].f != fmt_q8_0f) || a.hmix != nullptr) {
+            return reject("joint: per-lane activations need BF16 or Q8_0F matrices and no X-HMIX", i);
         }
     }
     for (int32_t u = 0; lane_x && u < j.lanes; ++u) {
         if (!aligned(j.x_f32[u], 16)) {
             return reject("joint: a lane's activations are not 16-byte aligned", -1);
         }
+    }
+    fset fs = fset::all;  // TTTS6
+    if (!fset_of(a, fs)) {
+        return false;
     }
     product_args l = a;
     l.conv = j.conv[0];
@@ -2766,7 +3217,7 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
     memset(&J, 0, sizeof(J));
     // B = R's contract on every matrix, X-HMIX lane 0 and lane 0's convolution: lone B = R's splits and checks, so a
     // switch-off joint launch is bitwise each lane's lone launch at B = R (FMS13)
-    if (!describe(j.rows, l, J.L)) {
+    if (!describe(j.rows, l, J.L) || !steps_match(a, J.L)) {
         return false;
     }
     work_layout wl;
@@ -2818,6 +3269,19 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
         }
     }
     const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (a.mats[0].f == fmt_q8_0f) {  // TTTS3: describe held the launch to Q8_0F matrices (no X-HMIX, no router)
+        if (j.peer != nullptr) {
+            return reject("joint: Q8_0F matrices send no peer half", 0);
+        }
+        switch (j.lanes) {
+            case 2:
+                return launch_joint_q8f_u<2>(J, j.rows, st);
+            case 3:
+                return launch_joint_q8f_u<3>(J, j.rows, st);
+            default:
+                return launch_joint_q8f_u<4>(J, j.rows, st);
+        }
+    }
     if (j.router_tc && has_route(a)) { // FMS5
         const mat_desc & lm = L.mats[L.route_logits];
         const mat_desc & gm = L.mats[L.route_gate];
@@ -2836,11 +3300,11 @@ bool product_joint(const product_args & a, const joint_args & j, void * stream) 
     const bool rtc = j.router_tc && has_route(a);
     switch (j.lanes) {
         case 2:
-            return launch_joint_u<2>(J, j.rows, rtc, j.dense_f16, st);
+            return launch_joint_u<2>(J, j.rows, rtc, j.dense_f16, fs, a.steps, st);
         case 3:
-            return launch_joint_u<3>(J, j.rows, rtc, j.dense_f16, st);
+            return launch_joint_u<3>(J, j.rows, rtc, j.dense_f16, fs, a.steps, st);
         default:
-            return launch_joint_u<4>(J, j.rows, rtc, j.dense_f16, st);
+            return launch_joint_u<4>(J, j.rows, rtc, j.dense_f16, fs, a.steps, st);
     }
 }
 

@@ -1,11 +1,12 @@
-// grid-test's device part (FMS4 item 2): the decoders' IQ2 selector recipe (experts_dev.cuh sign8_of7, iq2_signed)
-// on the device for every entry of the three selector tables and every sign pattern, against the 8-byte tables'
-// signed bytes. The device form of fnfl/evidence/fms4-decode-recipes/final.py.
+// grid-gpu-test (FMS4 item 2; TFC: split out of grid-test): the decoders' IQ2 selector recipe (experts_dev.cuh
+// sign8_of7, iq2_signed) on the device for every entry of the three selector tables and every sign pattern, against the
+// 8-byte tables' signed bytes. The device form of fnfl/evidence/fms4-decode-recipes/final.py.
 
-#include "fn/kernels/experts/grids_test.h"
-
+#include "fn/kernels/experts/codec.cuh"
 #include "fn/kernels/experts/experts.h"
 #include "fn/kernels/experts/experts_dev.cuh"
+#include "fn/kernels/experts/grids_test.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -53,11 +54,7 @@ __global__ void sel_kernel(sel_args a) {
 }
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "grid-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "grid-gpu-test", what);
 }
 
 } // namespace
@@ -118,8 +115,8 @@ int64_t fnfl_grid_sel_device(const uint8_t * buf, int dev) {
                 }
             }
         }
-        printf("grid-test: %-6s selector recipe on device %d: %4d entries x %3d sign patterns, %lld wrong\n", g.name,
-               dev, g.entries, g.signs, static_cast<long long>(bad));
+        printf("grid-gpu-test: %-6s selector recipe on device %d: %4d entries x %3d sign patterns, %lld wrong\n",
+               g.name, dev, g.entries, g.signs, static_cast<long long>(bad));
         wrong += bad;
     }
     return wrong;

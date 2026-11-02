@@ -62,6 +62,15 @@ struct load_params {
     int32_t pool_cells = 0;
     // TTTS1: this box's window (fn/model/state.h): the tensors outside it are not placed (model::win)
     model::window          win;
+    // VIS1 Stage B: the vision projector's file (empty: none). load_for_run reserves the vision classes for it on a
+    // box that embeds (win.ple()); the engine loads the file into them (engine_config::mmproj)
+    std::string            mmproj;
+    // VIS1 Stage B: the split's back when its front reads images: the rope planes' classes only (model::vision_params
+    // planes_only), on a box that does not embed
+    bool                   image_planes = false;
+    // APF2 (prompt-tune): the weights alone, with no KV, state or exchange built on them, so a window may sit on one
+    // device (both cards' halves there)
+    bool                   weights_only = false;
 };
 
 // Wall times are measured with steady_clock on the host; busy times are summed over threads (thread-seconds).

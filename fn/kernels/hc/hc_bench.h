@@ -8,5 +8,6 @@ int fnfl_hc_bench(int device);
 // card launched together from this thread, weights rotated over 422 MB a card; and each card's kernels with the peer's
 // data pre-filled (no wait). mode "all"; "ncu": only card 0's pre-filled arm A hc_up at B = 3 (nothing waits, so the
 // profiler's serialization cannot stall it); "nsys": only the arm A sublayer graph at B = 3. Prints one JSON line a
-// point; returns 0 when every launch succeeded and no poll gave up.
+// point; returns 0 when every launch succeeded and no poll gave up. "ttts4": TTTS4's kernel points, the Q8_0 lanes
+// forms and the Q8_0 joint sublayer at U = 4, R = 3, base B = 5 against ttts4, warm then cold.
 int fnfl_hc2_bench(int dev0, int dev1, const char * mode);

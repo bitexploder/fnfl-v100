@@ -2,6 +2,7 @@
 
 #include "fn/kernels/gdn/gdn.h"
 #include "fn/kernels/round/version.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -25,11 +26,7 @@ constexpr int32_t U_MAX = fn::xchg::max_lanes;
 constexpr uint8_t sentinel_byte = 0x7b;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "gdnj-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "gdnj-test", what);
 }
 
 // one device allocation and its initial bytes (uploaded by fresh)

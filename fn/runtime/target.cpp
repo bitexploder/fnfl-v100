@@ -7,6 +7,8 @@
 #include "fn/kernels/round/version.h"
 #include "fn/model/kv_tier.h"
 #include "fn/model/layer.h"
+#include "fn/runtime/nvtx.h"
+#include "fn/xchg/slow.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda.h>
@@ -17,9 +19,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <memory>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -887,7 +889,10 @@ bool target::prompt_head(std::string & err) {
                 return false;
             }
             bool ok = false;
-            if (part < 2 && m_->single) {
+            if (part < 2 && p.head.q8_down != nullptr) {
+                // TTTS2: the Q8_0 head HC, both cards' downs (part 0) before their ups (part 1)
+                ok = model::head_q8_sub(p, head_args(c), 1, part, st_[c]);
+            } else if (part < 2 && m_->single) {
                 // ME12: one device's head HC is one launch (hc::head_pair) at part 0, its scratch card 0's ws.mom[1]
                 // (pass.cpp pass_pair_enqueue); the streams were synchronized above
                 ok = part == 1 || c == 1 ||
@@ -895,9 +900,14 @@ bool target::prompt_head(std::string & err) {
             } else if (part < 2) {
                 ok = fn::hc::head_sub(1, part + 1, head_args(c), st_[c]);
             } else {
-                const fn::head::logits_args la = {
-                    rg.slot(c, fn::xchg::msg::hmix, s), rg.err(c), c, p.out_w, fn::head::n_vocab_card, p.logits, nullptr
-                };
+                const fn::head::logits_args la = { rg.slot(c, fn::xchg::msg::hmix, s),
+                                                   rg.err(c),
+                                                   c,
+                                                   p.out_w,
+                                                   fn::head::n_vocab_card,
+                                                   p.logits,
+                                                   nullptr,
+                                                   p.out_q8 };
                 ok = fn::head::logits(1, la, st_[c]);
             }
             if (!ok) {
@@ -1171,6 +1181,7 @@ bool target::check_ledger(std::string & err) {
 }
 
 bool target::wait(uint64_t round, double timeout_s, std::string & err) {
+    nvtx_range nr("round.wait");
     const auto t0 = clock_t_::now();
     // ME2b item 3 (Amendment 1): with the expert cache on one card, the wait backs off instead of spinning, so the CPU
     // expert pool's threads (the service drains on core 0, this thread on its sibling) keep the core: 64 checks, then
@@ -1187,21 +1198,38 @@ bool target::wait(uint64_t round, double timeout_s, std::string & err) {
     }
     int32_t checks = 0;
     long nap_ns = 5000;
+    // TTTS7: without the backoff, the streams' error check (cudaSetDevice and cudaStreamQuery on both cards: driver
+    // calls) runs on the first pass and then at most every query_s, not every pass, so the completion records are
+    // polled at memory speed; an asynchronous error still ends the wait within query_s, and the watchdog is unchanged
+    constexpr double query_s = 200e-6;
+    bool             queried = false;
+    auto             tq      = t0;
     for (;;) {
         const uint64_t a = reinterpret_cast<volatile uint64_t *>(&done_[0].round)[0];
         const uint64_t b = reinterpret_cast<volatile uint64_t *>(&done_[1].round)[0];
         if (a == round && b == round) {
             std::atomic_thread_fence(std::memory_order_acquire);
+            const double s = seconds(t0, clock_t_::now());
+            if (fn::xchg::slow::due(s)) {
+                fn::xchg::slow::line("target wait", s,
+                                     "slot " + std::to_string(slot_index()) + " round " + std::to_string(round));
+            }
             return true;
         }
-        for (int32_t c = 0; c < 2; ++c) {
-            cudaSetDevice(m_->device[c]);
-            const cudaError_t e = cudaStreamQuery(static_cast<cudaStream_t>(st_[c]));
-            if (e != cudaSuccess && e != cudaErrorNotReady) {
-                return fail(err, "card " + std::to_string(c) + ": " + cudaGetErrorString(e));
+        const auto now     = clock_t_::now();
+        const bool expired = seconds(t0, now) > timeout_s;
+        if (backoff || !queried || expired || seconds(tq, now) >= query_s) {
+            for (int32_t c = 0; c < 2; ++c) {
+                cudaSetDevice(m_->device[c]);
+                const cudaError_t e = cudaStreamQuery(static_cast<cudaStream_t>(st_[c]));
+                if (e != cudaSuccess && e != cudaErrorNotReady) {
+                    return fail(err, "card " + std::to_string(c) + ": " + cudaGetErrorString(e));
+                }
             }
+            queried = true;
+            tq      = now;
         }
-        if (seconds(t0, clock_t_::now()) > timeout_s) {
+        if (expired) {
             fail(err, "round " + std::to_string(round) + ": no completion record in " + std::to_string(timeout_s) +
                           " s (card 0 at " + std::to_string(a) + ", card 1 at " + std::to_string(b) + ")");
             // ME3 (Fable's load G ruling, Strata #267): the cache's waits released, so the streams drain and the
@@ -1222,6 +1250,8 @@ bool target::wait(uint64_t round, double timeout_s, std::string & err) {
             const timespec ts{0, nap_ns};
             nanosleep(&ts, nullptr);
             nap_ns = std::min(nap_ns * 2, 50000L);
+        } else {
+            _mm_pause();
         }
     }
 }
@@ -1231,6 +1261,7 @@ bool target::wait(uint64_t round, double timeout_s, std::string & err) {
 bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k, int32_t test_fail,
                          int32_t budget, const float * const * staged, uint64_t ple_use, staged_round & sr,
                          std::string & err) {
+    nvtx_range nr("round.stage");
     if (invalid_) {
         return fail(err, "the slot is invalidated (a decision-hash mismatch, FC-RD2): reset and re-prefill");
     }
@@ -1267,9 +1298,10 @@ bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, 
     d.n_out = 0;
     d.test_k = test_k;
     d.test_fail = test_fail;
+    d.pos_off         = pos_off_;  // MUP1 piece 5
     for (int32_t p = 0; p < 4; ++p) {
         for (int32_t t = 0; t < rows; ++t) {
-            d.pos[p * rows + t] = static_cast<int32_t>(n_before + t);
+            d.pos[p * rows + t] = static_cast<int32_t>(n_before + t) + pos_off_;  // MUP1: cell + the slot's offset
         }
     }
     for (int32_t t = 0; t < max_b; ++t) {
@@ -1279,6 +1311,7 @@ bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, 
     }
     float * e = e_host_ + size_t(rd % fn::round::ring) * max_b * E;
     if (upload_e && staged == nullptr) {
+        nvtx_range nr_ple("round.ple_gather");
         int32_t idx[max_b * ple_heads];
         if (!ple_indices(ple_, l_.tok.data(), n_before, tok, rows, idx)) {
             return fail(err, "PLE indices");
@@ -1329,6 +1362,7 @@ bool target::round_stage(int32_t kind, int32_t rows, bool upload_e, bool timed, 
 // recovery on an error word, the verify output's checks and the versions' commit
 bool target::round_collect(int32_t kind, int32_t rows, bool upload_e, bool timed, int32_t test_k,
                            const staged_round & sr, round_result & r, std::string & err) {
+    nvtx_range     nr("round.collect");
     const uint64_t rd = sr.rd;
     const int64_t n_before = sr.n_before;
     const auto t0 = sr.t0;
@@ -1434,6 +1468,7 @@ bool target::round(int32_t kind, int32_t rows, bool upload_e, bool timed, round_
 }
 
 bool target::round_launch(int32_t rows, bool timed, staged_round & sr, std::string & err) {
+    nvtx_range     nr("round.launch");
     const uint64_t rd = sr.rd;
     const bool eager = eager_;
     if (eager) {
@@ -1463,13 +1498,13 @@ bool target::round_launch(int32_t rows, bool timed, staged_round & sr, std::stri
         // all before the launches (as the phased enqueue's start): a cached replay's launch can block until the GPU
         // has run part of it, which needs the start and the service's flags
         model::expert_service * const svc = p_[0].c.ex_service;
-        if (svc != nullptr) {
-            if (!svc->pass_begin(st_, err) || !svc->pass_posted(rows, err)) {
-                return false;
-            }
-            std::atomic_thread_fence(std::memory_order_release);
-            reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
+        if (svc != nullptr && (!svc->pass_begin(st_, err) || !svc->pass_posted(rows, err))) {
+            return false;
         }
+        // TTTS7: the start condition before the launches (the descriptor slot was written at the staging), so a card
+        // starts when its own graph reaches it, not after the other card's cudaGraphLaunch call returns
+        std::atomic_thread_fence(std::memory_order_release);
+        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
         for (int32_t c = 0; c < 2; ++c) {
             cudaStream_t s = static_cast<cudaStream_t>(st_[c]);
             const bool launch = !(m_->single && c == 1); // ME3: one device's graph holds both cards' passes
@@ -1484,11 +1519,6 @@ bool target::round_launch(int32_t rows, bool timed, staged_round & sr, std::stri
                 return false;
             }
             sub_.target_graphs += launch ? 1 : 0;
-        }
-        if (svc == nullptr) {
-            // both cards' work is enqueued: release them together (RT-9)
-            std::atomic_thread_fence(std::memory_order_release);
-            reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
         }
     }
     sr.t3 = clock_t_::now();
@@ -1620,9 +1650,12 @@ bool target::joint_verify_begin(int32_t d, const int32_t * prop, int32_t budget,
     return true;
 }
 
-void target::joint_release(const staged_round & sr) {
+void target::joint_start(const staged_round & sr) {
     std::atomic_thread_fence(std::memory_order_release);
     reinterpret_cast<volatile uint64_t *>(flag_)[0] = sr.rd;
+}
+
+void target::joint_release(const staged_round & sr) {
     next_round_ = sr.rd + 1;
 }
 
@@ -1779,6 +1812,7 @@ bool target::front_end(const front_round & fr,
                        int32_t             cut_rows,
                        int64_t             n_keep,
                        std::string &       err) {
+    nvtx_range nr("front.end");
     if (!fr.waited) {
         return fail(err, "front_end: the round's completion was not seen (front_wait)");
     }
@@ -2116,6 +2150,7 @@ bool target::bootstrap(round_result & r, std::string & err, int32_t test_fail) {
     d.n_before = static_cast<int32_t>(l_.n);
     d.budget = 1;
     d.test_fail = test_fail;
+    d.pos_off          = pos_off_;  // MUP1 piece 5
     for (int32_t t = 0; t < max_b; ++t) {
         d.out[t] = -1;
         d.argmax[t] = -1;
@@ -2208,6 +2243,7 @@ bool target::catchup_check(int32_t rows, std::string & err) const {
 }
 
 bool target::draft_catchup(int32_t rows, round_result & r, std::string & err) {
+    nvtx_range    nr("target.draft_catchup");
     const int64_t first = draft_n_;
     if (!catchup_check(rows, err)) {
         return false;
@@ -2276,6 +2312,7 @@ bool target::draft_step_check(int32_t d, std::string & err) const {
 }
 
 bool target::draft_step(int32_t d, round_result & r, std::string & err) {
+    nvtx_range nr("target.draft_step");
     return draft_step_check(d, err) && draft_round(step_kind, d, draft_n_, 0, r, err);
 }
 
@@ -2311,6 +2348,9 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
         }
         ++sub_.eager_draft_rounds;
     } else {
+        // TTTS7: the start condition before the launches (the slot was written at draft_stage)
+        std::atomic_thread_fence(std::memory_order_release);
+        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
         for (int32_t c = 0; c < (m_->single ? 1 : 2); ++c) { // ME3: one device's graph holds both cards' phases
             if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
                 !cuda_ok(cudaGraphLaunch(static_cast<cudaGraphExec_t>(dexec_[dmode_][k == 0 ? var_ : 0][k][rows][c]),
@@ -2320,8 +2360,6 @@ bool target::draft_round(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
             }
             (step ? sub_.draft_graphs : sub_.catchup_graphs) += 1;
         }
-        std::atomic_thread_fence(std::memory_order_release);
-        reinterpret_cast<volatile uint64_t *>(flag_)[0] = rd;
     }
     sr.t1 = clock_t_::now();
     next_round_ = rd + 1;
@@ -2354,9 +2392,10 @@ bool target::draft_stage(int32_t kind, int32_t rows, int64_t first, int32_t hsrc
     d.n_before = static_cast<int32_t>(first);
     d.budget = rows;
     d.hsrc = hsrc;
+    d.pos_off            = pos_off_;  // MUP1 piece 5
     for (int32_t p = 0; p < 4; ++p) {
         for (int32_t t = 0; t < rows; ++t) {
-            d.pos[p * rows + t] = static_cast<int32_t>(first + t);
+            d.pos[p * rows + t] = static_cast<int32_t>(first + t) + pos_off_;  // MUP1: cell + the slot's offset
         }
     }
     for (int32_t t = 0; t < max_b; ++t) {

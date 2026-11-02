@@ -6,6 +6,7 @@
 //
 // Capacity is in cells per slot (one slot: one user on two cards). R1's case: 196,608 + 2,048 output tokens + 64.
 
+#include "fn/kernels/ple/ple.h"
 #include "fn/kernels/round/version.h"
 #include "fn/model/shapes.h"
 
@@ -89,6 +90,12 @@ struct state_params {
     // (cell c, QSA layer o, group g at [c * 64 + 4 o + g]; fn/kernels/qsa/kv_q8.cuh). Two devices, resident only
     bool kv_q8 = false;
     window  win;  // TTTS1: the box's layers and extras (whole by default)
+    // TTTS2: output.weight is Q8_0 (UD-Q4_K_XL): the draft head copy holds Q8_0 rows (head::draft_head_bytes)
+    bool            head_q8    = false;
+    // TTTS3: the PLE key and value's format (UD-Q4_K_XL: Q8_0 as stored) and TTTS2's F32 taps: their prompt replicas'
+    // bytes (prompt_replica_bytes)
+    fn::ple::kv_fmt ple_kv     = fn::ple::kv_fmt::bf16;
+    bool            ple_conv32 = false;
 };
 
 // TG1: the parts of the "round and pass (TG1)" class whose layout fn/model/pass.cpp carves (256-byte aligned pieces)
@@ -116,7 +123,8 @@ constexpr int32_t kv_q8_scale_stride = 64;
 std::vector<buffer_class> state_classes(const state_params & p);
 // ME1: whether a class is allocated in pinned host memory: on one device the prefill checkpoints (PF1), and with the
 // host-backed KV tier (kv_host) the target and draft KV (mapped: the tier's gathers and the draft's prompt K/V writes
-// reach it from the device); ME6: and the target and draft index keys (mapped, the tier's key history)
+// reach it from the device); ME6: and the target and draft index keys (mapped, the tier's key history); VIS1: the
+// vision staging (not mapped)
 bool host_class(const std::string & name, bool single, bool kv_host);
 
 // the prefill chunk buffers of one chunk size (the prefill design's memory formulas; EP1's workspace)
@@ -140,5 +148,48 @@ constexpr int32_t kv_page_cells = 16384;
 constexpr int32_t lane_rows = 4096;
 constexpr int32_t lane_half_rows = 2048;
 std::vector<buffer_class> lane_classes();
+
+// VIS1 Stage B (a vision projector loaded, on the box that embeds: win.ple()): the vision service's memory, in three
+// classes (vision_classes, in this order). "vision weights (VIS1)": the encoder's share of the projector (card 0:
+// blocks 0 .. 13 and the patch embedding; card 1: blocks 14 .. 26 and the merger). "vision work (VIS1)", its parts in
+// vision_part order: the encoder's scratch (both cards; at load also the weights' conversion staging), then for each
+// read lane L (lane 1 with the other-reader lane only, else 0 bytes): the image's encoder rows [4,096][2,560] F32
+// (card 1, the merger's card), the chunk's supplied rows (card c's half, [lane rows][1,280] F32) and its rope planes
+// ([lane rows][4] then [lane rows / 4 + 1][4] int32). On the split's front the work class is a view of the
+// other-reader arena (MU1), which the split never reads in (one read at a time, lane 0), so the KV pool loses nothing.
+// "vision staging (VIS1)" (host, pinned, not mapped): the patch rows of one image (card 0) and each lane's two plane
+// upload slots (both cards). Sizes from fn/vision/sizes.h, filled by the caller
+struct vision_params {
+    int64_t weights[2]   = { 0, 0 };
+    int64_t scratch      = 0;
+    int64_t patch_stage  = 0;
+    int32_t lanes        = 1;
+    int32_t lane_rows[2] = { 8192, fn::model::lane_rows };  // lane 0: pf_chunk_rows
+    // the split's back: the rope planes and their slots only (it embeds nothing: no weights, scratch or rows)
+    bool    planes_only  = false;
+    // one box (it drafts over the rows it supplies): the weights class's image-token row on each card, the draft's
+    // input at image rows (vision_service::token_row; the split's back embeds the tokens itself)
+    bool    token_row    = false;
+};
+
+// the image-token row (vision_params::token_row), each card: the token (int32) and the embed error word, then
+// fn/kernels/embed embed_rows' outputs for that one row, F32: its own half [1280], the peer's half received [1280],
+// the full row [2560] (the draft's input) and the four streams [4][2560]; each 256-byte aligned
+constexpr int64_t vtr_tok = 0, vtr_err = 16, vtr_own = 256, vtr_recv = vtr_own + 1280 * 4,
+                  vtr_full = vtr_recv + 1280 * 4, vtr_streams = vtr_full + 2560 * 4,
+                  vision_token_row_bytes = vtr_streams + 4 * 2560 * 4;
+
+enum vision_part : int32_t { vp_scratch, vp_rows, vp_supply, vp_planes };  // lane L's: vp_rows + 3 L ..
+
+constexpr int32_t vision_lane_part(int32_t part, int32_t lane) {
+    return part < vp_rows ? part : part + 3 * lane;
+}
+
+enum vision_stage_part : int32_t { vs_patch, vs_planes };  // lane L's plane slots: vs_planes + L
+
+// the plane bytes of a lane of `rows` rows: the planes, then (256-byte aligned) the block planes
+int64_t                   vision_plane_bytes(int32_t rows);
+int64_t                   vision_bplane_offset(int32_t rows);
+std::vector<buffer_class> vision_classes(const vision_params & p);
 
 } // namespace fn::model

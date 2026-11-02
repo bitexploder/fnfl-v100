@@ -12,8 +12,10 @@
 #include "fn/quant/synth.h"
 #include "fn/tools/prompt_test_util.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <string>
 #include <vector>
 
@@ -23,8 +25,9 @@ using namespace fn::ptest;
 constexpr int32_t D = 2560, F = 1280, CH = 4 * D, NH = 9;
 
 // the embedding: rows of two card tables (synthetic IQ3_S, 4,096 tokens a table), each card's half bitwise
-// fn/quant's decoder; then the join gives both cards the full rows
-bool embed_case(int32_t rows, verdict & v) {
+// fn/quant's decoder; then the join gives both cards the full rows. VIS1 (supply): two runs of rows take supplied rows
+// (embed_supply after embed_rows, before the join), so those rows are the supplied ones, bitwise, on both cards
+bool embed_case(int32_t rows, verdict & v, bool supply = false) {
     constexpr int32_t    V = 4096;
     std::vector<uint8_t> tab[2];
     for (int32_t h = 0; h < 2; ++h) {
@@ -50,6 +53,30 @@ bool embed_case(int32_t rows, verdict & v) {
         !s0.poison() || !s1.poison() || !err.zero()) {
         return false;
     }
+
+    // VIS1: the supplied runs (rows 1 .. and the last rows), each card's half packed
+    struct run {
+        int32_t row0, n;
+    };
+
+    std::vector<run> runs;
+    if (supply) {
+        const int32_t n0 = std::max(1, rows / 3), n1 = std::max(1, rows / 4);
+        runs = {
+            { 1,         n0 },
+            { rows - n1, n1 }
+        };
+    }
+    std::vector<float> sup(size_t(rows) * D, 0.0f);  // the supplied full rows by chunk row (runs only)
+    std::vector<bool>  is_sup(size_t(rows), false);
+    for (const run & u : runs) {
+        for (int32_t t = u.row0; t < u.row0 + u.n; ++t) {
+            is_sup[size_t(t)] = true;
+            for (int32_t c = 0; c < D; ++c) {
+                sup[size_t(t) * D + c] = static_cast<float>(r.normal());
+            }
+        }
+    }
     fn::embed::rows_args a[2];
     for (int32_t h = 0; h < 2; ++h) {
         a[h].table   = h == 0 ? dt0.as<uint8_t>() : dt1.as<uint8_t>();
@@ -64,13 +91,33 @@ bool embed_case(int32_t rows, verdict & v) {
     }
     std::vector<float>    f0, f1, st0, st1;
     std::vector<uint32_t> ew;
-    const bool            ok0 = fn::embed::embed_rows(a[0], fn::ptest::test_stream()) &&
-                                fn::embed::embed_rows(a[1], fn::ptest::test_stream()) &&
-                                fn::embed::embed_join(a[0], own1.as<float>(), fn::ptest::test_stream()) &&
-                                fn::embed::embed_join(a[1], own0.as<float>(), fn::ptest::test_stream()) &&
-                                cuda_ok(cudaDeviceSynchronize(), "embed") && full0.get(f0, size_t(rows) * D) &&
-                                full1.get(f1, size_t(rows) * D) && s0.get(st0, size_t(rows) * 4 * D) &&
-                                s1.get(st1, size_t(rows) * 4 * D) && err.get(ew, 1);
+    bool                  ok_sup =
+        fn::embed::embed_rows(a[0], fn::ptest::test_stream()) && fn::embed::embed_rows(a[1], fn::ptest::test_stream());
+    std::deque<dbuf> srcs;  // stable addresses (dbuf neither copies nor moves)
+    for (const run & u : runs) {
+        for (int32_t h = 0; h < 2 && ok_sup; ++h) {
+            std::vector<float> half(size_t(u.n) * F);
+            for (int32_t t = 0; t < u.n; ++t) {
+                std::memcpy(&half[size_t(t) * F], &sup[size_t(u.row0 + t) * D + size_t(h) * F], size_t(F) * 4);
+            }
+            srcs.emplace_back(half.size() * 4);
+            fn::embed::supply_args sa;
+            sa.src     = srcs.back().as<float>();
+            sa.row0    = u.row0;
+            sa.n       = u.n;
+            sa.rows    = rows;
+            sa.card    = h;
+            sa.own     = a[h].own;
+            sa.full    = a[h].full;
+            sa.streams = a[h].streams;
+            ok_sup     = srcs.back().put(half) && fn::embed::embed_supply(sa, fn::ptest::test_stream());
+        }
+    }
+    const bool ok0 = ok_sup && fn::embed::embed_join(a[0], own1.as<float>(), fn::ptest::test_stream()) &&
+                     fn::embed::embed_join(a[1], own0.as<float>(), fn::ptest::test_stream()) &&
+                     cuda_ok(cudaDeviceSynchronize(), "embed") && full0.get(f0, size_t(rows) * D) &&
+                     full1.get(f1, size_t(rows) * D) && s0.get(st0, size_t(rows) * 4 * D) &&
+                     s1.get(st1, size_t(rows) * 4 * D) && err.get(ew, 1);
     if (!ok0) {
         v.put("embed", false, "launch failed");
         return false;
@@ -82,6 +129,9 @@ bool embed_case(int32_t rows, verdict & v) {
             fn::quant::decode_row(fn::quant::wfmt::iq3_s, tab[h].data() + size_t(tok[size_t(t)]) * fn::embed::row_bytes,
                                   want.data() + ptrdiff_t(h) * F, F);
         }
+        if (is_sup[size_t(t)]) {
+            std::memcpy(want.data(), &sup[size_t(t) * D], size_t(D) * 4);
+        }
         bad += std::memcmp(&f0[size_t(t) * D], want.data(), size_t(D) * 4) != 0;
         bad += std::memcmp(&f1[size_t(t) * D], want.data(), size_t(D) * 4) != 0;
         for (int32_t s = 0; s < 4; ++s) {
@@ -89,8 +139,10 @@ bool embed_case(int32_t rows, verdict & v) {
             bad += std::memcmp(&st1[(size_t(t) * 4 + s) * D], want.data(), size_t(D) * 4) != 0;
         }
     }
-    v.put("embedding " + std::to_string(rows) + " rows", bad == 0 && ew[0] == 0,
-          std::to_string(bad) + " rows differ from fn/quant's IQ3_S decode (the full row on both cards, all streams)");
+    v.put("embedding " + std::to_string(rows) + " rows" + (supply ? ", two supplied runs (VIS1)" : ""),
+          bad == 0 && ew[0] == 0,
+          std::to_string(bad) + " rows differ from fn/quant's IQ3_S decode" + (supply ? " or the supplied rows" : "") +
+              " (the full row on both cards, all streams)");
     return bad == 0;
 }
 
@@ -301,6 +353,9 @@ int fnfl_pe_test(int device, const char * mode) {
     }
     for (const int32_t rows : san ? std::vector<int32_t>{3} : std::vector<int32_t>{1, 7, 1536, 3072, 8192}) {
         embed_case(rows, v);
+        if (rows >= 3) {
+            embed_case(rows, v, true);  // VIS1: supplied rows
+        }
     }
     for (const int32_t rows : san ? std::vector<int32_t>{ 5 } : std::vector<int32_t>{ 1, 5, 9, 10, 40 }) {
         ple_case(rows, v);

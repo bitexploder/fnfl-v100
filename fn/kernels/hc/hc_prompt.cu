@@ -1,6 +1,7 @@
 #include "fn/kernels/hc/hc.h"
 #include "fn/kernels/hc/hc_prompt.h"
 #include "fn/kernels/tc/tc_gemm.cuh"
+#include "fn/kernels/tc/tc_ladder.cuh"
 #include "fn/model/shapes.h"
 #include "fn/xchg/prompt_xchg.h"
 
@@ -381,6 +382,8 @@ using fn::tc::warp_max;
 constexpr int32_t cv_down_rows = 4 * J;
 constexpr int32_t cv_rows      = cv_down_rows + NB;
 
+// APF1 Part 4: VALUES false writes the row scales only (hct_scales: the fused route's prepared scales, bitwise these)
+template <bool VALUES = true>
 __global__ void __launch_bounds__(256) hct_convert_kernel(const hcp_weights w, const hct_weights o) {
     const int32_t row  = static_cast<int32_t>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
     const int32_t lane = static_cast<int32_t>(threadIdx.x & 31);
@@ -405,7 +408,7 @@ __global__ void __launch_bounds__(256) hct_convert_kernel(const hcp_weights w, c
         const int32_t e  = range_exp(warp_max(m));
         const float   sc = pow2(e);
 #pragma unroll
-        for (int32_t t = 0; t < 10; ++t) {
+        for (int32_t t = 0; t < 10 && VALUES; ++t) {
             const uint32_t x[4] = { v[t].x, v[t].y, v[t].z, v[t].w };
             uint4          out;
             out.x = pack2(bf16f(x[0] & 0xffffu) * sc, bf16f(x[0] >> 16) * sc);
@@ -438,7 +441,7 @@ __global__ void __launch_bounds__(256) hct_convert_kernel(const hcp_weights w, c
     const int32_t e  = range_exp(warp_max(m));
     const float   sc = pow2(e);
 #pragma unroll
-    for (int32_t t = 0; t < 2; ++t) {
+    for (int32_t t = 0; t < 2 && VALUES; ++t) {
         const int32_t g = lane + 32 * t;
         if (g < n_down / 8) {
             const uint32_t x[4] = { v[t].x, v[t].y, v[t].z, v[t].w };
@@ -454,6 +457,198 @@ __global__ void __launch_bounds__(256) hct_convert_kernel(const hcp_weights w, c
         o.up_s[b] = pow2(-e);
     }
 }
+
+// TTTS2: hct_convert from the Q8_0 halves (hcp_weights::q8). A Q8_0 value of 8 at i (a multiple of 8) of a block row:
+// d x q exactly; v[8] out
+__device__ __forceinline__ void q8_vals(const uint8_t * codes, const uint8_t * scales, int64_t i, float (&v)[8]) {
+    const uint2    q = __ldg(reinterpret_cast<const uint2 *>(codes + i));
+    const float    d = __half2float(__ushort_as_half(__ldg(reinterpret_cast<const unsigned short *>(scales) + i / 32)));
+    const uint32_t w[2] = { q.x, q.y };
+#pragma unroll
+    for (int32_t k = 0; k < 8; ++k) {
+        v[k] = d * static_cast<float>(static_cast<int8_t>((w[k / 4] >> (8 * (k % 4))) & 0xffu));
+    }
+}
+
+template <bool VALUES = true>
+__global__ void __launch_bounds__(256) hct_convert_q8_kernel(const hcp_weights w, const hct_weights o) {
+    const int32_t row  = static_cast<int32_t>((blockIdx.x * blockDim.x + threadIdx.x) >> 5);
+    const int32_t lane = static_cast<int32_t>(threadIdx.x & 31);
+    if (row >= cv_rows) {
+        return;
+    }
+    if (row < cv_down_rows) {
+        const int32_t s = row / J, j = row % J;
+        float         v[10][8];
+        float         m = 0.0f;
+#pragma unroll
+        for (int32_t t = 0; t < 10; ++t) {
+            const int32_t   i = 8 * lane + 256 * t, h = i / F, ii = i - h * F;
+            const uint8_t * b = reinterpret_cast<const uint8_t *>(w.down[h]);
+            if (j < n_down) {
+                const int64_t r = int64_t(s) * n_down + j;
+                q8_vals(b + r * F, b + int64_t(4) * n_down * F + r * (F / 32) * 2, ii, v[t]);
+            } else {
+                const uint4    x     = __ldg(reinterpret_cast<const uint4 *>(
+                    b + w_down_head_q8_bytes + ((int64_t(s) * n_inject + (j - n_down)) * F + ii) * 2));
+                const uint32_t xs[4] = { x.x, x.y, x.z, x.w };
+#pragma unroll
+                for (int32_t k = 0; k < 4; ++k) {
+                    v[t][2 * k]     = bf16f(xs[k] & 0xffffu);
+                    v[t][2 * k + 1] = bf16f(xs[k] >> 16);
+                }
+            }
+#pragma unroll
+            for (int32_t k = 0; k < 8; ++k) {
+                m = fmaxf(m, fabsf(v[t][k]));
+            }
+        }
+        const int32_t e  = range_exp(warp_max(m));
+        const float   sc = pow2(e);
+#pragma unroll
+        for (int32_t t = 0; t < 10 && VALUES; ++t) {
+            uint4 out;
+            out.x = pack2(v[t][0] * sc, v[t][1] * sc);
+            out.y = pack2(v[t][2] * sc, v[t][3] * sc);
+            out.z = pack2(v[t][4] * sc, v[t][5] * sc);
+            out.w = pack2(v[t][6] * sc, v[t][7] * sc);
+            *reinterpret_cast<uint4 *>(o.down + int64_t(row) * D + 8 * lane + 256 * t) = out;
+        }
+        if (lane == 0) {
+            o.down_s[row] = pow2(-e);
+        }
+        return;
+    }
+    const int32_t   b = row - cv_down_rows, f = up_feature(b), s = up_stream(b);
+    const int32_t   h = f / F, cc = f - h * F;
+    const uint8_t * u = reinterpret_cast<const uint8_t *>(w.up[h]);
+    const int64_t   r = int64_t(cc) * 4 + s;
+    float           v[2][8];
+    float           m = 0.0f;
+#pragma unroll
+    for (int32_t t = 0; t < 2; ++t) {
+        const int32_t g = lane + 32 * t;
+        if (g < n_down / 8) {
+            q8_vals(u + r * n_down, u + int64_t(F) * 4 * n_down + r * (n_down / 32) * 2, 8 * g, v[t]);
+        } else {
+#pragma unroll
+            for (int32_t k = 0; k < 8; ++k) {
+                v[t][k] = 0.0f;
+            }
+        }
+#pragma unroll
+        for (int32_t k = 0; k < 8; ++k) {
+            m = fmaxf(m, fabsf(v[t][k]));
+        }
+    }
+    const int32_t e  = range_exp(warp_max(m));
+    const float   sc = pow2(e);
+#pragma unroll
+    for (int32_t t = 0; t < 2 && VALUES; ++t) {
+        const int32_t g = lane + 32 * t;
+        if (g < n_down / 8) {
+            uint4 out;
+            out.x                                                          = pack2(v[t][0] * sc, v[t][1] * sc);
+            out.y                                                          = pack2(v[t][2] * sc, v[t][3] * sc);
+            out.z                                                          = pack2(v[t][4] * sc, v[t][5] * sc);
+            out.w                                                          = pack2(v[t][6] * sc, v[t][7] * sc);
+            *reinterpret_cast<uint4 *>(o.up + int64_t(b) * n_down + 8 * g) = out;
+        }
+    }
+    if (lane == 0) {
+        o.up_s[b] = pow2(-e);
+    }
+}
+
+// ---- APF1 Part 4: the fused route (hct_mix_fused) --------------------------------------------------------------------
+// The products' B operands formed in the tensor core's loader from the halves themselves, value for value as
+// hct_convert forms them (BF16 widened or Q8_0 d x q, times the row's 2^e from the prepared scale, rounded to FP16),
+// so every output is bitwise the converted route's; hct_convert's pass over the 9.8 MB of FP16 coefficients and its
+// writes are gone. 2^e from the prepared 2^-e exactly (both normal powers of two: the exponent field negated)
+__device__ __forceinline__ float inv_pow2(float s) {
+    return __int_as_float((254 << 23) - __float_as_int(s));
+}
+
+// half h's pointer by selection, not a dynamic index (which puts the kernel parameter's array in local memory)
+__device__ const __forceinline__ uint16_t * half_of(const uint16_t * const (&p)[2], int32_t h) {
+    return h == 0 ? p[0] : p[1];
+}
+
+__device__ __forceinline__ void bf16x8(const uint4 & q, float (&v)[8]) {
+    const uint32_t x[4] = { q.x, q.y, q.z, q.w };
+#pragma unroll
+    for (int32_t k = 0; k < 4; ++k) {
+        v[2 * k]     = bf16f(x[k] & 0xffffu);
+        v[2 * k + 1] = bf16f(x[k] >> 16);
+    }
+}
+
+__device__ __forceinline__ uint4 pack8(const float (&v)[8], float sc) {
+    uint4 out;
+    out.x = pack2(v[0] * sc, v[1] * sc);
+    out.y = pack2(v[2] * sc, v[3] * sc);
+    out.z = pack2(v[4] * sc, v[5] * sc);
+    out.w = pack2(v[6] * sc, v[7] * sc);
+    return out;
+}
+
+// down row (s, j) (j < 324), the 8 values at feature i (a multiple of 8) of the full width
+template <bool Q8>
+__device__ __forceinline__ void down_vals(const hcp_weights & w, int32_t s, int32_t j, int32_t i, float (&v)[8]) {
+    const int32_t h = i / F, ii = i - h * F;
+    if constexpr (!Q8) {
+        bf16x8(__ldg(reinterpret_cast<const uint4 *>(half_of(w.down, h) + (int64_t(s) * J + j) * F + ii)), v);
+    } else {
+        const uint8_t * b = reinterpret_cast<const uint8_t *>(half_of(w.down, h));
+        if (j < n_down) {
+            const int64_t r = int64_t(s) * n_down + j;
+            q8_vals(b + r * F, b + int64_t(4) * n_down * F + r * (F / 32) * 2, ii, v);
+        } else {
+            bf16x8(__ldg(reinterpret_cast<const uint4 *>(b + w_down_head_q8_bytes +
+                                                         ((int64_t(s) * n_inject + (j - n_down)) * F + ii) * 2)),
+                   v);
+        }
+    }
+}
+
+// up row b (hct_convert's order), the 8 values at j (a multiple of 8, < 320)
+template <bool Q8> __device__ __forceinline__ void up_vals(const hcp_weights & w, int32_t b, int32_t j, float (&v)[8]) {
+    const int32_t f = up_feature(b), s = up_stream(b), h = f / F, cc = f - h * F;
+    const int64_t r = int64_t(cc) * 4 + s;
+    if constexpr (!Q8) {
+        bf16x8(__ldg(reinterpret_cast<const uint4 *>(half_of(w.up, h) + r * n_down + j)), v);
+    } else {
+        const uint8_t * u = reinterpret_cast<const uint8_t *>(half_of(w.up, h));
+        q8_vals(u + r * n_down, u + int64_t(F) * 4 * n_down + r * (n_down / 32) * 2, j, v);
+    }
+}
+
+// gemm_cta_b's loaders: the down of stream s (columns the 320 low rows), the up (columns the 10,240 rows)
+template <bool Q8> struct down_loader {
+    hcp_weights   w;
+    const float * ds = nullptr;
+    int32_t       s  = 0;
+
+    __device__ __forceinline__ uint4 operator()(int32_t col, int32_t k) const {
+        if (col >= n_down) {
+            return make_uint4(0u, 0u, 0u, 0u);
+        }
+        float v[8];
+        down_vals<Q8>(w, s, col, k, v);
+        return pack8(v, inv_pow2(__ldg(ds + s * J + col)));
+    }
+};
+
+template <bool Q8> struct up_loader {
+    hcp_weights   w;
+    const float * us = nullptr;
+
+    __device__ __forceinline__ uint4 operator()(int32_t col, int32_t k) const {
+        float v[8];
+        up_vals<Q8>(w, col, k, v);
+        return pack8(v, inv_pow2(__ldg(us + col)));
+    }
+};
 
 // the scratch of hct_mix
 struct hct_scr {
@@ -497,12 +692,40 @@ __device__ __forceinline__ float4 f16x4(const uint8_t * p) {
                        __half2float(__ushort_as_half(static_cast<unsigned short>(u.y >> 16))));
 }
 
+// the FP16 values (widened) of injection row k of stream s at i (a multiple of 4): converted (MODE 0), or formed
+// from the BF16 (1) or Q8_0 layout's BF16 (2) inject rows as hct_convert forms them
+template <int32_t MODE>
+__device__ __forceinline__ float4
+inject4(const hcp_weights & hw, const hct_weights & w, int32_t s, int32_t k, int32_t i) {
+    if constexpr (MODE == 0) {
+        return f16x4(reinterpret_cast<const uint8_t *>(w.down + (int64_t(s) * J + n_down + k) * D + i));
+    } else {
+        const int32_t   h = i / F, ii = i - h * F;
+        const uint8_t * src =
+            MODE == 1 ?
+                reinterpret_cast<const uint8_t *>(half_of(hw.down, h) + ((int64_t(s) * J + n_down + k) * F + ii)) :
+                reinterpret_cast<const uint8_t *>(half_of(hw.down, h)) + w_down_head_q8_bytes +
+                    ((int64_t(s) * n_inject + k) * F + ii) * 2;
+        const uint2 u  = __ldg(reinterpret_cast<const uint2 *>(src));
+        const float sc = inv_pow2(__ldg(w.down_s + s * J + n_down + k));
+        const auto  r  = [&](uint32_t x) {
+            return __half2float(__float2half_rn(bf16f(x) * sc));
+        };
+        return make_float4(r(u.x & 0xffffu), r(u.x >> 16), r(u.y & 0xffffu), r(u.y >> 16));
+    }
+}
+
 // prescale: a block of 128 threads per (row, stream); thread t's float4s t + 128 u (u < 5). PB3: with cb.own, the
 // exchange's combine first (pcombine's arithmetic on the same values), the streams written back and used from registers.
 // PB3: the four injection rows of the down (J's rows 320 .. 323, a whole 64-column tile of the down for 4 columns) are
 // summed here over the same FP16 operands: each FP16 product exact in F32, summed over the thread's values in order,
 // the warp's xor tree, then the four warps as (0 + 1) + (2 + 3); scaled as the down's epilogue scales its columns
-__global__ void __launch_bounds__(128) hct_split_kernel(const hcp_args a, const hct_scr sc, const hct_combine cb,
+// APF1 Part 4: MODE 0 reads the converted injection rows; 1 (BF16 halves) and 2 (Q8_0 halves) form the same FP16
+// values from the halves and the prepared scales (w.down null)
+template <int32_t MODE = 0>
+__global__ void __launch_bounds__(128) hct_split_kernel(const hcp_args    a,
+                                                        const hct_scr     sc,
+                                                        const hct_combine cb,
                                                         const hct_weights w) {
     __shared__ double vs[4];
     __shared__ float  ms[4];
@@ -562,8 +785,7 @@ __global__ void __launch_bounds__(128) hct_split_kernel(const hcp_args a, const 
         a.mom[int64_t(r) * hcp_mom + s] = static_cast<float>((vs[0] + vs[1]) + (vs[2] + vs[3]));
         sc.x_s[int64_t(r) * 4 + s]      = pow2(-e);
     }
-    const int64_t o = (int64_t(r) * 4 + s) * D;
-    const uint16_t * wi = w.down + (int64_t(s) * J + n_down) * D; // the injection rows of stream s
+    const int64_t o           = (int64_t(r) * 4 + s) * D;
     float q[n_inject] = {0.0f, 0.0f, 0.0f, 0.0f};
 #pragma unroll
     for (int32_t u = 0; u < 5; ++u) {
@@ -576,7 +798,7 @@ __global__ void __launch_bounds__(128) hct_split_kernel(const hcp_args a, const 
                                       __half2float(__ushort_as_half(static_cast<unsigned short>(h.y >> 16))));
 #pragma unroll
         for (int32_t k = 0; k < n_inject; ++k) {
-            const float4 wk = f16x4(reinterpret_cast<const uint8_t *>(wi + int64_t(k) * D + i));
+            const float4 wk = inject4<MODE>(a.w, w, s, k, i);
             q[k] = fmaf(yh.w, wk.w, fmaf(yh.z, wk.z, fmaf(yh.y, wk.y, fmaf(yh.x, wk.x, q[k]))));
         }
     }
@@ -655,61 +877,38 @@ __global__ void __launch_bounds__(128) hct_mid_kernel(const hcp_args a, const hc
     }
 }
 
-// down: grid (j-tiles of 64 over the 320 low rows, row tiles of 128, streams); the injection rows in hct_split.
-// PB3: a CTA 128 rows x 64 columns, a warp 64 x 32 (the 32 x 32 warp tile read 0.25 shared bytes a MAC, the shared
-// memory's whole bandwidth at the tensor rate; 64 x 32 reads 0.1875)
-using dn_shape = fn::tc::shape<64, 4>;
+// the down's epilogue (the ladder's; hct_down_kernel keeps its own lambda, the same arithmetic, so its compiled code
+// is unchanged): the moments of stream s's low rows, scaled by the row's 2^-e and the coefficient row's
+struct down_epi {
+    float *       mom;
+    const float * x_s;
+    const float * down_s;
+    int32_t       s;
 
-__global__ void __launch_bounds__(dn_shape::threads, 3) hct_down_kernel(const hcp_args a, const hct_weights w,
-                                                                        const hct_scr sc) {
-    extern __shared__ uint4 dn_sm[];
-    const int32_t           s = static_cast<int32_t>(blockIdx.z);
-    fn::tc::problem         p;
-    p.a.a0         = sc.x16 + int64_t(s) * D;
-    p.a.ld0        = 4 * D;
-    p.a.k_split    = D;
-    p.b            = w.down + int64_t(s) * J * D;
-    p.ldb          = D;
-    p.rows         = a.rows;
-    p.n = n_down;
-    p.k            = D;
-    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) {
-        const float xs   = sc.x_s[int64_t(row) * 4 + s];
-        float * mo = a.mom + int64_t(row) * hcp_mom + 4 + n_down * s;
+    __device__ __forceinline__ void operator()(int32_t row, int32_t c0, const float (&v)[4]) const {
+        const float   xs    = x_s[int64_t(row) * 4 + s];
+        float *       mo    = mom + int64_t(row) * hcp_mom + 4 + n_down * s;
         const int32_t jj[4] = { c0, c0 + 1, c0 + 4, c0 + 5 };
 #pragma unroll
         for (int32_t i = 0; i < 4; ++i) {
-            mo[jj[i]] = v[i] * xs * __ldg(w.down_s + s * J + jj[i]);
+            mo[jj[i]] = v[i] * xs * __ldg(down_s + s * J + jj[i]);
         }
-    };
-    static_assert(n_down % 64 == 0, "the low rows tile exactly");
-    fn::tc::gemm_cta<64, 4>(p, static_cast<int32_t>(blockIdx.y) * dn_shape::rows, static_cast<int32_t>(blockIdx.x) * 64,
-                            reinterpret_cast<uint8_t *>(dn_sm), epi);
-}
+    }
+};
 
-// up: grid (row tiles of 128, 10,240 / 128 column tiles). PB3: a CTA 128 x 128 of four 64 x 64 warps (as pt_kernel),
-// and the row tiles adjacent in launch order, so a wave of CTAs shares a few 80 KB column slices of the 6.5 MB of
-// weights (row-tile-major order streamed all of them from memory for every two row tiles)
-using up_shape = fn::tc::shape<128, 4, 4>;
+// the up's epilogue: a lane's columns c0, c0 + 1, c0 + 4, c0 + 5 are one feature's streams 0..3, mixed into the
+// feature's output
+struct up_epi {
+    const hcp_args &    a;
+    const hct_weights & w;
+    const hct_scr &     sc;
 
-__global__ void __launch_bounds__(up_shape::threads, 2) hct_up_kernel(const hcp_args a, const hct_weights w,
-                                                                      const hct_scr sc) {
-    extern __shared__ uint4 up_sm[];
-    fn::tc::problem         p;
-    p.a.a0         = sc.l16;
-    p.a.ld0        = n_down;
-    p.a.k_split    = n_down;
-    p.b            = w.up;
-    p.ldb          = n_down;
-    p.rows         = a.rows;
-    p.n            = NB;
-    p.k            = n_down;
-    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) {
+    __device__ __forceinline__ void operator()(int32_t row, int32_t c0, const float (&v)[4]) const {
         const int32_t f      = up_feature(c0);
         const float   ls     = sc.l_s[row];
         const int32_t col[4] = { c0, c0 + 1, c0 + 4, c0 + 5 };  // streams 0..3
         float         mixed  = 0.0f;
-#pragma unroll
+    #pragma unroll
         for (int32_t s = 0; s < 4; ++s) {
             const float g  = v[s] * ls * __ldg(w.up_s + col[s]);
             const float ri = a.rinv[int64_t(row) * 4 + s];
@@ -726,9 +925,135 @@ __global__ void __launch_bounds__(up_shape::threads, 2) hct_up_kernel(const hcp_
             }
             a.mixed16[int64_t(row) * a.ld_mixed16 + f] = __half_as_ushort(__float2half_rn(mixed));
         }
+    }
+};
+
+// down: grid (j-tiles of 64 over the 320 low rows, row tiles of 128, streams); the injection rows in hct_split.
+// PB3: a CTA 128 rows x 64 columns, a warp 64 x 32 (the 32 x 32 warp tile read 0.25 shared bytes a MAC, the shared
+// memory's whole bandwidth at the tensor rate; 64 x 32 reads 0.1875)
+// APF1 Part 4: MODE 0 the converted coefficients (w.down), 1 and 2 the fused loaders (BF16, Q8_0 halves); MI 2 the
+// small tile (64 rows a CTA) for chunks of at most 64 rows. The same products in the same K order: bitwise
+template <int32_t MODE = 0, int32_t MI = 4>
+__global__ void __launch_bounds__(fn::tc::shape<64, MI>::threads, MI == 4 ? 3 : 4) hct_down_kernel(const hcp_args    a,
+                                                                                                   const hct_weights w,
+                                                                                                   const hct_scr sc) {
+    extern __shared__ uint4 dn_sm[];
+    const int32_t           s = static_cast<int32_t>(blockIdx.z);
+    fn::tc::problem         p;
+    p.a.a0         = sc.x16 + int64_t(s) * D;
+    p.a.ld0        = 4 * D;
+    p.a.k_split    = D;
+    if constexpr (MODE == 0) {
+        p.b = w.down + int64_t(s) * J * D;
+    }
+    p.ldb          = D;
+    p.rows         = a.rows;
+    p.n = n_down;
+    p.k            = D;
+    const auto epi = [&](int32_t row, int32_t c0, const float (&v)[4]) {
+        const float xs   = sc.x_s[int64_t(row) * 4 + s];
+        float * mo = a.mom + int64_t(row) * hcp_mom + 4 + n_down * s;
+        const int32_t jj[4] = { c0, c0 + 1, c0 + 4, c0 + 5 };
+#pragma unroll
+        for (int32_t i = 0; i < 4; ++i) {
+            mo[jj[i]] = v[i] * xs * __ldg(w.down_s + s * J + jj[i]);
+        }
     };
-    fn::tc::gemm_cta<128, 4, 4>(p, static_cast<int32_t>(blockIdx.x) * up_shape::rows,
-                                static_cast<int32_t>(blockIdx.y) * 128, reinterpret_cast<uint8_t *>(up_sm), epi);
+    static_assert(n_down % 64 == 0, "the low rows tile exactly");
+    if constexpr (MODE == 0) {
+        fn::tc::gemm_cta<64, MI>(p, static_cast<int32_t>(blockIdx.y) * fn::tc::shape<64, MI>::rows,
+                                 static_cast<int32_t>(blockIdx.x) * 64, reinterpret_cast<uint8_t *>(dn_sm), epi);
+    } else {
+        down_loader<MODE == 2> bl;
+        bl.w  = a.w;
+        bl.ds = w.down_s;
+        bl.s  = s;
+        fn::tc::gemm_cta_b<64, MI>(p, static_cast<int32_t>(blockIdx.y) * fn::tc::shape<64, MI>::rows,
+                                   static_cast<int32_t>(blockIdx.x) * 64, reinterpret_cast<uint8_t *>(dn_sm), epi, bl);
+    }
+}
+
+// up: grid (row tiles of 128, 10,240 / 128 column tiles). PB3: a CTA 128 x 128 of four 64 x 64 warps (as pt_kernel),
+// and the row tiles adjacent in launch order, so a wave of CTAs shares a few 80 KB column slices of the 6.5 MB of
+// weights (row-tile-major order streamed all of them from memory for every two row tiles)
+// APF1 Part 4: MODE and MI as hct_down_kernel's
+template <int32_t MODE = 0, int32_t MI = 4>
+__global__ void __launch_bounds__(fn::tc::shape<128, MI, 4>::threads, MI == 4 ? 2 : 3)
+hct_up_kernel(const hcp_args a, const hct_weights w, const hct_scr sc) {
+    extern __shared__ uint4 up_sm[];
+    fn::tc::problem         p;
+    p.a.a0         = sc.l16;
+    p.a.ld0        = n_down;
+    p.a.k_split    = n_down;
+    p.b            = w.up;
+    p.ldb          = n_down;
+    p.rows         = a.rows;
+    p.n            = NB;
+    p.k            = n_down;
+    const up_epi epi{ a, w, sc };
+    const int32_t row0 = static_cast<int32_t>(blockIdx.x) * fn::tc::shape<128, MI, 4>::rows;
+    const int32_t col0 = static_cast<int32_t>(blockIdx.y) * 128;
+    if constexpr (MODE == 0) {
+        fn::tc::gemm_cta<128, MI, 4>(p, row0, col0, reinterpret_cast<uint8_t *>(up_sm), epi);
+    } else {
+        up_loader<MODE == 2> bl;
+        bl.w  = a.w;
+        bl.us = w.up_s;
+        fn::tc::gemm_cta_b<128, MI, 4>(p, row0, col0, reinterpret_cast<uint8_t *>(up_sm), epi, bl);
+    }
+}
+
+// APF2: the ladder's tiles for the fused route's two products (fn/kernels/tc/tc_ladder.cuh), MODE 1 (BF16 halves)
+// or 2 (Q8_0 halves), the same loaders, operands and epilogues as hct_down_kernel / hct_up_kernel. The down's four
+// streams are one launch: grid y = stream x the column tiles over its 320 low rows (the last tile's columns past 320
+// read zero and are not written); K 2,560. The up: grid y the column tiles of its 10,240; K 320. Split K over grid z.
+template <int32_t MODE, int32_t BM, int32_t BN>
+__global__ void __launch_bounds__(fn::tc::ltile<BM, BN>::threads) hcl_down_kernel(const hcp_args          a,
+                                                                                  const hct_weights       w,
+                                                                                  const hct_scr           sc,
+                                                                                  const fn::tc::lsplit    ws,
+                                                                                  const int32_t           splits) {
+    static_assert(MODE == 1 || MODE == 2, "the fused route's loaders");
+    extern __shared__ uint4 hl_sm[];
+    constexpr int32_t       ct = (n_down + BN - 1) / BN;
+    const int32_t           s  = static_cast<int32_t>(blockIdx.y) / ct;
+    fn::tc::a_plain         al;
+    al.a.a0      = sc.x16 + int64_t(s) * D;
+    al.a.ld0     = 4 * D;
+    al.a.k_split = D;
+    al.rows      = a.rows;
+    fn::tc::b_chunks<BN, fn::tc::ltile<BM, BN>::threads, down_loader<MODE == 2>> bl;
+    bl.ch.w              = a.w;
+    bl.ch.ds             = w.down_s;
+    bl.ch.s              = s;
+    const down_epi  e{ a.mom, sc.x_s, w.down_s, s };
+    const auto      epi = [&](int32_t row, int32_t c0, const float (&v)[4]) {
+        if (c0 < n_down) {  // n_down a multiple of 8: a lane's four columns are in or out together
+            e(row, c0, v);
+        }
+    };
+    fn::tc::lgemm<BM, BN>(a.rows, D, splits, ws, reinterpret_cast<uint8_t *>(hl_sm), al, bl, epi, ct);
+}
+
+template <int32_t MODE, int32_t BM, int32_t BN>
+__global__ void __launch_bounds__(fn::tc::ltile<BM, BN>::threads) hcl_up_kernel(const hcp_args       a,
+                                                                                const hct_weights    w,
+                                                                                const hct_scr        sc,
+                                                                                const fn::tc::lsplit ws,
+                                                                                const int32_t        splits) {
+    static_assert(MODE == 1 || MODE == 2, "the fused route's loaders");
+    static_assert(NB % BN == 0, "the up's columns tile exactly");
+    extern __shared__ uint4 hl_sm[];
+    fn::tc::a_plain         al;
+    al.a.a0      = sc.l16;
+    al.a.ld0     = n_down;
+    al.a.k_split = n_down;
+    al.rows      = a.rows;
+    fn::tc::b_chunks<BN, fn::tc::ltile<BM, BN>::threads, up_loader<MODE == 2>> bl;
+    bl.ch.w            = a.w;
+    bl.ch.us           = w.up_s;
+    const up_epi epi{ a, w, sc };
+    fn::tc::lgemm<BM, BN>(a.rows, n_down, splits, ws, reinterpret_cast<uint8_t *>(hl_sm), al, bl, epi);
 }
 
 bool al16(const void * p) {
@@ -822,28 +1147,254 @@ bool hct_convert(const hcp_weights & a, const hct_weights & w, void * stream) {
         fprintf(stderr, "hct_convert: rejected\n");
         return false;
     }
+    if (a.q8) {
+        hct_convert_q8_kernel<<<(cv_rows * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(a, w);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
     hct_convert_kernel<<<(cv_rows * 32 + 255) / 256, 256, 0, static_cast<cudaStream_t>(stream)>>>(a, w);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
+int64_t hct_scale_bytes() {
+    return al256(int64_t(4) * J * 4) + al256(int64_t(NB) * 4);
+}
+
+hct_weights hct_carve_scales(uint8_t * region) {
+    hct_weights w;
+    w.down_s = reinterpret_cast<float *>(region);
+    w.up_s   = reinterpret_cast<float *>(region + al256(int64_t(4) * J * 4));
+    return w;
+}
+
+bool hct_scales(const hcp_weights & a, const hct_weights & w, void * stream) {
+    if (a.form != hcp_form::replicated || !weights_ok(a) || w.down_s == nullptr || w.up_s == nullptr ||
+        stream == nullptr) {
+        fprintf(stderr, "hct_scales: rejected\n");
+        return false;
+    }
+    const cudaStream_t s = static_cast<cudaStream_t>(stream);
+    hct_weights        o;
+    o.down_s = w.down_s;
+    o.up_s   = w.up_s;
+    if (a.q8) {
+        hct_convert_q8_kernel<false><<<(cv_rows * 32 + 255) / 256, 256, 0, s>>>(a, o);
+    } else {
+        hct_convert_kernel<false><<<(cv_rows * 32 + 255) / 256, 256, 0, s>>>(a, o);
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+namespace {
+
+template <int32_t MODE, int32_t MI>
+void launch_down(const hcp_args & a, const hct_weights & w, const hct_scr & sc, cudaStream_t s) {
+    using dn            = fn::tc::shape<64, MI>;
+    const uint32_t rows = static_cast<uint32_t>(a.rows);
+    hct_down_kernel<MODE, MI>
+        <<<dim3(n_down / 64, (rows + dn::rows - 1) / dn::rows, 4), dn::threads, dn::smem, s>>>(a, w, sc);
+}
+
+template <int32_t MODE, int32_t MI>
+void launch_up(const hcp_args & a, const hct_weights & w, const hct_scr & sc, cudaStream_t s) {
+    using up            = fn::tc::shape<128, MI, 4>;
+    const uint32_t rows = static_cast<uint32_t>(a.rows);
+    hct_up_kernel<MODE, MI><<<dim3((rows + up::rows - 1) / up::rows, NB / 128), up::threads, up::smem, s>>>(a, w, sc);
+}
+
+template <int32_t MODE, int32_t MI>
+void launch_mix(const hcp_args & a, const hct_combine & cb, const hct_weights & w, const hct_scr & sc, cudaStream_t s) {
+    const uint32_t rows = static_cast<uint32_t>(a.rows);
+    hct_split_kernel<MODE><<<dim3(rows, 4), 128, 0, s>>>(a, sc, cb, w);
+    launch_down<MODE, MI>(a, w, sc, s);
+    hct_mid_kernel<<<rows, 128, 0, s>>>(a, sc);
+    launch_up<MODE, MI>(a, w, sc, s);
+}
+
+// APF2: the ladder's products. hcl_with(t, product, run): run(kernel, ltile, column tiles of the launch's grid y)
+template <int32_t MODE, typename Fn> bool hcl_with(int32_t t, int32_t product, Fn && run) {
+    return fn::tc::lad_with_tile(t, [&](auto sh) {
+        using T = decltype(sh);
+        if (product == 0) {
+            return run(hcl_down_kernel<MODE, T::bm, T::bn>, sh, 4 * ((n_down + T::bn - 1) / T::bn));
+        }
+        return run(hcl_up_kernel<MODE, T::bm, T::bn>, sh, NB / T::bn);
+    });
+}
+
+int32_t hcl_k(int32_t product) {
+    return product == 0 ? D : n_down;
+}
+
+// whether product's tile t and splits launch at a's rows in ws
+bool hcl_fits(int32_t product, int32_t rows, int32_t t, int32_t splits, const fn::tc::lad_ws & ws) {
+    if (t < 0 || t >= fn::tc::lad_n_tiles || splits < 1 || splits > fn::tc::lad_max_splits ||
+        splits > hcl_k(product) / fn::tc::bk) {
+        return false;
+    }
+    const fn::tc::lad_tile & tl = fn::tc::lad_tiles[t];
+    return fn::tc::lad_ws_fits(ws, hcl_tile_count(product, rows, t), splits, tl.bm, tl.bn);
+}
+
+template <int32_t MODE>
+bool hcl_launch(const hcp_args &       a,
+                const hct_weights &    w,
+                const hct_scr &        sc,
+                int32_t                product,
+                int32_t                t,
+                int32_t                splits,
+                const fn::tc::lad_ws & ws,
+                cudaStream_t           s) {
+    return hcl_with<MODE>(t, product, [&](auto kern, auto sh, int32_t ny) {
+        using T = decltype(sh);
+        const dim3 grid((a.rows + T::bm - 1) / T::bm, ny, splits);
+        kern<<<grid, T::threads, T::smem, s>>>(a, w, sc, fn::tc::lsplit{ ws.part, ws.count }, splits);
+        return true;
+    });
+}
+
+template <int32_t MODE>
+void launch_mix_ladder(const hcp_args &       a,
+                       const hct_combine &    cb,
+                       const hct_weights &    w,
+                       const hct_scr &        sc,
+                       const hct_route &      r,
+                       const fn::tc::lad_ws & ws,
+                       cudaStream_t           s) {
+    const uint32_t rows = static_cast<uint32_t>(a.rows);
+    const bool     tiny = a.rows <= hct_small_rows;
+    hct_split_kernel<MODE><<<dim3(rows, 4), 128, 0, s>>>(a, sc, cb, w);
+    if (r.down_tile < 0) {
+        tiny ? launch_down<MODE, 2>(a, w, sc, s) : launch_down<MODE, 4>(a, w, sc, s);
+    } else {
+        hcl_launch<MODE>(a, w, sc, 0, r.down_tile, r.down_splits, ws, s);
+    }
+    hct_mid_kernel<<<rows, 128, 0, s>>>(a, sc);
+    if (r.up_tile < 0) {
+        tiny ? launch_up<MODE, 2>(a, w, sc, s) : launch_up<MODE, 4>(a, w, sc, s);
+    } else {
+        hcl_launch<MODE>(a, w, sc, 1, r.up_tile, r.up_splits, ws, s);
+    }
+}
+
+bool mix_ok(const hcp_args & a, const hct_combine & cb, uint8_t * scratch, void * stream) {
+    return common_ok(a, stream) && a.w.form == hcp_form::replicated && scratch != nullptr &&
+           (reinterpret_cast<uintptr_t>(scratch) & 255u) == 0 && al16(a.low) && a.rinv != nullptr &&
+           a.inject != nullptr && (a.mixed != nullptr || a.mixed16 != nullptr) &&
+           (cb.own == nullptr || ((cb.card == 0 || cb.card == 1) && al16(cb.own) && al16(cb.peer) &&
+                                  cb.inject != nullptr && cb.streams == a.x && a.err != nullptr));
+}
+
+}  // namespace
+
 bool hct_mix(const hcp_args & a, const hct_combine & cb, const hct_weights & w, uint8_t * scratch, void * stream) {
-    if (!common_ok(a, stream) || a.w.form != hcp_form::replicated || scratch == nullptr ||
-        (reinterpret_cast<uintptr_t>(scratch) & 255u) != 0 || !al16(a.low) || a.rinv == nullptr ||
-        a.inject == nullptr || (a.mixed == nullptr && a.mixed16 == nullptr) || !al16(w.down) || !al16(w.up) ||
-        (cb.own != nullptr && ((cb.card != 0 && cb.card != 1) || !al16(cb.own) || !al16(cb.peer) ||
-                               cb.inject == nullptr || cb.streams != a.x || a.err == nullptr))) {
+    if (!mix_ok(a, cb, scratch, stream) || !al16(w.down) || !al16(w.up)) {
         fprintf(stderr, "hct_mix: rejected\n");
         return false;
     }
-    const hct_scr      sc = carve_scr(scratch, a.rows);
-    const cudaStream_t s  = static_cast<cudaStream_t>(stream);
-    const uint32_t     rt = static_cast<uint32_t>((a.rows + dn_shape::rows - 1) / dn_shape::rows);
-    hct_split_kernel<<<dim3(static_cast<uint32_t>(a.rows), 4), 128, 0, s>>>(a, sc, cb, w);
-    hct_down_kernel<<<dim3(n_down / 64, rt, 4), dn_shape::threads, dn_shape::smem, s>>>(a, w, sc);
-    hct_mid_kernel<<<static_cast<uint32_t>(a.rows), 128, 0, s>>>(a, sc);
-    hct_up_kernel<<<dim3(static_cast<uint32_t>((a.rows + up_shape::rows - 1) / up_shape::rows), NB / 128),
-                    up_shape::threads, up_shape::smem, s>>>(a, w, sc);
+    launch_mix<0, 4>(a, cb, w, carve_scr(scratch, a.rows), static_cast<cudaStream_t>(stream));
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool hct_mix_fused(const hcp_args &    a,
+                   const hct_combine & cb,
+                   const hct_weights & scales,
+                   uint8_t *           scratch,
+                   void *              stream) {
+    if (!mix_ok(a, cb, scratch, stream) || scales.down_s == nullptr || scales.up_s == nullptr) {
+        fprintf(stderr, "hct_mix_fused: rejected\n");
+        return false;
+    }
+    hct_weights w;
+    w.down_s                = scales.down_s;
+    w.up_s                  = scales.up_s;
+    const hct_scr      sc   = carve_scr(scratch, a.rows);
+    const cudaStream_t s    = static_cast<cudaStream_t>(stream);
+    const bool         tiny = a.rows <= hct_small_rows;
+    if (a.w.q8) {
+        tiny ? launch_mix<2, 2>(a, cb, w, sc, s) : launch_mix<2, 4>(a, cb, w, sc, s);
+    } else {
+        tiny ? launch_mix<1, 2>(a, cb, w, sc, s) : launch_mix<1, 4>(a, cb, w, sc, s);
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+int32_t hcl_tile_count(int32_t product, int32_t rows, int32_t t) {
+    if (t < 0 || t >= fn::tc::lad_n_tiles || rows < 1 || (product != 0 && product != 1)) {
+        return 0;
+    }
+    const fn::tc::lad_tile & tl = fn::tc::lad_tiles[t];
+    const int32_t            ny = product == 0 ? 4 * ((n_down + tl.bn - 1) / tl.bn) : NB / tl.bn;
+    return (rows + tl.bm - 1) / tl.bm * ny;
+}
+
+bool hct_mix_ladder(const hcp_args &       a,
+                    const hct_combine &    cb,
+                    const hct_weights &    scales,
+                    uint8_t *              scratch,
+                    const hct_route &      r,
+                    const fn::tc::lad_ws & ws,
+                    void *                 stream) {
+    const bool dn_ok = r.down_tile < 0 ? r.down_splits == 1 : hcl_fits(0, a.rows, r.down_tile, r.down_splits, ws);
+    const bool up_ok = r.up_tile < 0 ? r.up_splits == 1 : hcl_fits(1, a.rows, r.up_tile, r.up_splits, ws);
+    if (!mix_ok(a, cb, scratch, stream) || scales.down_s == nullptr || scales.up_s == nullptr || !dn_ok || !up_ok) {
+        fprintf(stderr, "hct_mix_ladder: rejected (hct_mix_fused's checks, a tile, a split count or the workspace)\n");
+        return false;
+    }
+    hct_weights w;
+    w.down_s                = scales.down_s;
+    w.up_s                  = scales.up_s;
+    const hct_scr      sc   = carve_scr(scratch, a.rows);
+    const cudaStream_t s    = static_cast<cudaStream_t>(stream);
+    if (a.w.q8) {
+        launch_mix_ladder<2>(a, cb, w, sc, r, ws, s);
+    } else {
+        launch_mix_ladder<1>(a, cb, w, sc, r, ws, s);
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+
+namespace {
+
+template <int32_t MODE> bool hcl_attr_mode() {
+    for (int32_t t = 0; t < fn::tc::lad_n_tiles; ++t) {
+        for (int32_t product = 0; product < 2; ++product) {
+            const bool ok = hcl_with<MODE>(t, product, [](auto kern, auto sh, int32_t) {
+                return cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            decltype(sh)::smem) == cudaSuccess;
+            });
+            if (!ok) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool hcl_attributes() {
+    return hcl_attr_mode<1>() && hcl_attr_mode<2>();
+}
+
+bool hcl_resources(bool q8, int32_t product, int32_t t, fn::tc::lad_resources & r) {
+    const auto get = [&](auto kern, auto sh, int32_t) {
+        using T               = decltype(sh);
+        cudaFuncAttributes at = {};
+        int32_t            n  = 0;
+        if (cudaFuncGetAttributes(&at, kern) != cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kern, T::threads, T::smem) != cudaSuccess) {
+            return false;
+        }
+        r.regs         = at.numRegs;
+        r.local_bytes  = static_cast<int32_t>(at.localSizeBytes);
+        r.shared_bytes = static_cast<int32_t>(at.sharedSizeBytes) + T::smem;
+        r.ctas_per_sm  = n;
+        return true;
+    };
+    if (product != 0 && product != 1) {
+        return false;
+    }
+    return q8 ? hcl_with<2>(t, product, get) : hcl_with<1>(t, product, get);
 }
 
 bool hcp_kernel_resources(int32_t which, hcp_resources & r) {
@@ -866,19 +1417,43 @@ bool hcp_kernel_resources(int32_t which, hcp_resources & r) {
             e = cudaFuncGetAttributes(&at, hcp_up_kernel<hcp_form::split>);
             break;
         case 5:
-            e = cudaFuncGetAttributes(&at, hct_split_kernel);
+            e = cudaFuncGetAttributes(&at, hct_split_kernel<0>);
             break;
         case 6:
-            e = cudaFuncGetAttributes(&at, hct_down_kernel);
+            e = cudaFuncGetAttributes(&at, hct_down_kernel<0, 4>);
             break;
         case 7:
             e = cudaFuncGetAttributes(&at, hct_mid_kernel);
             break;
         case 8:
-            e = cudaFuncGetAttributes(&at, hct_up_kernel);
+            e = cudaFuncGetAttributes(&at, hct_up_kernel<0, 4>);
             break;
         case 9:
-            e = cudaFuncGetAttributes(&at, hct_convert_kernel);
+            e = cudaFuncGetAttributes(&at, hct_convert_kernel<true>);
+            break;
+        case 10:
+            e = cudaFuncGetAttributes(&at, hct_split_kernel<1>);
+            break;
+        case 11:
+            e = cudaFuncGetAttributes(&at, hct_split_kernel<2>);
+            break;
+        case 12:
+            e = cudaFuncGetAttributes(&at, hct_down_kernel<1, 4>);
+            break;
+        case 13:
+            e = cudaFuncGetAttributes(&at, hct_down_kernel<2, 4>);
+            break;
+        case 14:
+            e = cudaFuncGetAttributes(&at, hct_down_kernel<2, 2>);
+            break;
+        case 15:
+            e = cudaFuncGetAttributes(&at, hct_up_kernel<1, 4>);
+            break;
+        case 16:
+            e = cudaFuncGetAttributes(&at, hct_up_kernel<2, 4>);
+            break;
+        case 17:
+            e = cudaFuncGetAttributes(&at, hct_up_kernel<2, 2>);
             break;
         default:
             break;

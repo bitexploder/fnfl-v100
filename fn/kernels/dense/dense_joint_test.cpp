@@ -1,6 +1,9 @@
 #include "fn/kernels/dense/dense_joint_test.h"
 
+#include "fn/borrowed/gguf_tensors.h"
 #include "fn/kernels/dense/dense.h"
+#include "fn/kernels/dense/dense_cold.h"
+#include "fn/kernels/dense/dense_steps.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/experts/grids.h"
 #include "fn/kernels/gdn/gdn.h"
@@ -9,6 +12,8 @@
 #include "fn/quant/act_ref.h"
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/cases.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/x16_ref.h"
 #include "fn/xchg/xchg.h"
 
@@ -16,10 +21,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -32,12 +40,21 @@ namespace {
 constexpr int32_t n_rows = max_joint_rows; // the buffers' rows
 using hl = fn::xchg::hmix_layout;
 
+// TTTS6 (q4bench): the UTC time with milliseconds, as dp-bench prints it
+std::string utc_now() {
+    const auto        now = std::chrono::system_clock::now();
+    const std::time_t t   = std::chrono::system_clock::to_time_t(now);
+    const auto        ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
+    std::tm           tm = {};
+    gmtime_r(&t, &tm);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+             tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(ms));
+    return buf;
+}
+
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "dpj-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "dpj-test", what);
 }
 
 struct dev_mem {
@@ -104,6 +121,9 @@ template <typename F> void parallel_for(int32_t n, const F & fn) {
 }
 
 quant::wfmt to_wfmt(fmt f) {
+    if (f == fmt_q8_0f) {  // TTTS3: GGUF Q8_0 rows as stored
+        return quant::wfmt::q8_0;
+    }
     switch (f) {
         case fmt::q4_k:
             return quant::wfmt::q4_k;
@@ -138,6 +158,7 @@ struct mspec {
     int32_t split;
     int32_t period;
     bool scaled;
+    const char * tensor = nullptr;  // TTTS6: a GGUF tensor whose rows 0 .. m - 1 (first K weights) are the matrix
 };
 
 mspec plain(const char * name, fmt f, int32_t m, int32_t split = 0) {
@@ -151,6 +172,15 @@ mspec glu(const char * name, fmt f, epi e, int32_t pair, int32_t split = 0) {
 }
 mspec conv(const char * name, fmt f) {
     return {name, f, fn::gdn::n_channel, epi::conv_silu, -1, 1, n_synth_rows, false};
+}
+
+// TTTS6: real rows of the jcase's model file (a tensor's rows 0 .. m - 1, each row's first K weights)
+mspec real(const char * name, fmt f, int32_t m, const char * tensor) {
+    return { name, f, m, epi::f32, -1, 0, m, false, tensor };
+}
+
+mspec real_conv(const char * name, fmt f, const char * tensor) {
+    return { name, f, fn::gdn::n_channel, epi::conv_silu, -1, 1, fn::gdn::n_channel, false, tensor };
 }
 
 struct jcase {
@@ -171,6 +201,8 @@ struct jcase {
     bool over = false;     // FMS2 item 7: the case must send a value beyond FP16's range (its flag set)
     bool tc = false;       // FMS5: the router on the tensor cores (joint_args::router_tc), judged by run_case_tc
     bool f16 = false;      // FMS6: the quantized products in FP16 (joint_args::dense_f16), judged by run_case_f16
+    std::string model = {};         // TTTS6: the GGUF file (a split model's first shard) of the matrices' real rows
+    int32_t     prof_rr = 3;        // TTTS6: the case's R in the profiling mode (q4p)
 };
 
 // a case's device buffers for n_rows rows and the joint launch's arguments (row 0's pointers)
@@ -193,6 +225,12 @@ struct jrun {
     std::vector<int8_t> codes;
     std::vector<float> scales;
     std::vector<float>       sc;              // a scaled matrix's per-row scale
+    std::vector<synth>       real;            // TTTS6: matrix i's real rows (m rows of K), empty for synthetic rows
+    bool                     q8    = false;   // TTTS6: the launches on the Q8_0 instances (product_args::q8)
+    bool                     gated = false;   // TTTS6 item 2: lone launches through product_gated (gate 0 > at -1)
+    bool                     bench = false;   // TTTS6 kernel points: launches only (no poison or checks), on st
+    fn::dense::stage_steps   steps8;          // TTTS6 item 2: the Q8_0 launches' staging steps (stage_steps_of)
+    void *                   st = nullptr;
     int32_t                  rr = lane_rows;  // FMS13: R, the rows of each lane the launches read and write
 
     explicit jrun(const jcase & c) : tc(c) {}
@@ -329,7 +367,23 @@ struct jrun {
             l.conv = {taps->as<float>(), hist[u]->as<float>(), cur[u]->as<uint32_t>()};
         }
         l.work = work_l->p;
-        return product(rr, l, nullptr);
+        l.q8   = q8;
+        if (q8 && !stage_steps_of(l, steps8)) {
+            return false;
+        }
+        l.steps = &steps8;
+        // TTTS6 item 2: the Q8_0 instance after every SM's shared memory is poisoned, so a read of a run it did not
+        // stage differs from the shared kernel's output
+        if (gated) {
+            cudaStream_t s = nullptr;
+            bool ok = cuda_ok(cudaStreamCreate(&s), "stream") && (!q8 || fn::dense::poison_smem(s)) &&
+                      product_gated(rr, l, err->as<int32_t>(), -1, s) && cuda_ok(cudaStreamSynchronize(s), "gated");
+            if (s != nullptr) {
+                cudaStreamDestroy(s);
+            }
+            return ok;
+        }
+        return (!q8 || bench || fn::dense::poison_smem(nullptr)) && product(rr, l, st);
     }
 
     // the producer's peer words against send_half_joint's: row b < 5 lanes word q is the canonical bits of matrix 0's
@@ -386,6 +440,11 @@ struct jrun {
         j.dense_f16 = tc.f16;
         product_args l = a;
         l.work = work_j->p;
+        l.q8           = q8;
+        if (q8 && !stage_steps_of(l, steps8)) {
+            return false;
+        }
+        l.steps = &steps8;
         for (size_t i = 0; tc.lane_out && i < tc.mats.size(); ++i) {
             for (int32_t u = 0; u < lanes; ++u) {
                 j.out[i][u] = lane_out[i][u]->as<float>();
@@ -398,17 +457,17 @@ struct jrun {
         l.x_f32 = tc.lane_x ? nullptr : l.x_f32; // ignored with per-lane activations
         bool ok = true;
         if (tc.peer) {
-            ok = peer->poison() && (!tc.x16 || x16_err->zero());
+            ok          = bench || (peer->poison() && (!tc.x16 || x16_err->zero()));
             j.peer = peer->as<uint32_t>();
             j.peer_half = peer_half;
             j.x16_err = tc.x16 ? x16_err->as<uint32_t>() : nullptr;
         }
-        ok = ok && product_joint(l, j, nullptr);
-        if (ok && tc.peer) {
+        ok = ok && (!q8 || bench || fn::dense::poison_smem(nullptr)) && product_joint(l, j, st);  // TTTS6 item 2
+        if (ok && tc.peer && !bench) {
             ok = check_peer(lanes);
         }
         // each lane's buffers into its rows of the matrices' outputs, which the snapshot reads
-        for (size_t i = 0; ok && tc.lane_out && i < tc.mats.size(); ++i) {
+        for (size_t i = 0; ok && !bench && tc.lane_out && i < tc.mats.size(); ++i) {
             const size_t lane_bytes = size_t(lane_rows) * tc.mats[i].m * 4;
             for (int32_t u = 0; ok && u < lanes; ++u) {
                 ok = cuda_ok(cudaMemcpy(out[i]->as<uint8_t>() + u * lane_bytes, lane_out[i][u]->p, lane_bytes,
@@ -451,7 +510,7 @@ void extremize(fmt f, synth & s) {
                     b[i] = mode == 0 ? hi : mode == 1 ? lo : ((i & 1) ? lo : hi);
                 }
             };
-            switch (f) {
+            switch (f == fmt_q8_0f ? fmt::q8_0 : f) {  // TTTS3: Q8_0F's blocks are Q8_0's
                 case fmt::q8_0:
                     fill(2, 34, 0x7f, 0x80);
                     break;
@@ -499,6 +558,75 @@ int64_t synth_key(const jcase & tc, fmt f) {
     return int64_t(f) * 65536 + tc.k + (tc.extreme ? int64_t(1) << 40 : 0);
 }
 
+// TTTS6: matrix i's weight rows (its real rows, or its format's synthetic set), its period of distinct rows (a real
+// matrix: all m) and the set's row of matrix row r < period
+bool is_real(const jrun & cr, size_t i) {
+    return i < cr.real.size() && !cr.real[i].bytes.empty();
+}
+
+const synth & weight_set(const jrun & cr, std::map<int64_t, synth> & sets, size_t i) {
+    return is_real(cr, i) ? cr.real[i] : sets[synth_key(cr.tc, cr.tc.mats[i].f)];
+}
+
+int32_t period_of(const jrun & cr, size_t i) {
+    return is_real(cr, i) ? cr.tc.mats[i].m : std::min(cr.tc.mats[i].period, n_synth_rows);
+}
+
+int32_t set_row(const jrun & cr, size_t i, int32_t r) {
+    return is_real(cr, i) ? r : (r + cr.off[i]) % n_synth_rows;
+}
+
+// TTTS6: rows 0 .. m - 1 of GGUF tensor `name`, each row's first k weights, as format f's GGUF rows (CPU reads, no
+// model load). BF16 takes a BF16 tensor, or an F32 one whose every value read is a BF16 value (narrowed exactly, as the
+// loader narrows UD-Q4_K_XL's ssm_alpha and ssm_beta); Q8_0 a Q8_0 tensor. False when the tensor is missing, smaller or
+// of another type.
+bool read_real(const std::vector<fnfl_gguf_dir> & dirs, const char * name, fmt f, int32_t m, int32_t k, synth & out) {
+    for (const fnfl_gguf_dir & d : dirs) {
+        for (const fnfl_gguf_tensor & t : d.tensors) {
+            if (t.name != name) {
+                continue;
+            }
+            const bool f32 = f == fmt::bf16 && t.type_name == "f32";
+            const bool ok_type =
+                (f == fmt::bf16 && (t.type_name == "bf16" || f32)) || (f == fmt::q8_0 && t.type_name == "q8_0");
+            if (!ok_type || t.ne[0] < k || t.ne[1] < m || t.ne[2] != 1 || t.block_elems <= 0 ||
+                t.ne[0] % t.block_elems != 0 || k % t.block_elems != 0) {
+                return false;
+            }
+            const uint64_t src_row = uint64_t(t.ne[0] / t.block_elems) * uint64_t(t.block_bytes);
+            const uint64_t take    = uint64_t(k / t.block_elems) * uint64_t(t.block_bytes);
+            out.f                  = f;
+            out.k                  = k;
+            out.row_bytes          = size_t(row_bytes(f, k));
+            out.bytes.assign(out.row_bytes * size_t(m), 0);
+            std::vector<uint8_t> buf(static_cast<size_t>(take));
+            FILE *               fp = fopen(d.path.c_str(), "rb");
+            bool                 ok = fp != nullptr && (f32 ? take == uint64_t(k) * 4 : take == out.row_bytes);
+            for (int32_t r = 0; ok && r < m; ++r) {
+                ok            = fseeko(fp, static_cast<off_t>(t.offset + uint64_t(r) * src_row), SEEK_SET) == 0 &&
+                                fread(buf.data(), 1, buf.size(), fp) == buf.size();
+                uint8_t * dst = out.bytes.data() + size_t(r) * out.row_bytes;
+                if (ok && f32) {
+                    for (int32_t j = 0; j < k; ++j) {
+                        uint32_t v = 0;
+                        memcpy(&v, buf.data() + size_t(j) * 4, 4);
+                        ok               = ok && (v & 0xffffu) == 0;
+                        const uint16_t h = static_cast<uint16_t>(v >> 16);
+                        memcpy(dst + size_t(j) * 2, &h, 2);
+                    }
+                } else if (ok) {
+                    memcpy(dst, buf.data(), buf.size());
+                }
+            }
+            if (fp != nullptr) {
+                fclose(fp);
+            }
+            return ok;
+        }
+    }
+    return false;
+}
+
 bool setup(jrun & cr, std::map<int64_t, synth> & sets, const std::vector<uint8_t> & grids) {
     const jcase & tc = cr.tc;
     const int32_t k = tc.k, n = static_cast<int32_t>(tc.mats.size());
@@ -507,10 +635,40 @@ bool setup(jrun & cr, std::map<int64_t, synth> & sets, const std::vector<uint8_t
     a.n_mats = n;
     bool any_bf = false, any_q = false;
     cr.off.assign(size_t(n), 0);
+    cr.real.assign(size_t(n), synth{});
+    std::vector<fnfl_gguf_dir> dirs;  // TTTS6: the model's tensor directories, for real rows
+    if (!tc.model.empty()) {
+        std::vector<std::string> paths;
+        std::string              err;
+        bool                     ok = fnfl_gguf_shard_paths(tc.model, paths, err);
+        for (size_t p = 0; ok && p < paths.size(); ++p) {
+            dirs.emplace_back();
+            ok = fnfl_gguf_read_dir(paths[p], dirs.back(), err);
+        }
+        if (!ok) {
+            fprintf(stderr, "dpj-test: %s: %s\n", tc.model.c_str(), err.c_str());
+            return false;
+        }
+    }
     for (int32_t i = 0; i < n; ++i) {
         const mspec & ms = tc.mats[size_t(i)];
+        if (ms.tensor != nullptr) {  // TTTS6: the real rows, packed as the loader packs them
+            synth &              rs = cr.real[size_t(i)];
+            std::vector<uint8_t> packed(size_t(row_bytes(ms.f, k)) * ms.m);
+            if (!read_real(dirs, ms.tensor, ms.f, ms.m, k, rs) ||
+                !pack(ms.f, ms.m, k, rs.bytes.data(), rs.row_bytes, packed.data())) {
+                fprintf(stderr, "dpj-test: %s: tensor %s not readable as %s [%d x %d]\n", tc.name.c_str(), ms.tensor,
+                        fmt_name(ms.f), ms.m, k);
+                return false;
+            }
+            cr.w.push_back(std::make_unique<dev_mem>(packed.size()));
+            cr.out.push_back(std::make_unique<dev_mem>(size_t(n_rows) * ms.m * 4));
+            if (!cr.w.back()->put(packed.data(), packed.size())) {
+                return false;
+            }
+        }
         const int64_t key = synth_key(tc, ms.f);
-        if (sets.count(key) == 0) {
+        if (ms.tensor == nullptr && sets.count(key) == 0) {
             if (!make_synth(ms.f, k, sets[key])) {
                 fprintf(stderr, "dpj-test: no synthetic %s at K %d\n", fmt_name(ms.f), k);
                 return false;
@@ -519,21 +677,23 @@ bool setup(jrun & cr, std::map<int64_t, synth> & sets, const std::vector<uint8_t
                 extremize(ms.f, sets[key]);
             }
         }
-        const synth & s = sets[key];
-        cr.off[size_t(i)] = (37 * i + 11) % n_synth_rows;
-        std::vector<uint8_t> packed;
-        if (!pack_synth(s, ms.m, cr.off[size_t(i)], ms.period, packed)) {
-            return false;
-        }
-        if (i == 0 && tc.nan_expert >= 0) { // BF16: the row's first weight a quiet NaN
-            uint8_t * w0 = packed.data() + size_t(tc.nan_expert) * s.row_bytes;
-            w0[0] = 0xc0;
-            w0[1] = 0x7f;
-        }
-        cr.w.push_back(std::make_unique<dev_mem>(packed.size()));
-        cr.out.push_back(std::make_unique<dev_mem>(size_t(n_rows) * ms.m * 4));
-        if (!cr.w.back()->put(packed.data(), packed.size())) {
-            return false;
+        if (ms.tensor == nullptr) {
+            const synth & s   = sets[key];
+            cr.off[size_t(i)] = (37 * i + 11) % n_synth_rows;
+            std::vector<uint8_t> packed;
+            if (!pack_synth(s, ms.m, cr.off[size_t(i)], ms.period, packed)) {
+                return false;
+            }
+            if (i == 0 && tc.nan_expert >= 0) {  // BF16: the row's first weight a quiet NaN
+                uint8_t * w0 = packed.data() + size_t(tc.nan_expert) * s.row_bytes;
+                w0[0]        = 0xc0;
+                w0[1]        = 0x7f;
+            }
+            cr.w.push_back(std::make_unique<dev_mem>(packed.size()));
+            cr.out.push_back(std::make_unique<dev_mem>(size_t(n_rows) * ms.m * 4));
+            if (!cr.w.back()->put(packed.data(), packed.size())) {
+                return false;
+            }
         }
         mat & m = a.mats[i];
         m.f = ms.f;
@@ -692,14 +852,14 @@ bool reference(const jrun & cr, std::map<int64_t, synth> & sets, const std::vect
         if (ms.e != epi::f32) {
             continue;
         }
-        const synth & s = sets[synth_key(tc, ms.f)];
-        const int32_t period = std::min(ms.period, n_synth_rows), distinct = std::min(ms.m, period);
+        const synth &              s      = weight_set(cr, sets, i);
+        const int32_t              period = period_of(cr, i), distinct = std::min(ms.m, period);
         std::vector<double> d(size_t(rows) * distinct), da(size_t(rows) * distinct);
         const std::vector<float> & xa = ms.f == fmt::bf16 ? cr.x : cr.xv;
         std::atomic<bool> dec_ok{true};
         parallel_for(distinct, [&](int32_t r) {
             std::vector<float> wr(static_cast<size_t>(k));
-            if (!quant::decode_row(to_wfmt(ms.f), s.row((r + cr.off[i]) % n_synth_rows), wr.data(), k)) {
+            if (!quant::decode_row(to_wfmt(ms.f), s.row(set_row(cr, i, r)), wr.data(), k)) {
                 dec_ok = false;
                 return;
             }
@@ -747,6 +907,42 @@ bool reference(const jrun & cr, std::map<int64_t, synth> & sets, const std::vect
             worst = std::max(worst, rel);
         }
     }
+    return ok;
+}
+
+// TTTS6: the case's launches again on the Q8_0 instances (product_args::q8): each lane's lone launch and the joint
+// launch (peer half 0) bitwise the shared kernels' (lone, j1), for the Q4 cases; a line of its own
+bool q8_same(jrun & cr, int32_t lanes, const std::vector<uint8_t> & lone, const std::vector<uint8_t> & j1) {
+    if (cr.tc.model.empty()) {
+        return true;
+    }
+    std::vector<uint8_t> lone8, j8, g8;
+    cr.q8    = true;
+    bool ran = cr.reset(lanes);
+    for (int32_t u = 0; ran && u < lanes; ++u) {
+        ran = cr.lone(u);
+    }
+    ran             = ran && cr.snapshot(lanes, lone8);
+    // item 2: at R = 4 the gated launch (the joint catch-up's eh_proj form) too, gate open
+    const bool gate = cr.rr == 4 && !cr.tc.tc;
+    cr.gated        = gate;
+    for (int32_t u = 0; ran && gate && u < lanes; ++u) {
+        ran = (u > 0 || (cr.err->zero() && cr.reset(lanes))) && cr.lone(u);
+    }
+    cr.gated      = false;
+    ran           = ran && (!gate || cr.snapshot(lanes, g8));
+    cr.peer_half  = 0;
+    ran           = ran && cr.reset(lanes) && cr.joint(lanes) && cr.snapshot(lanes, j8);
+    cr.q8         = false;
+    uint32_t err  = 0;
+    ran           = ran && cr.err->get(&err, 4) && err == 0;
+    const bool ok = ran && lone8 == lone && j8 == j1 && (!gate || g8 == lone);
+    printf("      Q8_0 instances (TTTS6, shared memory poisoned before each): %s; lone %s, joint %s, gated %s\n",
+           ran ? "ran" : "LAUNCHES FAILED", lone8 == lone ? "bitwise the shared kernel's" : "DIFFER: FAIL",
+           j8 == j1 ? "bitwise the shared kernel's" : "DIFFERS: FAIL",
+           !gate      ? "not at this R" :
+           g8 == lone ? "bitwise the shared lone kernel's" :
+                        "DIFFERS: FAIL");
     return ok;
 }
 
@@ -832,7 +1028,8 @@ bool run_case(const jcase &                tc,
                 }
                 printf("      first differing byte %zu of %zu\n", first, lone.size());
             }
-            pass = pass && same && again && ref && stray == 0 && cr.peer_bad == 0 && (!tc.over || cr.x16_over == 2);
+            pass = q8_same(cr, lanes, lone, j1) && pass && same && again && ref && stray == 0 && cr.peer_bad == 0 &&
+                   (!tc.over || cr.x16_over == 2);
         }
     }
     printf("  %s\n", pass ? "PASS" : "FAIL");
@@ -863,14 +1060,14 @@ bool run_case_tc(const jcase &                tc,
     bool ok = true;
     for (size_t i = 0; i < tc.mats.size(); ++i) {
         const mspec & ms = tc.mats[i];
-        const synth & s = sets[synth_key(tc, ms.f)];
-        const int32_t period = std::min(ms.period, n_synth_rows), distinct = std::min(ms.m, period);
+        const synth & s      = weight_set(cr, sets, i);
+        const int32_t period = period_of(cr, i), distinct = std::min(ms.m, period);
         d[i].assign(size_t(max_r) * distinct, 0.0);
         da[i].assign(size_t(max_r) * distinct, 0.0);
         std::atomic<bool> dec_ok{true};
         parallel_for(distinct, [&](int32_t r) {
             std::vector<float> wr(static_cast<size_t>(k));
-            if (!quant::decode_row(to_wfmt(ms.f), s.row((r + cr.off[i]) % n_synth_rows), wr.data(), k)) {
+            if (!quant::decode_row(to_wfmt(ms.f), s.row(set_row(cr, i, r)), wr.data(), k)) {
                 dec_ok = false;
                 return;
             }
@@ -938,7 +1135,7 @@ bool run_case_tc(const jcase &                tc,
                 ++n_sent;
                 for (size_t i = 0; i < tc.mats.size(); ++i) {
                     const mspec & ms     = tc.mats[i];
-                    const int32_t period = std::min(ms.period, n_synth_rows), distinct = std::min(ms.m, period);
+                    const int32_t period = period_of(cr, i), distinct = std::min(ms.m, period);
                     const float * got = i == 0 ? lg + size_t(b) * ne : gt + b;
                     for (int32_t r = 0; r < ms.m; ++r) {
                         const double g = got[r];
@@ -1050,14 +1247,14 @@ bool run_case_f16(const jcase &                tc,
         if (ms.f == fmt::bf16 || ms.e != epi::f32) {
             continue;
         }
-        const synth & s = sets[synth_key(tc, ms.f)];
-        const int32_t period = std::min(ms.period, n_synth_rows), distinct = std::min(ms.m, period);
+        const synth & s      = weight_set(cr, sets, i);
+        const int32_t period = period_of(cr, i), distinct = std::min(ms.m, period);
         d[i].assign(size_t(max_r) * distinct, 0.0);
         da[i].assign(size_t(max_r) * distinct, 0.0);
         std::atomic<bool> dec_ok{true};
         parallel_for(distinct, [&](int32_t r) {
             std::vector<float> wr, wm;
-            if (!weight_mags(ms.f, s.row((r + cr.off[i]) % n_synth_rows), k, wr, wm)) {
+            if (!weight_mags(ms.f, s.row(set_row(cr, i, r)), k, wr, wm)) {
                 dec_ok = false;
                 return;
             }
@@ -1130,7 +1327,7 @@ bool run_case_f16(const jcase &                tc,
                     bf_bad += memcmp(got, ref, bytes) == 0 ? 0 : 1;
                 } else {
                     ++n_q;
-                    const int32_t period = std::min(ms.period, n_synth_rows), distinct = std::min(ms.m, period);
+                    const int32_t period = period_of(cr, i), distinct = std::min(ms.m, period);
                     for (int32_t b = 0; b < rows; ++b) {
                         if (!cr.sent(b)) {
                             continue;
@@ -1194,8 +1391,8 @@ bool run_case_f16(const jcase &                tc,
             if (bad > 0 || worst > 0.5) {
                 printf("      worst: %s\n", where.c_str());
             }
-            pass = pass && again && bad == 0 && stray == 0 && bf_bad == 0 && epi_bad == 0 && cr.peer_bad == 0 &&
-                   (!tc.over || cr.x16_over == 2);
+            pass = q8_same(cr, lanes, lone, j1) && pass && again && bad == 0 && stray == 0 && bf_bad == 0 &&
+                   epi_bad == 0 && cr.peer_bad == 0 && (!tc.over || cr.x16_over == 2);
         }
     }
     printf("  %s\n", pass ? "PASS" : "FAIL");
@@ -1234,14 +1431,192 @@ std::vector<jcase> f16_cases(const std::vector<jcase> & full) {
     return out;
 }
 
+// TTTS6 batch part 3 (the kernel points): one site in its served form at U = 4, R = prof_rr (the joint launch, or the
+// draft step's lone launch at B = 4), the shared kernel (base) and the Q8_0 instance (candidate) in turn, each warm and
+// cold once by dp-bench's method (dense_bench.cpp, DP1 and R17): launches rotate over copies of the weights (200 MB or
+// more, so each reads its weights from DRAM); warm, a graph of 64 launches, 3 untimed and 20 timed replays, a launch's
+// time a replay's over 64; cold, graph A = 20 x [12 MB L2 flush, instruction-cache eviction, launch] against graph B =
+// 20 x [flush, eviction], 3 untimed and 20 timed trials of (A - B) / 20. Median and p90 of the 20. Before timing, one
+// launch of each arm, its outputs compared bitwise (a setup check, not a timing).
+namespace bench_q4 {
+
+constexpr int32_t n_unit = 64, n_warm = 3, n_timed = 20, n_cold_rep = 20;
+constexpr size_t  min_bytes   = size_t(200) << 20;
+constexpr int64_t flush_bytes = 12ll << 20;
+
+struct stats {
+    double median = 0.0, p90 = 0.0;
+};
+
+stats finish(std::vector<double> s) {
+    std::sort(s.begin(), s.end());
+    return { 0.5 * (s[n_timed / 2 - 1] + s[n_timed / 2]), s[(9 * n_timed + 9) / 10 - 1] };
+}
+
+bool capture(cudaStream_t st, int32_t n, const std::function<bool(int32_t)> & unit, cudaGraphExec_t & x) {
+    cudaGraph_t g = nullptr;
+    if (!cuda_ok(cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal), "begin capture")) {
+        return false;
+    }
+    bool ok = true;
+    for (int32_t i = 0; i < n && ok; ++i) {
+        ok = unit(i);
+    }
+    ok = cuda_ok(cudaStreamEndCapture(st, &g), "end capture") && ok;
+    ok = ok && cuda_ok(cudaGraphInstantiate(&x, g, 0), "instantiate");
+    if (g != nullptr) {
+        cudaGraphDestroy(g);
+    }
+    return ok;
+}
+
+bool replay_us(cudaStream_t st, cudaGraphExec_t x, cudaEvent_t e0, cudaEvent_t e1, double & us) {
+    float      ms = 0.0f;
+    const bool ok = cuda_ok(cudaEventRecord(e0, st), "record") && cuda_ok(cudaGraphLaunch(x, st), "replay") &&
+                    cuda_ok(cudaEventRecord(e1, st), "record") && cuda_ok(cudaEventSynchronize(e1), "sync") &&
+                    cuda_ok(cudaEventElapsedTime(&ms, e0, e1), "elapsed");
+    us            = 1e3 * double(ms);
+    return ok;
+}
+
+bool point(cudaStream_t                         st,
+           const std::function<bool(int32_t)> & unit,
+           const std::function<bool()> &        cold,
+           stats &                              warm,
+           stats &                              cd) {
+    cudaGraphExec_t     gw = nullptr, ga = nullptr, gb = nullptr;
+    cudaEvent_t         e0 = nullptr, e1 = nullptr;
+    bool                ok = cuda_ok(cudaEventCreate(&e0), "event") && cuda_ok(cudaEventCreate(&e1), "event") &&
+                             capture(st, n_unit, unit, gw) &&
+                             capture(
+                                 st, n_cold_rep, [&](int32_t c) { return cold() && unit(c); }, ga) &&
+                             capture(st, n_cold_rep, [&](int32_t) { return cold(); }, gb);
+    double              us = 0.0, ta = 0.0, tb = 0.0;
+    std::vector<double> w, c;
+    for (int32_t i = 0; i < n_warm && ok; ++i) {
+        ok = replay_us(st, gw, e0, e1, us);
+    }
+    for (int32_t i = 0; i < n_timed && ok; ++i) {
+        ok = replay_us(st, gw, e0, e1, us);
+        w.push_back(us / n_unit);
+    }
+    for (int32_t i = 0; i < n_warm && ok; ++i) {
+        ok = replay_us(st, ga, e0, e1, ta) && replay_us(st, gb, e0, e1, tb);
+    }
+    for (int32_t i = 0; i < n_timed && ok; ++i) {
+        ok = replay_us(st, gb, e0, e1, tb) && replay_us(st, ga, e0, e1, ta);
+        c.push_back((ta - tb) / n_cold_rep);
+    }
+    for (cudaGraphExec_t x : { gw, ga, gb }) {
+        if (x != nullptr) {
+            cudaGraphExecDestroy(x);
+        }
+    }
+    for (cudaEvent_t e : { e0, e1 }) {
+        if (e != nullptr) {
+            cudaEventDestroy(e);
+        }
+    }
+    if (ok) {
+        warm = finish(w);
+        cd   = finish(c);
+    }
+    return ok;
+}
+
+bool run(const jcase &                tc,
+         std::map<int64_t, synth> &   sets,
+         const std::vector<uint8_t> & grids,
+         cudaStream_t                 st,
+         const dev_mem &              flush,
+         const dev_mem &              evict) {
+    jrun cr(tc);
+    if (!setup(cr, sets, grids)) {
+        fprintf(stderr, "dpj-test q4bench: %s: setup failed\n", tc.name.c_str());
+        return false;
+    }
+    const int32_t lanes = max_lanes, rr = tc.prof_rr;
+    const bool    lone_site = tc.name.find("draft attention") != std::string::npos;
+    // the weight copies: copy c of matrix i at c x its bytes
+    size_t        wb        = 0;
+    for (const auto & w : cr.w) {
+        wb += w->n;
+    }
+    const int32_t                         n_copies = static_cast<int32_t>((min_bytes + wb - 1) / wb);
+    std::vector<std::unique_ptr<dev_mem>> wc;
+    bool                                  ok = cr.inputs(rr) && cr.reset(lanes);
+    for (size_t i = 0; ok && i < cr.w.size(); ++i) {
+        wc.push_back(std::make_unique<dev_mem>(cr.w[i]->n * size_t(n_copies)));
+        for (int32_t c = 0; ok && c < n_copies; ++c) {
+            ok =
+                cuda_ok(cudaMemcpy(wc[i]->p + size_t(c) * cr.w[i]->n, cr.w[i]->p, cr.w[i]->n, cudaMemcpyDeviceToDevice),
+                        "weight copy");
+        }
+    }
+    cr.bench        = true;
+    cr.st           = st;
+    cr.peer_half    = 0;
+    const auto unit = [&](int32_t c) {
+        for (size_t i = 0; i < cr.w.size(); ++i) {
+            cr.a.mats[i].w = wc[i]->p + size_t(c % n_copies) * cr.w[i]->n;
+        }
+        return lone_site ? cr.lone(0) : cr.joint(lanes);
+    };
+    const auto cold = [&]() {
+        return cold_flush(flush.p, flush_bytes, st) && cold_icache(evict.as<float>(), st);
+    };
+    // the setup check: one launch of each arm on copy 0, outputs bitwise
+    std::vector<uint8_t> o[2];
+    for (int32_t arm = 0; ok && arm < 2; ++arm) {
+        cr.q8 = arm == 1;
+        // reset's memsets run on the legacy stream, which the non-blocking st does not wait for: the device first
+        ok    = cr.reset(lanes) && cuda_ok(cudaDeviceSynchronize(), "reset") && unit(0) &&
+                cuda_ok(cudaStreamSynchronize(st), "check") && cr.snapshot(lanes, o[arm]);
+    }
+    uint32_t err = 0;
+    ok           = ok && cr.err->get(&err, 4) && err == 0;
+    if (!ok || o[0] != o[1]) {
+        fprintf(stderr, "dpj-test q4bench: %s: setup check %s\n", tc.name.c_str(),
+                ok ? "outputs differ between the arms" : "launches failed");
+        return false;
+    }
+    for (int32_t arm = 0; ok && arm < 2; ++arm) {
+        cr.q8 = arm == 1;
+        stats       w, c;
+        std::string t0 = utc_now();
+        ok             = point(st, unit, cold, w, c);
+        if (!ok) {
+            fprintf(stderr, "dpj-test q4bench: %s: timing failed\n", tc.name.c_str());
+            break;
+        }
+        printf(
+            "{\"site\": \"%s\", \"arm\": \"%s\", \"kernel\": \"%s\", \"U\": %d, \"R\": %d, \"dense_f16\": %s, "
+            "\"weight_bytes\": %zu, \"copies\": %d, \"warm_median_us\": %.3f, \"warm_p90_us\": %.3f, "
+            "\"cold_median_us\": %.3f, \"cold_p90_us\": %.3f, \"n\": %d, \"warm_units\": %d, \"cold_rep\": %d, "
+            "\"t0\": \"%s\", \"t1\": \"%s\"}\n",
+            tc.name.c_str(), arm == 0 ? "base" : "candidate",
+            lone_site ? (arm == 0 ? "product_kernel<4,false>" : "product_fs_kernel<4,q8>") :
+                        (arm == 0 ? "joint_kernel" : "joint_fs_kernel"),
+            lone_site ? 1 : lanes, rr, tc.f16 ? "true" : "false", wb, n_copies, w.median, w.p90, c.median, c.p90,
+            n_timed, n_unit, n_cold_rep, t0.c_str(), utc_now().c_str());
+        fflush(stdout);
+    }
+    cr.q8 = false;
+    return ok;
+}
+
+}  // namespace bench_q4
+
 } // namespace
 } // namespace fn::dense
 
 int fnfl_dpj_test(int device, const char * mode, const char * only) {
     using namespace fn::dense;
     const bool san = strcmp(mode, "san") == 0, tcm = strcmp(mode, "tc") == 0, f16m = strcmp(mode, "f16") == 0;
-    if (!san && !tcm && !f16m && strcmp(mode, "full") != 0) {
-        fprintf(stderr, "dpj-test: mode is full, san, tc or f16\n");
+    const bool q4m = strcmp(mode, "q4") == 0, q4p = strcmp(mode, "q4p") == 0;  // TTTS6
+    const bool q4b = strcmp(mode, "q4bench") == 0;                             // TTTS6 kernel points
+    if (!san && !tcm && !f16m && !q4m && !q4p && !q4b && strcmp(mode, "full") != 0) {
+        fprintf(stderr, "dpj-test: mode is full, san, tc, f16, q4, q4p or q4bench\n");
         return 2;
     }
     if (cudaSetDevice(device) != cudaSuccess) {
@@ -1301,7 +1676,80 @@ int fnfl_dpj_test(int device, const char * mode, const char * only) {
     };
     std::vector<mspec> ties = router;
     ties[0].period = 128;
-    if (tcm) { // FMS5: the router cases with the switch on
+    // TTTS6: UD-Q4_K_XL's joint dense sites on the file's real rows (each tensor's rows 0 .. m - 1, card 0's shapes),
+    // and the draft's (the MTP file, shared with IQ3_XXS serving): q4 checks them as full (bitwise, switch off) and f16
+    // (the switch on); q4p runs the served form once a case at U = 4, R = prof_rr, for the profiler
+    const std::string q4f     = fn::cases::fixture_path("model-q4");  // TFC: the named fixtures
+    const std::string mtp     = fn::cases::fixture_path("draft");
+    const auto        q4_case = [](const char * name, int32_t k, std::vector<mspec> m, const std::string & model) {
+        jcase c{ name, k, std::move(m) };
+        c.model = model;
+        return c;
+    };
+    std::vector<jcase> q4;
+    {
+        jcase g = q4_case("Q4 GDN input + conv (layer 10, X-HMIX)", 2560,
+                          { real_conv("attn_qkv", fmt::q8_0, "blk.10.attn_qkv.weight"),
+                            real("attn_gate", fmt::q8_0, 3072, "blk.10.attn_gate.weight"),
+                            real("alpha", fmt::bf16, 24, "blk.10.ssm_alpha.weight"),
+                            real("beta", fmt::bf16, 24, "blk.10.ssm_beta.weight") },
+                          q4f);
+        g.conv = g.hmix = true;
+        q4.push_back(g);
+        jcase o = q4_case("Q4 QSA input owner (layer 11, X-HMIX)", 2560,
+                          { real("attn_q", fmt::q8_0, 6144, "blk.11.attn_q.weight"),
+                            real("attn_k", fmt::q8_0, 256, "blk.11.attn_k.weight"),
+                            real("attn_v", fmt::q8_0, 256, "blk.11.attn_v.weight"),
+                            real("idx_q", fmt::bf16, 512, "blk.11.indexer.q_proj.weight"),
+                            real("idx_k", fmt::bf16, 128, "blk.11.indexer.k_proj.weight") },
+                          q4f);
+        o.hmix  = true;
+        q4.push_back(o);
+        jcase pe = q4_case("Q4 QSA input peer (layer 11, X-HMIX)", 2560,
+                           { real("attn_q", fmt::q8_0, 6144, "blk.11.attn_q.weight"),
+                             real("attn_k", fmt::q8_0, 256, "blk.11.attn_k.weight"),
+                             real("attn_v", fmt::q8_0, 256, "blk.11.attn_v.weight") },
+                           q4f);
+        pe.hmix  = true;
+        q4.push_back(pe);
+        jcase so = q4_case("Q4 ssm_out split (layer 10, X-A from the producer)", 3072,
+                           { real("ssm_out", fmt::q8_0, 2560, "blk.10.ssm_out.weight") }, q4f);
+        so.peer  = true;
+        q4.push_back(so);
+        jcase ao = q4_case("Q4 attn_output split (layer 11, X-A from the producer)", 3072,
+                           { real("attn_output", fmt::q8_0, 2560, "blk.11.attn_output.weight") }, q4f);
+        ao.peer  = true;
+        q4.push_back(ao);
+        // the joint draft step's q/k/v: the lone launch at B = U (q4p: R = 4, the U = 4 step's lone launches)
+        jcase dq   = q4_case("Q4 draft attention input (MTP, X-HMIX)", 2560,
+                             { real("attn_q", fmt::q8_0, 6144, "blk.48.attn_q.weight"),
+                               real("attn_k", fmt::q8_0, 256, "blk.48.attn_k.weight"),
+                               real("attn_v", fmt::q8_0, 256, "blk.48.attn_v.weight") },
+                             mtp);
+        dq.hmix    = true;
+        dq.prof_rr = 4;
+        q4.push_back(dq);
+        // the joint catch-up's K/V (sparse draft: the index key in BF16), a joint launch at five rows a lane
+        jcase dk   = q4_case("Q4 draft catch-up K/V (MTP, X-HMIX)", 2560,
+                             { real("attn_k", fmt::q8_0, 256, "blk.48.attn_k.weight"),
+                               real("attn_v", fmt::q8_0, 256, "blk.48.attn_v.weight"),
+                               real("idx_k", fmt::bf16, 128, "blk.48.indexer.k_proj.weight") },
+                             mtp);
+        dk.hmix    = true;
+        dk.prof_rr = lane_rows;
+        q4.push_back(dk);
+    }
+    if (q4m) {
+        cases = q4;
+        for (const jcase & c : f16_cases(q4)) {
+            cases.push_back(c);
+        }
+    } else if (q4p || q4b) {  // the served forms: the switch on at 12 rows and more, off at the catch-up's
+        for (jcase c : q4) {
+            c.f16 = c.prof_rr * max_lanes >= 12 && c.name.find("catch-up") == std::string::npos;
+            cases.push_back(c);
+        }
+    } else if (tcm) {  // FMS5: the router cases with the switch on
         cases.push_back(route_case("router + shared gate split", router, 0.02, -1, false));
         cases.push_back(route_case("router + shared gate unsplit",
                                    {plain("router", fmt::bf16, 512, 1), plain("shexp_gate", fmt::bf16, 1, 1)}, 0.02, -1,
@@ -1447,9 +1895,10 @@ int fnfl_dpj_test(int device, const char * mode, const char * only) {
     if (f16m) { // FMS6
         cases = f16_cases(cases);
     }
-    const std::vector<int32_t> lane_set = san    ? std::vector<int32_t>{2, 4}
-                                          : f16m ? std::vector<int32_t>{3, 4}
-                                                 : std::vector<int32_t>{2, 3, 4};
+    const std::vector<int32_t> lane_set = san  ? std::vector<int32_t>{ 2, 4 } :
+                                          f16m ? std::vector<int32_t>{ 3, 4 } :
+                                          q4p  ? std::vector<int32_t>{ max_lanes } :
+                                                 std::vector<int32_t>{ 2, 3, 4 };
     // FMS13: every case at R = 2 .. 5 (san: R = 2, the ticket's sanitizer run)
     const std::vector<int32_t> rr_set   = san ? std::vector<int32_t>{ 2 } : std::vector<int32_t>{ 2, 3, 4, 5 };
     int32_t n_fail = 0;
@@ -1466,18 +1915,49 @@ int fnfl_dpj_test(int device, const char * mode, const char * only) {
         return names.empty() ||
                std::any_of(names.begin(), names.end(), [&](const std::string & f) { return n.find(f) != n.npos; });
     };
+    if (q4b) {  // TTTS6: the five sites "Diagnosis and plan" names, in its order (CASE filters by substring)
+        const char * sites[] = { "Q4 GDN input", "Q4 QSA input owner", "Q4 ssm_out split", "Q4 attn_output split",
+                                 "Q4 draft attention input" };
+        cudaStream_t st      = nullptr;
+        dev_mem      flush(size_t(bench_q4::flush_bytes)), evict(16), scratch(size_t(64) << 20);
+        bool         ok = cuda_ok(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream") &&
+                          cuda_ok(cudaMemsetAsync(flush.p, 0x5a, flush.n, st), "flush buffer");
+        // dp-bench's warm-up: the card busy for 2 s of 64 MiB memsets before timing (a process starts at 1,260 MHz)
+        const auto   t0 = std::chrono::steady_clock::now();
+        for (int64_t n = 0; ok && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() < 2.0;
+             ++n) {
+            ok = cuda_ok(cudaMemsetAsync(scratch.p, static_cast<int>(n & 0xff), scratch.n, st), "memset") &&
+                 ((n & 31) != 31 || cuda_ok(cudaStreamSynchronize(st), "warm sync"));
+        }
+        ok            = ok && cuda_ok(cudaStreamSynchronize(st), "warm sync");
+        int32_t n_pts = 0;
+        for (const char * site : sites) {
+            for (const jcase & tc : cases) {
+                if (ok && tc.name.rfind(site, 0) == 0 && picked(tc.name)) {
+                    ok = bench_q4::run(tc, sets, grids, st, flush, evict);
+                    ++n_pts;
+                }
+            }
+        }
+        if (st != nullptr) {
+            cudaStreamDestroy(st);
+        }
+        printf("dpj-test q4bench: %d sites, %s\n", n_pts, ok && n_pts > 0 ? "done" : "FAILED");
+        return ok && n_pts > 0 ? 0 : 1;
+    }
     size_t n_run = 0;
     for (const jcase & tc : cases) {
         if (picked(tc.name)) {
-            const bool ok = tc.tc  ? run_case_tc(tc, rr_set, lane_set, sets, grids) :
-                            tc.f16 ? run_case_f16(tc, rr_set, lane_set, sets, grids) :
-                                     run_case(tc, rr_set, lane_set, sets, grids);
+            const std::vector<int32_t> rr = q4p ? std::vector<int32_t>{ tc.prof_rr } : rr_set;
+            const bool                 ok = tc.tc  ? run_case_tc(tc, rr, lane_set, sets, grids) :
+                                            tc.f16 ? run_case_f16(tc, rr, lane_set, sets, grids) :
+                                                     run_case(tc, rr, lane_set, sets, grids);
             n_fail += ok ? 0 : 1;
             ++n_run;
         }
     }
     // FMU4: the joint draft step's sampled pick (two devices: this one and the other; san: loopback on this one)
-    if (!tcm && !f16m && picked("sampled pick")) {
+    if (!tcm && !f16m && !q4m && !q4p && picked("sampled pick")) {
         n_fail += fnfl_dpj_pick_test(device, san ? device : (device == 0 ? 1 : 0), san) > 0 ? 1 : 0;
         ++n_run;
     }

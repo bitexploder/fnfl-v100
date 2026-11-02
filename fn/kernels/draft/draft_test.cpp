@@ -9,6 +9,7 @@
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
 #include "fn/quant/synth.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_fp16.h>
@@ -52,11 +53,7 @@ constexpr double f32_bound = 1e-6;
 constexpr double eh_bound = 1e-5;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "draft-kernel-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "draft-kernel-test", what);
 }
 
 // device memory on the current device

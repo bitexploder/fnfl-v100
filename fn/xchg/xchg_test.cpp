@@ -1,5 +1,6 @@
 #include "fn/xchg/xchg_test.h"
 
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -17,11 +18,7 @@ namespace {
 constexpr double timeout_s = 120.0; // the host's bound on one row count's rounds (10,000 rounds take about 1 s)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "xchg-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "xchg-test", what);
 }
 
 // per card: a stream and the two 64-bit counters (mismatched words, checked words)

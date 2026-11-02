@@ -121,6 +121,43 @@ std::string random_string() {
     return result;
 }
 
+const char * get_media_marker() {
+    static const std::string marker = []() {
+        // allow user to pin a reproducible marker via env var
+        const char * env = getenv("LLAMA_MEDIA_MARKER");
+        if (env && env[0] != '\0') {
+            return std::string(env);
+        }
+        return std::string("<__media_") + random_string() + "__>";
+    }();
+    return marker.c_str();
+}
+
+// VIS1 Stage B: an image part's bytes from a data URL (data:image/...;base64,...); remote and file URLs are refused
+static raw_buffer image_from_url(const std::string & url) {
+    if (!string_starts_with(url, "data:")) {
+        throw std::invalid_argument("image_url: FNFL takes data URLs only (data:image/...;base64,...)");
+    }
+    const size_t comma = url.find(',');
+    if (comma == std::string::npos) {
+        throw std::invalid_argument("image_url: an invalid data URL (no comma)");
+    }
+    const std::string head = url.substr(0, comma);
+    if (!string_starts_with(head, "data:image/") || !string_ends_with(head, ";base64")) {
+        throw std::invalid_argument("image_url: the data URL is not a base64 image (" + head + ")");
+    }
+    std::string text;
+    try {
+        text = base64::decode(url.substr(comma + 1));
+    } catch (const std::exception &) {
+        throw std::invalid_argument("image_url: invalid base64 data");
+    }
+    if (text.empty()) {
+        throw std::invalid_argument("image_url: empty image data");
+    }
+    return raw_buffer(text.begin(), text.end());
+}
+
 std::string gen_chatcmplid() {
     return "chatcmpl-" + random_string();
 }
@@ -365,6 +402,46 @@ static server_tokens tokenize_input_subprompt(const llama_vocab * vocab, const j
    }
 }
 
+llama_tokens tokenize_with_images(const llama_vocab *                              vocab,
+                                  const std::string &                              prompt,
+                                  const std::vector<std::pair<int32_t, int32_t>> & grids,
+                                  llama_token                                      image_token,
+                                  std::vector<int64_t> &                           cells) {
+    cells.clear();
+    const std::string marker = get_media_marker();
+    llama_tokens      out;
+    if (llama_vocab_get_add_bos(vocab)) {
+        out.push_back(llama_vocab_bos(vocab));
+    }
+    const auto text = [&](const std::string & t) {
+        if (!t.empty()) {
+            const llama_tokens x = common_tokenize(vocab, t, /* add_special */ false, /* parse_special */ true);
+            out.insert(out.end(), x.begin(), x.end());
+        }
+    };
+    size_t at = 0, img = 0;
+    while (true) {
+        const size_t m = prompt.find(marker, at);
+        text(prompt.substr(at, m == std::string::npos ? std::string::npos : m - at));
+        if (m == std::string::npos) {
+            break;
+        }
+        if (img >= grids.size()) {
+            throw std::invalid_argument("the prompt has more image markers than images");
+        }
+        text("<|vision_start|>");
+        cells.push_back(int64_t(out.size()));
+        out.insert(out.end(), size_t(grids[img].first) * size_t(grids[img].second), image_token);
+        text("<|vision_end|>");
+        ++img;
+        at = m + marker.size();
+    }
+    if (img != grids.size()) {
+        throw std::invalid_argument("the prompt has fewer image markers than images");
+    }
+    return out;
+}
+
 std::vector<server_tokens> tokenize_input_prompts(const llama_vocab * vocab, const json & json_prompt, bool add_special, bool parse_special) {
     std::vector<server_tokens> result;
     if (json_prompt.is_array() && !json_is_array_and_contains_numbers(json_prompt)) {
@@ -425,10 +502,9 @@ json oaicompat_completion_params_parse(const json & body) {
 }
 
 // used by /chat/completions endpoint
-json oaicompat_chat_params_parse(
-    json & body, /* openai api json semantics */
-    const server_chat_params & opt)
-{
+json oaicompat_chat_params_parse(json &                     body, /* openai api json semantics */
+                                 const server_chat_params & opt,
+                                 std::vector<raw_buffer> *  out_files) {
     json llama_params;
 
     auto tools = json_value(body, "tools", json());
@@ -516,8 +592,22 @@ json oaicompat_chat_params_parse(
 
         for (auto & p : content) {
             std::string type = json_value(p, "type", std::string());
-            if (type == "image_url" || type == "input_audio" || type == "input_video") {
-                throw std::runtime_error(type + " input is not supported: FNFL serves text only");
+            if (type == "image_url" && opt.allow_image && out_files != nullptr) {
+                // VIS1 Stage B: the reference server's form: the bytes kept, the part a media marker
+                if (out_files->size() >= size_t(max_request_images)) {
+                    throw std::invalid_argument("too many images: at most " + std::to_string(max_request_images) +
+                                                " a request");
+                }
+                json image_url = json_value(p, "image_url", json::object());
+                out_files->push_back(image_from_url(json_value(image_url, "url", std::string())));
+                p["type"] = "media_marker";
+                p["text"] = get_media_marker();
+                p.erase("image_url");
+            } else if (type == "image_url") {
+                throw std::invalid_argument(
+                    "image input is not supported: FNFL reads images with its projector (--mmproj)");
+            } else if (type == "input_audio" || type == "input_video") {
+                throw std::runtime_error(type + " input is not supported: FNFL reads text and images");
             } else if (type != "text") {
                 throw std::invalid_argument("unsupported content[].type");
             }

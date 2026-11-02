@@ -13,7 +13,7 @@
 // Also the record writers: gdn_core's write conditions and indices (gdn.cu, restated here) over its whole grid at
 // B = 1..5, every element the replay reads written exactly once and nothing else in the set.
 //
-// Build and run (Carlin, CPU only):
+// Build and run (CPU only):
 //   g++-14 -std=c++17 -O2 -Wall -Wextra -Werror -I<engine> -I/usr/local/cuda-12.8/include
 //       fn/tools/me11_ledger_check.cpp fn/runtime/versions.cpp -o me11-ledger-check
 //   ./me11-ledger-check

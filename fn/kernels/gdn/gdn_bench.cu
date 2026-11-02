@@ -3,6 +3,7 @@
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/gdn/gdn.h"
 #include "fn/proto/xp1/timing.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -30,11 +31,7 @@ constexpr int64_t flush_bytes = 12 << 20; // the L2 flush (XP1 Amendment 4)
 constexpr int32_t n_block_probe = gd::n_head * gd::n_split;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "gd-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "gd-bench", what);
 }
 
 std::string utc_now() {

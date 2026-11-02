@@ -1,6 +1,7 @@
 #include "fn/model/model.h"
 
 #include "fn/model/kv_pool.h"
+#include "fn/model/shapes.h"
 
 #include <cuda_runtime_api.h>
 #include <fcntl.h>
@@ -208,6 +209,37 @@ int64_t reserved_class::live_bytes(int32_t p, int32_t card) const {
     }
     const int64_t live = pool == nullptr ? -1 : pool->live_bytes(pool_slot, plan.name, p, card);
     return live < 0 ? plan.parts[p].bytes[card] : live; // a fixed part's bytes are always mapped
+}
+
+fn::ple::kv_fmt ple_kv_of(const model & m) {
+    const int32_t t = model::find("blk.1.ple_key.weight");
+    const char *  f = t >= 0 ? m.tp(t).format : "";
+    return std::strcmp(f, "Q8_0") == 0 ? fn::ple::kv_fmt::q8_0 :
+           std::strcmp(f, "F32") == 0  ? fn::ple::kv_fmt::f32 :
+                                         fn::ple::kv_fmt::bf16;
+}
+
+bool dense_q8_of(const model & m) {
+    static const char * const names[] = { "attn_qkv", "attn_gate", "ssm_out",    "attn_q",
+                                          "attn_k",   "attn_v",    "attn_output" };
+    int32_t                   n       = 0;
+    for (int32_t l = 0; l < fn::n_layer; ++l) {
+        for (const char * nm : names) {
+            const int32_t t = model::find(("blk." + std::to_string(l) + "." + nm + ".weight").c_str());
+            if (t >= 0) {
+                if (std::strcmp(m.tp(t).format, "Q8_0") != 0) {
+                    return false;
+                }
+                ++n;
+            }
+        }
+    }
+    return n > 0;
+}
+
+bool ple_conv32_of(const model & m) {
+    const int32_t t = model::find("blk.1.ple_conv1d.weight");
+    return t >= 0 && std::strcmp(m.tp(t).format, "F32") == 0;
 }
 
 uint8_t * reserved_class::part_ptr(int32_t p, int32_t card) const {

@@ -8,6 +8,7 @@
 #include "fn/model/shapes.h"
 #include "fn/quant/formats.h"
 #include "fn/quant/synth.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -48,11 +49,7 @@ constexpr int32_t VC = fn::head::n_vocab_card;
 constexpr size_t vocab_bytes = size_t(VC) * (D / 256) * 176; // 218,521,600
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "v-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "v-bench", what);
 }
 
 bool sent(bool ok, const char * what) {

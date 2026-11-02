@@ -6,8 +6,11 @@
 // permanent behavior (STANDARDS "Switches": a decided switch keeps one path).
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <string>
+#include <system_error>
 #include <vector>
 
 // one reader as tu_order ranks it
@@ -20,6 +23,7 @@ struct tu_reader {
     int     id_task   = -1;
     bool    live      = false; // its chunk is in progress (the live job's reader)
     bool begun = false;        // FMU1: its read job is prepared (fnfl_read_begin ran)
+    bool    finishing = false;        // PRD1 item 9: its front ended, its back halves are out (polled on its own)
 };
 
 // TU6's order: priority (higher first); short readers (uncached <= fast_limit) before long ones; among long readers the
@@ -53,6 +57,19 @@ inline void tu_sort(std::vector<tu_reader> & r, int32_t fast_limit) {
     std::sort(r.begin(), r.end(), [&](const tu_reader & a, const tu_reader & b) { return tu_before(a, b, fast_limit); });
 }
 
+// PRD1 item 9: the readers TU6's order ranks: a finishing reader (its front done, 0 rows left, so it would sort first)
+// leaves the order, the pick and the reader to follow
+inline void tu_drop_finishing(std::vector<tu_reader> & r) {
+    r.erase(std::remove_if(r.begin(), r.end(), [](const tu_reader & x) { return x.finishing; }), r.end());
+}
+
+// the reader to serve next: the first in TU6's order of the readers not finishing (-1: none)
+inline int tu_pick_of(std::vector<tu_reader> r, int32_t fast_limit) {
+    tu_drop_finishing(r);
+    tu_sort(r, fast_limit);
+    return r.empty() ? -1 : r[0].slot;
+}
+
 // TU2/TU3's remaining tokens. A read not yet begun counts its prompt less the prefix its begin will reuse (computed
 // once per task); a begun read counts its prompt less the tokens its slot's state holds (FNFL's job covers the whole
 // read, so its unfinished rows are counted once). uncached: the larger of that and the prompt less the reused prefix
@@ -66,6 +83,7 @@ inline int32_t tu_uncached(int32_t remaining, int32_t n_tokens, int32_t prefix) 
 // FMU1: the reader TU6's order serves after the current main-lane turn (now_slot's, -1: none) ends: the order with no
 // live reader and now's turn the latest; the first reader whose job is begun (-1: none), possibly now itself
 inline int tu_follow(std::vector<tu_reader> r, int now_slot, int32_t fast_limit) {
+    tu_drop_finishing(r);
     int64_t latest = 0;
     for (const tu_reader & x : r) {
         latest = std::max(latest, x.last_seq);
@@ -87,8 +105,21 @@ inline int tu_follow(std::vector<tu_reader> r, int now_slot, int32_t fast_limit)
 
 // FMU1: the presence rule (resident TP). What a reader's step runs beside: nobody else with model work (lone: FMU2's
 // correction, TU3's geometry, one step a job call, so an arrival waits one step, not the chunk), generating slots
-// (writers: 1-layer groups, one step a slice, tu_writers_groups), or other readers only (shared: TU3's slices of the
-// policy's groups)
+// (writers: one step a slice, its units under the read budget, MUP2; APF1: the writer-pause deadline's), or other readers only (shared: TU3's slices of
+// the policy's groups)
+// PRD1 item 14: what the shell does at a read's end (the engine's done, cancelled or failed; cancel: the client asked
+// for one during the read). A cancel is honoured at any point of the read: a read that ended done while a cancel was
+// pending (the split's front was done before it came) releases the slot like a cancelled one, with no generated token
+enum class tu_read_out { done, cancelled, failed };
+enum class tu_end { generate, release, fail };
+
+inline tu_end tu_read_end(tu_read_out st, bool cancel) {
+    if (st == tu_read_out::failed) {
+        return tu_end::fail;
+    }
+    return st == tu_read_out::done && !cancel ? tu_end::generate : tu_end::release;
+}
+
 enum class tu_mode { shared, writers, lone };
 inline tu_mode tu_presence(int32_t n_writers, int32_t n_other_readers) {
     return n_writers > 0 ? tu_mode::writers : n_other_readers > 0 ? tu_mode::shared : tu_mode::lone;
@@ -99,16 +130,27 @@ inline double tu_mode_budget(tu_mode m, double slice_ms) {
     (void)m;
     return slice_ms;
 }
-// FMU2 (the reader rule, alpha = 0): beside writers a reader's slice is one step (one sync) of main's group in 1-layer
-// groups: the policy's group of layers, or as many 1-layer groups as fill the slice by the chunk's last measured group
-// (-1: none, as at a chunk's start) when more; at most 1,024
-inline int32_t tu_writers_groups(double slice_ms, double last_group_ms, int32_t group_layers) {
-    double n = std::max(1, group_layers);
-    if (last_group_ms >= 0.0) {
-        n = std::max(n, std::floor(slice_ms / std::max(last_group_ms, 1e-3)));
-    }
-    return static_cast<int32_t>(std::min(1024.0, n));
+
+// APF1: the writers' pause target P (POST /props tu.writer_pause_ms, --fnfl-writer-pause-ms): an integer from 10 to
+// 1,000 ms (fn/runtime/pace.h's range; the engine checks it again). A rejected value changes nothing
+constexpr int32_t tu_pause_min_ms = 10;
+constexpr int32_t tu_pause_max_ms = 1000;
+
+inline bool tu_pause_ok(bool is_integer, int64_t v) {
+    return is_integer && v >= tu_pause_min_ms && v <= tu_pause_max_ms;
 }
+
+// POST /props tu.writer_pause_ms (a JSON value J, nlohmann's): true with out set when valid; else false with err and out
+// untouched (the request is rejected whole, so the policy's P stays)
+template <typename J> inline bool tu_pause_parse(const J & v, int32_t & out, std::string & err) {
+    if (!v.is_number_integer() || !tu_pause_ok(true, v.template get<int64_t>())) {
+        err = "tu.writer_pause_ms must be an integer from 10 to 1000";
+        return false;
+    }
+    out = v.template get<int32_t>();
+    return true;
+}
+
 // FMU1: a lone writer (one generating slot, no reader, admission or job) runs the one-slot loop's body
 inline bool tu_lone_writer(int32_t n_writers, int32_t n_readers, bool job_active) {
     return n_writers == 1 && n_readers == 0 && !job_active;
@@ -152,4 +194,23 @@ inline int tu_lru(const std::vector<tu_slot_view> & s) {
         }
     }
     return ret;
+}
+
+// SSF1: a client's slot ID names a slot, [0, n_slots), or is exactly -1 where "any slot" is allowed (a request's
+// id_slot). Upstream wrapped any integer (id % n_slots, unsigned), so 99 and -1 named real slots
+inline bool slot_id_valid(int64_t id, int32_t n_slots, bool allow_any) {
+    return (id >= 0 && id < n_slots) || (allow_any && id == -1);
+}
+
+// SSF1: /slots/{id}'s path ID: the whole string is a decimal integer (no prefix, sign other than '-', or blank) that
+// names a slot; false otherwise, with id untouched
+inline bool slot_id_parse(const std::string & s, int32_t n_slots, int32_t & id) {
+    int64_t                      v   = 0;
+    const char *                 end = s.data() + s.size();
+    const std::from_chars_result r   = std::from_chars(s.data(), end, v);
+    if (s.empty() || r.ec != std::errc() || r.ptr != end || !slot_id_valid(v, n_slots, false)) {
+        return false;
+    }
+    id = static_cast<int32_t>(v);
+    return true;
 }

@@ -36,6 +36,7 @@
 #include "fn/kernels/samp/samp.h"
 #include "fn/runtime/expert_cache.h"
 #include "fn/runtime/ple_host.h"
+#include "fn/tools/cases.h"
 
 #include <cstdint>
 #include <memory>
@@ -53,15 +54,22 @@ struct fnfl_target_args {
     int32_t append_restore = 0; // its untimed prefix: a request of this many tokens, then the prompt restoring it
     std::string ids;         // the token IDs (model-test, model-bench: HX7's deep.ids; generate: the prompt)
     std::string joint_kl;    // FMS2 item 7 (joint-kl, rollback-test mu1 --joint-kl): the lanes' IDs (HX7's deep.ids)
+    // MUP2 (--kl-depths D,...; --kl-d d): joint-kl at depth on the split: each lane's history read to D cells first,
+    // the 1,024 compared positions after it; only that d (0: d = 1 .. 4, depth 0, as before)
+    std::vector<int32_t> kl_depths;
+    int32_t              kl_d = 0;
+    // APF2 (--route-kl, with --kl-depths on the split): joint-kl's comparison of the prompt routes (joint_kl.cpp
+    // route_kl_split) in place of the joint passes
+    bool                 route_kl = false;
     std::string out_dir;
     std::string mode; // model-test: full | san | race; model-bench: all | nsys
     // model-bench nsys (SF1): the traced point's depth and B (TG1's 131,072 and 3 when not given)
     int32_t bench_depth = 131072;
     int32_t bench_b = 3;
     bool bench_real = false; // model-bench nsys (TR1): a real history at any DEPTH; the file must hold DEPTH + B tokens
-    std::string model_path = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                             "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-    std::string draft_path = "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+    // TFC: the named fixtures (fn/tools/cases.cpp), each overridden by its environment variable
+    std::string model_path = fn::cases::fixture_path("model");
+    std::string draft_path = fn::cases::fixture_path("draft");
     int32_t n_pos = 4096;
     int32_t n_gen = 256;
     int32_t n_cells = 198720;
@@ -82,7 +90,7 @@ struct fnfl_target_args {
     // draft-bench (a missing value is an error); model-dry runs the draft rounds when it is given
     std::string draft_attention;
     bool draft_attention_given = false;
-    std::string draft_subset = "/home/jeremy/src/flashnext/work/DR1/stageC/subset/draft-subset.ids";
+    std::string draft_subset          = fn::cases::fixture_path("draft-subset");
     std::string ref_draft; // draft-test: the reference dumps' directory (src/ref_dump_draft.cpp: r4k/, deep/)
     // generate (SM1): sample with these options (FC-DEC2); unset: V1's greedy as TG1 built it
     bool sample = false;
@@ -108,6 +116,8 @@ struct fnfl_target_args {
     std::string              split_commit, split_digest;
     bool                     record_hash  = false;
     int32_t                  split_groups = 0;
+    // VIS1 Stage B (--image-planes, the follower): the front reads images: the back's rope planes (planes only)
+    bool                     image_planes = false;
     std::vector<run_setting> run_settings;
     int32_t runs = 3;
     std::vector<int32_t> eog; // empty: the tokenizer's EOS (248046) alone

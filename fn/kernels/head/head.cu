@@ -206,7 +206,7 @@ fn::dense::product_args vocab_args(const logits_args & a) {
     fn::dense::product_args p;
     p.k = k_in;
     p.n_mats = 1;
-    p.mats[0].f = fn::dense::fmt::q5_k;
+    p.mats[0].f      = a.q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k;
     p.mats[0].m = a.n;
     p.mats[0].w = a.w;
     p.mats[0].out = a.logits;
@@ -229,12 +229,13 @@ template <int B> bool launch_reduce(const reduce_args & a, cudaStream_t st) {
 
 } // namespace
 
-size_t logits_work_bytes(int32_t n) {
+size_t logits_work_bytes(int32_t n, bool q8) {
     if (n < 8 || n % 8 != 0 || n > n_vocab_card) {
         return 0;
     }
     logits_args a = {};
     a.n = n;
+    a.q8          = q8;
     return fn::dense::work_bytes(vocab_args(a));
 }
 
@@ -258,17 +259,18 @@ bool draft_ids(const int32_t * subset, int32_t n, int32_t card, int32_t * ids) {
     return true;
 }
 
-int64_t draft_head_bytes(int32_t m) {
+int64_t draft_head_bytes(int32_t m, bool q8) {
     if (m < 0) {
         return 0;
     }
-    return fn::dense::row_bytes(fn::dense::fmt::q5_k, k_in) * m;
+    return fn::dense::row_bytes(q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k, k_in) * m;
 }
 
 // one 8-row tile at a time: the tile's rows gathered contiguously, then dense::pack's layout of those 8 rows (pack
 // lays out each 8-row tile on its own, so packing tile by tile equals packing the gathered m rows at once)
-bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * ids, int32_t m, uint8_t * dst) {
-    const size_t rb = static_cast<size_t>(fn::dense::row_bytes(fn::dense::fmt::q5_k, k_in));
+bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * ids, int32_t m, uint8_t * dst, bool q8) {
+    const fn::dense::fmt f  = q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k;
+    const size_t         rb = static_cast<size_t>(fn::dense::row_bytes(f, k_in));
     if (vocab == nullptr || ids == nullptr || dst == nullptr || m < 8 || m % 8 != 0 || m > n_vocab_card ||
         row_bytes < rb) {
         return false;
@@ -282,7 +284,7 @@ bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * id
             }
             std::copy_n(vocab + static_cast<size_t>(id) * row_bytes, rb, tile.data() + static_cast<size_t>(i) * rb);
         }
-        if (!fn::dense::pack(fn::dense::fmt::q5_k, 8, k_in, tile.data(), rb, dst + static_cast<size_t>(t) * 8 * rb)) {
+        if (!fn::dense::pack(f, 8, k_in, tile.data(), rb, dst + static_cast<size_t>(t) * 8 * rb)) {
             return false;
         }
     }

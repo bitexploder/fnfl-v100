@@ -47,6 +47,9 @@ struct args {
     float * hpost = nullptr;         // [B][4] out: zero
     float * hx = nullptr;            // [B][1280] out: zero
     uint32_t * err = nullptr;        // this card's error word
+    // TTTS2: the table is Q8_0 (UD-Q4_K_XL), [V][1360] bytes (40 blocks of an FP16 d and 32 int8 q a card's row), each
+    // value d * q, one exact product (fn/quant's decode_q8_0); grids unused
+    bool            q8    = false;
 };
 
 // Host check before upload: every ID in [0, V). False (with a message naming the row and ID) otherwise.
@@ -74,10 +77,31 @@ struct rows_args {
     float *         full    = nullptr;  // [rows][2560]
     float *         streams = nullptr;  // [rows][4][2560]
     uint32_t *      err     = nullptr;
+    bool            q8      = false;    // TTTS2: as args::q8
 };
+
+constexpr int32_t q8_row_bytes = n_own / 32 * 34;  // TTTS2: a card's Q8_0 row
 
 bool embed_rows(const rows_args & a, void * stream);
 // peer: the received [rows][1280] of card 1 - a.card
 bool embed_join(const rows_args & a, const float * peer, void * stream);
+
+// VIS1 Stage B: supplied rows (an image's, the vision encoder's output) over embed_rows' output. Chunk rows row0 ..
+// row0 + n - 1 take src's rows (this card's half of each supplied row, F32 [n][1280], packed) in own and in the card's
+// columns of full and of all four streams; run after embed_rows and before the EMB message is stamped, so the peer's
+// embed_join takes the supplied half too. Exact copies; a thread a float4. Shapes: 1 <= n, 0 <= row0,
+// row0 + n <= rows <= 8,192; every pointer 16-byte aligned. Rejected otherwise (false, nothing enqueued).
+struct supply_args {
+    const float * src     = nullptr;  // [n][1280] device
+    int32_t       row0    = 0;
+    int32_t       n       = 0;
+    int32_t       rows    = 0;        // the chunk's rows (the outputs' extent)
+    int32_t       card    = 0;
+    float *       own     = nullptr;  // as rows_args
+    float *       full    = nullptr;
+    float *       streams = nullptr;
+};
+
+bool embed_supply(const supply_args & a, void * stream);
 
 } // namespace fn::embed

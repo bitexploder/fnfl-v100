@@ -1,5 +1,6 @@
 #include "fn/kernels/act/act.h"
 #include "fn/kernels/act/act_test.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -21,11 +22,7 @@ constexpr double warm_s = 2.0;    // HX12 Later 15: a process starts at 1,260 MH
 constexpr double hw_gbs = 1021.6; // the % of hardware speed's bandwidth (HX2 B1)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "act-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "act-bench", what);
 }
 
 std::string utc_now() {

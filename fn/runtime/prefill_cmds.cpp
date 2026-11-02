@@ -40,6 +40,7 @@
 #include "fn/runtime/runtime.h"
 #include "fn/runtime/target.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -55,6 +56,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -69,11 +71,7 @@ constexpr int32_t VC = 124160; // a card's logits row (pass.h)
 constexpr int32_t eos_tokenizer = 248046;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "prefill-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "prefill-test", what);
 }
 
 bool read_ids(const std::string & path, std::vector<int32_t> & out) {
@@ -362,6 +360,227 @@ int plan_mode(verdicts & v) {
                         !rt::checkpoint_due(8191, 9000) && !rt::checkpoint_due(0, 9000) &&
                         rt::checkpoint_due(16384, 16384) && !rt::checkpoint_due(3072, 9000);
         v.put("checkpoint positions", ok, "multiples of 8,192 and the prompt's end only");
+    }
+    // MUP2 piece 1: every planned chunk shape in pieces of every grid size: refining the halves, on the grid, evened
+    // out, the fewest pieces a half, the versions chained 0 -> 1 -> 2 -> 1 ..., the commit the last piece's
+    {
+        int32_t     cases = 0, refused = 0;
+        std::string bad;
+        const auto  note = [&](const std::string & e) {
+            if (bad.empty()) {
+                bad = e;
+            }
+        };
+        std::map<std::pair<int32_t, int32_t>, int32_t> shapes;  // (half 0, half 1) -> rows
+        for (const int32_t split : { rt::pf_split_rows, rt::pf_cached_split_rows }) {
+            for (const int64_t f : { int64_t(0), int64_t(1000), int64_t(3073), int64_t(8191) }) {
+                for (const int64_t n :
+                     { int64_t(1), int64_t(63), int64_t(64), int64_t(65), int64_t(1537), int64_t(2049), int64_t(3000),
+                       int64_t(4097), int64_t(6145), int64_t(8192), int64_t(20000) }) {
+                    for (const rt::pf_chunk & c : rt::plan_chunks(f, f + n, rt::pf_chunk_rows, split)) {
+                        shapes[{ c.half[0], c.half[1] }] = c.rows;
+                    }
+                }
+            }
+        }
+        for (const auto & sh : shapes) {
+            for (int32_t r = 0; r <= fn::model::prompt_half_rows; r += fn::model::prompt_piece_grid) {
+                fn::model::prompt_chunk c;
+                c.rows    = sh.second;
+                c.half[0] = sh.first.first;
+                c.half[1] = sh.first.second;
+                std::string   e;
+                const int32_t need =
+                    r == 0 ? (c.half[1] > 0 ? 2 : 1) : (c.half[0] + r - 1) / r + (c.half[1] + r - 1) / r;
+                const bool ok = fn::model::prompt_set_pieces(c, r, e);
+                ++cases;
+                const std::string at =
+                    std::to_string(c.half[0]) + "+" + std::to_string(c.half[1]) + " in " + std::to_string(r) + ": ";
+                if (!ok) {
+                    ++refused;
+                    if (need <= fn::model::prompt_max_pieces) {
+                        note(at + "refused within the most pieces: " + e);
+                    }
+                    continue;
+                }
+                if (need > fn::model::prompt_max_pieces || fn::model::prompt_pieces(c) != need ||
+                    !fn::model::prompt_pieces_ok(c)) {
+                    note(at + "pieces " + std::to_string(fn::model::prompt_pieces(c)) + ", expected " +
+                         std::to_string(need));
+                    continue;
+                }
+                int32_t lo = INT32_MAX, hi = 0, sum = 0;
+                bool    seq = true;
+                for (int32_t j = 0; j < fn::model::prompt_pieces(c); ++j) {
+                    const int32_t pr = fn::model::prompt_piece_rows(c, j);
+                    seq              = seq && fn::model::prompt_piece_r0(c, j) == sum;
+                    sum += pr;
+                    if (r > 0 && pr > r) {
+                        note(at + "a piece above the size");
+                    }
+                    if (j > 0 && fn::model::prompt_piece_v_in(j) != fn::model::prompt_piece_v_out(j - 1)) {
+                        note(at + "the versions do not chain");
+                    }
+                    if (j + 1 < fn::model::prompt_pieces(c) && fn::model::prompt_piece_r0(c, j + 1) != c.half[0]) {
+                        lo = std::min(lo, pr);
+                        hi = std::max(hi, pr);
+                    }
+                }
+                if (!seq || sum != c.rows) {
+                    note(at + "the pieces do not tile the chunk");
+                }
+                // evened out: a half's pieces before its last differ by nothing (one size a half)
+                if (r > 0 && hi > 0 && lo != hi && c.half[1] == 0) {
+                    note(at + "uneven pieces " + std::to_string(lo) + ".." + std::to_string(hi));
+                }
+                if (fn::model::prompt_piece_v_in(0) != 0 ||
+                    fn::model::prompt_last_version(c) != fn::model::prompt_piece_v_out(need - 1) ||
+                    (r == 0 && fn::model::prompt_last_version(c) != (c.half[1] > 0 ? 2 : 1))) {
+                    note(at + "the committed version");
+                }
+            }
+        }
+        // the 64-row grid: an off-grid size refused; a partition off the grid or missing half 0's cut invalid
+        fn::model::prompt_chunk g;
+        g.rows    = 8192;
+        g.half[0] = 4096;
+        g.half[1] = 4096;
+        std::string e;
+        const bool  off_grid = !fn::model::prompt_set_pieces(g, 1000, e) && !fn::model::prompt_set_pieces(g, 32, e);
+        g.n_pieces           = 2;
+        g.piece[0]           = 4000;
+        g.piece[1]           = 4192;
+        const bool no_cut    = !fn::model::prompt_pieces_ok(g);
+        g.n_pieces           = 3;
+        g.piece[0]           = 2048;
+        g.piece[1]           = 3072;
+        g.piece[2]           = 3072;
+        const bool no_half   = !fn::model::prompt_pieces_ok(g);
+        v.put("piece partitions", bad.empty() && off_grid && no_cut && no_half,
+              bad.empty() ? std::to_string(shapes.size()) + " chunk shapes x 65 sizes (" + std::to_string(cases) +
+                                " cases, " + std::to_string(refused) +
+                                " above 128 pieces refused): pieces tile the chunk in row order, cut at half 0 and on "
+                                "the 64-row grid, the fewest a half at most the size, evened out, versions 0 -> 1 -> 2 "
+                                "-> 1 .., the commit the last piece's; off-grid sizes and partitions refused" +
+                                (off_grid && no_cut && no_half ? "" : " (a refusal FAILED)") :
+                            bad);
+    }
+    // PRD1 item 12: serving's floor on the pieces made (min_rows 1,024): a half at most the size, or under twice the
+    // floor, stays whole; a larger half splits with every piece at least the floor; cuts on the grid. The chunks of
+    // 2,095 and 2,366 rows (MUP2's Load 2: 576/512/1,007 and 574..640-row pieces), every half of 1,024..3,072 rows at
+    // every size from the floor to 3,072, and the halves of every chunk planned for 2,048..3,072-row reads
+    {
+        const int32_t fl    = rt::pf_piece_floor_rows;
+        int32_t       cases = 0;
+        std::string   bad;
+        const auto    check = [&](int32_t h0, int32_t h1, int32_t r, const std::vector<int32_t> * want) {
+            fn::model::prompt_chunk c;
+            c.rows    = h0 + h1;
+            c.half[0] = h0;
+            c.half[1] = h1;
+            std::string e;
+            ++cases;
+            const std::string at = std::to_string(h0) + "+" + std::to_string(h1) + " in " + std::to_string(r) + ": ";
+            if (!fn::model::prompt_set_pieces(c, r, e, fl) || !fn::model::prompt_pieces_ok(c)) {
+                bad = bad.empty() ? at + "refused or invalid: " + e : bad;
+                return;
+            }
+            std::vector<int32_t> got;
+            int32_t              r0 = 0;
+            for (int32_t j = 0; j < fn::model::prompt_pieces(c); ++j) {
+                got.push_back(fn::model::prompt_piece_rows(c, j));
+                if (fn::model::prompt_piece_r0(c, j) != r0 || (r0 % fn::model::prompt_piece_grid) != 0) {
+                    bad = bad.empty() ? at + "off the grid or out of order" : bad;
+                }
+                r0 += got.back();
+            }
+            std::string gs;
+            for (const int32_t x : got) {
+                gs += (gs.empty() ? "" : "/") + std::to_string(x);
+            }
+            if (want != nullptr && got != *want && bad.empty()) {
+                bad = at + "pieces " + gs;
+            }
+            // each half: whole when at most the size or under twice the floor, else every piece at least the floor
+            int32_t j = 0;
+            for (const int32_t h : { h0, h1 }) {
+                if (h == 0) {
+                    continue;
+                }
+                int32_t n = 0, lo = INT32_MAX, sum = 0;
+                for (; sum < h && j < int32_t(got.size()); ++j, ++n) {
+                    sum += got[size_t(j)];
+                    lo = std::min(lo, got[size_t(j)]);
+                }
+                const bool whole = h <= r || h < 2 * fl;
+                if (sum != h || (whole ? n != 1 : n < 2 || lo < fl)) {
+                    bad = bad.empty() ? at + "pieces " + gs : bad;
+                }
+            }
+        };
+        const std::vector<int32_t> a = { 1088, 1007 }, b = { 1216, 1150 }, d = { 1024, 1076 }, f = { 1024, 1024 };
+        check(1088, 1007, fl, &a);
+        check(1216, 1150, fl, &b);
+        check(2100, 0, fl, &d);
+        check(2048, 0, fl, &f);
+        for (int32_t h = 1024; h <= 3072; ++h) {
+            for (int32_t r = fl; r <= 3072; r += fn::model::prompt_piece_grid) {
+                check(h, 0, r, nullptr);
+            }
+        }
+        std::set<std::pair<int32_t, int32_t>> halves;
+        for (const int32_t split : { rt::pf_split_rows, rt::pf_cached_split_rows }) {
+            for (int64_t n = 2048; n <= 3072; ++n) {
+                for (const rt::pf_chunk & c : rt::plan_chunks(0, n, rt::pf_chunk_rows, split)) {
+                    halves.insert({ c.half[0], c.half[1] });
+                }
+            }
+        }
+        for (const auto & hv : halves) {
+            for (int32_t r = fl; r <= 3072; r += fn::model::prompt_piece_grid) {
+                check(hv.first, hv.second, r, nullptr);
+            }
+        }
+        v.put("piece floor", bad.empty(),
+              bad.empty() ?
+                  std::to_string(cases) +
+                      " cases: 2,095 rows 1,088/1,007, 2,366 rows 1,216/1,150, 2,100 rows 1,024/1,076; a half "
+                      "at most the size or under 2,048 rows whole, a larger half in pieces of at least "
+                      "1,024 rows on the grid; the halves of the 2,048..3,072-row reads' chunks" :
+                  bad);
+    }
+    // MUP2 piece 2: the piece size from the budget (pf_piece_rows), a linear prediction 0.9 ms + 0.004 ms a row
+    {
+        const auto lin = [](int32_t r) {
+            return 0.9 + 0.004 * r;
+        };
+        const auto none = [](int32_t) {
+            return -1.0;
+        };
+        bool        bf = false;
+        std::string bad;
+        const auto  want = [&](const char * what, int32_t got, int32_t exp, bool below, bool exp_below) {
+            if ((got != exp || below != exp_below) && bad.empty()) {
+                bad = std::string(what) + ": " + std::to_string(got) + (below ? " (below the floor)" : "") +
+                      ", expected " + std::to_string(exp);
+            }
+        };
+        int32_t r = rt::pf_piece_rows(4096, -1.0, lin, bf);
+        want("no budget", r, 0, bf, false);
+        r = rt::pf_piece_rows(4096, 5.0, none, bf);
+        want("no prediction", r, 0, bf, false);
+        r = rt::pf_piece_rows(4096, 17.3, lin, bf);  // 0.9 + 16.384 fits
+        want("a half fits", r, 0, bf, false);
+        r = rt::pf_piece_rows(4096, 9.0, lin, bf);   // (9 - 0.9) / 0.004 = 2,025 rows: 1,984
+        want("pieces fit", r, 1984, bf, false);
+        r = rt::pf_piece_rows(4096, 3.0, lin, bf);   // 1,024 rows need 4.996 ms
+        want("the floor", r, rt::pf_piece_floor_rows, bf, true);
+        r = rt::pf_piece_rows(1024, 1.0, lin, bf);   // a half at the floor: the halves
+        want("a half at the floor", r, 0, bf, false);
+        v.put("piece sizes from the budget", bad.empty(),
+              bad.empty() ? "the halves with no budget, no prediction, a fitting half or a half at the floor; else the "
+                            "largest 64-row multiple whose prediction fits; else the 1,024-row floor, F not met" :
+                            bad);
     }
 
     // the bookkeeping

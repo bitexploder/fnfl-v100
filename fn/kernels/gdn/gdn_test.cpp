@@ -9,6 +9,7 @@
 #include "fn/model/placement.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/act_ref.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/tools/test_dump.h"
 
 #include <cuda_runtime.h>
@@ -50,11 +51,7 @@ constexpr double cond_floor = 1e-3;
 constexpr int32_t n_ref_threads = 8;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "gd-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "gd-test", what);
 }
 
 // owns one device allocation

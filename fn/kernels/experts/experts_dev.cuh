@@ -64,76 +64,9 @@ constexpr int32_t gu_threads = 8 * n_sub; // 640: one thread a record
 constexpr int32_t gu_warps = gu_threads / 32;
 constexpr int32_t red_stride = gu_warps + 1; // floats per row of the reduction buffer (21: conflict-free columns)
 
-struct gu_layout {
-    int32_t block_bytes; // packed bytes per 256 weights (GGUF's but for the K-quants, 4 more: the scales unpacked)
-    int32_t chunks;      // main chunks per record
-    bool aux8, sc8;
-    int32_t grid_off, grid_len; // in the grid buffer
-};
-
-__host__ __device__ constexpr gu_layout gu_layout_of(fmt f) {
-    return f == fmt::iq2_xxs   ? gu_layout{66, 4, false, false, 17424, 1024} // FMS4 item 2: the selector tables
-           : f == fmt::iq2_xs  ? gu_layout{74, 4, true, false, 18448, 2048}
-           : f == fmt::iq2_s   ? gu_layout{82, 5, false, false, 20496, 4096}
-           : f == fmt::iq3_xxs ? gu_layout{98, 6, false, false, 14336, 1024}
-           : f == fmt::iq3_s   ? gu_layout{110, 6, true, true, 15360, 2048}
-           : f == fmt::q8_0    ? gu_layout{8 * 34, 16, false, false, 0, 0}
-                               : gu_layout{0, 0, false, false, 0, 0};
-}
-// ME1: the K-quants (the Q4 candidate's routed gate/up) take their layout from gu_layout_k, every format's at compile
-// time; gu_layout_of keeps the deployed formats' chain, whose run-time form the IQ bodies take (two more arms in it
-// changed their SASS)
-__host__ __device__ constexpr bool is_kq(fmt f) {
-    return f == fmt::q4_k || f == fmt::q5_k;
-}
-// ME7: Q2_0 (the Q2 draft's routed gate/up) is here too, out of gu_layout_of's run-time chain for the same reason
-__host__ __device__ constexpr gu_layout gu_layout_k(fmt f) {
-    return f == fmt::q4_k   ? gu_layout{148, 8, false, false, 0, 0}
-           : f == fmt::q5_k ? gu_layout{180, 10, false, false, 0, 0}
-           : f == fmt::q2_0 ? gu_layout{72, 4, false, false, 0, 0}
-                            : gu_layout_of(f);
-}
-
+// TTTS3: the gate/up packed layouts (gu_layout_of, gu_layout_k, tile_bytes and the plane offsets) are the codecs'
+// (codec.cuh)
 constexpr int32_t kvalues_off = 17408;
-static_assert(kvalues_off + 16 == gu_layout_of(fmt::iq2_xxs).grid_off &&
-                  gu_layout_of(fmt::iq2_xxs).grid_off + gu_layout_of(fmt::iq2_xxs).grid_len ==
-                      gu_layout_of(fmt::iq2_xs).grid_off &&
-                  gu_layout_of(fmt::iq2_xs).grid_off + gu_layout_of(fmt::iq2_xs).grid_len ==
-                      gu_layout_of(fmt::iq2_s).grid_off &&
-                  gu_layout_of(fmt::iq2_s).grid_off + gu_layout_of(fmt::iq2_s).grid_len ==
-                      static_cast<int32_t>(grid_bytes),
-              "grid buffer layout: the IQ2 selector tables after kvalues_iq4nl");
-
-__host__ __device__ constexpr int64_t tile_bytes(fmt f) {
-    return int64_t(gu_threads) * gu_layout_k(f).block_bytes;
-}
-__host__ __device__ constexpr int64_t aux8_off(fmt f) {
-    return int64_t(gu_layout_k(f).chunks) * gu_threads * 16;
-}
-__host__ __device__ constexpr int64_t sc8_off(fmt f) {
-    return aux8_off(f) + (gu_layout_of(f).aux8 ? gu_threads * 8 : 0);
-}
-// ME1: a K-quant's scale plane is where the aux8 plane would be
-__host__ __device__ constexpr int64_t sm_off(fmt f) {
-    return aux8_off(f);
-}
-__host__ __device__ constexpr int64_t d_off(fmt f) {
-    return sc8_off(f) + (gu_layout_of(f).sc8 ? (n_sub / 2) * 8 * 8 : 0) + (is_kq(f) ? gu_threads * 16 : 0);
-}
-__host__ __device__ constexpr int64_t dmin_off(fmt f) {
-    return d_off(f) + 10 * 8 * 16;
-}
-
-static_assert(d_off(fmt::iq2_xxs) + 10 * 8 * 16 == tile_bytes(fmt::iq2_xxs), "IQ2_XXS tile bytes");
-static_assert(d_off(fmt::iq2_xs) + 10 * 8 * 16 == tile_bytes(fmt::iq2_xs), "IQ2_XS tile bytes");
-static_assert(d_off(fmt::iq2_s) + 10 * 8 * 16 == tile_bytes(fmt::iq2_s), "IQ2_S tile bytes");
-static_assert(d_off(fmt::iq3_xxs) + 10 * 8 * 16 == tile_bytes(fmt::iq3_xxs), "IQ3_XXS tile bytes");
-static_assert(d_off(fmt::iq3_s) + 10 * 8 * 16 == tile_bytes(fmt::iq3_s), "IQ3_S tile bytes");
-static_assert(d_off(fmt::q8_0) + gu_threads * 16 == tile_bytes(fmt::q8_0), "Q8_0 tile bytes");
-static_assert(dmin_off(fmt::q4_k) + 10 * 8 * 16 == tile_bytes(fmt::q4_k), "Q4_K tile bytes");
-static_assert(d_off(fmt::q2_0) + (n_sub / 2) * 8 * 16 == tile_bytes(fmt::q2_0) && tile_bytes(fmt::q2_0) == 46080,
-              "Q2_0 tile bytes: 64 rows of 2,560 weights at GGUF's 18 bytes a 64");
-static_assert(dmin_off(fmt::q5_k) + 10 * 8 * 16 == tile_bytes(fmt::q5_k), "Q5_K tile bytes");
 
 // ---- down packed layout ------------------------------------------------------------------------------------------
 // Per expert: item j5 (0..4) covers input columns 64 j5 .. 64 j5 + 63 of every output row n.
@@ -318,5 +251,23 @@ bool gate_up_lanes_iq3(fmt                        f,
                        int32_t                    rows,
                        const gate_up_lanes_args & a,
                        cudaStream_t               st);
+// TTTS3 item 3: the K-quant family bodies (experts_gu_body_<format>.cu): the lone launch under map 3 (B = 1-5) and the
+// lanes launch (B = 2-5); the caller checked the arguments
+bool gate_up_body_q4_k(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+bool gate_up_body_q5_k(fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const gate_up_args & a, cudaStream_t st);
+bool gate_up_lanes_q4_k(fmt                        f,
+                        fn::dense::fmt             fg,
+                        fn::dense::fmt             fu,
+                        int32_t                    lanes,
+                        int32_t                    rows,
+                        const gate_up_lanes_args & a,
+                        cudaStream_t               st);
+bool gate_up_lanes_q5_k(fmt                        f,
+                        fn::dense::fmt             fg,
+                        fn::dense::fmt             fu,
+                        int32_t                    lanes,
+                        int32_t                    rows,
+                        const gate_up_lanes_args & a,
+                        cudaStream_t               st);
 
 } // namespace fn::experts::detail

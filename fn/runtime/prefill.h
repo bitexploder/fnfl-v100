@@ -41,6 +41,7 @@
 
 #include "fn/model/model.h"
 #include "fn/model/prompt.h"
+#include "fn/runtime/pace.h"
 #include "fn/runtime/prompt_plan.h"
 #include "fn/runtime/target.h"
 
@@ -99,7 +100,12 @@ class checkpoint_book {
 
 // the owner's latest checkpoint at or before min(n_reuse, |all| - 1) whose token prefix is all's (mismatches
 // dropped), -1: none
-int32_t choose_checkpoint(checkpoint_book & book, const std::vector<int32_t> & all, int64_t n_reuse, int32_t owner = 0);
+// VIS1 Stage B: with images, the prefix keys are the ledger's (image_rows::key: the images' digests mixed in)
+int32_t choose_checkpoint(checkpoint_book &            book,
+                          const std::vector<int32_t> & all,
+                          int64_t                      n_reuse,
+                          int32_t                      owner  = 0,
+                          const image_rows *           images = nullptr);
 
 // one chunk as the driver ran it
 struct pf_chunk_stats {
@@ -134,6 +140,34 @@ struct pf_run_stats {
     uint64_t helper_mask = 0;
 };
 
+// MUP2 piece 2: a read unit's kind, as the budget predicts it (the last measured unit of the same kind)
+enum class pf_unit : int32_t { gdn = 0, qsa = 1, ffn = 2, end = 3 };
+constexpr int32_t pf_unit_kinds = 4;
+const char *      pf_unit_name(pf_unit u);
+// the most units a step runs (its timing events)
+constexpr int32_t pf_max_step_units   = 128;
+// a piece's floor (MUP2: below it a piece's fixed cost passes about a quarter of its time [E])
+constexpr int32_t pf_piece_floor_rows = 1024;
+// MUP2 piece 1: the piece rows (model::prompt_set_pieces) for a chunk whose larger half has rh rows under budget_ms,
+// worst(r) the largest layer unit's predicted ms at r rows (< 0: a kind not measured yet): 0 (the halves, level 1)
+// when a half fits, or with no budget or prediction, or rh at most the floor; else the largest multiple of 64 rows, at
+// least the floor, whose units fit; else the floor, below_floor set (1,024-row pieces above the budget)
+int32_t pf_piece_rows(int32_t rh, double budget_ms, const std::function<double(int32_t)> & worst, bool & below_floor);
+
+// MUP2 piece 2: a writers-mode step's budget (pf_mode::writers on resident TP): units run while the next one's predicted
+// time fits budget_ms, and at least one (budget_ms < 0: unknown, one unit; pace::unit_runs). APF1: budget_ms is the
+// box's writer-pause decision (fn/runtime/pace.h), pause_ms the P it came from and known whether its inputs were
+// measured (the log's); floor: no writer step is pending on this box, so the step runs one unit and counts it as read
+// time with none pending. PRD1 item 8: lagged (with floor, the follower's idle drain): the unit is launched with no
+// join, after unit i - 2's end (at most two in flight); units_settle joins and accounts them
+struct pf_budget {
+    double  budget_ms = -1;
+    int32_t pause_ms  = 0;
+    bool    known     = false;
+    bool    floor     = false;
+    bool    lagged    = false;
+};
+
 // MU1: a slot's resumable read on the multi-slot engine (the engine's slot holds it from its read's begin to its end):
 // its tokens and chunk plan (PF1's, unchanged), the chunk in progress and its next layer group, and the counters the
 // scheduler reads. A chunk runs in layer groups of `layers` layers (fixed when it starts); between two of its steps the
@@ -152,20 +186,77 @@ struct pf_job {
     // FMU1: the chunk's end (layer 48's last phase and the draft's halves) runs as its own group after the layer groups
     // (writers present when it started), and its finish (errors, commit, publication, checkpoint) as its own step
     bool end_group = false;
+    // MUP2 piece 1: a writers-mode chunk on resident TP runs in units, (layer, sublayer, piece) in order and then its
+    // end, the budget's grain; group indexes them and groups counts them (a back stage's after its crossing names the
+    // pieces)
+    bool                  units     = false;
     int32_t lane = -1;  // its lane (0: the main arena, 1: the other-reader lane)
     int32_t stage = -1; // its PLE staging slot (lane 0)
     model::prompt_chunk pc;
     bool short_read = false; // MXMU1: ME3's known-token short read (with the expert service): one step, no chunk
     bool cancel = false;   // BG1: stop at the chunk's end (or before the next chunk starts)
+    // PRD1 item 14: with cancel, the chunks the read finishes first (-1: the chunk in progress); the split's back runs
+    // the chunks its front finished. A cancel due at the last chunk's end ends the read as cancelled there too (the
+    // chunk kept, no handoff), never done
+    int64_t cancel_at  = -1;
+
+    bool         cancel_due() const { return cancel && (cancel_at < 0 || int64_t(chunk) >= cancel_at); }
     int64_t committed = 0; // the prompt rows the slot's state holds (published chunks; from at the begin)
     // counters: groups run, chunks and checkpoints done, the job's host service time (its steps, synchronized)
     int64_t groups_done = 0;
     int32_t chunks_done = 0, checkpoints = 0, steps = 0;
     double service_s = 0, longest_step_s = 0, last_group_s = -1;
+    // MUP2 piece 4: the units' account (the read job's log line): units run, the steps that ran units and the most in
+    // one, their GPU time (the slower card's, from the step's events), the units and time run with no writer step
+    // pending (floor), the known budgets given (their sum and count), the pieces' rows (smallest and largest piece of
+    // any chunk), and whether a piece's floor of 1,024 rows was above the budget
+    int64_t      units_run  = 0;
+    int32_t      unit_steps = 0, most_units = 0, floor_units = 0, budget_n = 0;
+    double       unit_ms = 0, floor_ms = 0, budget_ms_sum = 0;
+    int32_t      piece_min = 0, piece_max = 0;
+    int32_t      budget_misses = 0;      // PRD1 item 12: halves kept whole, their largest unit predicted over B
+    bool         below_floor = false;
+    // APF1: P (the last budgeted step's), the budgeted steps whose budget was zero or unknown, whether the last step
+    // ran only its progress unit (the budget zero or unknown, or its one unit predicted over it), and the owner's
+    // pacing totals at the job's first and last budgeted decision (runtime::engine's read job line)
+    int32_t      pause_ms = 0, budget_zero = 0, budget_unknown = 0;
+    bool         last_minimum = false;
+    bool         paced        = false;
+    pace::stats  pace0, pace1;
+    bool         small_whole = false;  // MUP1/MUP2 piece 3: a chunk ran whole as a small read (its prediction fit B)
+    // APF1 Part 4: the ladder's routes the job's steps took (prompt_path's executed-variant counts, summed over its
+    // steps) and the smallest and largest rung of its chunks (the read job line)
+    model::prompt_path::route_counts routes;
+    int32_t                          rung_min = 0, rung_max = 0;
     pf_run_stats stats;
 };
 
 enum class pf_step : int32_t { yielded, chunk_done, done, cancelled, error };
+
+// VIS1 Stage B: the device side of a chunk's image rows (the vision service implements it). Given the chunk's host
+// positions (image_rows::chunk, with images set) on read lane `lane` (0: the main arena, 1: the other reader's), it
+// uploads the planes and block planes to the lane's buffers, places each run's encoder rows in the lane's supply
+// halves (each card its half of the 2,560 columns) and points c's planes, bplanes, runs and embd at them, all ordered
+// before the chunk's first kernel on each card's stream (h is valid during the call only). No image feed: a prompt
+// with images is refused. sliced (the job steps): an image to encode is queued, and the chunk's first steps run
+// encode_step until its lane has none pending (pending), a slice of encoder blocks a step, synchronous, so other
+// slots' rounds run between them (the ticket: the encoder in layer-group slices beside writers, like a read); else
+// fill encodes before returning. forget: the lane's queued images dropped (its job abandoned)
+class pf_images {
+  public:
+    virtual ~pf_images()                                                      = default;
+    virtual bool fill(target &              t,
+                      int32_t               lane,
+                      const image_chunk &   h,
+                      model::prompt_chunk & c,
+                      bool                  sliced,
+                      std::string &         err)                              = 0;
+    virtual bool pending(int32_t lane) const                                  = 0;
+    // up to `blocks` encoder blocks of the queued images in queue order (the images queued before the lane's run
+    // first: one encoder), each finished image's rows copied to its lane's supply; the step's work complete on return
+    virtual bool encode_step(int32_t lane, int32_t blocks, std::string & err) = 0;
+    virtual void forget(int32_t lane)                                         = 0;
+};
 
 // TTTS1: a split stage's side of each chunk's crossing (fn/runtime/stage.h implements it over the link). The front's
 // out: chunk c's crossing (model::prompt_path::crossing_out) after its last layer, then sent; the back's in: chunk c's
@@ -176,6 +267,9 @@ class pf_stage {
     virtual ~pf_stage()                                                                                     = default;
     virtual bool out(target & t, model::prompt_path & pp, const model::prompt_chunk & c, std::string & err) = 0;
     virtual bool in(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err)        = 0;
+
+    // PRD1 item 11: the chunks of slot's current read received ahead (-1: not counted here)
+    virtual int64_t received_ahead(int32_t /* slot */) const { return -1; }
 };
 
 // FMU1: how a read step runs (resident TP; with the expert service every step is MU1's shared form). A chunk's geometry
@@ -223,8 +317,47 @@ class prefiller {
     // returns with its work complete. A chunk's last group is followed by its end (errors, commit, publication, the
     // checkpoint, the next chunk's staging), and the read's last chunk by the head (FC-PF2). cancelled: the job had
     // cancel set at a chunk's end or before its next chunk started (BG1: completed chunks and their checkpoints kept)
-    pf_step job_step(target & t, pf_job & j, int32_t n_groups, int32_t layers, std::string & err,
-                     pf_mode mode = pf_mode::shared);
+    // MUP2: a writers-mode chunk on resident TP runs units under budget (null: one unit a step)
+    pf_step job_step(target &          t,
+                     pf_job &          j,
+                     int32_t           n_groups,
+                     int32_t           layers,
+                     std::string &     err,
+                     pf_mode           mode   = pf_mode::shared,
+                     const pf_budget * budget = nullptr);
+    // MUP2 piece 2: the predicted time of a unit of kind k over rows rows (-1: none measured yet)
+    double  predict(pf_unit k, int32_t rows) const;
+
+    // MUP2 (TEST ONLY: rollback-test, split-test): a writers-mode chunk's pieces: 0 chosen from the budget (serving),
+    // -1 the halves, r > 0 pieces of r rows (a multiple of 64; at most 128 pieces a chunk)
+    void    test_piece_rows(int32_t r) { piece_rows_test_ = r; }
+
+    // APF1 Part 4 (TEST ONLY): both lanes' forced routes and synthetic skewed expert routing (prompt_path's)
+    void test_force_route(const model::prompt_route_force & f) {
+        for (model::prompt_path * pp : { pp_.get(), pp2_.get() }) {
+            if (pp != nullptr) {
+                pp->test_force_route(f);
+            }
+        }
+    }
+
+    // the unit graphs' nodes held by both lanes' caches
+    int64_t test_graph_nodes() const {
+        int64_t n = 0;
+        for (const model::prompt_path * pp : { pp_.get(), pp2_.get() }) {
+            n += pp != nullptr ? pp->graph_cache_nodes() : 0;
+        }
+        return n;
+    }
+
+    bool test_skew_experts(bool on, std::string & err) {
+        for (model::prompt_path * pp : { pp_.get(), pp2_.get() }) {
+            if (pp != nullptr && !pp->test_skew_experts(on, err)) {
+                return false;
+            }
+        }
+        return true;
+    }
     // FMU1 (P, resident TP): the staging of the reader whose turn follows the current one. now: the job whose lane-0
     // turn is in progress or starts next (null: none), its staged chunk kept; next: the job after it, whose next chunk
     // (after the one in progress) is gathered on the staging thread into a staging slot neither holds, then uploaded
@@ -242,14 +375,34 @@ class prefiller {
     // the job ended without its chunk's end (a failure): its lane and staging released, both cards drained; MXMU1: the
     // prompt loan its chunk held returned
     void job_abandon(target & t, pf_job & j);
+    // PRD1 item 8: the idle drain's launched units joined and accounted (true with none), the units of it not yet
+    // complete (an event query), and the units it launched since init
+    bool    units_settle(std::string & err);
+    int32_t units_in_flight() const;
+
+    int64_t drain_launched() const { return drain_launched_; }
+
+    bool    draining() const { return drain_n_ > 0; }
     // MXMU1: a read's plan as run() makes it: PF1's chunks (MX3: with the expert service, chunks of at most 4,096 rows
     // as one half) and whether it is ME3's known-token short read
-    void job_plan(int64_t from, int64_t to, bool cached, std::vector<pf_chunk> & plan, bool & short_read) const;
+    void    job_plan(int64_t                 from,
+                     int64_t                 to,
+                     bool                    cached,
+                     std::vector<pf_chunk> & plan,
+                     bool &                  short_read,
+                     bool                    images = false) const;
     // MXMU1: the job whose chunk holds the prompt loan (the expert service's lent region and staging), -1: none
     int64_t loan_job() const { return held_job_; }
 
     // TTTS1: the split stage's crossing (null: the whole model, no crossing)
     void set_stage(pf_stage * s) { stage_ = s; }
+
+    const pf_stage * stage() const { return stage_; }
+
+    // VIS1 Stage B: the image rows' device side (null: no projector; a prompt with images is refused)
+    void set_images(pf_images * f) { images_ = f; }
+
+    pf_images * images() const { return images_; }
 
     // PB1: the bulk path (the default) or PF1 Stage 1's forced B <= 4 slices (prefill-test's reference); the forced path
     // is kept selectable for the comparisons (PB1 item 9)
@@ -299,13 +452,36 @@ class prefiller {
     bool upload(int32_t s, int32_t rows, std::string & err);
     void start_gather(const ple_params & p, int32_t s, const pf_chunk & c, const std::vector<int32_t> * tok = nullptr);
     void join();
-    // MU1: the job's next chunk (FMU1: its geometry by mode)
-    bool job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, std::string & err);
+    // MU1: the job's next chunk (FMU1: its geometry by mode; MUP2: units only beside writers with a budget, budgeted)
+    bool
+    job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, bool budgeted, double budget_ms, std::string & err);
     // FMU1: a finished gather (joined without waiting) uploaded and tagged; false only on a CUDA error
     bool pump(std::string & err);
+    // prefetch's work (SSF1: prefetch times it for the slow-wait trace)
+    bool prefetch_rows(target & t, const pf_job * now, const pf_job * next, std::string & err);
     // FMU1: resident TP (the KV pool, two cards, no expert service): the paths FMU1 changes; else MU1's and MXMU1's
     bool resident(target & t) const;
     bool job_finish_chunk(target & t, pf_job & j, bool & done, std::string & err);
+    // MUP2: the units of a writers-mode chunk, the unit's place, and the pieces' size from the budget (0: the halves)
+    int32_t units_of(const pf_job & j) const;
+    pf_unit unit_at(const pf_job & j, int32_t u, int32_t & l, int32_t & sub, int32_t & piece) const;
+    int32_t choose_piece_rows(const pf_chunk & ch, double budget_ms, bool & below_floor) const;
+    // the largest layer unit's prediction at rows rows (-1: a kind not measured yet)
+    double  worst_unit(int32_t rows) const;
+    // a units chunk's step: units under the budget, or with none up to max_units (PRD1 item 8), joined; a lagged
+    // budget launches one unit unjoined (the drain)
+    bool    units_step(target &          t,
+                       pf_job &          j,
+                       const pf_budget * budget,
+                       int32_t           max_units,
+                       int32_t &         ran,
+                       std::string &     err);
+    bool    units_join(target &             t,
+                       pf_job &             j,
+                       model::prompt_path & pp,
+                       int32_t              ran,
+                       const pf_budget *    budget,
+                       std::string &        err);
     // MXMU1 (with the expert service): the chunk's loan, taken before its first write into the lent region (the
     // staging slot d's upload, run_start), and returned after its last reader
     bool job_hold(target & t, model::prompt_path & pp, const pf_chunk & ch, int32_t d, pf_job & j, std::string & err);
@@ -353,6 +529,27 @@ class prefiller {
     int64_t              seq_  = 0;  // the bulk path's chunks since init (prompt_chunk::seq)
     std::unique_ptr<model::prompt_path> pp_;
     pf_stage *                          stage_ = nullptr;  // TTTS1
+    // MUP2: the last measured unit of each kind on this box (its slower card's time and its rows; -1: none), the
+    // step's timing events [card][unit boundary], and the test's piece size
+    double                              unit_ms_[pf_unit_kinds]        = { -1, -1, -1, -1 };
+    int32_t                             unit_rows_[pf_unit_kinds]      = {};
+    void *                              uev_[2][pf_max_step_units + 1] = {};
+    pf_unit                             step_kind_[pf_max_step_units]  = {};
+    int32_t                             step_rows_[pf_max_step_units]  = {};
+    int32_t                             piece_rows_test_               = 0;
+    pf_images *                         images_                        = nullptr;  // VIS1 Stage B
+    // VIS1 Stage B: chunk c's positions from the slot's image ledger: rope_off alone for a text chunk (the slot's
+    // offset when the ledger is empty), else the image feed fills its planes, block planes and supplied rows
+    bool        chunk_positions(target & t, int32_t lane, model::prompt_chunk & c, bool sliced, std::string & err);
+    image_chunk img_chunk_;  // its host positions (reused between chunks)
+    // PRD1 item 8: the drain's units launched and not joined (their job, target and prompt path), and the units the
+    // drain launched since init (a test's count)
+    int32_t              drain_n_   = 0;
+    int64_t              drain_job_ = -1;
+    pf_job *             drain_     = nullptr;
+    model::prompt_path * drain_pp_  = nullptr;
+    target *             drain_t_   = nullptr;
+    std::atomic<int64_t> drain_launched_{ 0 };
 };
 
 } // namespace fn::runtime

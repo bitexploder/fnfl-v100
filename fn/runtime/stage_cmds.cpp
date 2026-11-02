@@ -24,9 +24,10 @@ bool fnfl_split_prepare(const fnfl_target_args & a,
     if (!s.buf.alloc(n_slots, nullptr, err)) {
         return false;
     }
-    c.stage       = a.split_role;
-    c.stage_buf   = s.buf.slot;
-    c.record_hash = a.record_hash && a.split_role == 2;
+    c.stage        = a.split_role;
+    c.stage_buf    = s.buf.slot;
+    c.record_hash  = a.record_hash && a.split_role == 2;
+    c.image_planes = a.image_planes && a.split_role == 2;  // VIS1 Stage B
     return true;
 }
 
@@ -42,7 +43,8 @@ bool fnfl_split_attach(const fnfl_target_args & a, rt::engine & e, int32_t cells
     lk::set_text(lo.me.digest, sizeof lo.me.digest, a.split_digest);
     const rt::engine_config & c = e.config();
     const std::string         settings =
-        st::hello_settings(a.split_k, e.n_slots(), cells, a.pool_cells, a.kv_q8, c.spec_d, c.draft.attention, c.eog);
+        st::hello_settings(a.split_k, e.n_slots(), cells, a.pool_cells, a.kv_q8, c.spec_d, c.draft.attention, c.eog,
+                           c.image_planes || !c.mmproj.empty() || bool(c.test_image_rows));
     printf("split: the shared settings: %s\n", settings.c_str());
     lk::set_text(lo.me.model, sizeof lo.me.model, st::hello_files(e.test_model()) + "/" + st::hello_hash(settings));
     lo.me.split = a.split_k;

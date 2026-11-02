@@ -1,6 +1,7 @@
 #include "fn/kernels/samp/samp_harness.h"
 
 #include "fn/kernels/head/head.h"
+#include "fn/tools/test_cuda.h"
 
 #include <chrono>
 #include <cstdio>
@@ -10,11 +11,7 @@
 namespace fn::samp::harness {
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "samp: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "samp", what);
 }
 
 card_s::card_s(int32_t d) : dev(d), guard(d) {

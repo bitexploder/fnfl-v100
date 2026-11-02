@@ -25,9 +25,12 @@
 #include "fn/model/kv_tier.h"
 #include "fn/model/model.h"
 #include "fn/model/pass.h"
+#include "fn/runtime/image_rows.h"
 #include "fn/runtime/ple_host.h"
 #include "fn/runtime/versions.h"
+#include "fn/vision/image.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -117,6 +120,24 @@ struct ready_state {
     std::vector<uint8_t> dev[2]; // per card: the regions in target::ready_regions order
 };
 
+// VIS1 Stage B: one image of a read's prompt: its span (cell, and nx, ny, digest unless img is given) and its prepared
+// image (null when the read reuses its rows: then the span's grid and digest key it)
+struct prompt_image {
+    image_span                              span;
+    std::shared_ptr<const vision::prepared> img;
+};
+
+// its span as the read keys it: the grid and digest of img when given, else the span's
+inline image_span span_of(const prompt_image & pi) {
+    image_span s = pi.span;
+    if (pi.img != nullptr) {
+        s.nx     = pi.img->nx;
+        s.ny     = pi.img->ny;
+        s.digest = pi.img->digest;
+    }
+    return s;
+}
+
 class target {
   public:
     target() = default;
@@ -150,6 +171,45 @@ class target {
     bool keep_processed(std::string & err);
     const ledger & slot() const { return l_; }
 
+    // MUP1 piece 5: the slot's rotary position offset. Every rotary site reads position = cell + offset: the target's
+    // and the draft's round descriptors (pos, pos_off), the prompt path's attention, index and draft catch-up (the
+    // chunk's rope_off). Cells, QSA blocks and checkpoint positions stay on cells. Text: 0, its bits unchanged. Set
+    // between requests (a prompt's rows and every later round take it)
+    void set_pos_offset(int32_t off) { pos_off_ = off; }
+
+    int32_t pos_offset() const { return pos_off_; }
+
+    // VIS1 Stage B: the slot's image spans (fn/runtime/image_rows.h), the prompt's, set by the engine before a read
+    // (the read's chunks take their positions from them; text: none) and kept to a truncation's prefix. A read sets the
+    // offset at its start and end from them (image_rows::offset_at). px: each span's prepared image for the read (the
+    // vision service encodes it when its first unread row comes up; null for an image the read does not reach),
+    // dropped when the read ends
+    void set_images(const image_rows & r, std::vector<std::shared_ptr<const vision::prepared>> px = {}) {
+        img_ = r;
+        px_  = std::move(px);
+        px_.resize(img_.spans().size());
+    }
+
+    const image_rows & images() const { return img_; }
+
+    std::shared_ptr<const vision::prepared> image_pixels(size_t i) const { return i < px_.size() ? px_[i] : nullptr; }
+
+    // A cut of a slot that holds images also sets the offset to the kept ledger's off(n) (an empty ledger: 0): the
+    // server's erase truncates to 0, and the next text read (no ledger, so it sets no offset) must decode at cell
+    // positions (VIS1 Load 3: the image's offset outlived the erase). A text slot's offset is left as it is
+    void keep_images(int64_t n) {
+        if (!img_.empty()) {
+            img_.keep(n);
+            pos_off_ = img_.offset_at(n);
+        }
+        px_.resize(std::min(px_.size(), img_.spans().size()));
+    }
+
+    void drop_pixels() { std::fill(px_.begin(), px_.end(), nullptr); }
+
+    // the key of the prompt prefix tok[0, n): fn::runtime::token_key's value with the images' digests mixed in
+    uint64_t prompt_key(const int32_t * tok, int64_t n) const { return img_.key(tok, n); }
+
     // a forced round of the next B ledger tokens (B <= U); a generate round (the pending token, B = 1). upload_e:
     // gather and upload the PLE rows (false only in model-bench's replays, whose rows stay on the cards). timed: CUDA
     // events around each card's upload and graph launch. Synchronous: returns with the round's completion records.
@@ -171,8 +231,9 @@ class target {
                 bool timed = false);
     // FMU2: a verify round as a lane of a joint round (fn/runtime/joint.h). joint_verify_begin: verify's checks, the
     // proposals into the ledger and the round staged (descriptor, PLE rows uploaded on the streams, the versions' step
-    // begun) with the lane ring's PLE use; the caller then launches the joint graphs and calls joint_release (the
-    // start flag), or joint_abandon when the launch failed; joint_verify_end: the completion wait and verify's checks,
+    // begun) with the lane ring's PLE use; the caller then calls joint_start (the start flag, TTTS7: before the
+    // launches), launches the joint graphs and calls joint_release (the round counter), or joint_abandon when the
+    // launch failed; joint_verify_end: the completion wait and verify's checks,
     // FC-RD2's recovery and the ledger, as verify. Graph executor only.
     struct staged_round {
         uint64_t rd = 0;
@@ -181,6 +242,7 @@ class target {
     };
     bool joint_verify_begin(int32_t d, const int32_t * prop, int32_t budget, uint64_t ple_use, staged_round & sr,
                             std::string & err);
+    void                  joint_start(const staged_round & sr);
     void joint_release(const staged_round & sr);
     void joint_abandon();
     bool joint_verify_end(int32_t d, const int32_t * prop, staged_round & sr, round_result & r, std::string & err);
@@ -190,15 +252,17 @@ class target {
     bool                  joint_forced_begin(int32_t rows, uint64_t ple_use, staged_round & sr, std::string & err);
     bool                  joint_forced_end(int32_t rows, staged_round & sr, round_result & r, std::string & err);
     // FMU2 (build item 2): a draft step as a lane of a joint draft step (joint_frame::draft). joint_draft_begin:
-    // draft_step's checks and its descriptor staged (eagerly the start flag too); the caller launches the joint draft
-    // and calls joint_release; nothing to undo when the launch fails. joint_draft_end: the completion wait and
-    // draft_step's checks (r.argmax[0][0 .. d - 1] the proposals). draft_pick_sampled: the draft's pick is SM1's.
+    // draft_step's checks and its descriptor staged (eagerly the start flag too); the caller calls joint_start,
+    // launches the joint draft and calls joint_release; nothing to undo when the launch fails. joint_draft_end: the
+    // completion wait and draft_step's checks (r.argmax[0][0 .. d - 1] the proposals). draft_pick_sampled: the
+    // draft's pick is SM1's.
     bool joint_draft_begin(int32_t d, staged_round & sr, std::string & err);
     bool joint_draft_end(int32_t d, const staged_round & sr, round_result & r, std::string & err);
     bool draft_pick_sampled() const { return dc_[0].sampled; }
     // FMS2 (build item 2): a catch-up as a lane of a joint catch-up (joint_frame::catchup). joint_catchup_begin:
     // draft_catchup's checks, the retained carry's pre-step copy and the descriptor staged (eagerly the start flag
-    // too); the caller launches the joint catch-up and calls joint_release; nothing to undo when the launch fails.
+    // too); the caller calls joint_start, launches the joint catch-up and calls joint_release; nothing to undo when
+    // the launch fails.
     // joint_catchup_end: the completion wait and draft_catchup's checks and ledger (on a recovered error the retained
     // carry back at its copy). test_draft_rewind (TEST ONLY, state-test mu1 catchup): the draft's length and index
     // back at n (>= batch_start(), <= draft_n()) and no carry copy, so a check repeats a catch-up from one state
@@ -247,7 +311,8 @@ class target {
                    std::string &       err);
     void front_abandon(front_round & fr);
     // TTTS1: a front verify as a lane of a joint round (joint_frame::front_verify): front_begin's checks and staging
-    // with the lane ring's PLE use, no launch (the caller launches the joint graphs and calls joint_release)
+    // with the lane ring's PLE use, no launch (the caller calls joint_start, launches the joint graphs and calls
+    // joint_release)
     bool joint_front_begin(int32_t         d,
                            const int32_t * prop,
                            int32_t         budget,
@@ -482,6 +547,9 @@ class target {
     bool sparse_built_ = false;  // SP2: the sparse form's graphs were captured (draft attention sparse)
     int64_t index_n_ = 0;        // SP2: the draft index's valid cells (index_n())
     int64_t draft_n_ = 0;     // -1: the draft no longer matches the ledger (a cut below it; reset clears it)
+    int32_t               pos_off_ = 0;     // MUP1 piece 5: the rotary position offset (set_pos_offset)
+    image_rows            img_;             // VIS1 Stage B: the slot's image spans (set_images)
+    std::vector<std::shared_ptr<const vision::prepared>> px_;  // and the read's prepared images
     // SP1: the retained carry's pre-step copy (20 KB a card, outside R1's reservation: debt), taken before the first
     // catch-up after a target round, with draft_n() then; restored with draft_n() on a truncate below the draft and
     // after a failed catch-up (FC-RD2's restore covers the draft's caches by their valid length)

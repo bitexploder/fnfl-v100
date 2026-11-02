@@ -5,7 +5,7 @@
 // round); a joiner goes to the smaller group, a leaver leaves when its group is not in flight, and membership changes
 // only between a group's steps. The leader's box (the front) runs one thing at a time: a group's front half and its
 // send (begin), then the follower runs the group's back half in arrival order; the leader takes a group's answers
-// (end) before that group's next front half. So Carlos runs F(A, n), F(B, n), F(A, n + 1), ... while Carlin runs
+// (end) before that group's next front half. So the front box runs F(A, n), F(B, n), F(A, n + 1), ... while the back box runs
 // B(A, n), B(B, n), ...: F(A, n + 1) waits only for B(A, n) (vLLM's batch queue of PP-size batches; SGLang's
 // micro-batch loop).
 //
@@ -13,6 +13,9 @@
 // (the whole chunk at once, in the lone geometry, while no writer is present). Its back chunks are the follower's:
 // it runs one read layer group after each step group's back half and more while no command waits, so a writer's back
 // half never waits behind more than one read layer group (fn/runtime/stage.h, the follower's read interleave).
+// MUP1 piece 3: a small read (engine_config::small_read_rows) runs each chunk's front whole in one read turn beside
+// writers too, and the follower runs its back half whole when it comes up, so a writer's halves wait behind at most one
+// small chunk's half on either box (the stall bound) and the read ends one turn after its front.
 //
 // The core decides; the caller acts and reports: next() names the next action, done() records its completion. The
 // invariants it keeps (pipe-test checks them on every action):
@@ -37,7 +40,8 @@ enum class act : int32_t {
     begin = 1,  // group g's front half and its send (its members: members)
     end   = 2,  // group g's answers (wait, then apply)
     front_read =
-        3,      // reader slot's front work: one layer group (n = 1, the writers geometry) or its chunk (n = 0, lone)
+        3,      // reader slot's front work: one layer group (n = 1, the writers geometry) or its chunk (n = 0, lone or
+                // a small read)
 };
 
 struct action {
@@ -54,8 +58,9 @@ class core {
     // begin); one missing leaves its group once the group is not in flight (one in flight finishes its step first)
     void set_writers(const std::vector<int32_t> & slots);
     // a read on slot has front work (its next chunk, or the rest of one); front_done: the read's front is finished
-    // (its back may still run on the follower: the caller makes the slot a writer once the read ended there)
-    void read_start(int32_t slot);
+    // (its back may still run on the follower: the caller makes the slot a writer once the read ended there). small
+    // (MUP1 piece 3): its front turns are whole chunks beside writers too
+    void read_start(int32_t slot, bool small = false);
     void front_done(int32_t slot);
     // a member's step failed or its request ended: it leaves its group (now when idle, else after its step)
     void leave(int32_t slot);
@@ -88,6 +93,7 @@ class core {
     int64_t              clock_    = 0;
     int32_t              last_     = 1;         // the group begun last
     std::vector<int32_t> readers_;
+    std::vector<int32_t> small_;                // MUP1: the readers whose reads are small
     size_t               next_reader_ = 0;      // the readers take the leader's read turns in rotation
     bool                 read_turn_   = false;  // a front read group is due before the next group action
     int32_t              groups_      = 2;
@@ -95,7 +101,7 @@ class core {
 
 // pipe-test: the core against a fake leader and follower (CPU only): 1 .. 8 writers, joins and leaves at every point,
 // cancels and ends of generation, readers interleaved and the follower's failure; every invariant checked at every
-// action. Appends one line a case to report; true when all pass
+// action; then APF1's writer-pause book (pace::self_test). Appends one line a case to report; true when all pass
 bool self_test(std::string & report);
 
 }  // namespace fn::runtime::pipe

@@ -3,6 +3,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -34,11 +35,7 @@ constexpr int32_t R = q::ratio;
 constexpr int32_t fixture_width = 2051; // the HX7 fixture's rows: the pinned source's top_k width (2,048 + 3)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "qa-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "qa-bench", what);
 }
 
 std::string utc_now() {

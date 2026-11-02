@@ -5,13 +5,17 @@
 // answers in the slot, and a third prompt that re-renders both.
 // MU1: also the two-user scheduling policy's pure parts (server-tu.h, Superfast TU1..TU6's rules): the readers' order,
 // the remaining and uncached counts, the one-sync slice's group prediction and the idle LRU's tie.
+// APF1: also P's range (tu.writer_pause_ms).
+// SSF1: also the slot-ID rule (a client's slot ID names a slot, or is -1 where any slot is allowed; no wrap).
 // usage: fnfl-splice-test. Exit status: 0 when every case passes.
 
 #include "server-splice.h"
 #include "server-tu.h"
 
+#include <climits>
 #include <cstdio>
 #include <map>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -318,15 +322,11 @@ int main() {
         // the path from what is active: nobody else lone, any writer writers, only other readers shared
         const bool a = tu_presence(0, 0) == tu_mode::lone && tu_presence(1, 0) == tu_mode::writers &&
                        tu_presence(3, 2) == tu_mode::writers && tu_presence(0, 1) == tu_mode::shared;
-        // FMU2's reader rule: every mode has the whole slice; beside writers one step of main's group in 1-layer
-        // groups (the policy's 2 layers at a chunk's start or when a group overfills the slice, else as many as fill
-        // it, at most 1,024)
-        const bool b = tu_mode_budget(tu_mode::writers, 100.0) == 100.0 &&
-                       tu_mode_budget(tu_mode::shared, 100.0) == 100.0 && tu_writers_groups(100.0, -1.0, 2) == 2 &&
-                       tu_writers_groups(100.0, 42.0, 2) == 2 && tu_writers_groups(100.0, 20.0, 2) == 5 &&
-                       tu_writers_groups(100.0, 120.0, 2) == 2 && tu_writers_groups(100.0, 0.0, 2) == 1024 &&
-                       tu_writers_groups(100.0, -1.0, 0) == 1;
-        put("presence rule: lone, writers, shared; the reader rule's whole slice and main's group", a && b,
+        // FMU2's reader rule: every mode has the whole slice (beside writers one step of units under the read budget,
+        // MUP2: the server's slice runs one step, so no group count)
+        const bool b =
+            tu_mode_budget(tu_mode::writers, 100.0) == 100.0 && tu_mode_budget(tu_mode::shared, 100.0) == 100.0;
+        put("presence rule: lone, writers, shared; the reader rule's whole slice", a && b,
             std::to_string(a) + std::to_string(b));
     }
     {
@@ -336,6 +336,33 @@ int main() {
         // admissions: all when nothing else has model work, one an iteration otherwise
         const bool adm = tu_admit_more(false, 3) && tu_admit_more(true, 0) && !tu_admit_more(true, 1);
         put("lone writer and admission charging", ok && adm, std::to_string(ok) + std::to_string(adm));
+    }
+    {
+        // APF1: the writers' pause target from POST /props: an integer from 10 to 1,000 ms; anything else is rejected
+        // (and a rejected request changes nothing: the server answers the error before any task)
+        const bool ok = tu_pause_ok(true, 10) && tu_pause_ok(true, 100) && tu_pause_ok(true, 1000) &&
+                        !tu_pause_ok(true, 9) && !tu_pause_ok(true, 1001) && !tu_pause_ok(true, 0) &&
+                        !tu_pause_ok(true, -100) && !tu_pause_ok(false, 100) && !tu_pause_ok(true, INT64_MAX);
+        put("writer pause P's range (APF1)", ok, std::to_string(ok));
+        // POST /props' parse: the valid integers set P; 5, 1,001, 100.5, "100", true and null are each refused with the
+        // range error and leave the valid P (250 here) untouched
+        using json    = nlohmann::json;
+        int32_t     p = 250;
+        std::string err;
+        bool        bad = true;
+        for (const json & v : { json(5), json(1001), json(100.5), json("100"), json(true), json(nullptr), json(-1) }) {
+            err.clear();
+            bad = bad && !tu_pause_parse(v, p, err) && p == 250 &&
+                  err == "tu.writer_pause_ms must be an integer from 10 to 1000";
+        }
+        bool good = true;
+        for (const int32_t x : { 10, 100, 1000 }) {
+            int32_t q = 250;
+            err.clear();
+            good = good && tu_pause_parse(json(x), q, err) && q == x && err.empty();
+        }
+        put("writer pause from POST /props: refused values keep P (APF1)", bad && good,
+            std::to_string(bad) + std::to_string(good));
     }
     {
         // the reader to follow the current turn: two long readers rotate (the other one); a lone reader follows
@@ -359,6 +386,102 @@ int main() {
         put("the reader to follow the current turn", a == 1 && b == 0 && c == 0 && d == 0 && e == -1 && f == 1,
             std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(c) + " " + std::to_string(d) + " " +
                 std::to_string(e) + " " + std::to_string(f));
+    }
+    {
+        // PRD1 item 9: a finishing reader (its front done, 0 rows left: TU6's order would rank it first, short) is
+        // never the pick nor the reader to follow; with only finishing readers, none (-1)
+        std::vector<tu_reader> r(3);
+        r[0]           = { 0, 0, 0, 100, 5, 20, false, true };
+        r[0].finishing = true;
+        r[1]           = { 1, 0, 30000, 32768, 4, 21, false, true };
+        r[2]           = { 2, 0, 9000, 9000, 3, 22, false, true };
+        const int a    = tu_pick_of(r, fast);
+        const int b    = tu_follow(r, 1, fast);
+        const int c    = tu_follow(r, -1, fast);
+        r[0].finishing = false;
+        const int d    = tu_pick_of(r, fast);  // the same reader not finishing: first (the control)
+        r[0].finishing = true;
+        const int e    = tu_pick_of(std::vector<tu_reader>{ r[0] }, fast);
+        const int f    = tu_follow(std::vector<tu_reader>{ r[0] }, 0, fast);
+        put("a finishing reader (front done) is never the pick or the reader to follow",
+            a == 2 && b == 2 && c == 2 && d == 0 && e == -1 && f == -1,
+            std::to_string(a) + " " + std::to_string(b) + " " + std::to_string(c) + " " + std::to_string(d) + " " +
+                std::to_string(e) + " " + std::to_string(f));
+    }
+
+    {
+        // PRD1 item 14: a read's end: generating only for a done read with no cancel pending; a cancel asked during the
+        // read releases the slot whether the engine ended it cancelled (at a chunk's end, the last one's included) or
+        // done (the split's front was done before the cancel came); a failure fails, cancel or not
+        const bool ok = tu_read_end(tu_read_out::done, false) == tu_end::generate &&
+                        tu_read_end(tu_read_out::done, true) == tu_end::release &&
+                        tu_read_end(tu_read_out::cancelled, true) == tu_end::release &&
+                        tu_read_end(tu_read_out::cancelled, false) == tu_end::release &&
+                        tu_read_end(tu_read_out::failed, false) == tu_end::fail &&
+                        tu_read_end(tu_read_out::failed, true) == tu_end::fail;
+        put("a cancel during a read is honoured at its end (done with a cancel pending: released, no token)", ok, "");
+    }
+
+    {
+        // SSF1: on 8 slots, only 0..7 name a slot and -1 means any slot only where allowed; upstream wrapped 99 to 3
+        // and -1, -2 to 7, 6
+        const int32_t n = 8;
+        std::string   got;
+        bool          ok = true;
+
+        const struct {
+            int64_t id;
+            bool    any;
+            bool    want;
+        } ids[] = {
+            { -2,      true,  false },
+            { -2,      false, false },
+            { -1,      true,  true  },
+            { -1,      false, false },
+            { 0,       false, true  },
+            { n - 1,   false, true  },
+            { n,       true,  false },
+            { 99,      true,  false },
+            { INT_MIN, true,  false },
+            { INT_MAX, true,  false },
+        };
+
+        for (const auto & c : ids) {
+            if (slot_id_valid(c.id, n, c.any) != c.want) {
+                ok = false;
+                got += " valid(" + std::to_string(c.id) + "," + std::to_string(int(c.any)) + ")";
+            }
+        }
+
+        // the path ID: the whole string parses, in range; a prefix ("3abc"), a blank, a '+' or an empty string do not
+        const struct {
+            const char * s;
+            int32_t      want;  // -1: refused
+        } paths[] = {
+            { "0",                    0  },
+            { "7",                    7  },
+            { "8",                    -1 },
+            { "99",                   -1 },
+            { "-1",                   -1 },
+            { "-2",                   -1 },
+            { "3abc",                 -1 },
+            { " 3",                   -1 },
+            { "3 ",                   -1 },
+            { "+3",                   -1 },
+            { "",                     -1 },
+            { "x",                    -1 },
+            { "99999999999999999999", -1 },
+        };
+
+        for (const auto & c : paths) {
+            int32_t    id   = -1;
+            const bool good = slot_id_parse(c.s, n, id);
+            if (good != (c.want >= 0) || (good && id != c.want) || (!good && id != -1)) {
+                ok = false;
+                got += std::string(" parse(\"") + c.s + "\")=" + std::to_string(good) + "," + std::to_string(id);
+            }
+        }
+        put("slot IDs (SSF1): in range or -1 for any, whole-string path IDs", ok, got);
     }
 
     std::printf("fnfl-splice-test: %s\n", n_fail == 0 ? "all PASS" : "FAIL");

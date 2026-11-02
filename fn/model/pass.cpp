@@ -81,6 +81,7 @@ bool embed(pass_card & p, int32_t rows, std::string & err) {
     a.hpost = p.emb_hpost;
     a.hx = p.emb_hx;
     a.err = p.c.rings->err(p.c.card);
+    a.q8    = p.embd_q8;
     return set_device(p, err) && (fn::embed::embed(rows, a, p.c.stream) ? true : fail(err, "embed"));
 }
 
@@ -293,6 +294,45 @@ fn::hc::sub_args head_sub_args(const pass_card & p, const use_counters & u) {
     return a;
 }
 
+// TTTS2: the Q8_0 head HC (UD-Q4_K_XL) as two launches: part 0 head_down2_q8 (the streams into carry, the moments into
+// head_mom; sends X-HC), part 1 head_up2_q8 (X-HMIX in both forms), each in head_sub's slots
+bool head_q8_part(pass_card & p, int32_t rows, int32_t part, const use_counters & u) {
+    return head_q8_sub(p, head_sub_args(p, u), rows, part, p.c.stream);
+}
+
+}  // namespace
+
+namespace {
+
+// the Q8_0 head's down and up arguments in h's slots (the lone launches' and, TTTS3, the joint head's lanes)
+fn::hc::down2_q8_args head_q8_down_args(const pass_card & p, const fn::hc::sub_args & h) {
+    fn::hc::down2_q8_args a;
+    a.a.d          = { nullptr, h.hres, h.hx, h.hpost, h.gamma, p.carry, p.head_mom };
+    a.a.hc_peer    = h.hc_peer;
+    a.a.hc_reset   = h.hc_reset;
+    a.a.hmix_reset = h.hmix_reset;
+    a.w            = p.head.q8_down;
+    return a;
+}
+
+fn::hc::up2_q8_args head_q8_up_args(const pass_card & p, const fn::hc::sub_args & h) {
+    fn::hc::up2_q8_args a;
+    a.a = { nullptr,    p.head_mom,  h.hc_ring,      p.carry, h.gamma, nullptr,
+            h.hmix_own, h.hmix_peer, p.c.ws.hc_runs, h.err,   h.card };
+    a.w = p.head.q8_up;
+    return a;
+}
+
+}  // namespace
+
+bool head_q8_sub(const pass_card & p, const fn::hc::sub_args & h, int32_t rows, int32_t part, void * stream) {
+    const auto st = static_cast<cudaStream_t>(stream);
+    return part == 0 ? fn::hc::head_down2_q8(rows, head_q8_down_args(p, h), st) :
+                       fn::hc::head_up2_q8(rows, head_q8_up_args(p, h), st);
+}
+
+namespace {
+
 // the head: part 0 HC's down phase (sends X-HC), 1 its up phase (reads X-HC, sends X-HMIX in both forms), 2 logits
 // (reads X-HMIX), then the decision's parts (decision_parts: each send before its read), and last commit and finish.
 // fused (the graphs, HC4): parts 0 and 1 are one launch of hc::head_sub at part 0
@@ -306,14 +346,22 @@ bool head_part(pass_card & p, int32_t rows, int32_t part, const use_counters & u
     const int32_t s = hc_slot_of(u, u.sub);
     const std::vector<decision_part> dp = decision_parts(o);
     bool ok = false;
-    if (part == 0 || part == 1) {
+    if ((part == 0 || part == 1) && p.head.q8_down != nullptr) {
+        ok = head_q8_part(p, rows, part, u);
+    } else if (part == 0 || part == 1) {
         if (fused && part == 1) {
             return true;
         }
         ok = fn::hc::head_sub(rows, fused ? 3 : part + 1, head_sub_args(p, u), p.c.stream);
     } else if (part == 2) {
-        const fn::head::logits_args la = {
-            rg.slot(r, fn::xchg::msg::hmix, s), rg.err(r), r, p.out_w, fn::head::n_vocab_card, p.logits, nullptr};
+        const fn::head::logits_args la = { rg.slot(r, fn::xchg::msg::hmix, s),
+                                           rg.err(r),
+                                           r,
+                                           p.out_w,
+                                           fn::head::n_vocab_card,
+                                           p.logits,
+                                           nullptr,
+                                           p.out_q8 };
         // SM1: the decision's start in context (stamp_logits), only with a sampler, so TG1's graphs are unchanged
         ok = fn::head::logits(rows, la, p.c.stream) &&
              (o.sampling == nullptr || fn::round::stamp_logits(p.rstate, p.c.stream));
@@ -353,7 +401,7 @@ bool ple_runs(const pass_options & o) {
     return o.layer_lo == 0 && o.layer_hi >= 1;
 }
 
-} // namespace
+}  // namespace
 
 bool pack_dense_all(model & m, std::string & err) {
     for (int32_t l = 0; l < fn::n_layer; ++l) {
@@ -382,6 +430,8 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
         }
     }
     p.token_embd = tensor_ptr(m, "token_embd.weight", card, err);
+    const int32_t te = model::find("token_embd.weight");
+    p.embd_q8        = te >= 0 && std::strcmp(m.tp(te).format, "Q8_0") == 0;  // TTTS2
     if (p.token_embd == nullptr) {
         return false;
     }
@@ -392,20 +442,35 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
         p.ple_w.norm_query = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_query.weight", card, err));
         p.ple_w.norm_conv  = reinterpret_cast<const float *>(tensor_ptr(m, "blk.1.ple_norm_conv.weight", card, err));
         p.ple_w.conv = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "blk.1.ple_conv1d.weight", card, err));  // F16
+        // TTTS3 (UD-Q4_K_XL): key and value Q8_0 as the file stores them; TTTS2: the taps F32 in the file
+        p.ple_w.kv         = ple_kv_of(m);
+        if (ple_conv32_of(m)) {
+            p.ple_w.conv32 = reinterpret_cast<const float *>(p.ple_w.conv);
+        }
         if (p.ple_w.key == nullptr || p.ple_w.value == nullptr || p.ple_w.norm_key == nullptr ||
             p.ple_w.norm_query == nullptr || p.ple_w.norm_conv == nullptr || p.ple_w.conv == nullptr) {
             return false;
         }
     }
     if (win.head) {
-        p.head.w_down = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_down.weight", card, err));  // BF16
-        p.head.w_up   = reinterpret_cast<const uint16_t *>(tensor_ptr(m, "output_hc_up.weight", card, err));
+        const int32_t   hd  = model::find("output_hc_down.weight");
+        const uint8_t * hdw = tensor_ptr(m, "output_hc_down.weight", card, err);
+        const uint8_t * huw = tensor_ptr(m, "output_hc_up.weight", card, err);
+        if (hd >= 0 && std::strcmp(m.tp(hd).format, "Q8_0") == 0) {
+            // TTTS2: UD-Q4_K_XL's Q8_0 head HC: head_down2_q8 / head_up2_q8 (the draft head's kernels, hc.h layouts)
+            p.head.q8_down = hdw;
+            p.head.q8_up   = huw;
+        } else {
+            p.head.w_down = reinterpret_cast<const uint16_t *>(hdw);  // BF16
+            p.head.w_up   = reinterpret_cast<const uint16_t *>(huw);
+        }
         p.head.gamma  = reinterpret_cast<const float *>(tensor_ptr(m, "output_hc_norm.weight", card, err));
         p.out_w       = tensor_ptr(m, "output.weight", card, err);
-        if (p.head.w_down == nullptr || p.head.w_up == nullptr || p.head.gamma == nullptr || p.out_w == nullptr) {
+        if (hdw == nullptr || huw == nullptr || p.head.gamma == nullptr || p.out_w == nullptr) {
             return false;
         }
         const int32_t oi = model::find("output.weight");
+        p.out_q8         = oi >= 0 && std::strcmp(m.tp(oi).format, "Q8_0") == 0;
         if (oi < 0 || oi >= (int32_t) m.dense_packed.size() || m.dense_packed[size_t(oi)] == 0) {
             return fail(err, "output.weight: not in DP2's packed layout (pack_dense_all)");
         }
@@ -496,6 +561,7 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     // the layers read N_before and the rope planes from the descriptor (FC-RD1)
     p.c.n_before = &p.desc->n_before;
     p.c.pos = p.desc->pos;
+    p.c.pos_off  = &p.desc->pos_off;  // MUP1 piece 5
     // SR1: every versioned object (each GDN layer's state and convolution history, the PLE history; FC-ST1) reads and
     // writes its versions through the round state's one committed-slot word, which the commit node moves
     p.c.cur = &p.rstate->cur;
@@ -631,8 +697,8 @@ step_status pass_pair_enqueue(pass_card * const p[2], int32_t rows, const pass_o
     }
     // ME12: on one device and stream the head HC's four phase launches are one (hc::head_pair) at part 0; the scratch
     // is card 0's ws.mom[1], which the target's BF16 layers leave unused (layer.cpp hc_pair_phase)
-    const bool hc_pair =
-        p[0]->c.device == p[1]->c.device && p[0]->c.stream != nullptr && p[0]->c.stream == p[1]->c.stream;
+    const bool hc_pair = p[0]->c.device == p[1]->c.device && p[0]->c.stream != nullptr &&
+                         p[0]->c.stream == p[1]->c.stream && p[0]->head.q8_down == nullptr;
     for (int32_t part = 0; part < n_head_parts(o); ++part) {
         if (hc_pair && part < 2) {
             if (part == 0 && !head_pair_part(p, rows, u, err)) {
@@ -759,6 +825,16 @@ bool joint_begin(joint_pass & jp, std::string & err) {
 // PLE's part 0 of every lane in one joint launch on lane 0's stream (FMU2 build item 4: each weight loaded once; each
 // lane's key and value bitwise its own part 0), in the joint frame's PLE region
 bool joint_ple_products(joint_pass & jp, std::string & err) {
+    // F32 matrices (TTTS2's widened form, the test reference) have no joint product: each lane's part 0 alone (TTTS3:
+    // and the test's forced fallback)
+    if (jp.lane[0]->ple_w.kv == fn::ple::kv_fmt::f32 || (jp.j.lone & joint_lone_ple) != 0) {
+        for (int32_t k = 0; k < jp.lanes; ++k) {
+            if (!ple_part(*jp.lane[k], jp.j.rows, 0, err)) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (jp.j.dense_work == nullptr) {
         return fail(err, "ple joint products: no joint work");
     }
@@ -785,7 +861,8 @@ void joint_layer_in(joint_pass & jp, int32_t l, const layer_state * st[], layer_
     }
 }
 
-// the head HC of every lane in one launch (hc::head_sub_joint; mode as sub's)
+// the head HC of every lane in one launch (hc::head_sub_joint; mode as sub's). TTTS3: the Q8_0 head (UD-Q4_K_XL) in
+// lanes, one launch a phase (mode bit 0 the down, bit 1 the up) at the round's rows, each lane with its own run counters
 bool joint_head_hc(joint_pass & jp, int32_t mode, const use_counters & u, std::string & err) {
     fn::hc::sub_args ha[fn::xchg::max_lanes];
     for (int32_t k = 0; k < jp.lanes; ++k) {
@@ -794,8 +871,23 @@ bool joint_head_hc(joint_pass & jp, int32_t mode, const use_counters & u, std::s
     if (!set_device(*jp.lane[0], err)) {
         return false;
     }
-    return fn::hc::head_sub_joint(jp.lanes, jp.j.rows, mode, ha, jp.lane[0]->c.stream) ? true :
-                                                                                         fail(err, "head hc sub_joint");
+    const auto st = jp.lane[0]->c.stream;
+    if (jp.lane[0]->head.q8_down != nullptr) {
+        fn::hc::down2_q8_args d[fn::xchg::max_lanes];
+        fn::hc::up2_q8_args   up[fn::xchg::max_lanes];
+        for (int32_t k = 0; k < jp.lanes; ++k) {
+            d[k]  = head_q8_down_args(*jp.lane[k], ha[k]);
+            up[k] = head_q8_up_args(*jp.lane[k], ha[k]);
+        }
+        if ((mode & 1) != 0 && !fn::hc::head_down2_q8_lanes(jp.lanes, jp.j.rows, d, st)) {
+            return fail(err, "head hc q8 down lanes");
+        }
+        if ((mode & 2) != 0 && !fn::hc::head_up2_q8_lanes(jp.lanes, jp.j.rows, up, st)) {
+            return fail(err, "head hc q8 up lanes");
+        }
+        return true;
+    }
+    return fn::hc::head_sub_joint(jp.lanes, jp.j.rows, mode, ha, st) ? true : fail(err, "head hc sub_joint");
 }
 
 // every lane's logits in one launch into its own buffer (head::logits_joint)
@@ -804,13 +896,14 @@ bool joint_logits(joint_pass & jp, const use_counters & u, std::string & err) {
     const int32_t s = hc_slot_of(u, u.sub);
     for (int32_t k = 0; k < jp.lanes; ++k) {
         pass_card & p = *jp.lane[k];
-        la[k] = {p.c.rings->slot(p.c.card, fn::xchg::msg::hmix, s),
-                 p.c.rings->err(p.c.card),
-                 p.c.card,
-                 p.out_w,
-                 fn::head::n_vocab_card,
-                 p.logits,
-                 nullptr};
+        la[k]         = { p.c.rings->slot(p.c.card, fn::xchg::msg::hmix, s),
+                          p.c.rings->err(p.c.card),
+                          p.c.card,
+                          p.out_w,
+                          fn::head::n_vocab_card,
+                          p.logits,
+                          nullptr,
+                          p.out_q8 };
     }
     pass_card & p0 = *jp.lane[0];
     if (!set_device(p0, err)) {

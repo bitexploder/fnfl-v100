@@ -7,10 +7,10 @@
 // stage's (fn/runtime/stage.h), so nothing here knows a model constant (the GLM port reuses it).
 //
 // One context and one worker a box, owned by the link thread: the worker is UCS_THREAD_MODE_SINGLE and only that thread
-// progresses it. The thread busy-polls while a request is outstanding and sleeps on the worker's event descriptor (and
-// the submission eventfd) when idle. The runtime talks to it through a bounded single-producer submission queue, and
-// reads each operation's completion from that operation's own slot (an atomic state the link thread publishes with
-// release order), so neither side blocks the other.
+// progresses it. The thread busy-polls while a request is outstanding, and for a bounded window after its last activity
+// (TTTS7), and sleeps on the worker's event descriptor (and the submission eventfd) when idle. The runtime talks to it
+// through a bounded single-producer submission queue, and reads each operation's completion from that operation's own
+// slot (an atomic state the link thread publishes with release order), so neither side blocks the other.
 //
 // Connection: the follower listens (ucp_listener_create) on its address; the leader connects by socket address
 // (ucp_ep_create, UCP_EP_PARAM_FIELD_SOCK_ADDR), both in UCP_ERR_HANDLING_MODE_PEER, so a lost peer completes every
@@ -46,6 +46,11 @@
 //                   (a graph's host-to-device copy node, in stream order) has run, or the host has read it.
 // Every wait is bounded (options::timeout_s): a wait that times out, or ends because the peer is lost, fails with a
 // message that names the kind, group, sequence and card.
+//
+// TTTSBS: an operation's buffer belongs to the transport from its post until the runtime observes its end (a
+// completion, or a cancel's acknowledged end); a timeout is the caller's wish to stop waiting, not that end. So a
+// wait never returns while its operation can still touch the buffer (unless it says it is held, with its owner kept
+// by the link), a stale handle is refused, and stop ends every operation before it unmaps.
 
 #include <atomic>
 #include <cstddef>
@@ -102,6 +107,9 @@ struct options {
     uint16_t    port      = 13371;
     double      timeout_s = 10.0;  // every operation's wait bound (the default for wait)
     double      connect_s = 60.0;  // the leader retries its connect this long; the follower waits this long for it
+    // TTTSBS: a failed wait's bound to observe its operations' ends after their cancels (then once more after the
+    // transport is quiesced)
+    double      retire_s  = 5.0;
     hello       me;
 };
 
@@ -126,19 +134,32 @@ class link {
     // register pinned host memory [p, p + n) once (ucp_mem_map); sends and receives inside it skip registration
     bool          map(void * p, size_t n, std::string & err);
 
-    // post a send or receive of n bytes at p (inside a mapped range, or not); returns the operation's id (>= 0), or
-    // -1 with err (the link is lost, or no operation slot is free). A receive matches tag exactly and must receive
-    // exactly n bytes. Single producer: one runtime thread posts, waits and tests
-    int32_t send(uint64_t tag, const void * p, size_t n, std::string & err);
-    int32_t recv(uint64_t tag, void * p, size_t n, std::string & err);
+    // post a send or receive of n bytes at p (inside a mapped range, or not); returns the operation's handle (>= 0;
+    // it names this use of an operation slot, so a handle of an earlier use is refused), or -1 with err (the link is
+    // lost, or no operation slot is free). A receive matches tag exactly and must receive exactly n bytes. keep: the
+    // buffer's owner, held by the link until the operation's end is observed (TTTSBS), whatever its caller does.
+    // Single producer: one runtime thread posts, waits and tests
+    int32_t send(uint64_t tag, const void * p, size_t n, std::string & err, std::shared_ptr<const void> keep = nullptr);
+    int32_t recv(uint64_t tag, void * p, size_t n, std::string & err, std::shared_ptr<const void> keep = nullptr);
     // wait for op to complete, at most timeout_s (< 0: options::timeout_s); true when it completed with its bytes.
-    // On false the message names the tag; a timed-out receive is cancelled (its buffer may still be written until the
-    // cancel completes, which the link thread finishes before the slot is reused). The op is done either way
+    // On false the message names the tag. Either way the op is finished and its buffer released by the transport
+    // (TTTSBS): a wait that gives up cancels the op and observes its end first (a completion that won the race is a
+    // success), within options::retire_s, else the link is quiesced and its end awaited once more; an op whose end
+    // still is not observed stays held, its keep with it, until it ends or the link stops, and the message says so
     bool    wait(int32_t op, std::string & err, double timeout_s = -1);
-    // without waiting: done set when the op completed (then as wait: true for its bytes, false with err)
+    // without waiting: done set when the op ended (then as wait: true for its bytes, false with err); a stale handle
+    // is false with done set
     bool    test(int32_t op, bool & done, std::string & err);
-    // wait for one of ops[0 .. n - 1] (n <= 8) to complete; which: its index. As wait otherwise
+    // wait for one of ops[0 .. n - 1] (n <= 8) to complete; which: its index. As wait otherwise (a give-up retires
+    // all n)
     bool    wait_any(const int32_t * ops, int32_t n, int32_t & which, std::string & err, double timeout_s = -1);
+    // TTTSBS: end ops[0 .. n - 1] (-1 and stale handles skipped) that are not finished: each cancelled, its end
+    // observed and the op finished (its result dropped), as a wait's give-up. Returns how many stay held (0: every
+    // buffer released by the transport)
+    int32_t retire(const int32_t * ops, int32_t n);
+    // TTTSBS: the transport stops touching memory: every posted operation cancelled and the endpoint force-closed by
+    // the link thread; the link is lost afterwards (why names it). Its operations' ends follow (wait, retire, held)
+    void    quiesce(const std::string & why);
 
     // the endpoint's transports as UCX chose them ("tcp/enp3s0np0 ...", "rc_mlx5/mlx5_0:1 ..."), set after start
     const std::string & transport() const;
@@ -148,12 +169,18 @@ class link {
     // an unexpected message waiting on the worker, if any (its tag), for a refusal's message; false: none seen
     bool                unexpected(uint64_t & tag, size_t & bytes);
     counters            totals() const;
-    // close the endpoint (flush, then close) and stop the thread; the destructor does it too
+    // TTTSBS: operations given up whose end has not been observed (their buffers still in use, their keeps held);
+    // the ones that ended are released first
+    int32_t             held();
+    // stop: every posted receive cancelled and the endpoint closed (flushed, or forced when lost) by the link thread,
+    // which ends with them, bounded; then the worker destroyed (any request left ends with it), and only then the
+    // ranges unmapped and the keeps released (TTTSBS). The destructor does it too
     void                stop();
 
     struct impl;
 
   private:
+    friend struct fault_access;  // fn/xchg/link_fault.h (test builds)
     std::unique_ptr<impl> p_;
 };
 

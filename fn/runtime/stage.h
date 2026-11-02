@@ -1,6 +1,6 @@
 #pragma once
 
-// TTTS1: the split's two stages. Flash-Next across Carlos and Carlin: tensor parallel across each box's two cards,
+// TTTS1: the split's two stages. Flash-Next across two boxes: tensor parallel across each box's two cards,
 // the layers split between the boxes at k (model::window). Each box runs its own engine (fn/runtime/runtime.h) on its
 // window: the leader's front (layers 0 .. k - 1, the embedding and PLE; the server, the tokenizer and the scheduler
 // stay on its box), the follower's back (layers k .. 47, the head, the decision, the commit and the MTP draft). The
@@ -37,41 +37,29 @@
 // No model constant lives here beyond the boundary's and the crossing's sizes (fn/model/pass.h, prompt.h), so the
 // GLM port reuses the protocol.
 
+#include "fn/runtime/pace.h"
 #include "fn/runtime/pipe.h"
 #include "fn/runtime/prefill.h"
 #include "fn/runtime/runtime.h"
+#include "fn/runtime/stage_msg.h"
+#include "fn/runtime/stage_wire.h"
 #include "fn/xchg/link.h"
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
 namespace fn::runtime::stage {
 
-// ---- the transport ----
-
-class port {
-  public:
-    virtual ~port()                                                                 = default;
-    virtual int32_t send(uint64_t tag, const void * p, size_t n, std::string & err) = 0;
-    virtual int32_t recv(uint64_t tag, void * p, size_t n, std::string & err)       = 0;
-    virtual bool    wait(int32_t op, std::string & err, double timeout_s)           = 0;
-    // without waiting: done set when op completed (then as wait: true for its bytes); op is finished either way
-    virtual bool    test(int32_t op, bool & done, std::string & err)                = 0;
-    virtual bool    map(void * p, size_t n, std::string & err)                      = 0;
-    virtual bool    lost() const                                                    = 0;
-
-    // the leader's side gives up on a lost stage (the in-process pair: the follower sees its peer lost; the link: the
-    // process's exit does it)
-    virtual void close() {}
-};
-
-// the box-to-box link (the caller keeps it alive)
-std::unique_ptr<port> link_port(fn::xchg::link::link & l);
+// ---- X-HELLO ----
 
 // X-HELLO's identities, computed the same way by every leader (the drive's, the server's) and the follower: the model
 // files (each file's size and first 16 MiB: its GGUF header and tensor table; a 128-bit FNV-1a, an identity check,
@@ -85,109 +73,9 @@ std::string hello_settings(int32_t                      k,
                            bool                         kv_q8,
                            int32_t                      spec_d,
                            const std::string &          attention,
-                           const std::vector<int32_t> & eog);
+                           const std::vector<int32_t> & eog,
+                           bool                         images = false);  // VIS1: the front reads images
 std::string hello_hash(const std::string & text);
-// split-test's in-process pair: a send completes into the peer's matching receive by a host copy
-void        loop_pair(std::unique_ptr<port> & a, std::unique_ptr<port> & b);
-
-// ---- the messages ----
-
-enum class op : int32_t {
-    set_sampling = 1,
-    prefill      = 2,
-    read_begin   = 3,
-    read_step    = 4,
-    read_cancel  = 5,
-    truncate     = 6,
-    release_slot = 7,
-    pool         = 8,
-    step_group   = 9,
-    bye          = 10,
-    set_draft    = 11,
-    drain        = 12,  // a failed read's crossings the follower did not take: received and dropped
-    // the drive's tests (rollback-test mu1, joint-kl): a probe of the back's state (a: what; answered with the
-    // ack's a bytes, then the bytes), the engine rebuilt (reconfigure: a the KV format q8, b the d, c the joint
-    // switches, base the cells a slot), and a slot reset with a ledger of the given tokens (test_prompt)
-    probe        = 13,
-    reconfigure  = 14,
-    test_prompt  = 15,
-};
-
-// reconfigure's c: the joint switches as engine_config holds them
-constexpr int32_t sw_joint_x16 = 1, sw_router_tc = 2, sw_dense_f16 = 4, sw_eager = 8;
-
-constexpr int32_t max_members = 8;
-
-// a step group's member: its slot's next step as the leader runs it (forced: the drive's tests, a forced round of
-// rows ledger rows; the back answers with its logits rows too)
-enum class mkind : int32_t { begin = 0, generate = 1, verify = 2, forced = 3 };
-
-struct member {
-    int32_t slot    = -1;
-    int32_t kind    = 0;  // mkind
-    int32_t rows    = 0;  // its front round's rows (0: begin)
-    int32_t d       = 0;  // verify: the proposals
-    int32_t joint   = 0;  // verify: a lane of the group's joint round
-    int32_t prop[4] = { 0, 0, 0, 0 };
-};
-
-struct ctrl {
-    int32_t  op   = 0;
-    int32_t  slot = -1;
-    int32_t  a = 0, b = 0, c = 0, n_tokens = 0;  // per op (prefill / read_begin: n_reuse; read_step: groups, mode)
-    int64_t  base = 0;                           // a read's first crossing number
-    // set_sampling: the request's options
-    uint64_t seed = 0;
-    float    temp = 1.0f, top_p = 0.95f, min_p = 0.05f;
-    int32_t  top_k = 20, max_tokens = -1, n_ctx = 0;
-    // step_group
-    int32_t  group = 0, n_members = 0;
-    member   m[max_members];
-    int32_t  pad[12] = {};
-};
-
-static_assert(sizeof(ctrl) % 8 == 0, "X-CTRL's record");
-
-struct ack {
-    int32_t status = 0;  // run_status, or the read's status
-    int32_t a = 0, b = 0, c = 0;
-    int64_t x = 0, y = 0;
-    char    why[232] = {};
-};
-
-static_assert(sizeof(ack) % 8 == 0, "X-ACK's record");
-
-// X-STEP: a member's step and its next step
-struct step_out {
-    int32_t  slot   = -1;
-    int32_t  status = 0;  // run_status of the step (ok: ran or only drafted)
-    int32_t  ran    = 0;  // a step ran (a begin may only draft)
-    int32_t  kind = 0, d = 0, a = 0, n_out = 0, end = 0, cut = 0, waits = 0, joint = 0;
-    int32_t  out[5]       = {};
-    int32_t  round_n_out  = 0;   // the decided round's tokens before the end-of-generation cut (verify: a + 1)
-    int32_t  round_out[5] = {};
-    int32_t  cut_rows     = -1;  // the cut's kept rows (-1: no cut)
-    int32_t  pad0         = 0;
-    int64_t  n_keep       = 0;
-    int64_t  n_before     = -1;  // -1: the step was not entered
-    uint64_t hash         = 0;   // the step's decision hash (with engine_config::record_hash)
-    double   to_draft_s = -1, to_verify_s = -1, to_catchup_s = -1, to_one_s = -1, wall_s = 0;
-    int32_t  next_kind    = 0;   // mkind of the next step: 0 none (the request ended), 1 generate, 2 verify
-    int32_t  next_d       = 0;
-    int32_t  next_prop[4] = {};
-    char     why[192]     = {};
-};
-
-static_assert(sizeof(step_out) % 8 == 0, "X-STEP's record");
-
-struct crossing_head {
-    int32_t slot = -1;
-    int32_t rows = 0, half[2] = { 0, 0 };
-    int64_t start = 0, seq = 0, bytes = 0;
-    int32_t pieces = 0, pad = 0;
-};
-
-constexpr int64_t piece_bytes = int64_t(42) << 20;  // a crossing's piece (about 1,024 rows)
 
 // ---- the prompt crossing (prefiller's pf_stage) ----
 
@@ -200,8 +88,10 @@ class crossing : public pf_stage {
     void expect(int32_t slot, int64_t base);
     bool out(target & t, model::prompt_path & pp, const model::prompt_chunk & c, std::string & err) override;
     bool in(target & t, model::prompt_path & pp, model::prompt_chunk & c, std::string & err) override;
-    // the leader: every crossing's sends completed (before a read reports done)
+    // the leader: every crossing's sends completed; PRD1 item 9: with a slot, those of the buffers that slot filled
+    // last (before its read reports done)
     bool drain(std::string & err);
+    bool drain(int32_t slot, std::string & err);
 
     // the leader: the crossings sent for slot's current read (its chunks' count); abort, when set, is asked before
     // each crossing: true stops the read there (the follower already failed it)
@@ -213,6 +103,23 @@ class crossing : public pf_stage {
     std::function<bool()> abort;
     // the follower: slot's crossings base + i for i below count that it has not taken, received and dropped
     bool                  drop(int32_t slot, int64_t base, int64_t count, std::string & err);
+
+    // PRD1 item 11 (the follower): the received-ahead crossing. plan: the slot's read has chunks chunks (set after
+    // its read_begin; 0, as a prefill, takes none ahead). When chunk n's copy-in starts, chunk n + 1's header receive
+    // is posted if it is in the plan; poll (between units, never waiting) posts its pieces once the header landed,
+    // next says no other chunk's copy-in comes before it, and its buffer's previous copy-in completed. in validates a
+    // header taken ahead as any other. retire_ahead ends a receive taken ahead for slot (the read's end or cancel)
+    void plan(int32_t slot, int64_t chunks);
+
+    int32_t ahead_slot() const { return ahead_.slot; }
+
+    bool poll(bool next, std::string & err);
+    void retire_ahead(int32_t slot);
+
+    // the chunks of slot's current read whose pieces had all landed before in was entered (the follower's)
+    int64_t received_ahead(int32_t slot) const override {
+        return front_ ? -1 : slot >= 0 && slot < max_split_slots ? ahead_done_[slot] : 0;
+    }
 
     // totals: crossings and bytes
     int64_t count() const { return n_; }
@@ -228,13 +135,35 @@ class crossing : public pf_stage {
     uint8_t *            buf_[2] = { nullptr, nullptr };
     int64_t              cap_    = 0;
     std::vector<int32_t> ops_[2];                       // the sends (front) of each buffer
+    int32_t              owner_[2] = { -1, -1 };        // the slot whose crossing filled each buffer last (front)
     void *               done_[2][2]             = {};  // the back: each buffer's copy-in completed, on each card
     bool                 used_[2]                = { false, false };
     int64_t              base_[max_split_slots]  = {};
     int64_t              sent_[max_split_slots]  = {};  // the leader: crossings sent for the slot's read
     int64_t              taken_[max_split_slots] = {};  // the follower: the next crossing number the slot's read takes
     int64_t              n_ = 0, bytes_ = 0;
-    crossing_head        head_ = {};
+
+    // PRD1 item 11: the crossing taken ahead (slot -1: none), its header's receive (head: landed) and its pieces'
+    struct ahead_rx {
+        int32_t                        slot = -1;
+        int64_t                        n    = -1;
+        int32_t                        hop  = -1;
+        bool                           head = false, posted = false;
+        std::shared_ptr<crossing_head> hr;
+        std::vector<int32_t>           ops;
+    };
+
+    ahead_rx ahead_;
+    int64_t  plan_[max_split_slots]       = {};
+    int64_t  ahead_done_[max_split_slots] = {};
+    int32_t  dev_[2]                      = { -1, -1 };  // the back's cards (the copy-in events' devices)
+
+    // every send of both buffers ended (retired) after a failure: none reads a buffer refilled later
+    void retire_sends();
+    // a header's pieces' receives into buffer b (posted; their ops in ops)
+    bool post_pieces(const crossing_head & h, int64_t n, int32_t b, std::vector<int32_t> & ops, std::string & err);
+    // the buffer's previous copy-in completed on both cards (wait: synchronize; else query)
+    bool buffer_free(int32_t b, bool wait, std::string & err);
 };
 
 // ---- the boundary buffers ----
@@ -248,9 +177,13 @@ struct buffers {
 
 // ---- the leader (the front engine's driver) ----
 
-struct leader_stats {
-    int64_t groups = 0, members = 0, boundaries = 0, boundary_bytes = 0, crossings = 0, crossing_bytes = 0;
-    double  back_wait_s = 0;  // the leader's time waiting for X-STEP and acknowledgments
+// TTTS3: the split's joint refusals. A failed graph capture turns that joint path off for the engine's life (the
+// one-box path's rule, runtime.cpp); every refusal's message is printed once per distinct cause, not once a round.
+struct joint_refusals {
+    bool                  off = false;  // a capture failed: no more joint rounds on this path
+    std::set<std::string> said;
+    // record a refusal: latch on a failed capture, then print "<tag>: <cause>; <tail>" if this cause is new
+    void                  refuse(const char * tag, const std::string & cause, bool capture_failed, const char * tail);
 };
 
 class leader {
@@ -260,14 +193,35 @@ class leader {
     bool init(engine & e, port & p, crossing & x, std::string & err);
 
     run_status set_sampling(int32_t slot, const request_options & o);
-    run_status prefill(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse, int32_t & n_processed);
-    int32_t read_begin(int32_t slot, const int32_t * tokens, int32_t n_tokens, int32_t n_reuse, int32_t & n_processed);
-    read_status read_step(int32_t slot, int32_t n_groups, read_mode mode);
+    // VIS1 Stage B: images as engine::prefill's; their spans (not their pixels) go to the follower after the tokens
+    run_status  prefill(int32_t                           slot,
+                        const int32_t *                   tokens,
+                        int32_t                           n_tokens,
+                        int32_t                           n_reuse,
+                        int32_t &                         n_processed,
+                        const std::vector<prompt_image> * images = nullptr);
+    int32_t     read_begin(int32_t                           slot,
+                           const int32_t *                   tokens,
+                           int32_t                           n_tokens,
+                           int32_t                           n_reuse,
+                           int32_t &                         n_processed,
+                           const std::vector<prompt_image> * images = nullptr);
+    // MUP2: writers mode with a budget: the front's units under this box's budget, and the back's chunks budgeted on
+    // the follower (APF1: by its own writer-pause deadline under the budget's P)
+    // PRD1 item 9: beside writers or other readers, front_done once the front's read ended with its back halves out;
+    // the slot is then polled: read_ready (no wait: every back half answered), read_poll (its end, or front_done)
+    read_status read_step(int32_t slot, int32_t n_groups, read_mode mode, const read_budget * budget = nullptr);
+    bool        read_ready(int32_t slot);
+    read_status read_poll(int32_t slot);
     void        read_cancel(int32_t slot);
+    // MUP2 piece 4: the back's units account of slot's read so far (its last answered back chunk's)
+    void        back_info(int32_t slot, read_info & out) const;
     run_status  truncate(int32_t slot, int32_t n_keep);
     run_status  release_slot(int32_t slot);
     // the draft's d and form (engine::set_draft) on both boxes, between requests
     run_status  set_draft(int32_t d, bool sparse);
+    // MUP1 piece 5: the slot's rotary position offset (engine::set_pos_offset) on both boxes, between its requests
+    run_status  set_pos_offset(int32_t slot, int32_t off);
     // one step of each of n slots (1 .. 8), as engine::step_joint (the full-d verifies of 2 .. 4 lanes as joint
     // rounds); synchronous: returns with every member's step
     void        step_group(const int32_t * slots, int32_t n, joint_step_out * res);
@@ -276,13 +230,22 @@ class leader {
     // an orderly end: X-BYE, answered
     void        bye();
 
-    bool lost() const { return lost_; }
+    bool lost() const { return ctl_.lost(); }
 
-    const std::string & lost_why() const { return why_; }
+    const std::string & lost_why() const { return ctl_.why(); }
 
     const leader_stats & stats() const { return st_; }
 
+    // PRD1 item 4 (TEST): the front round's joint verify refusals (the latch and the causes said)
+    const joint_refusals & test_joint_verify() const { return joint_verify_; }
+
     const std::string & error() const { return err_; }
+
+    // APF1: what the next step groups carry to the follower (the pipeline sets it before each begin): P, the front's
+    // groups (bit g) and their generations; and the last ended group's back stage (ms, from its answers; -1: none)
+    void set_pace(int32_t pause_ms, uint32_t live, const int32_t * gen);
+
+    double last_back_ms() const { return last_back_ms_; }
 
     // the pipelined group step's halves (fn/runtime/pipe.h): begin runs the members' front rounds and sends the group,
     // end waits for its answers and closes the members' steps; one group in flight per member slot
@@ -299,8 +262,12 @@ class leader {
     // after the leader rebuilt its engine (rebind): the follower's rebuilt alike (c: op::reconfigure's fields)
     run_status               reconfigure(ctrl c);
     void                     rebind(engine & e);
-    // both boxes' slot reset, its ledger the tokens (none processed)
-    run_status               test_prompt(int32_t slot, const std::vector<int32_t> & tokens);
+    // both boxes' slot reset, its ledger the tokens (none processed); MUP2 keep: no reset, the processed tokens kept
+    // (target::keep_processed) and the tokens appended to the ledger (joint-kl at depth)
+    run_status               test_prompt(int32_t slot, const std::vector<int32_t> & tokens, bool keep = false);
+    // APF2: both boxes' forced prompt routes (prefiller::test_force_route) for the chunks that start after the call;
+    // back: the follower process's executed-variant totals (prompt_route_totals; collected from the first call)
+    run_status test_force_route(const model::prompt_route_force & f, model::prompt_path::route_counts * back = nullptr);
     // a forced round of rows rows on each of n slots (2 .. 4 of the same rows: a joint round) as a step group; its
     // members' back logits (forced_logits) after group_end: card 0's rows x n_vocab_card F32, then card 1's
     std::unique_ptr<pending> group_begin_forced(const int32_t * slots, int32_t n, int32_t rows, int32_t group);
@@ -322,35 +289,51 @@ class leader {
         int32_t prop[4] = {};
     };
 
-    bool command(ctrl & c, const int32_t * tokens, ack & a, double timeout_s);
-    void dispatch(pending & g, int32_t group);
+    // a command answered (its X-ACK in a); false: the stage is lost (err_)
+    bool                 command(ctrl & c, const int32_t * tokens, ack & a, double timeout_s);
+    std::shared_ptr<cmd> send_cmd(const ctrl & c, const int32_t * tokens);
+    bool                 wait_cmd(cmd & k, double timeout_s);
+    void                 dispatch(pending & g, int32_t group);
     // a failed read's crossings the follower did not take, dropped there (op::drain)
-    void drain_read(int32_t slot, int64_t base);
-    bool send_ctrl(ctrl & c, const int32_t * tokens, int32_t & ack_op, ack & a);
-    bool wait_ack(int32_t op, ack & a, double timeout_s);
-    void lose(const std::string & why);
+    void                 drain_read(int32_t slot, int64_t base);
 
     engine *                                            e_ = nullptr;
     port *                                              p_ = nullptr;
     crossing *                                          x_ = nullptr;
     std::vector<next_step>                              next_;
+    // MUP1 piece 2: each slot's set_sampling command awaiting its X-ACK (sent without waiting; collected by the slot's
+    // next command, read_begin's in the same follower turn, or a group's start when it has come)
+    std::vector<std::shared_ptr<cmd>>                   samp_;
+    run_status                                          settle(int32_t slot, bool wait);
+    run_status                                          settle_all();
     std::vector<int64_t>                                read_base_;  // per slot: its read's first crossing number
-    std::vector<std::vector<std::pair<int32_t, ack *>>> read_acks_;
+    std::vector<std::vector<std::shared_ptr<cmd>>>      read_acks_;  // per slot: its read's back halves' commands
     // per slot: the front's read ended with this status while the back's chunks may still run (-1: none)
     std::vector<int32_t>                                read_end_;
+    std::vector<read_info>                              back_acct_;  // per slot: MUP2's back account (back_info)
     // the read's end once the back's chunks are answered: blocking, or yielded while one is not
     read_status                                         read_finish(int32_t slot, bool block);
     bool                                                block_reads_ = false;
     std::vector<std::vector<float>>                     logits_;  // per slot: its last forced round's back logits
-    uint32_t                                            seq_  = 1;
+    control                                             ctl_;     // the command channel and the lost stage
     int64_t                                             base_ = 0;
-    bool                                                lost_ = false;
-    std::string                                         why_, err_;
+    std::string                                         err_;
     leader_stats                                        st_;
+    joint_refusals                                      joint_verify_;  // TTTS3: the front round's joint verify
+    int32_t                                             pace_pause_   = pace::pause_default_ms;  // APF1 (set_pace)
+    uint32_t                                            pace_live_    = 0;
+    int32_t                                             pace_gen_[2]  = { 0, 0 };
+    double                                              last_back_ms_ = -1;
 };
 
 // ---- the leader's pipeline (fn/runtime/pipe.h's core over the leader's group halves) ----
 
+// TTTS8: the server's split calls (fn/glue's split branches) are this class's: each glue entry naming a slot forwards
+// to one method here, so split-test's deliver case drives the server's own code. A step the engine finished for a
+// slot reaches that slot's request exactly once, in order, whichever call takes it: a group's results are queued by
+// slot when the group ends, each call that steps a slot takes its oldest first, and only end_request (the request
+// ended) drops them. A slot whose request delivered its end (end of generation or a failure) steps again only after
+// end_request: a step after it is refused, never run
 class pipeline {
   public:
     explicit pipeline(leader & l);
@@ -364,21 +347,63 @@ class pipeline {
     // this turn (res[k] its); false while its group is in flight. A step settle finished is returned at once (no
     // group begins in that turn)
     void step(const int32_t * slots, int32_t n, joint_step_out * res, bool * done);
+    // one slot's step outside the pipeline (fnfl_step: the shell's lone writer): the slot's oldest finished step not
+    // yet delivered (its group in flight ends first) is this call's; with none, every group in flight ends (their
+    // members' steps queued for them) and the slot steps alone, a group of one, synchronous
+    void    step_one(int32_t slot, joint_step_out & res);
     // slot's group, when in flight, ends now; its members' results are kept for their next step call
     void settle(int32_t slot);
     void settle_all();
-    // a kept result dropped (the slot's request ended or was cancelled)
-    void forget(int32_t slot);
-    bool in_flight(int32_t slot) const;
+    // the slot's request ended (end of generation, a stop, a cancel, a failure or a release; call names the server's
+    // call for the line): its group in flight ends and its finished steps not delivered are dropped, the only place
+    // they are, with a line when any was; returns how many
+    int32_t end_request(int32_t slot, const char * call = "end_request");
+    bool    in_flight(int32_t slot) const;
+    // the slot's finished steps not yet delivered
+    int32_t queued(int32_t slot) const;
+
+    // APF1: the front's writer-pause book (fn/runtime/pace.h): each group's begin and send, its answers, an emptied
+    // group, a slot's request end; fnfl_read_step_paced decides the front's read budget from it
+    pace::pacer & pace() { return pace_; }
+
+    const pace::pacer & pace() const { return pace_; }
+
+    // the server's calls that name a slot between its requests (fnfl_set_sampling, fnfl_prefill, fnfl_read_begin,
+    // fnfl_truncate, fnfl_release_slot): the slot's request ended first (end_request), then the leader's call
+    run_status set_sampling(int32_t slot, const request_options & o);
+    // VIS1 Stage B: images as engine::prefill's; their spans (not their pixels) go to the follower after the tokens
+    run_status prefill(int32_t                           slot,
+                       const int32_t *                   tokens,
+                       int32_t                           n_tokens,
+                       int32_t                           n_reuse,
+                       int32_t &                         n_processed,
+                       const std::vector<prompt_image> * images = nullptr);
+    int32_t    read_begin(int32_t                           slot,
+                          const int32_t *                   tokens,
+                          int32_t                           n_tokens,
+                          int32_t                           n_reuse,
+                          int32_t &                         n_processed,
+                          const std::vector<prompt_image> * images = nullptr);
+    run_status truncate(int32_t slot, int32_t n_keep);
+    run_status release_slot(int32_t slot);
+    run_status set_pos_offset(int32_t slot, int32_t off);  // MUP1 piece 5
 
   private:
     void end_group(int32_t g);
+    // the slot's oldest queued step into res (false: none); a delivered end or failure ends the slot's stepping
+    bool take(int32_t slot, joint_step_out & res);
+    void delivered(int32_t slot, const joint_step_out & res);
+    bool ended(int32_t slot) const;
 
     leader *                                        l_;
     pipe::core                                      core_;
     std::unique_ptr<leader::pending>                fl_[2];
     std::vector<int32_t>                            members_[2];
-    std::vector<std::pair<int32_t, joint_step_out>> kept_;
+    std::vector<std::pair<int32_t, joint_step_out>> kept_;  // finished steps not delivered, in the order they ended
+    bool                                            ended_[pipe::max_writers] = {};
+    pace::pacer                                     pace_{ pace::role::front };
+    // the groups the front has (bit g: members or in flight), and each one's pacing generation, for set_pace
+    uint32_t                                        live_mask() const;
 };
 
 // ---- the follower (the back engine's executor) ----
@@ -393,8 +418,24 @@ class follower {
     // which rebuilds the engine and returns it (nullptr and err on a failure); the follower then serves it
     std::function<bool(int32_t slot, int32_t what, std::vector<uint8_t> & out, std::string & err)> probe_fn;
     std::function<engine *(const ctrl & c, std::string & err)>                                     reconfigure_fn;
+    // split-test's injection (TTTS8, the truncate case): the next truncate of this slot fails on the follower as
+    // engine::truncate's failed write inside the last step leaves it (the slot's checkpoints dropped, its state
+    // restored at the next read); -1: off
+    std::atomic<int32_t>                                                                           test_fail_cut{ -1 };
+    // PRD1 items 8, 9 and 11 (TEST): the most idle-drain units in flight when a command arrived and the drains joined
+    // at one; with test_order, the order (test_log): 'L' a read step that ran, 'C' a step group's arrival, 'Q' its
+    // back half queued, 'P' and the slot's digit a read's end on this box; test_hold_reads: no read work runs here
+    // (commands still do), so a front can finish reads before the back takes them
+    std::atomic<bool>                                                                              test_order{ false };
+    std::atomic<bool>    test_hold_reads{ false };
+    std::atomic<int32_t> test_in_flight_max{ 0 };
+    std::atomic<int64_t> test_settles{ 0 };
+    std::string          test_log() const;
 
   private:
+    mutable std::mutex test_mu_;
+    std::string        test_log_;
+    void               test_note(char c);
     struct pre {
         bool     valid = false;
         int32_t  kind = 0, d = 0;
@@ -409,15 +450,28 @@ class follower {
 
     // the back chunks of reads in arrival order (op::read_step): a lone chunk whole when it comes up, an interleaved
     // one a layer group at a time, after each step group and while no command waits; each answered at its end
+    // MUP2: a budgeted chunk (a = 2) runs units after each step group under this box's writer-pause deadline (APF1:
+    // pace_, from the step groups' arrivals and back stages here, P carried by the commands), and through an idle gap
+    // while no command waits (no writer step pending: the floor). PRD1 item 7: a small read is a lone chunk (a = 0)
     struct iread {
         int32_t  slot = -1;
         uint32_t seq  = 0;
         bool     lone = false, cancel = false, cancel_sent = false;
         int64_t  want = 0;  // cancel: the chunks the front finished (their crossings sent), run before the cancel
+        bool     budgeted = false;
     };
 
     std::deque<iread> reads_;
-    void              read_group();
+    // idle: no command waits (the floor); else after a step group (the budget)
+    void                                  read_group(bool idle = false);
+    void                                  read_answer(const iread & r, ack & a);
+    // PRD1 item 8: a command arrived: the idle drain's in-flight units joined first, as read time (false: the read
+    // failed, answered)
+    bool                                  read_settle();
+    // PRD1 item 11: the crossing taken ahead's pieces posted when they may be (between units, never waiting)
+    void                                  poll_ahead();
+    // APF1: the back's writer-pause book (fn/runtime/pace.h)
+    pace::pacer                           pace_{ pace::role::back };
     void              step_group(const ctrl & c, uint32_t seq);
     void next_of(const std::vector<int32_t> & slots, std::vector<pre> & out, std::vector<std::string> & why);
     bool reply(uint32_t seq, const ack & a);
@@ -426,11 +480,12 @@ class follower {
     port *                                           p_ = nullptr;
     crossing *                                       x_ = nullptr;
     std::vector<pre>                                 pre_;
-    std::vector<std::unique_ptr<step_out>>           outs_;       // X-STEP records in flight (their sends' buffers)
-    std::vector<std::unique_ptr<std::vector<float>>> lgs_;        // forced members' logits in flight
-    std::vector<uint8_t>                             probe_out_;  // a probe's answer bytes in flight
+    std::vector<std::shared_ptr<step_out>>           outs_;       // X-STEP records in flight (their sends' keeps)
+    std::vector<std::shared_ptr<std::vector<float>>> lgs_;        // forced members' logits in flight (kept too)
+    std::vector<uint8_t>                             probe_out_;  // a probe's answer as filled (sent from a copy)
     void                                             forced_group(const ctrl & c, uint32_t seq);
     std::vector<int32_t>                             out_ops_;
+    joint_refusals                                   joint_draft_, joint_catchup_;  // TTTS3
 };
 
 }  // namespace fn::runtime::stage

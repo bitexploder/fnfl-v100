@@ -15,4 +15,7 @@
 // Real weights (layer 1's PLE tensors, token_embd rows, per_layer_token_embd rows, the ple.* keys) are read from the
 // model's files on the CPU; no model load. dev0 == dev1: loopback on one device and one stream (Compute Sanitizer).
 // mode "all" or "san" (64 positions, B = 1 and 3). Prints "ple-test: PASS" and returns 0 when every check passes.
+// TTTS3: mode "q8" (model: UD-Q4_K_XL's first shard; dev0 only): layer 1's key and value as the file's Q8_0 against the
+// same rows widened to F32, bitwise: the lone products at B = 1..5, the joint products (each lane against its lone
+// products) and the prompt products. Prints "ple-test q8: PASS".
 int fnfl_ple_test(const char * mode, int dev0, int dev1, const char * model);

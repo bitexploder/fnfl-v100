@@ -8,12 +8,17 @@
 #include "fn/loader/sha256.h"
 #include "fn/model/model.h"
 #include "fn/model/state.h"
+#include "fn/vision/image.h"
+#include "fn/vision/profile.h"
+#include "fn/vision/sizes.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -273,9 +278,9 @@ bool capture(model::model & m, int32_t c, bool hc_graph, graph_row & row) {
         const int32_t t_sd = model::model::find("blk.0.ffn_down_shexp.weight");
         experts::fmt fg{}, fd{}, fsd{};
         dense::fmt sgf{}, suf{};
-        ok = ok && ex1_fmt_of(model::tensors[t_gate].format, fg) && ex1_fmt_of(model::tensors[t_down].format, fd) &&
-             ex1_fmt_of(model::tensors[t_sd].format, fsd) && dense_fmt_of(model::tensors[t_sg].format, sgf) &&
-             dense_fmt_of(model::tensors[t_su].format, suf);
+        ok = ok && ex1_fmt_of(m.tp(t_gate).format, fg) && ex1_fmt_of(m.tp(t_down).format, fd) &&
+             ex1_fmt_of(m.tp(t_sd).format, fsd) && dense_fmt_of(m.tp(t_sg).format, sgf) &&
+             dense_fmt_of(m.tp(t_su).format, suf);
         uint8_t * grids = ws->part_ptr(4, c);
         experts::gate_up_args ga{};
         ga.w = m.region_ptr(t_gate, c);
@@ -526,6 +531,7 @@ int fnfl_load_check(const fnfl_load_check_args & a) {
     sp.n_cells = a.n_cells;
     sp.ple_conv_kernel = m.ple_conv_kernel;
     sp.ple_ngram = m.ple_ngram;
+    fn::loader::file_state_params(m, sp);  // TTTS3: the Q4 file's head and PLE state, as the run load's
     for (const model::buffer_class & plan : model::state_classes(sp)) {
         account_row r;
         std::unique_ptr<model::reserved_class> rc;
@@ -741,8 +747,9 @@ namespace {
 struct stage_plan {
     int64_t weights[2] = { 0, 0 };
     int64_t slots[2] = { 0, 0 }, pool[2] = { 0, 0 }, engine[2] = { 0, 0 }, lanes[2] = { 0, 0 };
+    int64_t vision[2] = { 0, 0 };  // VIS1 Stage B (--images): the front's projector share; the back's planes
 
-    int64_t total(int32_t c) const { return weights[c] + slots[c] + pool[c] + engine[c] + lanes[c]; }
+    int64_t total(int32_t c) const { return weights[c] + slots[c] + pool[c] + engine[c] + lanes[c] + vision[c]; }
 };
 
 bool plan_stage(const std::string & model_path,
@@ -774,6 +781,7 @@ bool plan_stage(const std::string & model_path,
     sp.ple_ngram       = m.ple_ngram;
     sp.kv_q8           = kv_q8;
     sp.win             = m.win;
+    fn::loader::file_state_params(m, sp);  // TTTS3: the Q4 file's head and PLE state, as the run load's
     p                  = stage_plan();
     for (int32_t c = 0; c < 2; ++c) {
         p.weights[c] = m.weight_alloc[c];
@@ -804,10 +812,14 @@ int fnfl_split_plan(const fnfl_split_plan_args & a) {
         "split-plan: %s, k %d: %d slots of %d cells, the KV pool %d cells (CPU only: the placement and the state "
         "classes; no GPU)\n",
         a.model_path.c_str(), a.k, a.slots, a.slot_cells, a.pool_cells);
+    // MUP2 piece 5: the largest q8 pool every card holds with floor_mib free (the binding card)
+    int64_t     most_cells = INT64_MAX;
+    std::string binding;
+    int32_t     n_cal = 0;
     for (int32_t role = 0; role < 2; ++role) {
         const bool     front = role == 0;
-        const char *   box   = front ? "the front (Carlos: layers 0 .. k - 1, the embeddings)" :
-                                       "the back (Carlin: layers k .. 47, the head and the draft)";
+        const char *   box   = front ? "the front (layers 0 .. k - 1, the embeddings)" :
+                                       "the back (layers k .. 47, the head and the draft)";
         const double * freem = front ? a.free_front : a.free_back;
         // the calibration: the measured config's plan (its free figure measured with it)
         stage_plan     cal;
@@ -824,12 +836,47 @@ int fnfl_split_plan(const fnfl_split_plan_args & a) {
                 fprintf(stderr, "split-plan: %s\n", err.c_str());
                 return 1;
             }
+            if (a.images) {
+                // VIS1 Stage B, as load_for_run reserves: the front's projector share (its work class in the
+                // other-reader arena when the lane is reserved, more than one slot), the back's planes (two lanes)
+                model::vision_params vp;
+                vp.weights[0]  = int64_t(vision::weight_bytes(0, vision::vision_split, true, false));
+                vp.weights[1]  = int64_t(vision::weight_bytes(vision::vision_split, vision::blocks, false, true));
+                vp.scratch     = int64_t(vision::plan_scratch(vision::max_patches).total);
+                vp.planes_only = !front;
+                vp.lanes       = front ? 1 : (a.slots > 1 ? 2 : 1);
+                if (!front) {
+                    vp.weights[0] = vp.weights[1] = vp.scratch = 0;
+                }
+                for (const model::buffer_class & b : model::vision_classes(vp)) {
+                    const bool lent = front && a.slots > 1 && b.name == "vision work (VIS1)";
+                    for (int32_t c = 0; c < 2 && b.name != "vision staging (VIS1)" && !lent; ++c) {
+                        p.vision[c] += b.allocation(c);
+                    }
+                }
+            }
             for (int32_t c = 0; c < 2; ++c) {
                 printf(
                     "split-plan: %s, card %d, %s KV: weights %.3f GiB; state %.3f GiB (slot classes x %d %.3f, the "
-                    "KV pool %.3f, the engine's %.3f, the other-reader lane %.3f); planned %.3f GiB",
+                    "KV pool %.3f, the engine's %.3f, the other-reader lane %.3f, vision %.3f); planned %.3f GiB",
                     box, c, q8 ? "q8" : "BF16", gib(p.weights[c]), gib(p.total(c) - p.weights[c]), a.slots,
-                    gib(p.slots[c]), gib(p.pool[c]), gib(p.engine[c]), gib(p.lanes[c]), gib(p.total(c)));
+                    gib(p.slots[c]), gib(p.pool[c]), gib(p.engine[c]), gib(p.lanes[c]), gib(p.vision[c]),
+                    gib(p.total(c)));
+                if (have_cal && q8 != 0) {
+                    // free at pool P: measured free - (planned(P) - planned at the calibration); the pool's bytes a
+                    // cell from this plan
+                    const double bpc     = double(p.pool[c]) / double(std::max(1, a.pool_cells));
+                    const double reserve = (front ? a.reserve_front_gib : a.reserve_back_gib) * 1073741824.0;
+                    const double spare =
+                        freem[c] * 1073741824.0 - double(p.total(c) - cal.total(c)) - reserve - a.floor_mib * 1048576.0;
+                    const int64_t cells = int64_t(a.pool_cells) + int64_t(std::floor(spare / bpc));
+                    if (cells < most_cells) {
+                        most_cells = cells;
+                        binding = std::string(front ? "the front" : "the back") + " card " + std::to_string(c) + " (" +
+                                  std::to_string(int64_t(bpc)) + " bytes a cell)";
+                    }
+                    ++n_cal;
+                }
                 if (have_cal) {
                     const double head = freem[c] - (gib(p.total(c)) - gib(cal.total(c)));
                     printf(
@@ -841,6 +888,16 @@ int fnfl_split_plan(const fnfl_split_plan_args & a) {
                 printf("\n");
             }
         }
+    }
+    if (n_cal == 4) {
+        const int64_t page  = model::kv_page_cells;
+        const int64_t cells = most_cells >= page ? most_cells / page * page : 0;
+        printf(
+            "split-plan: largest pool (q8): %lld cells (%lld pages of %lld; %.2fx today's 819,200), every card keeping "
+            "%.0f MiB free after its measured overhead, %.2f GiB reserved a front card and %.2f GiB a back card; "
+            "binding: %s\n",
+            static_cast<long long>(cells), static_cast<long long>(cells / page), static_cast<long long>(page),
+            double(cells) / 819200.0, a.floor_mib, a.reserve_front_gib, a.reserve_back_gib, binding.c_str());
     }
     return 0;
 }

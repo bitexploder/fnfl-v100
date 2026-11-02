@@ -15,25 +15,30 @@
 //        fnfl-drive gd-bench [DEVICE] [all|ncu|probe|diag]
 //        fnfl-drive ple-test [all|san] [DEV0] [DEV1] [MODEL]   (E1: defaults all 0 1; DEV0 == DEV1: loopback on one
 //            device, for Compute Sanitizer; layer 1's PLE tensors, token_embd rows, PLE table rows and the ple.* keys
-//            are read from MODEL's files, no model load)
+//            are read from MODEL's files, no model load). TTTS3: ple-test q8 [DEV0] [DEV1] [MODEL]: the Q8_0 key and value
+//            against the rows widened to F32 on DEV0 (MODEL default UD-Q4_K_XL), and (item 7) the Q8_0 embed and
+//            embed_rows on its real token_embd rows against the CPU decode
 //        fnfl-drive ple-bench [all|ncu:LAUNCH:B|host:off|on:B] [DEV0] [DEV1] [MODEL] [TOKENS]   (E1 step 4; TOKENS: a
 //            JSON list of token IDs for the host gather, default FL2's fl1-tokenize.out; PL1: host:<off|on>:<1|3>,
 //            the host gather alone from an evicted table, no device)
-//        fnfl-drive ple-pin-test [probe|unit] [DIR] [DEVICE]   (PN1: the PLE table's residency on a temporary file in
-//            DIR, default work/PN1; no model load)
+//        fnfl-drive ple-pin-test probe|unit DIR [DEVICE]   (PN1: the PLE table's residency on a temporary file in
+//            DIR; no model load)
 //        fnfl-drive hc-test|hc-bench [DEVICE] [ROWS]   (hc-test only: ROWS = row counts, for example 1,3)
 //        fnfl-drive qa-test [DEVICE] [DEPTHS|all] [ROWS|all] [FIXTURE]   (lists like 65536 or 1,3; FIXTURE: the HX7 case)
 //        fnfl-drive qa-bench [DEVICE] [all|acceptance] [FIXTURE]
 //        fnfl-drive qa2-test [DEVICE] [all|san] [MODEL] [FIXTURE]   (QA2: attend against its FP64 reference; layer 11's
 //            norms and the rope and attention keys read from MODEL's file, no model load; FIXTURE: QA1's HX7 case)
 //        fnfl-drive qa2-bench [DEVICE] [all|ncu] [FIXTURE]   (QA2 steps 4-5)
+//        fnfl-drive ladder-test   (APF2: the kernel-size ladder's selector against hand-computed costs; host only)
+//        fnfl-drive prompt-tune MODEL DRAFT OUT [DEVICE]   (APF2: the ladder's calibration, fn/tools/prompt_tune.h)
 //        fnfl-drive kv-tier-test [DEVICE] [all|san]   (ME1: the host-backed KV tier against a resident cache, bitwise;
 //            synthetic, no model data; san: 32,768 cells for Compute Sanitizer)
 //        fnfl-drive draft-kernel-test [DEV0] [DEV1] [all|san]   (DR1 Stage C: the draft kernels against FP64)
 //        fnfl-drive draft-kernel-bench [DEV0] [DEV1]   (DR1 Stage C: DA-TC at the four depths, X-DRAFT-IN on both)
 //        fnfl-drive ex-calib [DEVICE]
 //        fnfl-drive ex-prep [CACHE]   (CPU only: the synthetic expert weights)
-//        fnfl-drive ex-cpu-test [CACHE]   (CPU only, ME2: the CPU miss path round trip, against FP64, a throughput line)
+//        fnfl-drive ex-cpu-test [CACHE] [all|CASES]   (CPU only, ME2: the CPU miss path round trip, against FP64, a
+//            throughput line; TFC: CASES a comma list of its cases, fn/kernels/experts/experts_cpu_test.h)
 //        fnfl-drive ex-test [DEVICE] [ROWS] [FORMATS] [CACHE] [BASE]   (EX2: ROWS like 1,2,3,4; FORMATS all, san or
 //            routed gate/up formats like iq2_xxs,iq3_s: every deployed instantiation with the shared expert; XB2:
 //            BASE, 71b92a9's experts cubins, adds the xb3-bitwise and xb4-bitwise arms)
@@ -43,42 +48,54 @@
 //        fnfl-drive ep-prep [REFS] [CACHE] [ROUTES] [all|q4]   (CPU only: ep-test's FP64 references; q4: ME1's)
 //        fnfl-drive ep-test [DEVICE] [ROWS] [FORMATS] [full|san] [REFS] [CACHE] [ROUTES]   (ROWS like 128,1536)
 //        fnfl-drive ep-bench [DEVICE] [all|ncu] [CACHE] [ROUTES]   (ROUTES: FN4's routes.txt)
-//        fnfl-drive grid-test [HEADER]   (the grid tables against ggml-common.h at 66e11c3, default the pinned
-//            tree's; FMS4: the IQ2 selector tables, and their recipe on device 0)
+//        fnfl-drive grid-test [HEADER]   (host only: the grid tables against ggml-common.h at 66e11c3, default this
+//            source tree's; FMS4: the IQ2 selector tables)
+//        fnfl-drive grid-gpu-test [DEVICE]   (FMS4: the IQ2 selector recipe on the device; TFC: split out of grid-test)
 //        fnfl-drive decode-check DIR   (CPU only: fn/quant's decoders bitwise against work/C1b/ref's pinned dump)
 //        fnfl-drive synth-check   (CPU only: fn/quant's synthetic-block generators)
 //        fnfl-drive xchg-test [DEV0] [DEV1] [ROUNDS] [ROWS]   (defaults 0 1 10000 1,3)
 //        fnfl-drive hc2-test [DEV0] [DEV1] [ROWS]   (default ROWS 1,2,3,4,5)
 //            (DEV0 == DEV1: loopback on one device and one stream, sends before reads: for Compute Sanitizer)
-//        fnfl-drive hcj-test [DEV0] [DEV1]   (FMU2: the joint sublayer against each lane's own; DEV0 == DEV1 loopback)
+//        fnfl-drive hcj-test [DEV0] [DEV1]   (FMU2: the joint sublayer against each lane's own; DEV0 == DEV1 loopback;
+//            TTTS3 item 6: the Q8_0 head in lanes)
+//        fnfl-drive hcmix-test [DEV0] [DEV1] [MODEL]   (TTTS3 item 7: TTTS2's mixed HC down on UD-Q4_K_XL's real modules,
+//            lone against FP64 and in lanes against each lane's own; CPU reads, no model load)
 //        fnfl-drive qsaj-test [DEV0] [DEV1]   (FMS2: the joint round's merged QSA launches against each lane's own;
 //            DEV0 == DEV1 loopback)
 //        fnfl-drive gdnj-test [DEV]   (FMS2: the joint round's one GDN core launch against each lane's core())
-//        fnfl-drive hc2-bench [DEV0] [DEV1] [all|ncu|ncu-up|ncu-fused|nsys|q8|cold]   (q8: DR1; cold, ncu-up, ncu-fused: HC4)
-//        fnfl-drive load-plan [OUT] [MODEL] [DRAFT]   (CPU only: the placement, the GGUF slice hashes, the dry run)
+//        fnfl-drive hc2-bench [DEV0] [DEV1] [all|ncu|ncu-up|ncu-fused|nsys|q8|cold|ttts4]   (q8: DR1; cold, ncu-up,
+//            ncu-fused: HC4; ttts4: TTTS4's kernel points)
+//        fnfl-drive load-plan OUT [MODEL] [DRAFT]   (CPU only: the placement, the GGUF slice hashes, the dry run)
 //        fnfl-drive split-plan [--model GGUF] [--k K] [--slots N] [--slot-cells C] [--pool-cells P] [--cal ...]
-//            [--free-front G0,G1] [--free-back G0,G1]   (TTTS1, CPU only: each box's weights and state, BF16 and q8,
-//            and the headroom from a measured free figure; fn/loader/load_check.h)
-//        fnfl-drive load-check [OUT] [CELLS] [MODEL] [DRAFT]   (devices 0 and 1; default CELLS 198,720)
+//            [--free-front G0,G1] [--free-back G0,G1] [--floor-mib M] [--reserve-front G] [--reserve-back G]
+//            [--images]   (TTTS1, CPU only: each box's weights and state, BF16 and q8, and the headroom from a
+//            measured free figure; MUP2: with both boxes' figures, the largest q8 pool keeping M MiB free a card;
+//            VIS1 --images: with the vision classes; fn/loader/load_check.h)
+//        fnfl-drive load-check OUT [CELLS] [MODEL] [DRAFT]   (devices 0 and 1; default CELLS 198,720)
 //        fnfl-drive xchg2-test [DEV0] [DEV1] [ROUNDS]   (R2: X-A, X-F, X-ROUTE and X-SELECT, synthetic; default 0 1 200)
 //        fnfl-drive x16-test [DEV0] [DEV1]   (FMS2 item 7: the joint 16-bit X-A / X-F against the host's rounding)
 //        fnfl-drive px1-link [DEV0] [DEV1] [all|nsys|san] [CACHE] [ROUTES]   (PX1 Part A: large two-way messages
 //            beside the read kernel and EP1's gate/up; default 0 1 all)
 //        fnfl-drive dp-test [DEVICE] [ROWS|all] [full|san|all]   (DP1, DP2; ROWS like 1,3, default all; san: the
 //            vocabulary at 8,192 rows, full: at 124,160, all: both; default full)
-//        fnfl-drive dpj-test [DEVICE] [full|san|tc|f16] [CASE]   (FMU2: the joint product at U = 2, 3, 4 lanes
-//            against each lane's B = 5 launch, bitwise, and FP64; FMU4: then "sampled pick", the joint draft step's
-//            sampled pick against each lane's lone pick on DEVICE and the other, san: loopback; san: fewer cases, U = 2
-//            and 4; tc (FMS5): the router cases on the tensor cores, against FP64's bound; f16 (FMS6): the quantized
-//            cases at U = 3 and 4 with the dense FP16 switch on, against FP64's 2^-8 bound; CASE: only the cases whose
-//            name contains one of its '|'-separated parts)
+//        fnfl-drive dpj-test [DEVICE] [full|san|tc|f16|q4|q4p|q4bench] [CASE]
+//            (FMU2: the joint product at U = 2, 3, 4 lanes against each lane's B = 5 launch, bitwise, and FP64; FMU4:
+//            then "sampled pick", the joint draft step's sampled pick against each lane's lone pick on DEVICE and the
+//            other, san: loopback; san: fewer cases, U = 2 and 4; tc (FMS5): the router cases on the tensor cores,
+//            against FP64's bound; f16 (FMS6): the quantized cases at U = 3 and 4 with the dense FP16 switch on,
+//            against FP64's 2^-8 bound; CASE: only the cases whose name contains one of its '|'-separated parts; TTTS6:
+//            q4, UD-Q4_K_XL's and the draft's real rows, with the Q8_0 instances; q4p, the served forms once, for ncu;
+//            q4bench, the kernel points, base and Q8_0 instance)
 //        fnfl-drive dp-bench [DEVICE] [all|seq|nsys|ncu:POINT|group:NAME]   (DP1 steps 6-8, DP2 steps 5-7)
 //        fnfl-drive pd-test|hcp-test|gdp-test|qsp-test|pe-test|dcp-test [DEVICE] [full|san]   (PB1: the prompt
 //            kernels against their FP64 or bitwise references: dense and router, HC and the exchange, GDN, QSA,
 //            embedding and PLE, the draft's catch-up pieces; san: fewer and smaller cases; hcp-test real=DIR: PB3's
-//            tensor HC on PB1's saved real inputs in DIR as well)
-//        fnfl-drive v-test [all|san] [MODEL]   (V1: the head, the logits and greedy on devices 0 and 1; san: fewer
-//            cases, loopback on device 0, for Compute Sanitizer; the GGUF read on the CPU only)
+//            tensor HC on PB1's saved real inputs in DIR as well; TTTS3 item 7: hcp-test q8=GGUF, hct_convert from
+//            the Q8_0 halves on UD-Q4_K_XL's real modules against the CPU conversion; pd-test q8=GGUF, the EX1-down
+//            Q8_0 on its real shared downs)
+//        fnfl-drive v-test [all|san|q8] [MODEL]   (V1: the head, the logits and greedy on devices 0 and 1; san: fewer
+//            cases, loopback on device 0, for Compute Sanitizer; the GGUF read on the CPU only; TTTS3 item 7: q8 with
+//            UD-Q4_K_XL, the Q8_0 logits and draft head on device 0)
 //        fnfl-drive v-bench [DEV0] [DEV1]   (V1 step 5; synthetic weights, default 0 1)
 //        fnfl-drive layer-test|layer-bench REF_DECODE REF_PROMPT OUT [full|san] [POSITIONS]   (R2: layers 10 and 11 on
 //            devices 0 and 1 against ref_dump's decode and prompt dumps; san: one pass over 64 positions; exit 3 and no
@@ -134,13 +151,21 @@
 //            FMS2 item 7: rollback-test IDS OUT mu1 --joint-kl DEEP runs joint-kl after mu1's PASS on its model
 //        fnfl-drive joint-kl DEEP OUT [real|dry]   (FMS2 item 7: KL(lone || joint) of four lanes, 16-bit joint X-A /
 //            X-F, against the lone BF16-KV yardstick; one load, or model-dry's zero weights)
+//        TTTS3: --model GGUF (the target's first shard, default IQ3_XXS) on rollback-test, joint-kl (after the mode)
+//            and model-dry, as on stage
 //        fnfl-drive split-test [all|san] [graph|eager] [--k LIST] [--cases lone,joint]   (TTTS1: one box against the
 //            split at k = 3, 27, 45, bitwise, on synthetic weights (no model data): lone rounds of 1 .. 5 rows, commits
 //            and cuts, a reset, joint rounds of U = 2 .. 4 at every d, the HC slot rule; san: layers 0 .. 5 at k = 3,
 //            eager, for Compute Sanitizer)
+//        fnfl-drive vis-test DEV0 DEV1 MMPROJ IMAGE   (VIS1 Stage B: the vision service on two cards, no text model:
+//            each card's supplied rows bitwise one card's whole encoder, the held image, the planes, the refusals)
+//        fnfl-drive vis-kl REF MODEL DRAFT MMPROJ [--pool-cells P] [--subset FILE] [--a0 PROMPT_IDS REF_IDS]
+//            (VIS1 Stage B, Load 2: one load as the served IQ3 one box; a0's 2,048 tokens bitwise against FMU4's; the
+//            reference's prompts with their images, the top-20 KL a step and top-1 agreement; work/VIS1/tools)
 //        fnfl-drive stage --split-layer K --draft-attention sparse [--slots N] [--cells N] [--pool-cells N]
-//            [--spec-d D] [--eog IDS] [--record-hash] [--split-addr IP]   (TTTS1: the split's follower, the back
-//            stage, until the leader's X-BYE); --split [--split-layer K] on spec run (and rollback-test, joint-kl):
+//            [--spec-d D] [--eog IDS] [--record-hash] [--image-planes] [--split-addr IP]   (TTTS1: the split's
+//            follower, the back stage, until the leader's X-BYE; VIS1 --image-planes: its front reads images, the
+//            back takes their rope planes); --split [--split-layer K] on spec run (and rollback-test, joint-kl):
 //            this process the leader, the front stage
 //        fnfl-drive pipe-test   (TTTS1: the split's two-group pipeline core against a fake leader and follower, CPU
 //            only: 1 .. 8 writers, joins and leaves at every point, cancels, ends of generation, readers interleaved,
@@ -149,66 +174,83 @@
 //            [--devices D0,D1]   (TTTS1: the box-to-box link, one process a box: X-HELLO, the transport line,
 //            X-BOUNDARY decode and prompt forms with pattern payloads compared on the far cards, X-STEP, X-CTRL and
 //            X-ACK, N (100,000) messages alternating groups, refusals, and the follower killed mid-transfer; no
-//            timings printed)
+//            timings printed; TTTSBS: retire, stop (named only), --host: host buffers, no card. TTTS7: --cases time
+//            (never in all) times a step group's hand-off at U = 2 and 4, R rows (--time-rows, default 3), and a whole
+//            prompt chunk's crossing, at the stage's sizes)
+//        fnfl-drive cases [FILTER] | cases fixtures | cases run [FILTER] [--out DIR] [--timeout S]   (TFC: the check
+//            inventory, fn/tools/cases.h: every check's ID, needs, cards, fixtures and arguments; run: the host checks)
+//        Fixtures (TFC): a default path below is fn/tools/cases.cpp's named fixture, overridden by its environment
+//            variable (fnfl-drive cases fixtures lists them)
 //        --ple-table lazy|full, anywhere after the command (PN1): the PLE table's residency in every model load;
 //            lazy (default, PN1 Amendment 1): the plain mapping and PL1's hints; full: read into RAM and pinned at
 //            the load; generate --evict-ple needs lazy
 
 #include "fn/fnfl.h"
 #include "fn/kernels/act/act_test.h"
-#include "fn/kernels/dense/dense_bench.h"
 #include "fn/kernels/dense/dense_joint_test.h"
 #include "fn/kernels/dense/dense_prompt_test.h"
 #include "fn/kernels/dense/dense_test.h"
-#include "fn/kernels/draft/draft_bench.h"
 #include "fn/kernels/draft/draft_prompt_test.h"
 #include "fn/kernels/draft/draft_test.h"
-#include "fn/kernels/experts/experts_bench.h"
-#include "fn/kernels/experts/experts_calib.h"
 #include "fn/kernels/experts/experts_cpu_test.h"
-#include "fn/kernels/experts/experts_prompt_bench.h"
 #include "fn/kernels/experts/experts_prompt_test.h"
 #include "fn/kernels/experts/experts_test.h"
 #include "fn/kernels/experts/grids_test.h"
-#include "fn/kernels/gdn/gdn_bench.h"
 #include "fn/kernels/gdn/gdn_prompt_test.h"
 #include "fn/kernels/gdn/gdn_test.h"
 #include "fn/kernels/gdn/gdnj_test.h"
-#include "fn/kernels/hc/hc_bench.h"
 #include "fn/kernels/hc/hc_prompt_test.h"
 #include "fn/kernels/hc/hc_test.h"
-#include "fn/kernels/head/head_bench.h"
 #include "fn/kernels/head/head_test.h"
-#include "fn/kernels/ple/ple_bench.h"
 #include "fn/kernels/ple/ple_prompt_test.h"
 #include "fn/kernels/ple/ple_test.h"
-#include "fn/kernels/qsa/qa2_bench.h"
 #include "fn/kernels/qsa/qa2_test.h"
-#include "fn/kernels/qsa/qsa_bench.h"
 #include "fn/kernels/qsa/qsa_prompt_test.h"
 #include "fn/kernels/qsa/qsa_test.h"
 #include "fn/kernels/qsa/qsaj_test.h"
-#include "fn/kernels/samp/samp_bench.h"
 #include "fn/kernels/samp/samp_ref.h"
 #include "fn/kernels/samp/samp_test.h"
 #include "fn/loader/load_check.h"
 #include "fn/model/kv_tier_test.h"
-#include "fn/proto/px1/px1_link.h"
-#include "fn/proto/xp1/xp1_bench.h"
-#include "fn/proto/xp1/xp1_test.h"
+#include "fn/model/ladder_test.h"
+#include "fn/model/pass.h"
+#include "fn/model/prompt.h"
 #include "fn/quant/quant_test.h"
 #include "fn/runtime/layer_test.h"
 #include "fn/runtime/pipe.h"
 #include "fn/runtime/ple_host.h"
 #include "fn/runtime/ple_pin_test.h"
 #include "fn/runtime/split_stage_test.h"
+#include "fn/runtime/stage.h"
 #include "fn/runtime/stage_cmds.h"
 #include "fn/runtime/state_test.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/runtime/vis_kl.h"
+#include "fn/runtime/vision_service_test.h"
+#include "fn/tools/cases.h"
+#include "fn/tools/prompt_tune.h"
 #include "fn/xchg/link_test.h"
 #include "fn/xchg/x16_test.h"
 #include "fn/xchg/xchg2_test.h"
 #include "fn/xchg/xchg_test.h"
+#ifdef FNFL_DRIVE_BENCH
+// TFC item 4: the optional tools' headers (fnfl-bench only)
+#    include "fn/kernels/dense/dense_bench.h"
+#    include "fn/kernels/draft/draft_bench.h"
+#    include "fn/kernels/experts/experts_bench.h"
+#    include "fn/kernels/experts/experts_calib.h"
+#    include "fn/kernels/experts/experts_prompt_bench.h"
+#    include "fn/kernels/gdn/gdn_bench.h"
+#    include "fn/kernels/hc/hc_bench.h"
+#    include "fn/kernels/head/head_bench.h"
+#    include "fn/kernels/ple/ple_bench.h"
+#    include "fn/kernels/qsa/qa2_bench.h"
+#    include "fn/kernels/qsa/qsa_bench.h"
+#    include "fn/kernels/samp/samp_bench.h"
+#    include "fn/proto/px1/px1_link.h"
+#    include "fn/proto/xp1/xp1_bench.h"
+#    include "fn/proto/xp1/xp1_test.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -468,7 +510,8 @@ struct split_opts {
     std::string addr   = "10.25.0.2";
     int32_t     port   = 13371;
     std::string commit, digest;
-    bool        record_hash = false;
+    bool        record_hash  = false;
+    bool        image_planes = false;  // VIS1 Stage B: --image-planes (the follower of a front that reads images)
     int32_t     groups = 0;  // --fnfl-split-groups (joint-kl on the split: 1 one U4 group, 2 two pipelined U2; 0 both)
 };
 
@@ -481,9 +524,15 @@ void apply_split(fnfl_target_args & a, const split_opts & so, int32_t role) {
     a.split_digest = so.digest;
     a.record_hash  = so.record_hash;
     a.split_groups = so.groups;
+    a.image_planes = so.image_planes;
 }
 
 int main(int argc, char ** argv) {
+    // PRD1: the build stamp (fnfl-serve.sh compares the boxes' before the follower starts); no CUDA call
+    if (argc >= 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "version") == 0)) {
+        printf("fnfl: commit %s\n", fnfl_build_commit());
+        return 0;
+    }
     // PN1: --ple-table lazy|full anywhere after the command sets the residency of every model load; it is taken out
     // of argv here so each command's own parsing is unchanged
     fn::runtime::ple_residency ple_table = fn::runtime::ple_residency::lazy;
@@ -513,6 +562,9 @@ int main(int argc, char ** argv) {
         } else if (f == "--record-hash") {
             so.record_hash = true;
             take           = 1;
+        } else if (f == "--image-planes") {
+            so.image_planes = true;
+            take            = 1;
         } else if (has && (f == "--split-layer" || f == "--fnfl-split-layer")) {
             so.k = atoi(argv[i + 1]);
             take = 2;
@@ -667,36 +719,76 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "act-test") == 0) {
         return fnfl_act_test(argc >= 3 ? atoi(argv[2]) : 0);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "act-bench") == 0) {
         return fnfl_act_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
     }
+#endif
+    if (argc >= 2 && strcmp(argv[1], "cases") == 0) {
+        return fn::cases::main(argc, argv);
+    }
+#ifndef FNFL_DRIVE_BENCH
+    // TFC item 4: the benches, EX1's calibration and the XP1/PX1 prototypes are optional tools, outside the default
+    // build: fnfl-bench takes the same commands and arguments
+    static const char * const bench_cmds[] = { "act-bench", "hc-bench",   "hc2-bench",          "qa-bench",
+                                               "qa2-bench", "gd-bench",   "ple-bench",          "dp-bench",
+                                               "ex-calib",  "ex-bench",   "draft-kernel-bench", "ep-bench",
+                                               "v-bench",   "samp-bench", "layer-bench",        "px1-link",
+                                               "xp1-test",  "xp1-bench" };
+    for (const char * c : bench_cmds) {
+        if (argc >= 2 && strcmp(argv[1], c) == 0) {
+            fprintf(stderr,
+                    "%s: an optional tool, not in fnfl-drive: build the fnfl-bench target (cmake --build DIR --target "
+                    "fnfl-bench) and run fnfl-bench %s with the same arguments\n",
+                    c, c);
+            return 2;
+        }
+    }
+#endif
+    // TFC: the named fixtures (fn/tools/cases.cpp), each overridden by its environment variable
+    const std::string fx_model = fn::cases::fixture_path("model"), fx_model_q4 = fn::cases::fixture_path("model-q4"),
+                      fx_draft   = fn::cases::fixture_path("draft");
+    const char *      fnfl_model = fx_model.c_str();
     if (argc >= 2 && strcmp(argv[1], "gd-test") == 0) {
-        static const char * model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                                    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-        return fnfl_gd_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : model);
+        return fnfl_gd_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all",
+                            argc >= 5 ? argv[4] : fnfl_model);
     }
     if (argc >= 2 && strcmp(argv[1], "gdnj-test") == 0) {
         return fnfl_gdnj_test(argc >= 3 ? atoi(argv[2]) : 0);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "gd-bench") == 0) {
         return fnfl_gd_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
     }
-    static const char * fnfl_model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                                     "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
+#endif
     if (argc >= 2 && strcmp(argv[1], "ple-test") == 0) {
+        // TTTS3: ple-test q8 reads UD-Q4_K_XL's PLE key and value unless MODEL is given
+        const char * q4 = fx_model_q4.c_str();
+        const bool q8 = argc >= 3 && strcmp(argv[2], "q8") == 0;
         return fnfl_ple_test(argc >= 3 ? argv[2] : "all", argc >= 4 ? atoi(argv[3]) : 0, argc >= 5 ? atoi(argv[4]) : 1,
-                             argc >= 6 ? argv[5] : fnfl_model);
+                             argc >= 6 ? argv[5] :
+                             q8        ? q4 :
+                                         fnfl_model);
     }
     if (argc >= 2 && strcmp(argv[1], "ple-pin-test") == 0) {
-        static const char * pn1_dir = "/home/jeremy/src/flashnext/work/PN1";
-        return fnfl_ple_pin_test(argc >= 3 ? argv[2] : "unit", argc >= 4 ? argv[3] : pn1_dir,
-                                 argc >= 5 ? atoi(argv[4]) : 0);
+        // STALL: warm-file PATH OFFSET BYTES runs the warm on a real file's range
+        if (argc >= 6 && strcmp(argv[2], "warm-file") == 0) {
+            return fnfl_ple_warm_file(argv[3], strtoull(argv[4], nullptr, 10), strtoull(argv[5], nullptr, 10));
+        }
+        // TFC: DIR is required (a scratch directory; the temporary file is removed before return)
+        if (argc < 4) {
+            fprintf(stderr, "ple-pin-test: [probe|unit|warm] DIR [DEVICE] | warm-file PATH OFFSET BYTES\n");
+            return 2;
+        }
+        return fnfl_ple_pin_test(argv[2], argv[3], argc >= 5 ? atoi(argv[4]) : 0);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "ple-bench") == 0) {
-        static const char * tokens = "/home/jeremy/src/flashnext/work/FL2/smoke/fl1-tokenize.out";
+        const std::string tokens = fn::cases::fixture_path("fl2-tokens");
         return fnfl_ple_bench(argc >= 4 ? atoi(argv[3]) : 0, argc >= 5 ? atoi(argv[4]) : 1, argc >= 3 ? argv[2] : "all",
-                              argc >= 6 ? argv[5] : fnfl_model, argc >= 7 ? argv[6] : tokens);
+                              argc >= 6 ? argv[5] : fnfl_model, argc >= 7 ? argv[6] : tokens.c_str());
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "hc-test") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         uint32_t rows_mask = argc >= 4 ? 0u : 0xfu;
@@ -710,10 +802,12 @@ int main(int argc, char ** argv) {
         }
         return fnfl_hc_test(device, rows_mask);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "hc-bench") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_hc_bench(device);
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "qa-test") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         std::vector<int32_t> depths, rows;
@@ -729,27 +823,38 @@ int main(int argc, char ** argv) {
         }
         return fnfl_qsa_test(device, depths, rows, argc >= 6 ? argv[5] : "");
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "qa-bench") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_qsa_bench(device, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : "");
     }
-    static const char * hx7_fixture = "/home/jeremy/src/flashnext/work/QA1/fixtures/hx7-l3-w0.bin"; // QA1's HX7 case
+#endif
+    const std::string fx_hx7      = fn::cases::fixture_path("hx7-case");  // QA1's HX7 case
+    const char *      hx7_fixture = fx_hx7.c_str();
     if (argc >= 2 && strcmp(argv[1], "qa2-test") == 0) {
-        static const char * model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                                    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-        return fnfl_qa2_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : model,
-                             argc >= 6 ? argv[5] : hx7_fixture, kv_q8);
+        return fnfl_qa2_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all",
+                             argc >= 5 ? argv[4] : fnfl_model, argc >= 6 ? argv[5] : hx7_fixture, kv_q8);
+    }
+    if (argc >= 2 && strcmp(argv[1], "ladder-test") == 0) {  // APF2: the selector's host checks
+        return fn::model::fnfl_ladder_test();
+    }
+    if (argc >= 2 && strcmp(argv[1], "prompt-tune") == 0) {  // APF2: the ladder's calibration (one model load)
+        return fn::tools::fnfl_prompt_tune(argc, argv);
     }
     if (argc >= 2 && strcmp(argv[1], "kv-tier-test") == 0) {
         return fnfl_kv_tier_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "qa2-bench") == 0) {
         return fnfl_qa2_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all",
                               argc >= 5 ? argv[4] : hx7_fixture);
     }
+#endif
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "draft-kernel-bench") == 0) {
         return fnfl_draft_kernel_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1);
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "draft-kernel-test") == 0) {
         return fnfl_draft_kernel_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1,
                                       argc >= 5 ? argv[4] : "all");
@@ -768,16 +873,19 @@ int main(int argc, char ** argv) {
         }
         return 0;
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "ex-calib") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_ex_calib(device);
     }
-    static const char * ex_cache = "/home/jeremy/src/flashnext/work/C1b/cache"; // fn/quant's synthetic blocks (C1b)
+#endif
+    const std::string fx_ex_cache = fn::cases::fixture_path("ex-cache");  // fn/quant's synthetic blocks (C1b)
+    const char *      ex_cache    = fx_ex_cache.c_str();
     if (argc >= 2 && strcmp(argv[1], "ex-prep") == 0) {
         return fnfl_ex_prep(argc >= 3 ? argv[2] : ex_cache);
     }
     if (argc >= 2 && strcmp(argv[1], "ex-cpu-test") == 0) {
-        return fnfl_ex_cpu_test(argc >= 3 ? argv[2] : ex_cache);
+        return fnfl_ex_cpu_test(argc >= 3 ? argv[2] : ex_cache, argc >= 4 ? argv[3] : "all");
     }
     if (argc >= 2 && strcmp(argv[1], "ex-test") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
@@ -793,15 +901,19 @@ int main(int argc, char ** argv) {
         return fnfl_ex_test(device, rows_mask, argc >= 5 ? argv[4] : "all", argc >= 6 ? argv[5] : ex_cache,
                             argc >= 7 ? argv[6] : nullptr);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "ex-bench") == 0) {
-        static const char * hx7 = "/home/jeremy/src/flashnext/work/HX7/runs/capture-58581-20261009T090240Z";
+        const std::string hx7    = fn::cases::fixture_path("hx7-capture");
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_ex_bench(device, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : ex_cache,
-                             argc >= 6 ? argv[5] : hx7);
+                             argc >= 6 ? argv[5] : hx7.c_str());
     }
-    static const char * fn4 = "/home/jeremy/src/flashnext-opt/work/FN4/20261007T170304Z/routes.txt";
+#endif
+    const std::string fx_fn4     = fn::cases::fixture_path("fn4-routes");
+    const char *      fn4        = fx_fn4.c_str();
     // FP16 input (C2), fn/quant's deployed-range weights (C1b Amendment 4)
-    static const char * ep_refs = "/home/jeremy/src/flashnext/work/C1b/ep-refs-a4";
+    const std::string fx_ep_refs = fn::cases::fixture_path("ep-refs");
+    const char *      ep_refs    = fx_ep_refs.c_str();
     if (argc >= 2 && strcmp(argv[1], "ep-prep") == 0) {
         return fnfl_ep_prep(argc >= 3 ? argv[2] : ep_refs, argc >= 4 ? argv[3] : ex_cache, argc >= 5 ? argv[4] : fn4,
                             argc >= 6 ? argv[5] : "all");
@@ -812,11 +924,13 @@ int main(int argc, char ** argv) {
                             argc >= 7 ? argv[6] : ep_refs, argc >= 8 ? argv[7] : ex_cache, argc >= 9 ? argv[8] : fn4,
                             argc >= 6 ? argv[5] : "full");
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "ep-bench") == 0) {
         const int device = argc >= 3 ? atoi(argv[2]) : 0;
         return fnfl_ep_bench(device, argc >= 4 ? argv[3] : "all", argc >= 5 ? argv[4] : ex_cache,
                              argc >= 6 ? argv[5] : fn4);
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "decode-check") == 0) {
         if (argc < 3) {
             fprintf(stderr, "decode-check: DIR (work/C1b/ref's dump) is required\n");
@@ -828,20 +942,26 @@ int main(int argc, char ** argv) {
         return fnfl_synth_check();
     }
     if (argc >= 2 && strcmp(argv[1], "grid-test") == 0) {
-        return fnfl_grid_test(argc >= 3 ? argv[2]
-                                        : "/home/jeremy/src/flashnext-opt/work/REL2/engine/ggml/src/ggml-common.h");
+        return fnfl_grid_test(argc >= 3 ? argv[2] : fn::cases::fixture_path("grid-header").c_str());
+    }
+    if (argc >= 2 && strcmp(argv[1], "grid-gpu-test") == 0) {
+        return fnfl_grid_gpu_test(argc >= 3 ? atoi(argv[2]) : 0);
     }
     if (argc >= 2 &&
         (strcmp(argv[1], "xchg-test") == 0 || strcmp(argv[1], "hc2-test") == 0 || strcmp(argv[1], "hc2-bench") == 0 ||
-         strcmp(argv[1], "hcj-test") == 0 || strcmp(argv[1], "qsaj-test") == 0)) {
+         strcmp(argv[1], "hcj-test") == 0 || strcmp(argv[1], "qsaj-test") == 0 || strcmp(argv[1], "hcmix-test") == 0)) {
         const int dev0 = argc >= 3 ? atoi(argv[2]) : 0;
         const int dev1 = argc >= 4 ? atoi(argv[3]) : 1;
         if (strcmp(argv[1], "hcj-test") == 0) {
             return fnfl_hcj_test(dev0, dev1);
         }
+        if (strcmp(argv[1], "hcmix-test") == 0) {  // TTTS3 item 7
+            return fnfl_hcmix_test(dev0, dev1, argc >= 5 ? argv[4] : fx_model_q4.c_str());
+        }
         if (strcmp(argv[1], "qsaj-test") == 0) {
             return fnfl_qsaj_test(dev0, dev1);
         }
+#ifdef FNFL_DRIVE_BENCH
         if (strcmp(argv[1], "hc2-bench") == 0) {
             if (dev0 == dev1) {
                 fprintf(stderr, "hc2-bench: DEV0 and DEV1 must differ\n");
@@ -849,6 +969,7 @@ int main(int argc, char ** argv) {
             }
             return fnfl_hc2_bench(dev0, dev1, argc >= 5 ? argv[4] : "all");
         }
+#endif
         const bool xt = strcmp(argv[1], "xchg-test") == 0;
         const char * rows = argc >= (xt ? 6 : 5) ? argv[xt ? 5 : 4] : (xt ? "1,3" : "1,2,3,4,5");
         uint32_t mask = 0u;
@@ -868,6 +989,43 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "split-test") == 0) {
         return fn::runtime::fnfl_split_test(argc, argv);
+    }
+    if (argc >= 2 && strcmp(argv[1], "vis-test") == 0) {
+        // VIS1 Stage B: the vision service on two cards, no text model (fn/runtime/vision_service_test.h)
+        if (argc < 6) {
+            fprintf(stderr, "usage: fnfl-drive vis-test DEV0 DEV1 MMPROJ IMAGE\n");
+            return 2;
+        }
+        return fn::runtime::vision_service_test(atoi(argv[2]), atoi(argv[3]), argv[4], argv[5]);
+    }
+    if (argc >= 2 && strcmp(argv[1], "vis-kl") == 0) {
+        // VIS1 Stage B, Load 2: the image and text KL against the reference's top 20 (fn/runtime/vis_kl.h)
+        fn::runtime::vis_kl_args va;
+        bool                     ok = argc >= 6;
+        for (int i = 6; i < argc && ok; ++i) {
+            const std::string s = argv[i];
+            if (s == "--pool-cells" && i + 1 < argc) {
+                va.pool_cells = atoi(argv[++i]);
+            } else if (s == "--subset" && i + 1 < argc) {
+                va.subset = argv[++i];
+            } else if (s == "--a0" && i + 2 < argc) {
+                va.a0_prompt = argv[++i];
+                va.a0_ref    = argv[++i];
+            } else {
+                ok = false;
+            }
+        }
+        if (!ok) {
+            fprintf(stderr,
+                    "usage: fnfl-drive vis-kl REF MODEL DRAFT MMPROJ [--pool-cells P] [--subset FILE] "
+                    "[--a0 PROMPT_IDS REF_IDS]\n");
+            return 2;
+        }
+        va.ref    = argv[2];
+        va.model  = argv[3];
+        va.draft  = argv[4];
+        va.mmproj = argv[5];
+        return fn::runtime::fnfl_vis_kl(va);
     }
     if (argc >= 2 && strcmp(argv[1], "pipe-test") == 0) {
         std::string report;
@@ -896,15 +1054,33 @@ int main(int argc, char ** argv) {
                 o.stream_messages = atol(argv[++i]);
             } else if (strcmp(argv[i], "--devices") == 0 && has) {
                 ok = sscanf(argv[++i], "%d,%d", &o.device[0], &o.device[1]) == 2;
+            } else if (strcmp(argv[i], "--host") == 0) {
+                o.host = true;
+            } else if (strcmp(argv[i], "--time-rows") == 0 && has) {
+                o.time_rows = atoi(argv[++i]);
             } else {
                 ok = false;
             }
         }
+        // TTTS7: the time case's sizes are the stage's own (a decode boundary row, the X-CTRL and X-STEP records, a
+        // crossing's head, a whole prompt chunk's crossing and its pieces)
+        {
+            fn::model::prompt_chunk big;
+            big.rows      = fn::model::prompt_chunk_rows;
+            big.half[0]   = fn::model::prompt_half_rows;
+            big.half[1]   = fn::model::prompt_chunk_rows - fn::model::prompt_half_rows;
+            o.row_bytes   = fn::model::stage_row_bytes;
+            o.ctrl_bytes  = int64_t(sizeof(fn::runtime::stage::ctrl));
+            o.step_bytes  = int64_t(sizeof(fn::runtime::stage::step_out));
+            o.head_bytes  = int64_t(sizeof(fn::runtime::stage::crossing_head));
+            o.chunk_bytes = fn::model::prompt_path::crossing_bytes(big);
+            o.piece_bytes = fn::runtime::stage::piece_bytes;
+        }
         if (!ok || o.timeout_s <= 0 || o.stream_messages < 1000) {
             fprintf(stderr,
                     "usage: fnfl-drive link-test leader|follower [--addr IP] [--port P] [--timeout S] "
-                    "[--cases all|decode,prompt,small,stream,refuse,kill] [--stream N >= 1000] "
-                    "[--devices D0,D1]\n");
+                    "[--cases all|decode,prompt,small,stream,refuse,retire,kill,stop,time] [--stream N >= 1000] "
+                    "[--devices D0,D1] [--host] [--time-rows R]\n");
             return 2;
         }
         return fn::xchg::link::run_test(o);
@@ -912,7 +1088,11 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && (strcmp(argv[1], "load-plan") == 0 || strcmp(argv[1], "load-check") == 0)) {
         const bool check = strcmp(argv[1], "load-check") == 0;
         fnfl_load_check_args a;
-        a.out_dir = argc >= 3 ? argv[2] : "/home/jeremy/src/flashnext/work/R1/raw";
+        if (argc < 3) {  // TFC: OUT is required (no default inside another ticket's directory)
+            fprintf(stderr, "%s: OUT [CELLS] [MODEL] [DRAFT]\n", argv[1]);
+            return 2;
+        }
+        a.out_dir = argv[2];
         int32_t i = 3;
         a.n_cells = 196608 + 2048 + 64;
         if (check && argc > i) {
@@ -923,20 +1103,15 @@ int main(int argc, char ** argv) {
             }
             a.n_cells = static_cast<int32_t>(n);
         }
-        static const char * model = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                                    "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-        static const char * draft = "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/"
-                                    "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
-        a.model_path = argc > i ? argv[i] : model;
-        a.draft_path = argc > i + 1 ? argv[i + 1] : draft;
+        a.model_path = argc > i ? argv[i] : fx_model;
+        a.draft_path = argc > i + 1 ? argv[i + 1] : fx_draft;
         return check ? fnfl_load_check(a) : fnfl_load_plan(a);
     }
     if (argc >= 2 && strcmp(argv[1], "split-plan") == 0) {
         // TTTS1 step 8 (CPU only): the split's per-box plan (fn/loader/load_check.h)
         fnfl_split_plan_args a;
-        a.model_path =
-            "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf";
-        a.draft_path    = "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+        a.model_path    = fx_model_q4;
+        a.draft_path    = fx_draft;
         const auto pair = [](const char * v, double out[2]) {
             return sscanf(v, "%lf,%lf", &out[0], &out[1]) == 2;
         };
@@ -967,6 +1142,14 @@ int main(int argc, char ** argv) {
                 bad = !pair(argv[++i], a.free_front);
             } else if (f == "--free-back" && has) {
                 bad = !pair(argv[++i], a.free_back);
+            } else if (f == "--floor-mib" && has) {  // MUP2 piece 5
+                a.floor_mib = atof(argv[++i]);
+            } else if (f == "--reserve-front" && has) {
+                a.reserve_front_gib = atof(argv[++i]);
+            } else if (f == "--reserve-back" && has) {
+                a.reserve_back_gib = atof(argv[++i]);
+            } else if (f == "--images") {
+                a.images = true;  // VIS1 Stage B
             } else {
                 bad = true;
             }
@@ -975,15 +1158,18 @@ int main(int argc, char ** argv) {
             fprintf(stderr,
                     "usage: fnfl-drive split-plan [--model GGUF] [--draft GGUF] [--k K] [--slots N] "
                     "[--slot-cells C] [--pool-cells P] [--cal MODEL DRAFT K SLOTS SLOT_CELLS POOL_CELLS] "
-                    "[--free-front G0,G1] [--free-back G0,G1]\n");
+                    "[--free-front G0,G1] [--free-back G0,G1] [--floor-mib M] [--reserve-front G] "
+                    "[--reserve-back G] [--images]\n");
             return 2;
         }
         return fnfl_split_plan(a);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "px1-link") == 0) {
         return fnfl_px1_link(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1, argc >= 5 ? argv[4] : "all",
                              argc >= 6 ? argv[5] : ex_cache, argc >= 7 ? argv[6] : fn4);
     }
+#endif
     if (argc >= 2 && strcmp(argv[1], "x16-test") == 0) {
         return fnfl_x16_test(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1);
     }
@@ -1032,10 +1218,7 @@ int main(int argc, char ** argv) {
     if (argc >= 2 && strcmp(argv[1], "v-test") == 0) {
         const char * vmode = argc >= 3 ? argv[2] : "all";
         const bool loop = strcmp(vmode, "san") == 0;
-        return fnfl_v_test(0, loop ? 0 : 1, vmode,
-                           argc >= 4 ? argv[3]
-                                     : "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                                       "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf");
+        return fnfl_v_test(0, loop ? 0 : 1, vmode, argc >= 4 ? argv[3] : fnfl_model);
     }
     if (argc >= 2 && strcmp(argv[1], "sampler-ref") == 0) {
         return fn::samp::fnfl_sampler_ref();
@@ -1044,19 +1227,24 @@ int main(int argc, char ** argv) {
         const char * md = argc >= 3 ? argv[2] : "all";
         const int d0 = argc >= 4 ? atoi(argv[3]) : 0;
         const int d1 = argc >= 5 ? atoi(argv[4]) : (strcmp(md, "san") == 0 ? d0 : 1);
-        return fnfl_samp_test(d0, d1, md,
-                              argc >= 6 ? argv[5] : "/home/jeremy/src/flashnext/work/TG1/raw/ref-decode/logits.bin.gz",
+        return fnfl_samp_test(d0, d1, md, argc >= 6 ? argv[5] : fn::cases::fixture_path("tg1-logits").c_str(),
                               argc >= 7 ? argv[6] : "");
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "samp-bench") == 0) {
         return fnfl_samp_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1, argc >= 5 ? argv[4] : "");
     }
+#endif
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "v-bench") == 0) {
         return fnfl_v_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? atoi(argv[3]) : 1, "all");
     }
+#endif
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 2 && strcmp(argv[1], "dp-bench") == 0) {
         return fnfl_dp_bench(argc >= 3 ? atoi(argv[2]) : 0, argc >= 4 ? argv[3] : "all");
     }
+#endif
     if (argc >= 2 && (strcmp(argv[1], "layer-test") == 0 || strcmp(argv[1], "layer-bench") == 0)) {
         if (argc < 5) {
             fprintf(stderr, "%s: REF_DECODE REF_PROMPT OUT [full|san] [POSITIONS]\n", argv[1]);
@@ -1085,10 +1273,13 @@ int main(int argc, char ** argv) {
             }
             a.n_pos = static_cast<int32_t>(n);
         }
-        a.model_path = "/home/jeremy/models/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/IQ3_XXS/"
-                       "Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf";
-        a.draft_path = "/home/jeremy/models/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf";
+        a.model_path = fx_model;
+        a.draft_path = fx_draft;
+#ifdef FNFL_DRIVE_BENCH
         return strcmp(argv[1], "layer-test") == 0 ? fnfl_layer_test(a) : fnfl_layer_bench(a);
+#else
+        return fnfl_layer_test(a);
+#endif
     }
     if (argc >= 2 && strcmp(argv[1], "model-test") == 0) {
         fnfl_target_args a;
@@ -1164,7 +1355,10 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "rollback-test") == 0) {
         if (argc < 4) {
-            fprintf(stderr, "rollback-test: IDS OUT [real|dry|retain|mu1|mu1-dry|mu1-joint|mu1-joint-eager]\n");
+            fprintf(stderr,
+                    "rollback-test: IDS OUT [real|dry|retain|mu1|mu1-dry|mu1-joint|mu1-joint-eager|mu1-ladder] "
+                    "[--joint-kl DEEP] "
+                    "[--kl-depths D,...] [--kl-d d] [--route-kl] [--model GGUF]\n");
             return 2;
         }
         fnfl_target_args a;
@@ -1176,10 +1370,35 @@ int main(int argc, char ** argv) {
         for (int i = 5; i < argc; ++i) { // FMS2 item 7: --joint-kl DEEP after mu1 (load 1)
             if (strcmp(argv[i], "--joint-kl") == 0 && i + 1 < argc) {
                 a.joint_kl = argv[++i];
+            } else if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+                a.model_path = argv[++i];  // TTTS3: the target's first shard (UD-Q4_K_XL)
+            } else if (strcmp(argv[i], "--kl-depths") == 0 && i + 1 < argc) {  // MUP2: joint-kl at depth
+                for (const char * p = argv[++i]; *p != '\0';) {
+                    char *     end = nullptr;
+                    const long v   = strtol(p, &end, 10);
+                    if (end == p || v < 1 || v > 200000) {
+                        fprintf(stderr, "rollback-test: --kl-depths D,... (1 .. 200,000)\n");
+                        return 2;
+                    }
+                    a.kl_depths.push_back(int32_t(v));
+                    p = *end == ',' ? end + 1 : end;
+                }
+            } else if (strcmp(argv[i], "--route-kl") == 0) {  // APF2: the prompt routes' KL at depth
+                a.route_kl = true;
+            } else if (strcmp(argv[i], "--kl-d") == 0 && i + 1 < argc) {
+                a.kl_d = atoi(argv[++i]);
+                if (a.kl_d < 1 || a.kl_d > 4) {
+                    fprintf(stderr, "rollback-test: --kl-d 1 .. 4\n");
+                    return 2;
+                }
             } else {
                 fprintf(stderr, "rollback-test: unknown argument %s\n", argv[i]);
                 return 2;
             }
+        }
+        if (!a.kl_depths.empty() && (a.joint_kl.empty() || !so.leader)) {
+            fprintf(stderr, "rollback-test: --kl-depths needs --joint-kl and --split (MUP2: the split's joint-kl)\n");
+            return 2;
         }
         if (!a.joint_kl.empty() && a.mode != "mu1" && a.mode != "mu1-dry") {
             fprintf(stderr, "rollback-test: --joint-kl follows mu1 or mu1-dry\n");
@@ -1194,8 +1413,11 @@ int main(int argc, char ** argv) {
         return fnfl_rollback_test(a);
     }
     if (argc >= 2 && strcmp(argv[1], "joint-kl") == 0) {
-        if (argc < 4 || (argc >= 5 && strcmp(argv[4], "real") != 0 && strcmp(argv[4], "dry") != 0)) {
-            fprintf(stderr, "joint-kl: DEEP OUT [real|dry]\n");
+        // TTTS3: --model GGUF, the target's first shard (UD-Q4_K_XL), after the mode
+        const bool model = argc == 7 && strcmp(argv[5], "--model") == 0;
+        if (argc < 4 || (argc >= 5 && strcmp(argv[4], "real") != 0 && strcmp(argv[4], "dry") != 0) ||
+            (argc > 5 && !model)) {
+            fprintf(stderr, "joint-kl: DEEP OUT [real|dry] [--model GGUF]\n");
             return 2;
         }
         fnfl_target_args a;
@@ -1203,6 +1425,9 @@ int main(int argc, char ** argv) {
         a.joint_kl = argv[2];
         a.out_dir = argv[3];
         a.mode = argc >= 5 ? argv[4] : "real";
+        if (model) {
+            a.model_path = argv[6];
+        }
         apply_split(a, so, so.leader ? 1 : 0);  // TTTS1: --split [--fnfl-split-groups 1|2]
         return fnfl_joint_kl(a);
     }
@@ -1282,6 +1507,8 @@ int main(int argc, char ** argv) {
         for (size_t i = 0; i < rest.size() && !bad; ++i) {
             if (rest[i] == "--cells" && i + 1 < rest.size()) {
                 a.n_cells = atoi(rest[++i].c_str());
+            } else if (rest[i] == "--model" && i + 1 < rest.size()) {
+                a.model_path = rest[++i];  // TTTS3: the target's first shard (UD-Q4_K_XL)
             } else if (!sampling_flag(rest, i, a.sampling)) {
                 bad = rest[i].rfind("--", 0) == 0;
                 pos.push_back(rest[i]);
@@ -1337,6 +1564,8 @@ int main(int argc, char ** argv) {
             const bool more = i + 1 < rest.size();
             if (rest[i] == "--dry") {
                 a.mode = "dry";  // model-dry's load: zero weights, no model data (the no-load checks)
+            } else if (rest[i] == "--model" && more) {
+                a.model_path = rest[++i];  // TTTS2: the target's first shard (the leader's -m)
             } else if (rest[i] == "--slots" && more) {
                 a.n_slots = atoi(rest[++i].c_str());
             } else if (rest[i] == "--cells" && more) {
@@ -1358,7 +1587,8 @@ int main(int argc, char ** argv) {
         }
         if (bad || a.n_slots < 1 || a.n_slots > 8 || a.spec_d < 1 || a.spec_d > 4) {
             fprintf(stderr,
-                    "usage: fnfl-drive stage --split-layer K --draft-attention sparse [--dry] [--slots N (1 .. 8)] "
+                    "usage: fnfl-drive stage --split-layer K --draft-attention sparse [--dry] [--model GGUF] [--slots "
+                    "N (1 .. 8)] "
                     "[--cells N] [--pool-cells N] [--spec-d D] [--eog IDS] [--record-hash] [--split-addr IP] "
                     "[--split-port P] [--split-commit HEX] [--split-digest HEX] [--kv-format q8]\n");
             return 2;
@@ -1536,7 +1766,7 @@ int main(int argc, char ** argv) {
                             "--me3-arms\n");
             return 2;
         }
-        // ME4 (Carlos request 1, R1-08): a run of an append extends the previous run's state, so its tokens cannot
+        // ME4 (request 1, R1-08): a run of an append extends the previous run's state, so its tokens cannot
         // equal run 0's; an append is read once
         if (a.runs != 1 && std::find(a.next_append.begin(), a.next_append.end(), true) != a.next_append.end()) {
             fprintf(stderr, "spec: --next-append and --next-append-rows take --runs 1 (each run would extend the "
@@ -1615,14 +1845,15 @@ int main(int argc, char ** argv) {
         }
         return fnfl_generate(a);
     }
+#ifdef FNFL_DRIVE_BENCH
     if (argc >= 4 && (strcmp(argv[1], "xp1-test") == 0 || strcmp(argv[1], "xp1-bench") == 0)) {
         const bool test = strcmp(argv[1], "xp1-test") == 0;
         fnfl_xp1_test_args t;
         fnfl_xp1_bench_args b;
         t.dev0 = b.dev0 = atoi(argv[2]);
         t.dev1 = b.dev1 = atoi(argv[3]);
-        t.synth_dir = b.synth_dir = "/home/jeremy/src/flashnext/work/XP1/synth";
-        t.hx7_dir = b.hx7_dir = "/home/jeremy/src/flashnext/work/HX7/runs/capture-58581-20261009T090240Z";
+        t.synth_dir = b.synth_dir = fn::cases::fixture_path("xp1-synth");
+        t.hx7_dir = b.hx7_dir = fn::cases::fixture_path("hx7-capture");
         int i = 4;
         if (!test) {
             if (argc < 5) {
@@ -1722,12 +1953,16 @@ int main(int argc, char ** argv) {
         }
         return test ? fnfl_xp1_test(t) : fnfl_xp1_bench(b);
     }
+#endif
     fprintf(
         stderr,
         "usage: %s "
-        "act-test|act-bench|gd-test|gd-bench|hc-test|hc-bench|qa-test|qa-bench|qa2-test|qa2-bench|kv-tier-test|"
+        "act-test|act-bench|gd-test|gd-bench|hc-test|hc-bench|qa-test|qa-bench|qa2-test|qa2-bench|kv-tier-test|ladder-"
+        "test|prompt-tune|"
         "settings|kv-format-test|ex-calib|ex-prep|ex-cpu-test|ex-test|ex-bench|"
-        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|xchg-test|hc2-test|hcj-test|qsaj-test|gdnj-test|"
+        "ep-prep|ep-test|ep-bench|decode-check|synth-check|grid-test|grid-gpu-test|cases|"
+        "xchg-test|hc2-test|hcj-test|hcmix-test|qsaj-test|"
+        "gdnj-test|"
         "hc2-bench|load-plan|"
         "load-check|xchg2-test|px1-link|layer-test|layer-bench|xp1-test|xp1-bench|dp-test|dpj-test|dp-bench|pd-test|"
         "hcp-test|gdp-test|qsp-test|pe-test|dcp-test|ple-test|ple-pin-test|ple-bench|state-test|"

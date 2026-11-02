@@ -48,15 +48,16 @@
 // (C11): two slots through engine::step_joint step alone, each slot's steps, tokens and ledger its engine::step run's.
 
 #include "fn/kernels/round/version.h"
+#include "fn/loader/run_load.h"
 #include "fn/model/kv_pool.h"
 #include "fn/model/layer.h"
 #include "fn/model/model.h"
 #include "fn/model/state.h"
-#include "fn/loader/run_load.h"
 #include "fn/runtime/expert_cache.h"
 #include "fn/runtime/joint.h"
 #include "fn/runtime/runtime.h"
 #include "fn/runtime/target_cmds.h"
+#include "fn/tools/cases.h"
 
 #include <cuda_runtime.h>
 
@@ -1292,7 +1293,7 @@ bool part_c(int32_t dev, bool eager) {
     aa.kv_host = true;
     aa.draft_attention = "sparse";
     aa.draft_attention_given = true;
-    aa.draft_path = "/home/jeremy/src/flashnext/work/ME7/out/mtp-Qwen3.8-Flash-Next-shared-Q8_0-q2experts.gguf";
+    aa.draft_path            = fn::cases::fixture_path("draft-q2");  // TFC: the named fixture
     aa.device_cap_mib = 16160; // Config D
     aa.ex_reserve_mib = 640;
     aa.cache.lend_pct = 98;

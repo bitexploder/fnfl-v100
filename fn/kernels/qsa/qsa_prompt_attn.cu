@@ -1,4 +1,5 @@
 #include "fn/kernels/qsa/attend.h"
+#include "fn/kernels/qsa/imrope.cuh"
 #include "fn/kernels/qsa/kv_q8.cuh"
 #include "fn/kernels/qsa/qsa_prompt.h"
 #include "fn/kernels/tc/tc_gemm.cuh"
@@ -94,7 +95,8 @@ template <bool Q8> __global__ void __launch_bounds__(256) kv_kernel(const qsp_kv
     }
     const int64_t cell = int64_t(a.pos0) + t;
     float         y[8];
-    norm_rope_pos(y, a.kv_k + int64_t(t) * HD, a.k_norm, a.pos0 + t, theta_scale, lane);
+    norm_rope_pos(y, a.kv_k + int64_t(t) * HD, a.k_norm, prompt_rope_pos(a.planes, a.pos0 + a.rope_off, t, lane),
+                  theta_scale, lane);
     if constexpr (Q8) {
         put_q8(y, a.k_cache, a.k_scale, cell, lane);
         const float4 v0 = __ldg(reinterpret_cast<const float4 *>(a.kv_v + int64_t(t) * HD) + 2 * lane);
@@ -231,7 +233,7 @@ __global__ void __launch_bounds__(at_threads, 2) attend_kernel(const qsp_attend_
     const int32_t      tid = static_cast<int32_t>(threadIdx.x), lane = tid & 31, warp = tid >> 5;
     const int32_t      qp  = (lane >> 2) & 3;
     const int32_t      fr  = (lane & 3) + (lane >= 16 ? 4 : 0);
-    const int32_t      pos = a.pos0 + t;
+    const int32_t      pos = prompt_rope_pos(a.planes, a.pos0 + a.rope_off, t, lane);  // MUP1: its rotary position
     const int32_t      slab = t / prompt_slab, rr = t % prompt_slab;
     const uint32_t * body = a.body + int64_t(slab) * prompt_slab_words + a.offsets[slab * (prompt_slab + 1) + rr] / 4;
     const int32_t    nb = static_cast<int32_t>(body[0]), ntail = static_cast<int32_t>(body[1]);

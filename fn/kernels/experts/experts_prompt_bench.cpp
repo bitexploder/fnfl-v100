@@ -5,6 +5,7 @@
 #include "fn/kernels/experts/experts_prompt_test.h"
 #include "fn/kernels/experts/experts_test.h"
 #include "fn/model/shapes.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -37,11 +38,7 @@ constexpr double warm_s = 2.0;               // HX12 Later 15: a process starts 
 constexpr size_t min_cold = size_t(1) << 30; // weights rotated over at least this many bytes (EP1 step 7)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "ep-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "ep-bench", what);
 }
 
 std::string utc_now() {

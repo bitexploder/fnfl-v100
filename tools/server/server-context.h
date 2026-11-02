@@ -7,6 +7,7 @@
 #include "json.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -73,6 +74,9 @@ static server_state server_state_from_str(const std::string & str) {
     if (str == "sleeping")    return SERVER_STATE_SLEEPING;
     GGML_ASSERT(false && "invalid server_state string");
 }
+
+// PRD1: the FNFL build stamp line ("fnfl: commit ..."), printed with --version
+void server_print_fnfl_build(FILE * out);
 
 using server_state_callback_t = std::function<void(server_state, json /* payload */)>;
 
@@ -143,31 +147,34 @@ struct server_routes {
     json get_model_info() const;
 
 private:
-    std::unique_ptr<server_res_generator> handle_completions_impl(
-            const server_http_req & req,
-            server_task_type type,
-            const json & data,
-            task_response_type res_type);
-    std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
-    std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab * vocab, const server_http_req & req, task_response_type res_type);
+  std::unique_ptr<server_res_generator> handle_completions_impl(
+      const server_http_req & req,
+      server_task_type        type,
+      const json &            data,
+      task_response_type      res_type,
+      std::vector<raw_buffer> files = {});  // VIS1 Stage B: the chat's images, in marker order
+  std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
+  std::unique_ptr<server_res_generator> handle_count_tokens(const llama_vocab *     vocab,
+                                                            const server_http_req & req,
+                                                            task_response_type      res_type);
 
-    // using unique_ptr to allow late initialization of const
-    std::unique_ptr<const server_context_meta> meta;
+  // using unique_ptr to allow late initialization of const
+  std::unique_ptr<const server_context_meta> meta;
 
-    const common_params & params;
-    server_context_impl & ctx_server;
+  const common_params & params;
+  server_context_impl & ctx_server;
 
-    server_queue & queue_tasks;
-    server_response & queue_results;
-    std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+  server_queue &                        queue_tasks;
+  server_response &                     queue_results;
+  std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
 
-    // cached responses, to be used during sleep
-    std::mutex     mutex_cache;
-    json           cached_models  = nullptr;
-    json           cached_props   = nullptr;
-    server_metrics cached_metrics;
-    // set when a scrape during sleep already reported the throughput buckets
-    bool           should_reset_buckets = false;
-    // call right before sleep to update the cached responses
-    void update_cached_responses(bool is_sleeping);
+  // cached responses, to be used during sleep
+  std::mutex     mutex_cache;
+  json           cached_models = nullptr;
+  json           cached_props  = nullptr;
+  server_metrics cached_metrics;
+  // set when a scrape during sleep already reported the throughput buckets
+  bool           should_reset_buckets = false;
+  // call right before sleep to update the cached responses
+  void           update_cached_responses(bool is_sleeping);
 };

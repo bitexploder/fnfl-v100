@@ -4,7 +4,10 @@
 // decode select run one row at a time on the same summaries and queries (rows below, across and above 512 visible
 // blocks, across slabs; deterministic ties, every block's score equal; pathological keys: zero, one-hot 1e19, the
 // smallest subnormal and -0.0 blocks); the K/V write against FP64 (K within one BF16 step, V bitwise); attention over
-// the prompt's own selection against FP64 (1e-5 a row and head) and a rerun bitwise. mode "san": small cases.
+// the prompt's own selection against FP64 (1e-5 a row and head) and a rerun bitwise; VIS1 Stage B: the index with rope
+// planes (summaries at their blocks' planes and the prepared queries at their rows' against FP64 pair by pair, within
+// 4e-3 of the largest value; uniform planes bitwise the offset path's, summaries and selection). mode "san": small
+// cases.
 // "qsp-test: PASS".
 // KV8: q8 runs the K/V write and attention cases with the caches in the 8-bit format
 int fnfl_qsp_test(int device, const char * mode, bool q8 = false);

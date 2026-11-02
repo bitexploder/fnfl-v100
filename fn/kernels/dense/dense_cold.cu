@@ -7,6 +7,18 @@
 namespace fn::dense {
 namespace {
 
+// TTTS6: poison_smem's fill (volatile: the stores have no reader in this kernel)
+__global__ void poison_kernel() {
+    extern __shared__ uint4 poison[];
+    volatile uint4 *        p = poison;
+    for (int32_t i = static_cast<int32_t>(threadIdx.x); i < 96 * 1024 / 16; i += static_cast<int32_t>(blockDim.x)) {
+        p[i].x = 0xffffffffu;
+        p[i].y = 0xffffffffu;
+        p[i].z = 0xffffffffu;
+        p[i].w = 0xffffffffu;
+    }
+}
+
 // reads the buffer, so L2 ends full of clean lines: a write flush would leave dirty lines whose write-back the timed
 // kernel pays; a store under a condition on the loaded words keeps the reads
 __global__ void __launch_bounds__(512) flush_kernel(uint4 * p, int64_t n) {
@@ -142,6 +154,15 @@ bool l2keep_walk(const uint32_t * keep, int32_t n_walks, int32_t n_steps, uint32
         return false;
     }
     keep_walk_kernel<<<n_walks, 32, 0, static_cast<cudaStream_t>(stream)>>>(keep, n_steps, cycles, walk_cycles);
+    return launched();
+}
+
+bool poison_smem(void * stream) {
+    constexpr int32_t bytes = 96 * 1024;
+    if (cudaFuncSetAttribute(poison_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes) != cudaSuccess) {
+        return false;
+    }
+    poison_kernel<<<72, 1024, bytes, static_cast<cudaStream_t>(stream)>>>();
     return launched();
 }
 

@@ -8,7 +8,7 @@
 // rows, stream-major), ple_value rows r*1280 .. (1,280), the norms' and ple_conv1d's channels s*2560 + r*1280 .. as
 // card channel c = 1280 s + i. Three launches a step, one stream a card, then the frame's commit:
 //   products: key [B][5120] = ple_key . e and value [B][1280] = ple_value . e, DP2's BF16 product (fn::dense), one
-//             launch with both matrices.
+//             launch with both matrices (TTTS3: UD-Q4_K_XL's Q8_0 as stored, dense::fmt::q8_0f, bitwise the F32 rows').
 //   stats:    per row, the 13 partial statistics over the card's features (WP2's factorization), with
 //             h = hres + hpost * hx (FC-LAY1, one fmaf): sum key_s^2, sum h_s^2, sum key_s nk_s h_s nq_s (s = 0..3), sum
 //             value^2. Sends them to the peer as X-PLE-STATS (fn/xchg/xchg.h has the protocol and its reuse chain) and
@@ -29,7 +29,8 @@
 //   state:    history F32 [6][5120][9] (R1's "L1 PLE" part): logical version 0 committed; version v = the channel's
 //             last 9 inputs after the first v rows, oldest first. A step reads version 0 and writes versions 1..B.
 //             Logical version v is at slot fn::round::version_slot(*cur, v) (fn/kernels/round/version.h, SR1).
-//   numerics: F32 storage, accumulation and outputs; weights BF16 (key, value), F32 norms, F16 taps, widened exactly.
+//   numerics: F32 storage, accumulation and outputs; weights BF16 or Q8_0 (key, value), F32 norms, F16 or F32 taps,
+//             widened exactly.
 //             Built without fast math (--ftz=false --prec-div=true --prec-sqrt=true --fmad=true); sqrtf, expf and the
 //             divisions are the precise forms. Every reduction has a fixed order and no atomics (stats: a thread's 5
 //             features in order, a shuffle-xor tree, the 8 warps in order), one block a row, so a row is bitwise
@@ -68,13 +69,25 @@ constexpr int32_t n_stats = 13;
 constexpr int64_t hist_version_floats = int64_t(n_channel) * n_hist;
 constexpr int64_t hist_bytes = n_version * hist_version_floats * 4;
 
+// TTTS3: the key and value's stored format. BF16 (the IQ3_XXS file); Q8_0 as UD-Q4_K_XL stores them (GGUF blocks of 34
+// bytes, fn::dense::fmt::q8_0f: each weight d x q formed exactly in F32, so the products are bitwise F32's); F32 rows
+// (TTTS2's widened form of the same Q8_0, kept as Q8_0's test reference; products_joint refuses it)
+enum class kv_fmt : uint8_t { bf16, f32, q8_0 };
+
+constexpr int64_t kv_row_bytes(kv_fmt f) {
+    return f == kv_fmt::bf16 ? int64_t(2) * n_in : f == kv_fmt::f32 ? int64_t(4) * n_in : int64_t(n_in / 32) * 34;
+}
+
 struct weights {
-    const uint8_t * key = nullptr;      // [5120][2560] BF16, GGUF rows (fn::dense's BF16 pack is a copy)
-    const uint8_t * value = nullptr;    // [1280][2560] BF16
+    const uint8_t *  key   = nullptr;  // [5120][2560] GGUF rows in kv's format (fn::dense's BF16 and Q8_0F packs copy)
+    const uint8_t *  value = nullptr;  // [1280][2560]
     const float * norm_key = nullptr;   // [4][1280]
     const float * norm_query = nullptr; // [4][1280]
     const float * norm_conv = nullptr;  // [4][1280]
     const uint16_t * conv = nullptr;    // [5120][4] F16 bits
+    kv_fmt           kv         = kv_fmt::bf16;  // TTTS3
+    // TTTS2 (UD-Q4_K_XL): the taps F32 [5120][4] in conv32 (conv unused)
+    const float *    conv32     = nullptr;
 };
 
 struct step_args {
@@ -123,7 +136,8 @@ bool step(int32_t rows, const step_args & a, void * stream);
 
 // FMU2 (build item 4): every lane's products in one fn::dense::product_joint launch, each weight loaded once: lanes 2..4,
 // lane u's a[u] at rows (FMS13: the round's R, 2 .. fn::dense::lane_rows) rows, its own e and workspace, the same
-// weights. Lane u's key and value are bitwise its products(rows, a[u]) (the joint product's contract, dense.h). work:
+// weights (BF16 or, TTTS3, Q8_0). Lane u's key and value are bitwise its products(rows, a[u]) (the joint product's
+// contract, dense.h). work:
 // joint_products_work_bytes(), zeroed once, private to these launches. Enqueued on stream; false as products.
 size_t joint_products_work_bytes();
 bool   products_joint(int32_t lanes, int32_t rows, const step_args * const a[], uint8_t * work, void * stream);

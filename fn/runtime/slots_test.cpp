@@ -3,6 +3,7 @@
 #include "fn/runtime/slots_test.h"
 
 #include "fn/model/kv_pool.h"
+#include "fn/runtime/image_rows.h"
 #include "fn/runtime/prefill.h"
 #include "fn/runtime/prompt_plan.h"
 
@@ -120,6 +121,33 @@ bool slots_cpu_test() {
                  full && sel && repl && drop && clr,
                  std::to_string(full) + std::to_string(sel) + std::to_string(repl) + std::to_string(drop) +
                      std::to_string(clr)) &&
+             ok;
+    }
+    {
+        // VIS1 Stage B: with images the keys are the ledger's: the same token ids with another image (its digest)
+        // match only below that image; the same image matches; no ledger reads token_key's keys as before
+        std::vector<int32_t> tok(30000, 11);
+        std::fill(tok.begin() + 9000, tok.begin() + 9000 + 64 * 32, image_token);
+        image_rows      a, o;
+        std::string     e;
+        const bool      set = a.set(tok.data(), 30000,
+                                    {
+                                        { 9000, 64, 32, 0x1234 }
+        },
+                                    e) &&
+                              o.set(tok.data(), 30000, { { 9000, 64, 32, 0x9999 } }, e);
+        checkpoint_book b;
+        for (const int64_t pos : { int64_t(8192), int64_t(16384), int64_t(24576) }) {
+            b.record(b.slot_for(pos, 0), pos, a.key(tok.data(), pos), 0);
+        }
+        const int32_t same  = choose_checkpoint(b, tok, 29000, 0, &a);
+        const bool    s_ok  = same >= 0 && b.at(same).pos == 24576;
+        const int32_t other = choose_checkpoint(b, tok, 29000, 0, &o);  // drops 24,576 and 16,384 (another image)
+        const bool    o_ok  = other >= 0 && b.at(other).pos == 8192 && b.count_owner(0) == 1;
+        const bool    k_ok  = a.key(tok.data(), 8192) == token_key(tok.data(), 8192) &&
+                              image_rows().key(tok.data(), 20000) == token_key(tok.data(), 20000);
+        ok = put("checkpoint keys with images (the same image, another image, no image)", set && s_ok && o_ok && k_ok,
+                 std::to_string(set) + std::to_string(s_ok) + std::to_string(o_ok) + std::to_string(k_ok)) &&
              ok;
     }
     {

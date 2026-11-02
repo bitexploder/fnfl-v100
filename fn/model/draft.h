@@ -42,6 +42,7 @@ constexpr int32_t draft_max_steps = 4; // d (SP2: 1..4)
 struct draft_card {
     draft_weights w;
     const uint8_t * head_w = nullptr;   // the draft head copy: 32,768 Q5_K rows, DP2's packed layout
+    bool                head_q8     = false;     // TTTS2: its rows Q8_0 (UD-Q4_K_XL's output.weight)
     const int32_t * head_ids = nullptr; // their global IDs
     uint16_t * k_cache = nullptr;       // F16 [max_cells][256] (layer 48's KV head of this card)
     uint16_t * v_cache = nullptr;
@@ -127,6 +128,7 @@ struct draft_joint {
     const int32_t * one = nullptr;            // device word 1: X-DRAFT-IN reads hidden row i at h or carry row i
     uint32_t * sel_body[fn::xchg::max_lanes] = {};
     int32_t * sel_off[fn::xchg::max_lanes] = {};
+    bool            q8 = false;  // TTTS6: the dense products on the Q8_0 instances (fn::dense product_args::q8)
 };
 
 // One card's joint draft step of d = rows steps for a graph capture (u: draft_graph_counters(draft_step, rows)), and
@@ -156,9 +158,13 @@ struct catchup_joint {
     uint32_t * runs = nullptr;              // [max_lanes][fn::hc::n_runs_card] the lanes' up2 run counters, zeroed once
     void * kv_work[2] = {nullptr, nullptr}; // the K/V product's joint work, dense and sparse forms, zeroed once
     size_t kv_work_bytes[2] = {0, 0};
+    bool       q8 = false;  // TTTS6: the dense products on the Q8_0 instances (fn::dense product_args::q8)
+    const fn::dense::stage_steps * kv_steps = nullptr;  // TTTS6 item 2: the K/V product's, dense and sparse forms
 };
 // the K/V product's joint work bytes of a draft form (fn::dense::joint_work_bytes of its shape)
 size_t catchup_kv_work_bytes(bool sparse);
+// TTTS6 item 2: the K/V product's staging steps of a draft form (fn::dense::stage_steps_of of its shape)
+bool         catchup_kv_steps(bool sparse, fn::dense::stage_steps & out);
 // the joint catch-up's counters, every round (a graph's, eagerly too): the catch-up's slot rule
 use_counters catchup_joint_counters();
 // One card's joint catch-up for a graph capture, and both cards in phases eagerly (the pair form's order). False

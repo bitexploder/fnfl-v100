@@ -85,7 +85,13 @@ bool norm_case(int32_t rows, verdict & v) {
     return bad == 0;
 }
 
-bool mixed_prepare_case(int32_t rows, verdict & v) {
+// MUP1 piece 5: off, the slot's rotary offset (K at cell + off, written at its cell); planes: supplied rope planes
+// [rows][4] (four that differ, pair i at plane imrope(i); VIS1's rows)
+int32_t imrope_plane_ref(int32_t i) {
+    return i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : i % 3 == 0 && i < 33 ? 0 : 3;
+}
+
+bool mixed_prepare_case(int32_t rows, verdict & v, int32_t off = 0, bool planes = false) {
     rng                r(0xd7 + uint64_t(rows));
     std::vector<float> half[2], kk(size_t(rows) * HD), vv(size_t(rows) * HD), kn(HD);
     for (int32_t h = 0; h < 2; ++h) {
@@ -105,9 +111,18 @@ bool mixed_prepare_case(int32_t rows, verdict & v) {
     }
     const int32_t cells = 8192, pos0 = 3000; // PB3: room for a 4,096-row half after pos0
     dbuf          h0(half[0].size() * 4), h1(half[1].size() * 4), m16(size_t(rows) * D * 2), dk(kk.size() * 4),
-        dv(vv.size() * 4), dkn(size_t(HD) * 4), kc(size_t(cells) * HD * 2), vc(size_t(cells) * HD * 2), err(256);
+        dv(vv.size() * 4), dkn(size_t(HD) * 4), kc(size_t(cells) * HD * 2), vc(size_t(cells) * HD * 2), err(256),
+        dpl(size_t(rows) * 4 * 4);
+    std::vector<int32_t> pl(size_t(rows) * 4);
+    for (int32_t t = 0; t < rows; ++t) {
+        const int32_t p       = 700 + t / 9;  // a 9-wide grid's rows: t, h, w, e
+        pl[size_t(t) * 4 + 0] = p;
+        pl[size_t(t) * 4 + 1] = p + (t / 9) % 4;
+        pl[size_t(t) * 4 + 2] = p + t % 9;
+        pl[size_t(t) * 4 + 3] = p;
+    }
     if (!h0.put(half[0]) || !h1.put(half[1]) || !dk.put(kk) || !dv.put(vv) || !dkn.put(kn) || !kc.zero() ||
-        !vc.zero() || !err.zero()) {
+        !vc.zero() || !err.zero() || !dpl.put(pl)) {
         return false;
     }
     std::vector<uint16_t> g16[2];
@@ -128,6 +143,8 @@ bool mixed_prepare_case(int32_t rows, verdict & v) {
     fn::draft::kvp_args ka;
     ka.rows        = rows;
     ka.pos0        = pos0;
+    ka.rope_off    = off;
+    ka.planes      = planes ? dpl.as<int32_t>() : nullptr;
     ka.max_cells   = cells;
     ka.kv_k        = dk.as<float>();
     ka.kv_v        = dv.as<float>();
@@ -152,7 +169,7 @@ bool mixed_prepare_case(int32_t rows, verdict & v) {
             terms[e] = std::fabs(y[e]);
         }
         for (int32_t i = 0; i < 32; ++i) {
-            float theta = static_cast<float>(pos0 + t);
+            float theta = static_cast<float>(planes ? pl[size_t(t) * 4 + imrope_plane_ref(i)] : pos0 + t + off);
             for (int32_t q = 0; q < i; ++q) {
                 theta = theta * ka.theta_scale;
             }
@@ -169,7 +186,9 @@ bool mixed_prepare_case(int32_t rows, verdict & v) {
         }
     }
     const bool pass = ok && mbad == 0 && kbad == 0 && vbad == 0;
-    v.put("mixed and K/V " + std::to_string(rows) + " positions", pass,
+    v.put("mixed and K/V " + std::to_string(rows) + " positions" + (off != 0 ? " offset " + std::to_string(off) : "") +
+              (planes ? " supplied planes" : ""),
+          pass,
           std::to_string(mbad) + " mixed values not f16 of their card's half; " + std::to_string(kbad) +
               " K beyond one F16 step of FP64 plus F32 term rounding; " + std::to_string(vbad) + " V not f16(v)");
     return pass;
@@ -187,5 +206,10 @@ int fnfl_dcp_test(int device, const char * mode) {
         norm_case(rows, v);
         mixed_prepare_case(rows, v);
     }
+    const int32_t rows = san ? 2 : 300;  // MUP1 piece 5: the rotary offset and supplied planes
+    mixed_prepare_case(rows, v, 99991);
+    mixed_prepare_case(rows, v, -1000);
+    mixed_prepare_case(rows, v, -3200);  // rows crossing position zero (-200 .. 99)
+    mixed_prepare_case(rows, v, 0, true);
     return v.finish();
 }

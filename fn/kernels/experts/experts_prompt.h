@@ -93,9 +93,27 @@ struct ep_route {
 // at least e, task_off[512] the task count (0 after a bad ID). The ring's groups run [task_off[e_lo], task_off[e_hi])
 bool ep_task_offsets(const ep_route & r, int32_t * task_off, void * stream);
 
+// APF2, the ladder's grouped route (experts_ladder.h): ep_group with lists also writes up to two grouped task lists,
+// one a tile size: list i (tasks[i] non-null, [ep_max_ltasks][4] I32, 16-byte aligned: expert, first position, pairs,
+// 0) splits every expert's pairs into ceil(n / rows[i]) runs of near-equal size (rows[i] a multiple of 8 in
+// [8, ep_ladder_max_rows]), expert-major, and counters[2 + i] is its count (0 after a bad ID or without the list).
+// The per-task list still covers every expert
+constexpr int32_t ep_ladder_max_rows = 128;
+constexpr int32_t ep_max_ltasks      = ep_max_pairs / 8 + 512;  // 5,632
+
+struct ep_lists {
+    int32_t * tasks[2] = { nullptr, nullptr };
+    int32_t   rows[2]  = { 0, 0 };
+};
+
 // task_rows: ep_task_rows of the layer's gate/up format (any multiple of 8 in [8, 48] for ep_down alone)
-bool ep_group(int32_t rows, int32_t task_rows, const int32_t * ids, const ep_route & r, uint32_t * status,
-              void * stream);
+bool ep_group(int32_t          rows,
+              int32_t          task_rows,
+              const int32_t *  ids,
+              const ep_route & r,
+              uint32_t *       status,
+              void *           stream,
+              const ep_lists & lists = {});
 
 struct ep_gate_up_args {
     const uint8_t * w;     // [512][gate_up_bytes(f)] packed
@@ -149,6 +167,9 @@ struct ep_sum_args {
 // Enqueue on stream (a cudaStream_t). Return false, with nothing enqueued, for an unsupported format or argument;
 // false after a failed launch submission (the CUDA error is left for the caller).
 bool ep_gate_up(fmt f, int32_t rows, const ep_gate_up_args & a, void * stream);
+// the resident gate/up and down kernels' shared memory opt-ins on the current device, ahead of a launch (APF1 Part 4:
+// before any stream capture)
+bool ep_prompt_attributes();
 bool ep_down(fmt f, int32_t rows, const ep_down_args & a, void * stream);
 bool ep_sum(int32_t rows, const ep_sum_args & a, void * stream);
 

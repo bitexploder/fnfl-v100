@@ -50,6 +50,10 @@ struct kvp_args {
     uint16_t *    k_cache     = nullptr;  // F16 [max_cells][256]
     uint16_t *    v_cache     = nullptr;
     float         theta_scale = 0.0f;
+    // MUP1 piece 5: row t's rotary position: planes (device [rows][4], VIS1's supplied rows) when set, else every
+    // plane pos0 + rope_off + t (text: the slot's offset); its cell stays pos0 + t
+    int32_t         rope_off = 0;
+    const int32_t * planes   = nullptr;
 };
 
 bool dcp_prepare(const kvp_args & a, void * stream);

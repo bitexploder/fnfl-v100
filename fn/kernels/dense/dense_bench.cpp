@@ -5,6 +5,7 @@
 #include "fn/kernels/dense/dense_cold.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/gdn/gdn.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -39,11 +40,7 @@ constexpr double tail_across_us = 0.83;    // HX12: a launch that finishes acros
 constexpr int32_t D = 2560;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "dp-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "dp-bench", what);
 }
 
 std::string utc_now() {

@@ -12,6 +12,8 @@
 //            summary[b] = rope(rms_norm(mean(k[4b..4b+3])) * k_norm, position 4b), the F32 pooled key, stored when
 //                         block b completes (summary_update)
 //            q'[t][h]   = rope(rms_norm(q[t][h]) * q_norm, position depth + t)
+//            (MUP1 piece 5: rotary positions are cell + the slot's offset, 4b + off and depth + t + off; cells,
+//            blocks and the selection stay on cells; text's offset is 0)
 //            score[t][b] = sum_h relu(q'[t][h] . summary[b])
 //            row t sees block b whole when 4b + 3 <= depth + t; it takes the 512 whole blocks with the highest
 //            score (equal scores: the lower block first), in ascending block order, and its tail cells (the
@@ -117,6 +119,12 @@ struct update_args {
     int32_t first;
     int32_t count; // 1 .. max_blocks
     rope_params rope;
+    // MUP1 piece 5: the slot's rotary position offset; block b's summary is roped at position 4b + rope_off (text: 0)
+    int32_t rope_off = 0;
+    // VIS1 Stage B: optional device [count][4], block first + i's first row's rope planes (fn/runtime/image_rows.h):
+    // its summary is roped at them (each rotation pair its IMROPE plane, fn/kernels/qsa/imrope.cuh) instead of at
+    // 4b + rope_off; text planes are that position in every plane, so text's bits are unchanged (null: text)
+    const int32_t * planes = nullptr;
 };
 bool summary_update(const update_args & a, void * stream);
 
@@ -140,6 +148,9 @@ struct round_update_args {
     // ME6 (the host-backed tier's graphs, fn/model/kv_tier.h): optional device word w; when set, cell c is read and
     // written at keys + (c - *w) * 128, *w read on the device (null: the resident form)
     const int64_t * shift = nullptr;
+    // MUP1 piece 5: optional device word (the round descriptor's pos_off), read on the device: the slot's rotary
+    // position offset, block b roped at 4b + *rope_off (null: 0)
+    const int32_t * rope_off = nullptr;
 };
 bool summary_update(const round_update_args & a, void * stream);
 // FMS2 (build item 2, the joint catch-up): the round form of lanes 2 .. 4 in one launch, lane u on a[u] with *rows[u]
@@ -179,6 +190,9 @@ struct select_args {
     // instead of depth (the draft's step-0 query at its cell N, scoring the N / 4 whole blocks of the prefix with
     // depth = N - 1); rows must be 1. 0: the target's form.
     int32_t q_ahead = 0;
+    // MUP1 piece 5: optional device word (the round descriptor's pos_off): row t's query is roped at depth + t +
+    // q_ahead + *rope_off (null: 0); the visible blocks and tail stay on cells
+    const int32_t * rope_off = nullptr;
 };
 // Both launches are always enqueued, so one captured pair serves every depth: launch 1 (score) returns at once when no
 // row sees more than 512 whole blocks, and its grid is sized for max_cells (a CTA past the depth's tiles exits). A

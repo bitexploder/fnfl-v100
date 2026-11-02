@@ -3,6 +3,7 @@
 #include "fn/kernels/qsa/qsa.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_runtime.h>
 
@@ -17,6 +18,7 @@
 #include <random>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -29,11 +31,7 @@ constexpr int32_t R = q::ratio;
 constexpr int32_t fixture_width = 2051; // the HX7 fixture's rows: the pinned source's top_k width (2,048 + 3)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "qa-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "qa-test", what);
 }
 
 // owns one device allocation of n elements of T (at least one)
@@ -264,6 +262,7 @@ struct case_data {
     std::vector<float> qv;      // [rows][4][128]
     std::vector<float> k_norm, q_norm;
     std::vector<std::set<int32_t>> expect; // the HX7 case: each row's captured blocks
+    int32_t off = 0;  // MUP1 piece 5: the rotary offset (summaries at 4b + off, queries at depth + t + off)
 };
 
 float bf16_round(float f) {
@@ -515,21 +514,34 @@ struct device_case {
     dev_buf<uint32_t> body; // exactly body_words: a write past the body is the sanitizer's to find
     dev_buf<int32_t> offsets;
     dev_buf<int32_t> depth; // [1]: select reads the depth on the device (TG1)
+    dev_buf<int32_t>  off;   // [1]: MUP1, the rotary offset select reads on the device (the descriptor's pos_off)
     q::workspace ws;
 
-    device_case(cudaStream_t s, const case_data & c)
-        : st(s), cd(c), n_kv(c.depth + c.rows), nb(n_kv / R), keys(c.keys.size()),
-          summaries(q::summary_bytes(n_kv / R) / 4), qv(c.qv.size()), k_norm(HD), q_norm(HD),
-          ws_mem(q::workspace_bytes()), body(static_cast<size_t>(q::body_words(c.depth, c.rows))),
-          offsets(static_cast<size_t>(c.rows) + 1), depth(1), ws(q::carve(ws_mem.p)) {}
+    device_case(cudaStream_t s, const case_data & c) :
+        st(s),
+        cd(c),
+        n_kv(c.depth + c.rows),
+        nb(n_kv / R),
+        keys(c.keys.size()),
+        summaries(q::summary_bytes(n_kv / R) / 4),
+        qv(c.qv.size()),
+        k_norm(HD),
+        q_norm(HD),
+        ws_mem(q::workspace_bytes()),
+        body(static_cast<size_t>(q::body_words(c.depth, c.rows))),
+        offsets(static_cast<size_t>(c.rows) + 1),
+        depth(1),
+        off(1),
+        ws(q::carve(ws_mem.p)) {}
 
     bool ready() const {
-        return keys.p && summaries.p && qv.p && k_norm.p && q_norm.p && ws_mem.p && body.p && offsets.p && depth.p;
+        return keys.p && summaries.p && qv.p && k_norm.p && q_norm.p && ws_mem.p && body.p && offsets.p && depth.p &&
+               off.p;
     }
 
     bool upload() {
-        return keys.put(cd.keys, st) && qv.put(cd.qv, st) && depth.put(std::vector<int32_t>{cd.depth}, st) &&
-               k_norm.put(cd.k_norm, st) && q_norm.put(cd.q_norm, st) &&
+        return keys.put(cd.keys, st) && qv.put(cd.qv, st) && depth.put(std::vector<int32_t>{ cd.depth }, st) &&
+               off.put(std::vector<int32_t>{ cd.off }, st) && k_norm.put(cd.k_norm, st) && q_norm.put(cd.q_norm, st) &&
                cuda_ok(cudaMemsetAsync(ws_mem.p, 0, q::workspace_bytes(), st), "workspace") &&
                // the tiles' lists as a deeper earlier call would leave them: the largest key everywhere, so a select that
                // reads a list launch 1 did not write this time takes junk
@@ -551,7 +563,7 @@ struct device_case {
                   cuda_ok(cudaMemsetAsync(offsets.p, 0xab, offsets.n * 4, st), "clear");
         q::summary_index idx;
         if (ok && nb > 0) {
-            const q::update_args u = {keys.p, k_norm.p, summaries.p, 0, nb, q::model_rope()};
+            const q::update_args u = { keys.p, k_norm.p, summaries.p, 0, nb, q::model_rope(), cd.off };
             ok = q::summary_update(u, st) && q::mark_updated(idx, 0, nb);
             if (ok && nb >= 3) {
                 // a rollback of the last three blocks: their summaries are stale until recomputed
@@ -561,18 +573,19 @@ struct device_case {
                      cuda_ok(cudaMemsetAsync(summaries.p + tile0 * HD, 0x7f, (summaries.n - tile0 * HD) * 4, st),
                              "stale");
                 // the round-sized updates: at most two blocks a launch
-                const q::update_args u1 = {keys.p, k_norm.p, summaries.p, nb - 3, 1, q::model_rope()};
-                const q::update_args u2 = {keys.p, k_norm.p, summaries.p, nb - 2, 2, q::model_rope()};
+                const q::update_args u1 = { keys.p, k_norm.p, summaries.p, nb - 3, 1, q::model_rope(), cd.off };
+                const q::update_args u2 = { keys.p, k_norm.p, summaries.p, nb - 2, 2, q::model_rope(), cd.off };
                 ok = ok && q::summary_update(u1, st) && q::mark_updated(idx, nb - 3, 1) && q::summary_update(u2, st) &&
                      q::mark_updated(idx, nb - 2, 2) && idx.n_valid == nb;
                 // the rollback cleared whole tiles: rebuild the rest of the first one
                 if (ok && tile0 < static_cast<size_t>(nb - 3)) {
-                    const q::update_args u3 = {keys.p,
-                                               k_norm.p,
-                                               summaries.p,
-                                               static_cast<int32_t>(tile0),
-                                               nb - 3 - static_cast<int32_t>(tile0),
-                                               q::model_rope()};
+                    const q::update_args u3 = { keys.p,
+                                                k_norm.p,
+                                                summaries.p,
+                                                static_cast<int32_t>(tile0),
+                                                nb - 3 - static_cast<int32_t>(tile0),
+                                                q::model_rope(),
+                                                cd.off };
                     ok = q::summary_update(u3, st);
                 }
             }
@@ -586,8 +599,10 @@ struct device_case {
             fprintf(stderr, "qa-test: summaries %d do not cover the depth's %d blocks\n", idx.n_valid, n_kv / R);
             return false;
         }
-        const q::select_args sa = {summaries.p,     qv.p, q_norm.p, depth.p,  q::max_cells,
-                                   q::model_rope(), ws,   body.p,   offsets.p};
+        q::select_args sa = {
+            summaries.p, qv.p, q_norm.p, depth.p, q::max_cells, q::model_rope(), ws, body.p, offsets.p
+        };
+        sa.rope_off = cd.off != 0 ? off.p : nullptr;  // MUP1: offset 0 keeps the null (base) form
         if (!q::select(cd.rows, sa, st)) {
             fprintf(stderr, "qa-test: select not enqueued: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
@@ -708,7 +723,7 @@ bool run_case(const case_data & cd, cudaStream_t st, const oracle & orc, checker
     std::vector<float> pooled(static_cast<size_t>(nb) * HD);
     std::vector<int32_t> bpos(static_cast<size_t>(nb));
     for (int32_t b = 0; b < nb; ++b) {
-        bpos[static_cast<size_t>(b)] = b * R;
+        bpos[static_cast<size_t>(b)] = b * R + cd.off;  // MUP1: rotary positions are cell + offset
         for (int e = 0; e < HD; ++e) {
             float x = 0.0f;
             for (int r = 0; r < R; ++r) {
@@ -724,7 +739,7 @@ bool run_case(const case_data & cd, cudaStream_t st, const oracle & orc, checker
     std::vector<float> qref = cd.qv;
     std::vector<int32_t> qpos(static_cast<size_t>(B) * NH);
     for (int32_t i = 0; i < B * NH; ++i) {
-        qpos[static_cast<size_t>(i)] = cd.depth + i / NH;
+        qpos[static_cast<size_t>(i)] = cd.depth + i / NH + cd.off;
     }
     if (!norm_rope_ref(qref, qpos, cd.q_norm, rp, orc)) {
         return false;
@@ -979,6 +994,20 @@ int fnfl_qsa_test(int device, const std::vector<int32_t> & depths_in, const std:
     if (depths_in.empty() && rows_in.empty()) {
         ok = ok && run_case(make_all_tied(262140, 1), st, orc, ck);
         ++n_cases;
+        // MUP1 piece 5: a nonzero rotary offset (positive and negative), the CPU reference at cell + offset
+        for (const auto & [d, b, x] : {
+                 std::tuple<int32_t, int32_t, int32_t>{ 8192,  3, 99991 },
+                 std::tuple<int32_t, int32_t, int32_t>{ 65536, 4, -2051 },
+                 std::tuple<int32_t, int32_t, int32_t>{ 2051,  1, 7     },
+                 // negative rotary positions: queries and every summary below zero
+                 std::tuple<int32_t, int32_t, int32_t>{ 2051,  1, -3000 }
+        }) {
+            case_data cd = make_synthetic(d, b);
+            cd.off       = x;
+            cd.name += " off " + std::to_string(x);
+            ok = ok && run_case(cd, st, orc, ck);
+            ++n_cases;
+        }
     }
     if (!fixture.empty()) {
         // the capture's depth, then qa-bench's clustered point (196,608 cells, B = 3)

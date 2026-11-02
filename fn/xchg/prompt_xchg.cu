@@ -124,7 +124,8 @@ uint32_t blocks_of(int64_t n) {
 
 uint64_t pgen(int64_t chunk, int32_t layer, int32_t sub, int32_t half, pkind kind) {
     return (static_cast<uint64_t>(chunk & 0xffffff) << 24) | (static_cast<uint64_t>(layer & 0x3f) << 16) |
-           (static_cast<uint64_t>(sub & 1) << 12) | (static_cast<uint64_t>(half & 1) << 8) |
+           (static_cast<uint64_t>(sub & 1) << 12) | (static_cast<uint64_t>(half & 0xf) << 8) |
+           (static_cast<uint64_t>((half >> 4) & 0x7) << 13) |
            static_cast<uint64_t>(static_cast<int32_t>(kind) & 0xff) | (uint64_t(1) << 63);
 }
 

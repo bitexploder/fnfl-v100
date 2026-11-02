@@ -8,10 +8,10 @@
 #include "fn/quant/act_ref.h"
 #include "fn/quant/decode.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
-
 #include <strings.h>
 
 #include <algorithm>
@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <string>
 #include <thread>
@@ -44,11 +45,7 @@ constexpr int32_t q5_row_bytes = D / 256 * 176; // 1,760: a GGUF Q5_K row of out
 constexpr uint16_t f16_nan = 0x7e00;
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "v-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "v-test", what);
 }
 
 // owns one device allocation of n elements of T (on the current device)
@@ -1222,13 +1219,197 @@ bool check_rejects(card_v & k, const fn::xchg::rings & rg) {
     return report("rejects bad B, n, id0, card, alignment, null slot/error/work/stream", ok, ok ? "yes" : "no");
 }
 
+// ---- TTTS3 item 7: TTTS2's Q8_0 logits and draft head on UD-Q4_K_XL's output.weight --------------------------------
+
+constexpr int32_t q8_vrow_bytes = D / 32 * 34;  // 2,720: a GGUF Q8_0 row of output.weight
+
+// an X-HMIX slot holding rows 0 .. B-1 of full (F32 [B][2560]) in both forms (act_ref's codes and scales), the other
+// rows the sentinels; xv gets the rows' act values (what the logits multiply)
+std::vector<uint32_t> hmix_slot_of(const std::vector<float> & full, int32_t B, std::vector<float> & xv) {
+    using hl = fn::xchg::hmix_layout;
+    std::vector<uint32_t> slot(size_t(hl::slot_words), fn::xchg::sentinel);
+    std::fill(slot.begin() + hl::code_at, slot.begin() + hl::scale_at, fn::xchg::code_sentinel);
+    std::vector<int8_t> codes(size_t(B) * D);
+    std::vector<float>  scales(size_t(B) * D / 32 * 2);
+    fn::quant::act_quantize_ref(full.data(), B, D, codes.data(), scales.data());
+    std::memcpy(slot.data(), full.data(), size_t(B) * D * 4);
+    std::memcpy(slot.data() + hl::code_at, codes.data(), codes.size());
+    std::memcpy(slot.data() + hl::scale_at, scales.data(), scales.size() * 4);
+    xv.assign(size_t(B) * D, 0.0f);
+    for (int32_t b = 0; b < B; ++b) {
+        fn::quant::act_values_ref(&codes[size_t(b) * D], &scales[size_t(b) * D / 32 * 2], D, &xv[size_t(b) * D]);
+    }
+    return slot;
+}
+
+// FP64 logits of B rows against n Q8_0 rows (decoded exactly), threaded over rows
+std::vector<double> q8_logits_ref(const std::vector<uint8_t> & raw,
+                                  int32_t                      n,
+                                  const std::vector<float> &   xv,
+                                  int32_t                      B) {
+    std::vector<double>      out(size_t(B) * n);
+    const int32_t            nt = 12;
+    std::vector<std::thread> th;
+    for (int32_t t = 0; t < nt; ++t) {
+        th.emplace_back([&, t] {
+            std::vector<float> w(D);
+            for (int32_t i = t; i < n; i += nt) {
+                fn::quant::decode_row(fn::quant::wfmt::q8_0, &raw[size_t(i) * q8_vrow_bytes], w.data(), D);
+                for (int32_t b = 0; b < B; ++b) {
+                    double acc = 0.0;
+                    for (int32_t k = 0; k < D; ++k) {
+                        acc += double(w[size_t(k)]) * double(xv[size_t(b) * D + k]);
+                    }
+                    out[size_t(b) * n + i] = acc;
+                }
+            }
+        });
+    }
+    for (auto & x : th) {
+        x.join();
+    }
+    return out;
+}
+
+// one Q8_0 logits case on device dev: n GGUF rows (raw), card `card`, rows at B = 1..5 of five input rows (plain,
+// plain, stress, plain, plain): every row within 1e-5 of FP64, each row at B < 5 bitwise the same row inside B = 5,
+// a rerun at B = 5 bitwise, the error word zero
+bool q8_logits_case(int dev, const std::string & label, const std::vector<uint8_t> & raw, int32_t n, int32_t card) {
+    constexpr int32_t    R = fn::hc::max_rows;
+    std::vector<uint8_t> packed(raw.size());
+    if (!fn::dense::pack(fn::dense::fmt::q8_0, n, D, raw.data(), q8_vrow_bytes, packed.data())) {
+        return report((label + ": dense::pack").c_str(), false);
+    }
+    std::mt19937                          rng(0x51a7u + uint32_t(n) + uint32_t(card));
+    std::uniform_real_distribution<float> dv(-2.0f, 2.0f);
+    std::vector<float>                    full(size_t(R) * D);
+    for (int32_t b = 0; b < R; ++b) {
+        for (int32_t k = 0; k < D; ++k) {
+            full[size_t(b) * D + k] = dv(rng) * (b == 2 ? (k % 97 == 0 ? 300.0f : 1e-2f) : 1.0f);
+        }
+    }
+    cudaStream_t      st = nullptr;
+    bool              ok = cuda_ok(cudaSetDevice(dev), "cudaSetDevice") &&
+                           cuda_ok(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream");
+    const size_t      wb = fn::head::logits_work_bytes(n, true);
+    dev_buf<uint8_t>  w(packed.size()), work(std::max<size_t>(wb, 16));
+    dev_buf<uint32_t> slot(size_t(fn::xchg::hmix_layout::slot_words)), err(1);
+    dev_buf<float>    lg(size_t(R) * n);
+    ok = ok && w.put(packed.data(), packed.size(), st) && work.zero(st);
+    std::vector<float>  got[R + 1], again;
+    std::vector<float>  xv5;
+    std::vector<double> ref;
+    uint32_t            e_all = 0;
+    for (int32_t B = 1; B <= R && ok; ++B) {
+        std::vector<float>          xv;
+        const std::vector<uint32_t> sl = hmix_slot_of(full, B, xv);
+        if (B == R) {
+            xv5 = xv;
+        }
+        const fn::head::logits_args la = {
+            reinterpret_cast<const float *>(slot.p), err.p, card, w.p, n, lg.p, wb > 0 ? work.p : nullptr, true
+        };
+        std::vector<uint32_t> e;
+        ok = slot.put(sl.data(), sl.size(), st) && err.zero(st) && lg.poison(st) && fn::head::logits(B, la, st) &&
+             lg.get(got[B], size_t(B) * n, st) && err.get(e, 1, st) && cuda_ok(cudaStreamSynchronize(st), "logits");
+        e_all |= ok ? e[0] : ~0u;
+        if (ok && B == R) {
+            ok = lg.poison(st) && fn::head::logits(B, la, st) && lg.get(again, size_t(B) * n, st) &&
+                 cuda_ok(cudaStreamSynchronize(st), "rerun");
+        }
+    }
+    if (st != nullptr) {
+        cudaStreamDestroy(st);
+    }
+    if (!ok) {
+        return report((label + ": launches").c_str(), false);
+    }
+    ref          = q8_logits_ref(raw, n, xv5, R);
+    double worst = 0.0;
+    for (int32_t b = 0; b < R; ++b) {
+        worst = std::max(worst, rel_err(&got[R][size_t(b) * n], &ref[size_t(b) * n], size_t(n)));
+    }
+    int32_t inv = 0;
+    for (int32_t B = 1; B < R; ++B) {
+        inv += std::memcmp(got[B].data(), got[R].data(), size_t(B) * n * 4) == 0 ? 1 : 0;
+    }
+    const bool rerun = std::memcmp(again.data(), got[R].data(), again.size() * 4) == 0;
+    return report((label + ": logits vs FP64 (<= 1e-5 a row), B = 1..4 bitwise inside B = 5, rerun bitwise").c_str(),
+                  worst <= logits_bound && inv == R - 1 && rerun && e_all == 0u,
+                  "worst row " + fmt_e(worst) + "; " + std::to_string(inv) + " of " + std::to_string(R - 1) +
+                      " bitwise; rerun " + (rerun ? "bitwise" : "DIFFERS") + "; error words 0x" +
+                      std::to_string(e_all));
+}
+
+// TTTS3 (v-test q8 MODEL): the Q8_0 logits on both cards' whole shards (rows 0 .. 124,159 and 124,160 .. 248,319, the
+// vocabulary's last row among them) and a 1,000-row slice; the draft head's packed copy (pack_draft_head with q8)
+// bitwise dense::pack of the gathered rows, draft_head_bytes, its rejects, and the logits on the copy as above
+bool q8_logits_cases(int dev, const std::vector<fnfl_gguf_dir> & dirs) {
+    const uint64_t       total = uint64_t(fn::head::n_vocab) * q8_vrow_bytes;
+    std::vector<uint8_t> vocab(static_cast<size_t>(total));
+    if (!read_bytes(dirs, "output.weight", "q8_0", total, 0, total, vocab.data())) {
+        return report("q8 logits: output.weight (Q8_0 [248320][2560])", false);
+    }
+    bool pass = true;
+    for (int32_t r = 0; r < 2; ++r) {
+        const std::vector<uint8_t> shard(vocab.begin() + int64_t(r) * VC * q8_vrow_bytes,
+                                         vocab.begin() + int64_t(r + 1) * VC * q8_vrow_bytes);
+        pass =
+            q8_logits_case(dev, "q8 logits card " + std::to_string(r) + " shard (124,160 rows)", shard, VC, r) && pass;
+    }
+    {
+        const int64_t              first = 77777;
+        const std::vector<uint8_t> part(vocab.begin() + first * q8_vrow_bytes,
+                                        vocab.begin() + (first + 1000) * q8_vrow_bytes);
+        pass = q8_logits_case(dev, "q8 logits 1,000 rows (from 77,777)", part, 1000, 0) && pass;
+    }
+    // the draft head
+    const std::vector<int32_t> subset = make_subset(n_subset);
+    for (int32_t r = 0; r < 2; ++r) {
+        std::vector<int32_t> ids(size_t(n_dcard), -1);
+        bool                 ok = fn::head::draft_ids(subset.data(), n_subset, r, ids.data());
+        std::vector<uint8_t> gathered(size_t(n_dcard) * q8_vrow_bytes), whole,
+            copy(size_t(fn::head::draft_head_bytes(n_dcard, true)));
+        for (int32_t i = 0; i < n_dcard && ok; ++i) {
+            std::memcpy(&gathered[size_t(i) * q8_vrow_bytes], &vocab[size_t(ids[size_t(i)]) * q8_vrow_bytes],
+                        q8_vrow_bytes);
+        }
+        ok   = ok && fn::head::pack_draft_head(vocab.data(), q8_vrow_bytes, ids.data(), n_dcard, copy.data(), true) &&
+               (whole.assign(copy.size(), 0), true) &&
+               fn::dense::pack(fn::dense::fmt::q8_0, n_dcard, D, gathered.data(), q8_vrow_bytes, whole.data()) &&
+               std::memcmp(whole.data(), copy.data(), copy.size()) == 0;
+        pass = report(("q8 draft head card " + std::to_string(r) +
+                       ": pack_draft_head bitwise dense::pack of the gathered "
+                       "rows")
+                          .c_str(),
+                      ok, std::to_string(copy.size()) + " bytes") &&
+               pass;
+        pass =
+            q8_logits_case(dev, "q8 draft head card " + std::to_string(r) + " (" + std::to_string(n_dcard) + " rows)",
+                           gathered, n_dcard, r) &&
+            pass;
+    }
+    const int64_t bytes = fn::head::draft_head_bytes(fn::head::n_draft_card, true);
+    pass =
+        report("q8 draft head: draft_head_bytes(32,768, q8) = 89,128,960", bytes == 89128960, std::to_string(bytes)) &&
+        pass;
+    std::vector<int32_t> ids(8, 0);
+    std::iota(ids.begin(), ids.end(), 0);
+    std::vector<uint8_t> dst(size_t(8) * q8_vrow_bytes);
+    pass = report("q8 draft head: rejects rows shorter than a Q8_0 row",
+                  !fn::head::pack_draft_head(vocab.data(), q8_vrow_bytes - 1, ids.data(), 8, dst.data(), true)) &&
+           pass;
+    return pass;
+}
+
 } // namespace
 
 int fnfl_v_test(int dev0, int dev1, const char * mode, const char * model) {
     const std::string md = mode;
     const bool san = md == "san";
-    if (!san && md != "all") {
-        fprintf(stderr, "v-test: mode is all or san\n");
+    const bool        q8  = md == "q8";  // TTTS3 item 7: UD-Q4_K_XL's Q8_0 logits and draft head only
+    if (!san && !q8 && md != "all") {
+        fprintf(stderr, "v-test: mode is all, san or q8\n");
         return 2;
     }
     if (dev0 == dev1) {
@@ -1250,6 +1431,11 @@ int fnfl_v_test(int dev0, int dev1, const char * mode, const char * model) {
             fprintf(stderr, "v-test: %s\n", err.c_str());
             return 1;
         }
+    }
+    if (q8) {
+        const bool pass = q8_logits_cases(dev0, dirs);
+        printf("v-test: %s\n", pass ? "PASS" : "FAIL");
+        return pass ? 0 : 1;
     }
     head_weights hw;
     std::vector<uint8_t> raw[2];

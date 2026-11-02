@@ -1,9 +1,11 @@
 #include "fn/kernels/hc/hc_test.h"
 
+#include "fn/borrowed/gguf_tensors.h"
 #include "fn/kernels/hc/hc.h"
 #include "fn/model/shapes.h"
 #include "fn/quant/act_ref.h"
 #include "fn/quant/formats.h"
+#include "fn/tools/test_cuda.h"
 #include "fn/xchg/xchg.h"
 
 #include <cuda_runtime.h>
@@ -36,11 +38,7 @@ constexpr int32_t M = fn::hc::n_mom;        // 1,300
 constexpr int32_t RD = fn::hc::n_rows_down; // 324
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "hc-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "hc-test", what);
 }
 
 uint16_t to_bf16(float f) {
@@ -94,6 +92,8 @@ struct weights {
     std::vector<float> down_f, inject_f, up_f;
     // DR1: the Q8_0 card repacks (hc.h), for make_weights_q8's weights
     std::vector<uint8_t> q_down[2], q_up[2];
+    // TTTS3 item 7: the mixed down layout (hc.h w_down_mix_bytes: Q8_0 rows, BF16 inject rows), for real modules
+    std::vector<uint8_t>  q_mix[2];
 };
 
 // the BF16 card repacks of down, inject and up, and gamma's
@@ -701,6 +701,7 @@ struct card2 {
     dev_buf<uint8_t> q_down{size_t(fn::hc::w_down_q8_bytes)}, q_up{size_t(fn::hc::w_up_q8_bytes)};
     dev_buf<uint16_t> hw_down{size_t(fn::hc::w_down_head_elems)};
     dev_buf<uint8_t> hq_down{size_t(fn::hc::w_down_head_q8_bytes)};
+    dev_buf<uint8_t>        qm_down{ size_t(fn::hc::w_down_mix_bytes) };  // TTTS3 item 7: TTTS2's mixed down layout
 
     explicit card2(int32_t d) : dev(d), guard(d) {
         if (!cuda_ok(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "stream")) {
@@ -836,9 +837,17 @@ fn::hc::sub_args sub_args_of(card2 & k, fn::xchg::rings & rg, int32_t r, int32_t
 // HC4: fused runs hc::sub instead (mode 3 on both cards at once; in loopback mode 1 on both, then mode 2 on both),
 // and copies each card's moments from the own region of its X-HC slot after the launch, before the next sublayer's
 // reset, so they are checked as down2's are.
-bool run_hc2_case(card2 * c[2], fn::xchg::rings & rg, const inputs & in, const reference & ref, const gpu_out * bits,
-                  fn::hc::up_arm arm, const std::string & label, pair_out * keep = nullptr, bool q8 = false,
-                  bool fused = false) {
+bool run_hc2_case(card2 *             c[2],
+                  fn::xchg::rings &   rg,
+                  const inputs &      in,
+                  const reference &   ref,
+                  const gpu_out *     bits,
+                  fn::hc::up_arm      arm,
+                  const std::string & label,
+                  pair_out *          keep  = nullptr,
+                  bool                q8    = false,
+                  bool                fused = false,
+                  bool                mix   = false) {
     using fn::xchg::msg;
     const int32_t B = in.rows;
     bool ok = rg.reset_all() && put_inputs(c, in);
@@ -892,8 +901,10 @@ bool run_hc2_case(card2 * c[2], fn::xchg::rings & rg, const inputs & in, const r
             const fn::hc::down2_args d2 = {da, rg.slot(1 - r, msg::hc, sl), n > 0 ? rg.slot(r, msg::hc, prev) : nullptr,
                                            n > 0 ? rg.slot(r, msg::hmix, prev) : nullptr};
             ok = cuda_ok(cudaSetDevice(k.dev), "cudaSetDevice") &&
-                 (q8 ? fn::hc::down2_q8(B, {d2, k.q_down.p}, launch_stream(c, r))
-                     : fn::hc::down2(B, d2, launch_stream(c, r)));
+                 (mix ? fn::hc::down2_q8_mix(B, { d2, k.qm_down.p }, launch_stream(c, r))  // TTTS3 item 7
+                  :
+                  q8 ? fn::hc::down2_q8(B, { d2, k.q_down.p }, launch_stream(c, r)) :
+                       fn::hc::down2(B, d2, launch_stream(c, r)));
         }
         for (int32_t r = 0; r < 2 && ok; ++r) {
             card2 & k = *c[r];
@@ -1055,13 +1066,19 @@ bool run_hc2_case(card2 * c[2], fn::xchg::rings & rg, const inputs & in, const r
 // gives bitwise the same x, inject, F32 mixed, codes and scales on both cards, for both arms. DR1: q8 runs the Q8_0
 // forms (arm 0) on the cards' Q8_0 weights, without HC1c's bits (dw is not read). SP2: HC1c's bits only for rows up to
 // hc1_max_rows (its kernels' rows).
-bool batch_invariance(card2 * c[2], fn::xchg::rings & rg, const weights & w, const device_weights & dw, cudaStream_t st,
-                      int32_t dev0, bool q8 = false) {
+bool batch_invariance(card2 *                c[2],
+                      fn::xchg::rings &      rg,
+                      const weights &        w,
+                      const device_weights & dw,
+                      cudaStream_t           st,
+                      int32_t                dev0,
+                      bool                   q8  = false,
+                      bool                   mix = false) {
     inputs in4;
     make_inputs(in4, fn::hc::max_rows, kind::plain);
     bool ok = true;
     int32_t n_same = 0, n_cmp = 0;
-    const std::string pre = q8 ? "hc2 q8 batch B" : "hc2 batch B";
+    const std::string    pre      = mix ? "hc2 mix batch B" : q8 ? "hc2 q8 batch B" : "hc2 batch B";
     // HC4: variant 2 is the one-launch sublayer (hc::sub), BF16 only
     std::vector<int32_t> variants = {0};
     if (!q8) {
@@ -1079,7 +1096,7 @@ bool batch_invariance(card2 * c[2], fn::xchg::rings & rg, const weights & w, con
         ok = ok && cuda_ok(cudaSetDevice(dev0), "cudaSetDevice") &&
              (q8 || in4.rows > fn::hc::hc1_max_rows || run_gpu(dw, in4, bits4, st, candidates[0])) &&
              run_hc2_case(c, rg, in4, ref4, q8 || in4.rows > fn::hc::hc1_max_rows ? nullptr : &bits4, arm,
-                          pre + std::to_string(in4.rows) + " " + name, &o4, q8, fused);
+                          pre + std::to_string(in4.rows) + " " + name, &o4, q8, fused, mix);
         for (int32_t B = 1; B < fn::hc::max_rows && ok; ++B) {
             inputs in;
             in.rows = B;
@@ -1092,7 +1109,7 @@ bool batch_invariance(card2 * c[2], fn::xchg::rings & rg, const weights & w, con
             pair_out o;
             ok = cuda_ok(cudaSetDevice(dev0), "cudaSetDevice") && (q8 || run_gpu(dw, in, bits, st, candidates[0])) &&
                  run_hc2_case(c, rg, in, ref, q8 ? nullptr : &bits, arm, pre + std::to_string(B) + " " + name, &o, q8,
-                              fused);
+                              fused, mix);
             for (int32_t r = 0; r < 2 && ok; ++r) {
                 const auto prefix = [](const auto & a, const auto & b) {
                     return a.size() <= b.size() && std::equal(a.begin(), a.end(), b.begin(), [](auto u, auto v) {
@@ -1107,11 +1124,14 @@ bool batch_invariance(card2 * c[2], fn::xchg::rings & rg, const weights & w, con
             }
         }
     }
-    printf("hc-test %s batch invariance: rows at B = 1 .. %d against the same rows inside B = %d (x, inject, F32 "
-           "mixed, codes, scales; both cards, %s): %d of %d bitwise%s\n",
-           q8 ? "hc2 q8" : "hc2", fn::hc::max_rows - 1, fn::hc::max_rows,
-           q8 ? "arm 0" : "both arms and the fused launch", n_same, n_cmp,
-           ok && n_same == n_cmp ? "" : "  FAIL");
+    printf(
+        "hc-test %s batch invariance: rows at B = 1 .. %d against the same rows inside B = %d (x, inject, F32 "
+        "mixed, codes, scales; both cards, %s): %d of %d bitwise%s\n",
+        mix ? "hc2 mix" :
+        q8  ? "hc2 q8" :
+              "hc2",
+        fn::hc::max_rows - 1, fn::hc::max_rows, q8 ? "arm 0" : "both arms and the fused launch", n_same, n_cmp,
+        ok && n_same == n_cmp ? "" : "  FAIL");
     return ok && n_same == n_cmp;
 }
 
@@ -2085,6 +2105,544 @@ bool joint_rejects(const jlanes & ln) {
     return ok && refused == cases && touched == 0;
 }
 
+// TTTS3 item 6: the Q8_0 head in lanes (hc::head_down2_q8_lanes, head_up2_q8_lanes); item 7: TTTS2's mixed sublayer
+// in lanes (down2_q8_mix_lanes, up2_q8_lanes); TTTS4 item 1: the draft's Q8_0 sublayer in lanes (down2_q8_lanes,
+// up2_q8_lanes), and every sublayer form at the round's rows. Lane k on its own buffers, ring set and run counters,
+// every lane on lane 0's Q8_0 weights. Lane k's arguments for card r, slot 0 (as run_head's and run_hc2_case's
+// sublayer 0).
+enum class q8_form { head, mix, sub };
+
+const char * q8_form_name(q8_form f) {
+    return f == q8_form::head ? "head_down2_q8 and head_up2_q8" :
+           f == q8_form::mix  ? "down2_q8_mix and up2_q8" :
+                                "down2_q8 and up2_q8";
+}
+
+fn::hc::down2_q8_args q8_lane_down(jlane & l, const card2 & w, int32_t r, q8_form f) {
+    using fn::xchg::msg;
+    card2 &                 k  = *l.c[r];
+    const fn::hc::down_args da = { nullptr, k.hres.p, k.hx.p, k.hpost.p, w.gamma.p, k.x.p, k.mom.p };
+    return {
+        { da, l.rg.slot(1 - r, msg::hc, 0), nullptr, nullptr },
+        f == q8_form::head ? w.hq_down.p :
+        f == q8_form::mix  ? w.qm_down.p :
+                             w.q_down.p
+    };
+}
+
+fn::hc::up2_q8_args q8_lane_up(jlane & l, const card2 & w, int32_t r, q8_form f) {
+    using fn::xchg::msg;
+    card2 &                k  = *l.c[r];
+    const fn::hc::up2_args ua = { nullptr,
+                                  k.mom.p,
+                                  l.rg.slot(r, msg::hc, 0),
+                                  k.x.p,
+                                  w.gamma.p,
+                                  f == q8_form::head ? nullptr : k.inj.p,
+                                  l.rg.slot(r, msg::hmix, 0),
+                                  l.rg.slot(1 - r, msg::hmix, 0),
+                                  k.runs.p,
+                                  l.rg.err(r),
+                                  r };
+    return { ua, w.q_up.p };
+}
+
+// fresh rings, x and inject poisoned and run counters zero on every lane
+bool q8_lanes_fresh(const jlanes & ln) {
+    bool ok = joint_fresh(ln);
+    for (size_t k = 0; k < ln.size() && ok; ++k) {
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            card2 & c = *ln[k]->c[r];
+            ok        = cuda_ok(cudaSetDevice(c.dev), "cudaSetDevice") &&
+                        cuda_ok(cudaMemsetAsync(c.runs.p, 0, c.runs.n * sizeof(uint32_t), c.st), "runs");
+        }
+    }
+    return ok && devices_idle(ln);
+}
+
+// lane k's snapshot (snapshot's words, slot 0's sublayer) and then both cards' run counters
+bool q8_lane_snapshot(jlane & l, bool head, std::vector<uint32_t> & out) {
+    bool ok = snapshot(l.c, l.rg, 0, head, out);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") && append_words(l.c[r]->runs.p, l.c[r]->runs.n, out);
+    }
+    return ok;
+}
+
+// lane k alone at B rows: the down on both cards (head_down2_q8, down2_q8_mix or down2_q8), then the up (head_up2_q8
+// or up2_q8)
+bool q8_lane_lone(const jlanes & ln, size_t k, int32_t B, q8_form f, std::vector<uint32_t> & out) {
+    jlane &    l    = *ln[k];
+    const bool head = f == q8_form::head;
+    out.clear();
+    bool ok = q8_lanes_fresh(ln);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        const fn::hc::down2_q8_args d  = q8_lane_down(l, *ln[0]->c[r], r, f);
+        cudaStream_t                st = launch_stream(l.c, r);
+        ok                             = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                                         (head              ? fn::hc::head_down2_q8(B, d, st) :
+                                          f == q8_form::mix ? fn::hc::down2_q8_mix(B, d, st) :
+                                                              fn::hc::down2_q8(B, d, st));
+    }
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        const fn::hc::up2_q8_args u = q8_lane_up(l, *ln[0]->c[r], r, f);
+        ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+             (head ? fn::hc::head_up2_q8(B, u, launch_stream(l.c, r)) : fn::hc::up2_q8(B, u, launch_stream(l.c, r)));
+    }
+    return ok && wait_two(l.c, hc2_timeout_s) && q8_lane_snapshot(l, head, out);
+}
+
+// the lanes jointly at B = rows: one down lanes launch a card, then one up lanes launch a card (lane 0's streams)
+bool q8_lanes_joint(const jlanes & ln, int32_t lanes, int32_t rows, q8_form f, std::vector<uint32_t> * out) {
+    const bool head = f == q8_form::head;
+    bool       ok   = q8_lanes_fresh(ln);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        fn::hc::down2_q8_args d[fn::xchg::max_lanes] = {};
+        for (int32_t k = 0; k < lanes; ++k) {
+            d[k] = q8_lane_down(*ln[k], *ln[0]->c[r], r, f);
+        }
+        cudaStream_t st = launch_stream(ln[0]->c, r);
+        ok              = cuda_ok(cudaSetDevice(ln[0]->c[r]->dev), "cudaSetDevice") &&
+                          (head              ? fn::hc::head_down2_q8_lanes(lanes, rows, d, st) :
+                           f == q8_form::mix ? fn::hc::down2_q8_mix_lanes(lanes, rows, d, st) :
+                                               fn::hc::down2_q8_lanes(lanes, rows, d, st));
+    }
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        fn::hc::up2_q8_args u[fn::xchg::max_lanes] = {};
+        for (int32_t k = 0; k < lanes; ++k) {
+            u[k] = q8_lane_up(*ln[k], *ln[0]->c[r], r, f);
+        }
+        ok = cuda_ok(cudaSetDevice(ln[0]->c[r]->dev), "cudaSetDevice") &&
+             (head ? fn::hc::head_up2_q8_lanes(lanes, rows, u, launch_stream(ln[0]->c, r)) :
+                     fn::hc::up2_q8_lanes(lanes, rows, u, launch_stream(ln[0]->c, r)));
+    }
+    ok = ok && wait_two(ln[0]->c, hc2_timeout_s);
+    for (int32_t k = 0; k < lanes && ok; ++k) {
+        out[k].clear();
+        ok = q8_lane_snapshot(*ln[k], head, out[k]);
+    }
+    return ok;
+}
+
+// U lanes, each its own inputs at rows (2 .. 5; rows .. 4 zero). Every form (TTTS4 item 1: the sublayer forms too, as
+// the head since f64c1a2): every lane's whole snapshot and run counters (all five rows, those past rows-1 poisoned by
+// q8_lanes_fresh and left as the lone launches leave them; both cards) bitwise its lone launches at B = rows; the second
+// joint run bitwise the first; the error words zero
+bool q8_lanes_case(const jlanes & ln, int32_t lanes, int32_t rows, q8_form f, const std::string & what) {
+    using fn::xchg::msg;
+    const bool            head  = f == q8_form::head;
+    const std::string     label = what + " R" + std::to_string(rows) + " U" + std::to_string(lanes);
+    std::vector<uint32_t> want[fn::xchg::max_lanes], got[fn::xchg::max_lanes], again[fn::xchg::max_lanes];
+    bool                  ok = true;
+    for (int32_t k = 0; k < lanes && ok; ++k) {
+        ok = q8_lane_lone(ln, size_t(k), rows, f, want[k]);
+    }
+    ok = ok && q8_lanes_joint(ln, lanes, rows, f, got) && q8_lanes_joint(ln, lanes, rows, f, again);
+    if (!ok) {
+        printf("hc-test %-16s not run: %s  FAIL\n", label.c_str(), cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    const size_t slots      = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    const size_t card_words = size_t(fn::xchg::n_slot) * slots + card2::n_x + (head ? 0 : card2::n_j) + 1;
+    size_t       bad = 0, bad2 = 0, words = 0;
+    bool         clean = true;
+    for (int32_t k = 0; k < lanes; ++k) {
+        bad += words_differ(want[k], got[k]);
+        bad2 += words_differ(got[k], again[k]);
+        words += got[k].size();
+        clean = clean && got[k].size() >= 2 * card_words && got[k][card_words - 1] == 0u &&
+                got[k][2 * card_words - 1] == 0u;
+    }
+    printf(
+        "hc-test %-16s each lane bitwise its lone %s at B = %d (X-HC and X-HMIX slots, x%s, error words, run "
+        "counters; all five rows, those past row %d poisoned first; both cards; %zu words): %s; second joint run: "
+        "%s%s\n",
+        label.c_str(), q8_form_name(f), rows, head ? "" : ", inject", rows - 1, words, bad == 0 ? "yes" : "NO  FAIL",
+        bad2 == 0 ? "bitwise" : "DIFFERS  FAIL", clean ? "" : "; error words not zero  FAIL");
+    return bad == 0 && bad2 == 0 && clean;
+}
+
+// refused with nothing enqueued: lanes 1 and 5, rows 1 and 6, a null stream, two lanes on one card's run counters (up), a null or
+// misaligned Q8_0 weight pointer, card 2 (up); the head's forms and (TTTS4 item 1) the sublayer's
+bool q8_lanes_rejects(const jlanes & ln) {
+    const card2 &         w = *ln[0]->c[0];
+    fn::hc::down2_q8_args d[fn::xchg::max_lanes];
+    fn::hc::up2_q8_args   u[fn::xchg::max_lanes];
+    for (size_t k = 0; k < ln.size(); ++k) {
+        d[k] = q8_lane_down(*ln[k], w, 0, q8_form::head);
+        u[k] = q8_lane_up(*ln[k], w, 0, q8_form::head);
+    }
+    cudaStream_t st      = ln[0]->c[0]->st;
+    bool         ok      = q8_lanes_fresh(ln) && cuda_ok(cudaSetDevice(w.dev), "cudaSetDevice");
+    int32_t      refused = 0, cases = 0;
+    const auto   refuse = [&](bool launched) {
+        ++cases;
+        refused += launched ? 0 : 1;
+    };
+    refuse(fn::hc::head_down2_q8_lanes(1, 2, d, st));
+    refuse(fn::hc::head_down2_q8_lanes(fn::xchg::max_lanes + 1, 2, d, st));
+    refuse(fn::hc::head_up2_q8_lanes(1, 2, u, st));
+    refuse(fn::hc::head_up2_q8_lanes(fn::xchg::max_lanes + 1, 2, u, st));
+    refuse(fn::hc::head_down2_q8_lanes(2, 1, d, st));
+    refuse(fn::hc::head_down2_q8_lanes(2, fn::hc::max_rows + 1, d, st));
+    refuse(fn::hc::head_up2_q8_lanes(2, 1, u, st));
+    refuse(fn::hc::head_up2_q8_lanes(2, fn::hc::max_rows + 1, u, st));
+    refuse(fn::hc::head_down2_q8_lanes(2, 2, d, nullptr));
+    refuse(fn::hc::head_up2_q8_lanes(2, 2, u, nullptr));
+    fn::hc::down2_q8_args db[fn::xchg::max_lanes];
+    fn::hc::up2_q8_args   ub[fn::xchg::max_lanes];
+    std::copy_n(u, fn::xchg::max_lanes, ub);
+    ub[2].a.runs = ub[0].a.runs;  // lanes 0 and 2 on one set of run counters
+    refuse(fn::hc::head_up2_q8_lanes(3, 2, ub, st));
+    std::copy_n(d, fn::xchg::max_lanes, db);
+    db[1].w = nullptr;
+    refuse(fn::hc::head_down2_q8_lanes(2, 2, db, st));
+    std::copy_n(d, fn::xchg::max_lanes, db);
+    db[1].w = d[0].w + 8;
+    refuse(fn::hc::head_down2_q8_lanes(2, 2, db, st));
+    std::copy_n(u, fn::xchg::max_lanes, ub);
+    ub[1].w = nullptr;
+    refuse(fn::hc::head_up2_q8_lanes(2, 2, ub, st));
+    std::copy_n(u, fn::xchg::max_lanes, ub);
+    ub[1].w = u[0].w + 2;
+    refuse(fn::hc::head_up2_q8_lanes(2, 2, ub, st));
+    std::copy_n(u, fn::xchg::max_lanes, ub);
+    ub[1].a.card = 2;
+    refuse(fn::hc::head_up2_q8_lanes(2, 2, ub, st));
+    refuse(fn::hc::head_down2_q8_lanes(2, 2, nullptr, st));
+    refuse(fn::hc::head_up2_q8_lanes(2, 2, nullptr, st));
+    // TTTS4 item 1: the sublayer forms' rows argument, lanes, stream and run counters
+    fn::hc::down2_q8_args ds[fn::xchg::max_lanes], dm[fn::xchg::max_lanes];
+    fn::hc::up2_q8_args   us[fn::xchg::max_lanes];
+    for (size_t k = 0; k < ln.size(); ++k) {
+        ds[k] = q8_lane_down(*ln[k], w, 0, q8_form::sub);
+        dm[k] = q8_lane_down(*ln[k], w, 0, q8_form::mix);
+        us[k] = q8_lane_up(*ln[k], w, 0, q8_form::sub);
+    }
+    for (const int32_t bad_rows : { 1, fn::hc::max_rows + 1 }) {
+        refuse(fn::hc::down2_q8_lanes(2, bad_rows, ds, st));
+        refuse(fn::hc::down2_q8_mix_lanes(2, bad_rows, dm, st));
+        refuse(fn::hc::up2_q8_lanes(2, bad_rows, us, st));
+    }
+    for (const int32_t bad_lanes : { 1, fn::xchg::max_lanes + 1 }) {
+        refuse(fn::hc::down2_q8_lanes(bad_lanes, 2, ds, st));
+        refuse(fn::hc::down2_q8_mix_lanes(bad_lanes, 2, dm, st));
+        refuse(fn::hc::up2_q8_lanes(bad_lanes, 2, us, st));
+    }
+    refuse(fn::hc::down2_q8_lanes(2, 2, ds, nullptr));
+    refuse(fn::hc::down2_q8_mix_lanes(2, 2, dm, nullptr));
+    refuse(fn::hc::up2_q8_lanes(2, 2, us, nullptr));
+    refuse(fn::hc::down2_q8_lanes(2, 2, nullptr, st));
+    refuse(fn::hc::down2_q8_mix_lanes(2, 2, nullptr, st));
+    refuse(fn::hc::up2_q8_lanes(2, 2, nullptr, st));
+    std::copy_n(us, fn::xchg::max_lanes, ub);
+    ub[1].a.runs = ub[0].a.runs;
+    refuse(fn::hc::up2_q8_lanes(2, 3, ub, st));
+    ok              = ok && cuda_ok(cudaStreamSynchronize(st), "refused") && cuda_ok(cudaGetLastError(), "refused");
+    int64_t touched = 0;
+    for (size_t k = 0; k < ln.size() && ok; ++k) {
+        int64_t bad = 0;
+        ok          = hmix_slot_reset(ln[k]->rg, 0, bad);
+        touched += bad;
+    }
+    printf("hc-test hcj q8 lanes rejects: %d of %d refused, rings untouched: %s\n", refused, cases,
+           ok && touched == 0 ? "yes" : "NO  FAIL");
+    return ok && refused == cases && touched == 0;
+}
+
+// ---- TTTS4 item 3: the Q8_0 joint sublayer (hc::sub_joint_q8) ---------------------------------------------------
+
+// the mixed down layout (hc.h w_down_mix_bytes) of make_weights_q8's weights for card r: the head layout's Q8_0 rows
+// (head_weights), then the inject rows' values narrowed to BF16, inj[s][k][i]
+std::vector<uint8_t> mix_weights(const weights & w, int32_t r) {
+    std::vector<uint16_t> bf;
+    std::vector<uint8_t>  q8;
+    head_weights(w, r, bf, q8);
+    q8.resize(static_cast<size_t>(fn::hc::w_down_mix_bytes));
+    uint8_t * inj = q8.data() + fn::hc::w_down_head_q8_bytes;
+    for (int32_t s = 0; s < S; ++s) {
+        for (int32_t k = 0; k < J; ++k) {
+            for (int32_t i = 0; i < F; ++i) {
+                const uint16_t v = to_bf16(w.inject_f[static_cast<size_t>(k) * K + s * D + r * F + i]);
+                std::memcpy(inj + ((static_cast<size_t>(s) * J + k) * F + i) * 2, &v, 2);
+            }
+        }
+    }
+    return q8;
+}
+
+// lane l's lone sublayer n on card r, from its joint arguments (joint_lane_args'): down2_q8_mix and up2_q8 on lane 0's
+// mixed down and Q8_0 up (w), its own moments in its mom row set n (where the lone launches keep them)
+fn::hc::down2_q8_args q8j_down(jlane & l, const card2 & w, int32_t r, int32_t n) {
+    const fn::hc::sub_args  a  = joint_lane_args(l, w, r, n, false);
+    card2 &                 k  = *l.c[r];
+    const fn::hc::down_args da = { nullptr, a.hres, a.hx, a.hpost, a.gamma, a.x, k.mom.p + size_t(n) * card2::n_m };
+    return {
+        { da, a.hc_peer, a.hc_reset, a.hmix_reset },
+        w.qm_down.p
+    };
+}
+
+fn::hc::up2_q8_args q8j_up(jlane & l, const card2 & w, int32_t r, int32_t n) {
+    const fn::hc::sub_args a  = joint_lane_args(l, w, r, n, false);
+    card2 &                k  = *l.c[r];
+    const fn::hc::up2_args ua = { nullptr,    k.mom.p + size_t(n) * card2::n_m,
+                                  a.hc_ring,  a.x,
+                                  a.gamma,    a.inject,
+                                  a.hmix_own, a.hmix_peer,
+                                  k.runs.p,   a.err,
+                                  r };
+    return { ua, w.q_up.p };
+}
+
+// a snapshot's words a card (snapshot's: every slot's X-HC and X-HMIX, x, inject, the error word)
+size_t q8j_card_words() {
+    using fn::xchg::msg;
+    const size_t slots = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    return size_t(fn::xchg::n_slot) * slots + card2::n_x + card2::n_j + 1;
+}
+
+// lane k's sequence of n_joint_sub sublayers alone at rows (down2_q8_mix on both cards, then up2_q8), a snapshot after
+// each; the lone launches keep a card's own moments in mom, so rows 0 .. rows - 1 of mom set n go into the own region of
+// the sublayer's X-HC slot in the snapshot (the joint launch's place for them, compared in the lone row layout)
+bool q8j_lone(const jlanes & ln, size_t k, int32_t rows, std::vector<uint32_t> & out) {
+    using fn::xchg::msg;
+    jlane &      l          = *ln[k];
+    const size_t slots      = size_t(fn::xchg::slot_words(msg::hc) + fn::xchg::slot_words(msg::hmix));
+    const size_t card_words = q8j_card_words();
+    out.clear();
+    bool ok = q8_lanes_fresh(ln);
+    for (int32_t n = 0; n < n_joint_sub && ok; ++n) {
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                 fn::hc::down2_q8_mix(rows, q8j_down(l, *ln[0]->c[r], r, n), launch_stream(l.c, r));
+        }
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            ok = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                 fn::hc::up2_q8(rows, q8j_up(l, *ln[0]->c[r], r, n), launch_stream(l.c, r));
+        }
+        const size_t at = out.size();
+        ok              = ok && wait_two(l.c, hc2_timeout_s) && snapshot(l.c, l.rg, n, false, out);
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            std::vector<uint32_t> m;
+            ok               = cuda_ok(cudaSetDevice(l.c[r]->dev), "cudaSetDevice") &&
+                               append_words(l.c[r]->mom.p + size_t(n) * card2::n_m, size_t(rows) * M, m);
+            const size_t own = at + size_t(r) * card_words + size_t(n % fn::xchg::n_slot) * slots + fn::xchg::hc_own_at;
+            for (size_t i = 0; i < m.size() && ok; ++i) {
+                out[own + i] = m[i];
+            }
+        }
+    }
+    return ok;
+}
+
+// the lanes' sequence jointly at rows (hc::sub_joint_q8 a card on lane 0's streams; loopback modes 1 then 2, as
+// joint_run), each lane's snapshots
+bool q8j_joint(const jlanes & ln, int32_t lanes, int32_t rows, std::vector<uint32_t> * out) {
+    const bool loopback = ln[0]->c[0]->dev == ln[0]->c[1]->dev;
+    for (int32_t k = 0; k < lanes; ++k) {
+        out[k].clear();
+    }
+    bool ok = q8_lanes_fresh(ln);
+    for (int32_t n = 0; n < n_joint_sub && ok; ++n) {
+        for (const int32_t mode : { loopback ? 1 : 3, loopback ? 2 : 0 }) {
+            for (int32_t r = 0; r < 2 && ok && mode != 0; ++r) {
+                const card2 &    w                      = *ln[0]->c[r];
+                fn::hc::sub_args a[fn::xchg::max_lanes] = {};
+                for (int32_t k = 0; k < lanes; ++k) {
+                    a[k] = joint_lane_args(*ln[k], w, r, n, false);
+                }
+                ok = cuda_ok(cudaSetDevice(w.dev), "cudaSetDevice") &&
+                     fn::hc::sub_joint_q8(lanes, rows, mode, a, w.qm_down.p, w.q_up.p, launch_stream(ln[0]->c, r));
+            }
+        }
+        ok = ok && wait_two(ln[0]->c, hc2_timeout_s);
+        for (int32_t k = 0; k < lanes && ok; ++k) {
+            ok = snapshot(ln[k]->c, ln[k]->rg, n, false, out[k]);
+        }
+    }
+    return ok;
+}
+
+// U lanes at rows (2 .. 5), each its own inputs, a sequence of n_joint_sub sublayers (slots in turn, each sublayer's
+// resets of the previous): every lane's snapshots (X-HC from the joint layout, both regions, the own one against the
+// lone launches' own moments; X-HMIX in both forms; x, inject, error words; both cards) bitwise its lone down2_q8_mix
+// and up2_q8 at B = rows; rows .. 4 untouched; the second joint run bitwise the first; the error words zero
+bool q8j_case(const jlanes & ln, int32_t lanes, int32_t rows, const std::string & what) {
+    const std::string     label = what + " R" + std::to_string(rows) + " U" + std::to_string(lanes);
+    std::vector<uint32_t> want[fn::xchg::max_lanes], got[fn::xchg::max_lanes], again[fn::xchg::max_lanes];
+    bool                  ok = true;
+    for (int32_t k = 0; k < lanes && ok; ++k) {
+        ok = q8j_lone(ln, size_t(k), rows, want[k]);
+    }
+    ok = ok && q8j_joint(ln, lanes, rows, got) && q8j_joint(ln, lanes, rows, again);
+    if (!ok) {
+        printf("hc-test %-16s not run: %s  FAIL\n", label.c_str(), cudaGetErrorString(cudaGetLastError()));
+        return false;
+    }
+    const size_t card_words = q8j_card_words();
+    size_t       bad = 0, bad2 = 0, words = 0, gap = 0, touched = 0;
+    bool         clean = true;
+    for (int32_t k = 0; k < lanes; ++k) {
+        hcj_to_lone(got[k], false, card_words, gap);
+        hcj_to_lone(again[k], false, card_words, gap);
+        touched += tail_touched(got[k], false, card_words, rows);
+        bad += words_differ(want[k], got[k]);
+        bad2 += words_differ(got[k], again[k]);
+        words += want[k].size();
+        clean = clean && got[k].size() == want[k].size() && got[k].back() == 0u &&
+                got[k][got[k].size() - 1 - card_words] == 0u;
+    }
+    printf(
+        "hc-test %-16s each lane bitwise its lone down2_q8_mix and up2_q8 at B = %d after each of %d sublayers (X-HC "
+        "both regions, the own against the lone moments; X-HMIX; x, inject, error words; both cards; %zu words; X-HC "
+        "from the joint layout, %zu unused words not zero%s): %s; second joint run: %s%s; rows %d .. 4 words touched "
+        "%zu%s\n",
+        label.c_str(), rows, n_joint_sub, words, gap, gap == 0 ? "" : "  FAIL", bad == 0 ? "yes" : "NO  FAIL",
+        bad2 == 0 ? "bitwise" : "DIFFERS  FAIL", clean ? "" : "; error words not zero  FAIL", rows, touched,
+        touched == 0 ? "" : "  FAIL");
+    return bad == 0 && bad2 == 0 && clean && gap == 0 && touched == 0;
+}
+
+// refused with nothing enqueued (every lane's X-HMIX slots still the sentinels): a null argument array, lanes 1 and 5,
+// rows 1 and 6, modes 0 and 4, a null stream, a null or misaligned Q8_0 down or up, two lanes on one ring, lanes on
+// different cards
+bool q8j_rejects(const jlanes & ln) {
+    const card2 &    w = *ln[0]->c[0];
+    fn::hc::sub_args a[fn::xchg::max_lanes];
+    for (size_t k = 0; k < ln.size(); ++k) {
+        a[k] = joint_lane_args(*ln[k], w, 0, 0, false);
+    }
+    cudaStream_t    st      = w.st;
+    const uint8_t * wd      = w.qm_down.p;
+    const uint8_t * wu      = w.q_up.p;
+    bool            ok      = q8_lanes_fresh(ln) && cuda_ok(cudaSetDevice(w.dev), "cudaSetDevice");
+    int32_t         refused = 0, cases = 0;
+    const auto      refuse = [&](bool launched) {
+        ++cases;
+        refused += launched ? 0 : 1;
+    };
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, nullptr, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(1, 2, 3, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(fn::xchg::max_lanes + 1, 2, 3, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 1, 3, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, fn::hc::max_rows + 1, 3, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 0, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 4, a, wd, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, a, wd, wu, nullptr));
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, a, nullptr, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, a, wd + 8, wu, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, a, wd, nullptr, st));
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, a, wd, wu + 2, st));
+    fn::hc::sub_args b[fn::xchg::max_lanes];
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[1].hc_ring = b[0].hc_ring;  // two lanes on one X-HC slot
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, b, wd, wu, st));
+    std::copy_n(a, fn::xchg::max_lanes, b);
+    b[1].card = 1;  // lanes on different cards
+    refuse(fn::hc::sub_joint_q8(2, 2, 3, b, wd, wu, st));
+    ok              = ok && cuda_ok(cudaStreamSynchronize(st), "refused") && cuda_ok(cudaGetLastError(), "refused");
+    int64_t touched = 0;
+    for (size_t k = 0; k < ln.size() && ok; ++k) {
+        int64_t bad = 0;
+        ok          = hmix_slot_reset(ln[k]->rg, 0, bad);
+        touched += bad;
+    }
+    printf("hc-test q8 sub_joint rejects: %d of %d refused, rings untouched: %s\n", refused, cases,
+           ok && touched == 0 ? "yes" : "NO  FAIL");
+    return ok && refused == cases && touched == 0;
+}
+
+// ---- TTTS3 item 7: TTTS2's mixed down (Q8_0 rows, BF16 inject rows) on UD-Q4_K_XL's real HC modules ----------
+
+// a module's values in weights' layouts (the GGUF's own: down_f [320][10240], inject_f [4][10240], up_f [10240][320],
+// gamma [10240]) and its card repacks: q_mix (the mixed down) and q_up; false when the module is missing, not Q8_0 /
+// F32, or an inject value is not exactly a BF16
+bool read_mix_module(const std::vector<fnfl_gguf_dir> & dirs, const std::string & pre, weights & w) {
+    const auto read = [&](const std::string & name, const char * type, uint64_t bytes, void * out) {
+        for (const fnfl_gguf_dir & d : dirs) {
+            for (const fnfl_gguf_tensor & t : d.tensors) {
+                if (t.name == name && t.type_name == type && t.bytes == bytes) {
+                    FILE *     fp = fopen(d.path.c_str(), "rb");
+                    const bool ok = fp != nullptr && fseeko(fp, static_cast<off_t>(t.offset), SEEK_SET) == 0 &&
+                                    fread(out, 1, bytes, fp) == bytes;
+                    if (fp != nullptr) {
+                        fclose(fp);
+                    }
+                    return ok;
+                }
+            }
+        }
+        return false;
+    };
+    constexpr int64_t    down_row = int64_t(K) / 32 * 34, up_row = int64_t(L) / 32 * 34;
+    std::vector<uint8_t> down(size_t(L) * down_row), up(size_t(K) * up_row);
+    w.inject_f.resize(size_t(J) * K);
+    w.gamma.resize(K);
+    if (!read(pre + "_down.weight", "q8_0", down.size(), down.data()) ||
+        !read(pre + "_up.weight", "q8_0", up.size(), up.data()) ||
+        !read(pre + "_inject.weight", "f32", w.inject_f.size() * 4, w.inject_f.data()) ||
+        !read(pre + "_norm.weight", "f32", w.gamma.size() * 4, w.gamma.data())) {
+        return false;
+    }
+    const auto decode = [](const std::vector<uint8_t> & q, int64_t n, std::vector<float> & f) {
+        f.resize(size_t(n));
+        for (int64_t b = 0; b < n / 32; ++b) {
+            uint16_t dh = 0;
+            std::memcpy(&dh, q.data() + b * 34, 2);
+            const float d = fn::quant::f16_to_f32(dh);
+            for (int32_t i = 0; i < 32; ++i) {
+                f[size_t(b * 32 + i)] = d * static_cast<float>(static_cast<int8_t>(q[size_t(b * 34 + 2 + i)]));
+            }
+        }
+    };
+    decode(down, int64_t(L) * K, w.down_f);
+    decode(up, int64_t(K) * L, w.up_f);
+    constexpr int64_t FB = F / 32, LB = L / 32, n_codes = int64_t(S) * L * F, u_codes = int64_t(F) * S * L;
+    for (int32_t r = 0; r < 2; ++r) {
+        w.gamma_card[r].resize(size_t(S) * F);
+        std::vector<uint8_t> & qm = w.q_mix[r];
+        std::vector<uint8_t> & qu = w.q_up[r];
+        qm.assign(size_t(fn::hc::w_down_mix_bytes), 0);
+        qu.assign(size_t(fn::hc::w_up_q8_bytes), 0);
+        for (int32_t s = 0; s < S; ++s) {
+            std::memcpy(&w.gamma_card[r][size_t(s) * F], &w.gamma[size_t(s) * D + size_t(r) * F], size_t(F) * 4);
+            // the Q8_0 rows: codes [s][j][i], then scales [s][j][i / 32] (the head layout's planes)
+            for (int32_t j = 0; j < L; ++j) {
+                const int64_t   row = int64_t(s) * L + j;
+                const uint8_t * src = down.data() + size_t(j) * down_row + size_t((s * D + r * F) / 32) * 34;
+                for (int64_t b = 0; b < FB; ++b) {
+                    std::memcpy(qm.data() + row * F + b * 32, src + b * 34 + 2, 32);
+                    std::memcpy(qm.data() + n_codes + (row * FB + b) * 2, src + b * 34, 2);
+                }
+            }
+            // the inject rows BF16 [s][k][i], each exactly the file's F32
+            for (int32_t k = 0; k < J; ++k) {
+                for (int32_t i = 0; i < F; ++i) {
+                    const float    x  = w.inject_f[size_t(k) * K + size_t(s) * D + size_t(r) * F + size_t(i)];
+                    const uint16_t bf = to_bf16(x);
+                    if (fn::quant::bf16_to_f32(bf) != x) {
+                        return false;
+                    }
+                    std::memcpy(qm.data() + fn::hc::w_down_head_q8_bytes + ((int64_t(s) * J + k) * F + i) * 2, &bf, 2);
+                }
+            }
+        }
+        // the up: codes [c][s][j], then scales [c][s][j / 32] from GGUF row s * 2560 + r * 1280 + c
+        for (int32_t c = 0; c < F; ++c) {
+            for (int32_t s = 0; s < S; ++s) {
+                const uint8_t * src = up.data() + size_t(int64_t(s) * D + int64_t(r) * F + c) * up_row;
+                const int64_t   at  = int64_t(c) * S + s;
+                for (int64_t b = 0; b < LB; ++b) {
+                    std::memcpy(qu.data() + at * L + b * 32, src + b * 34 + 2, 32);
+                    std::memcpy(qu.data() + u_codes + (at * LB + b) * 2, src + b * 34, 2);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int fnfl_hc_test(int device, uint32_t rows_mask) {
@@ -2277,9 +2835,155 @@ int fnfl_hcj_test(int dev0, int dev1) {
                 }
             }
         }
+        // TTTS3 item 6: the Q8_0 head in lanes, on general FP16-scale Q8_0 head weights on lane 0's cards; TTTS4 item
+        // 1: the draft's Q8_0 sublayer lanes (down2_q8_lanes, up2_q8_lanes) on the same weights' sublayer layout
+        weights wq;
+        make_weights_q8(wq, false);
+        for (int32_t r = 0; r < 2 && ok; ++r) {
+            card2 &               c = *ln[0]->c[r];
+            std::vector<uint16_t> hbf;
+            std::vector<uint8_t>  hq;
+            head_weights(wq, r, hbf, hq);
+            ok = cuda_ok(cudaSetDevice(c.dev), "cudaSetDevice") && c.q_up.put(wq.q_up[r], c.st) &&
+                 c.hq_down.put(hq, c.st) && c.q_down.put(wq.q_down[r], c.st) && c.gamma.put(wq.gamma_card[r], c.st) &&
+                 c.qm_down.put(mix_weights(wq, r), c.st) &&  // TTTS4 item 3: the mixed down of the same weights
+                 cuda_ok(cudaStreamSynchronize(c.st), "weights");
+        }
+        ok = ok && q8_lanes_rejects(ln) && q8j_rejects(ln);
+        for (int32_t rows = 2; rows <= fn::hc::max_rows && ok; ++rows) {
+            for (int32_t k = 0; k < fn::xchg::max_lanes && ok; ++k) {
+                // plain, stress, zero-hx, and for lane 3 plain's activations negated and halved (special's NaN
+                // rows would set the error words, which this case holds zero)
+                inputs in;
+                make_inputs(in, rows, kinds[k] == kind::special ? kind::plain : kinds[k]);
+                for (size_t i = 0; i < in.hres.size() && kinds[k] == kind::special; ++i) {
+                    in.hres[i] *= -0.5f;
+                }
+                for (size_t i = 0; i < in.hx.size() && kinds[k] == kind::special; ++i) {
+                    in.hx[i] *= -0.5f;
+                }
+                ok = put_inputs(ln[size_t(k)]->c, in) && devices_idle(ln);
+            }
+            for (int32_t lanes = 2; lanes <= fn::xchg::max_lanes && ok; ++lanes) {
+                ok = q8_lanes_case(ln, lanes, rows, q8_form::head, "hcj q8 head") && ok;
+                ok = q8_lanes_case(ln, lanes, rows, q8_form::sub, "hcj q8 sub") && ok;  // TTTS4 item 1
+                ok = q8j_case(ln, lanes, rows, "hcj q8 joint") && ok;                   // TTTS4 item 3
+            }
+        }
         ok = devices_idle(ln) && ok;
         cudaSetDevice(dev0);
     }
     printf("hcj-test: %s\n", ok ? "PASS" : "FAIL");
+    return ok ? 0 : 1;
+}
+
+// TTTS3 item 7 (hcmix-test): TTTS2's down2_q8_mix on real UD-Q4_K_XL modules (CPU reads, no model load). Lone, with up2_q8
+// and ready, on layers 0 (attention), 25 (FFN) and 47 (attention) at B = 1..5 for plain, stress and zero-hx rows:
+// against the FP64 reference of the file's values (x, moments, inject, mixed and the full mixed within 1e-5), five
+// sublayers bitwise sublayer 0 and the cards equal, codes and scales bitwise act_ref, X-HMIX reset; batch invariance
+// (each row at B = 1..4 bitwise inside B = 5). Lanes, on layer 25's FFN: down2_q8_mix_lanes and up2_q8_lanes, each lane
+// bitwise its lone launches at B = R (TTTS4 item 1), R = 2..5, U = 2..4.
+int fnfl_hcmix_test(int dev0, int dev1, const char * model) {
+    if (dev0 == dev1) {
+        printf("hcmix-test: loopback on device %d: both cards' kernels on one stream, sends before reads\n", dev0);
+    } else if (!fn::xchg::enable_peer_access(dev0, dev1)) {
+        printf("hcmix-test: FAIL (no peer access)\n");
+        return 1;
+    }
+    std::vector<std::string>   paths;
+    std::vector<fnfl_gguf_dir> dirs;
+    std::string                err;
+    bool                       ok = fnfl_gguf_shard_paths(model, paths, err);
+    for (size_t i = 0; ok && i < paths.size(); ++i) {
+        dirs.emplace_back();
+        ok = fnfl_gguf_read_dir(paths[i], dirs.back(), err);
+    }
+    if (!ok) {
+        printf("hcmix-test: %s: %s  FAIL\n", model, err.c_str());
+        return 1;
+    }
+    printf("hcmix-test: devices %d %d, model %s\n", dev0, dev1, model);
+    {
+        card2           k0(dev0), k1(dev1);
+        card2 *         c[2] = { &k0, &k1 };
+        fn::xchg::rings rg(dev0, dev1);
+        ok              = rg.ok() && k0.st != nullptr && k1.st != nullptr;
+        cudaStream_t st = nullptr;
+        ok              = ok && cuda_ok(cudaSetDevice(dev0), "cudaSetDevice") &&
+                          cuda_ok(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "cudaStreamCreate");
+        device_weights dw;  // not read by the Q8_0 forms
+        const auto     put = [&](card2 * const * cc, const weights & w) {
+            bool good = true;
+            for (int32_t r = 0; r < 2 && good; ++r) {
+                good = cuda_ok(cudaSetDevice(cc[r]->dev), "cudaSetDevice") && fn::hc::prepare2() &&
+                       cc[r]->qm_down.put(w.q_mix[r], cc[r]->st) && cc[r]->q_up.put(w.q_up[r], cc[r]->st) &&
+                       cc[r]->gamma.put(w.gamma_card[r], cc[r]->st) &&
+                       cuda_ok(cudaStreamSynchronize(cc[r]->st), "weights");
+            }
+            return good;
+        };
+        for (const auto & [layer, sub] : std::vector<std::pair<int32_t, const char *>>{
+                 { 0,  "attn" },
+                 { 25, "ffn"  },
+                 { 47, "attn" }
+        }) {
+            const std::string pre = "blk." + std::to_string(layer) + ".hc_" + sub;
+            weights           w;
+            if (!ok || !read_mix_module(dirs, pre, w)) {
+                printf("hcmix-test: %s: missing, not Q8_0 / F32, or an inject value not a BF16  FAIL\n", pre.c_str());
+                ok = false;
+                break;
+            }
+            ok = put(c, w);
+            for (const kind kd : { kind::plain, kind::stress, kind::zero_hx }) {
+                for (int32_t rows = 1; rows <= fn::hc::max_rows && ok; ++rows) {
+                    inputs in;
+                    make_inputs(in, rows, kd);
+                    reference ref;
+                    make_reference(w, in, ref);
+                    const std::string label =
+                        "mix L" + std::to_string(layer) + " " + sub + " " + kind_name(kd) + " B" + std::to_string(rows);
+                    ok = run_hc2_case(c, rg, in, ref, nullptr, fn::hc::up_arm::ring, label, nullptr, true, false,
+                                      true) &&
+                         ok;
+                }
+            }
+            ok = ok && batch_invariance(c, rg, w, dw, st, dev0, true, true);
+            if (layer != 25 || !ok) {
+                continue;
+            }
+            // the lanes on this module
+            jlanes ln;
+            for (int32_t k = 0; k < fn::xchg::max_lanes; ++k) {
+                ln.push_back(std::make_unique<jlane>(dev0, dev1));
+                ok = ok && ln.back()->rg.ok() && ln.back()->k0.st != nullptr && ln.back()->k1.st != nullptr;
+            }
+            ok                                    = ok && put(ln[0]->c, w) && q8j_rejects(ln);
+            const kind kinds[fn::xchg::max_lanes] = { kind::plain, kind::stress, kind::zero_hx, kind::plain };
+            for (int32_t rows = 2; rows <= fn::hc::max_rows && ok; ++rows) {
+                for (int32_t k = 0; k < fn::xchg::max_lanes && ok; ++k) {
+                    inputs in;
+                    make_inputs(in, rows, kinds[k]);
+                    for (size_t i = 0; k == 3 && i < in.hres.size(); ++i) {  // lane 3: lane 0's rows negated, halved
+                        in.hres[i] *= -0.5f;
+                    }
+                    for (size_t i = 0; k == 3 && i < in.hx.size(); ++i) {
+                        in.hx[i] *= -0.5f;
+                    }
+                    ok = put_inputs(ln[size_t(k)]->c, in) && devices_idle(ln);
+                }
+                for (int32_t lanes = 2; lanes <= fn::xchg::max_lanes && ok; ++lanes) {
+                    ok = q8_lanes_case(ln, lanes, rows, q8_form::mix, "hcmix lanes") && ok;
+                    ok = q8j_case(ln, lanes, rows, "hcmix joint") && ok;  // TTTS4 item 3: hc::sub_joint_q8
+                }
+            }
+            ok = devices_idle(ln) && ok;
+        }
+        if (st != nullptr) {
+            cudaStreamDestroy(st);
+        }
+        cudaSetDevice(dev0);
+    }
+    printf("hcmix-test: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

@@ -3,6 +3,8 @@
 // PB1's prompt-kernel tests (fnfl-drive pd-test, hcp-test, gdp-test, qsp-test, pe-test, dcp-test): the small pieces
 // they share. Host code only (test support, not part of the engine).
 
+#include "fn/tools/test_cuda.h"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -17,11 +19,7 @@
 namespace fn::ptest {
 
 inline bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "prompt test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "prompt test", what);
 }
 
 // one device allocation (poisoned to NaN bytes on request, so a missed output cannot pass)
@@ -55,6 +53,15 @@ struct dbuf {
         h.resize(count);
         return p != nullptr && count * sizeof(T) <= n &&
                cuda_ok(cudaMemcpy(h.data(), p, count * sizeof(T), cudaMemcpyDeviceToHost), "get");
+    }
+
+    // TFC: the byte forms (dense_prompt_test's)
+    bool put(const void * h, size_t bytes) const {
+        return p != nullptr && bytes <= n && cuda_ok(cudaMemcpy(p, h, bytes, cudaMemcpyHostToDevice), "put");
+    }
+
+    bool get(void * h, size_t bytes) const {
+        return p != nullptr && bytes <= n && cuda_ok(cudaMemcpy(h, p, bytes, cudaMemcpyDeviceToHost), "get");
     }
 
     bool poison() const { return p != nullptr && cuda_ok(cudaMemset(p, 0xff, n), "memset"); }

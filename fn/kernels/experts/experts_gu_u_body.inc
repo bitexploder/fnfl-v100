@@ -11,32 +11,13 @@
     constexpr bool U = true; // the generic sections' run-time form; F, FG and FU are unused placeholders
     constexpr fmt F = fmt::iq2_xxs;
     constexpr dfmt FG = dfmt::q4_k, FU = dfmt::q4_k;
-    static_assert(!FAM::iq3 || B >= 4, "the IQ3 body: B = 4 and 5");
-    // the routed format's sections: body(gu_fc<f>{}) for this launch's f
+    static_assert(B >= FAM::b_min, "the family body's B");
+    // the routed format's sections: body(gu_fc<f>{}) for this launch's f (the family's fold, gu_family::with_f)
     const auto with_f = [&](auto && body) {
         if constexpr (!U) {
             body(gu_fc<F>{});
-        } else if constexpr (FAM::iq3) {
-            switch (static_cast<fmt>(a.u_f)) {
-                case fmt::iq3_xxs:
-                    body(gu_fc<fmt::iq3_xxs>{});
-                    break;
-                default:
-                    body(gu_fc<fmt::iq3_s>{});
-                    break;
-            }
         } else {
-            switch (static_cast<fmt>(a.u_f)) {
-                case fmt::iq2_xxs:
-                    body(gu_fc<fmt::iq2_xxs>{});
-                    break;
-                case fmt::iq2_xs:
-                    body(gu_fc<fmt::iq2_xs>{});
-                    break;
-                default:
-                    body(gu_fc<fmt::iq2_s>{});
-                    break;
-            }
+            FAM::with_f(a.u_f, body);
         }
     };
     extern __shared__ uint4 smem_u4[];
@@ -132,6 +113,9 @@
     // a chunk of format C::f's sequence: the aux chunk is one or two 8-byte loads, every other chunk one 16-byte load
     const auto load_chunk = [&](auto fc, const uint8_t * tl, int32_t q, uint32_t z) -> uint4 {
         using C = decltype(fc);
+        if constexpr (gu_codec<C::f>::kq) {  // TTTS3 item 3: the K-quants through their codec
+            return gu_codec<C::f>::load(tl, q, z, tid, j, sb, rs);
+        }
         if (C::NA == 1 && q == 1) {
             uint4 v = {0, 0, 0, 0};
             if (C::L.aux8) {
@@ -248,6 +232,7 @@
                 // (z, w) chunk, main chunk 0
                 [[maybe_unused]] bytes8 ax8 = {0, 0}, sc8 = {0, 0};
                 [[maybe_unused]] uint4 held = {0, 0, 0, 0}; // IQ3: the sign words waiting
+                [[maybe_unused]] float   mn8[8];              // the K-quants' mins (the codecs' take signature)
                 [[maybe_unused]] int32_t is8[B];            // Q8_0: a row's integer sums, over its two chunks
                 // the unit's chunks in order; out(rd, r) finishes row r of a record (Q8_0 finishes its rows itself)
                 const auto chunks = [&](auto out) {
@@ -271,8 +256,8 @@
                             sc8 = take8(v.z, v.w);
                             continue;
                         }
-                        const int32_t c = q - 1 - C::NA;
                         if constexpr (C::f == fmt::q8_0) {
+                            const int32_t c    = q - 1 - C::NA;
                             // chunk c: half c & 1 of row c / 2's sub-block, against codes 16 (c & 1) .. of each routed
                             // row
                             const int32_t mrow = c >> 1, hh = c & 1;
@@ -294,69 +279,10 @@
                             }
                             continue;
                         }
+                        // the format's chunks: the codec's (codec.cuh)
                         row_dec rd;
-                        if constexpr (C::f == fmt::iq2_xxs || C::f == fmt::iq2_xs) {
-                            // IQ2_XS
-                            [[maybe_unused]] const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
-#pragma unroll
-                            for (int32_t h = 0; h < 2; ++h) {
-                                const int32_t mrow = 2 * c + h;
-                                const uint2 qq = h == 0 ? make_uint2(v.x, v.y) : make_uint2(v.z, v.w);
-                                const float dh = dh8[mrow];
-                                if constexpr (C::f == fmt::iq2_xxs) {
-                                    dec_iq2_xxs(rd, qq, dh, grid);
-                                    out(rd, rs + 8 * mrow);
-                                } else {
-                                    const uint32_t sc = byte8(ax8, mrow);
-                                    dec_iq2_xs(rd, qq, sc, dh, grid);
-                                    out(rd, rs + 8 * mrow);
-                                }
-                            }
-                        } else if constexpr (C::f == fmt::iq2_s) {
-                            if (c == 0) {
-                                ax8 = take8(v.x, v.y); // qh of rows 0..7
-                                sc8 = take8(v.z, v.w); // scales of rows 0..7
-                                continue;
-                            }
-                            const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
-#pragma unroll
-                            for (int32_t h = 0; h < 2; ++h) {
-                                const int32_t mrow = 2 * (c - 1) + h;
-                                const float dh = dh8[mrow];
-                                const uint32_t qh = byte8(ax8, mrow);
-                                const uint32_t sc = byte8(sc8, mrow);
-                                dec_iq2_s(rd, h == 0 ? v.x : v.z, h == 0 ? v.y : v.w, qh, sc, dh, grid);
-                                out(rd, rs + 8 * mrow);
-                            }
-                        } else {
-                            // IQ3: chunk k of row quad hq: k 0 [q r0][sg r0][sg r1], k 1 [q r1][sg r2][sg r3],
-                            // k 2 [q r2][q r3]
-                            const uint32_t * grid = reinterpret_cast<const uint32_t *>(sv.grid);
-                            const int32_t hq = c / 3;
-                            const int32_t k = c - 3 * hq;
-                            const auto row = [&](int32_t mrow, uint2 qq, uint32_t sg) {
-                                const float dh = dh8[mrow];
-                                if constexpr (C::f == fmt::iq3_xxs) {
-                                    dec_iq3_xxs(rd, qq, sg, dh, grid);
-                                } else {
-                                    const uint32_t qh = byte8(ax8, mrow);
-                                    const uint32_t scb = byte8(sc8, mrow);
-                                    dec_iq3_s(rd, qq, sg, qh, (j & 1) ? scb >> 4 : scb & 0xfu, dh, grid);
-                                }
-                                out(rd, rs + 8 * mrow);
-                            };
-                            if (k == 0) {
-                                held.x = v.w;
-                                row(4 * hq + 0, make_uint2(v.x, v.y), v.z);
-                            } else if (k == 1) {
-                                held.y = v.z;
-                                held.z = v.w;
-                                row(4 * hq + 1, make_uint2(v.x, v.y), held.x);
-                            } else {
-                                row(4 * hq + 2, make_uint2(v.x, v.y), held.y);
-                                row(4 * hq + 3, make_uint2(v.z, v.w), held.z);
-                            }
-                        }
+                        gu_codec<C::f>::take(q, v, dh8, mn8, ax8, sc8, held, rd,
+                                             reinterpret_cast<const uint32_t *>(sv.grid), j, rs, out);
                     }
                 };
                 // XB3 K1b: one body. Every record's rows run the unit's first routed row b0 with no row test (row_out1
@@ -368,6 +294,53 @@
                 // at 96 registers (IQ2_S, IQ3_S).
                 if constexpr (C::f == fmt::q8_0) {
                     chunks([](const row_dec &, int32_t) {});
+                } else if constexpr (gu_codec<C::f>::kq) {
+                    // TTTS3 item 3, the K-quants (gate_up_kernel's ME1 form): the unit's first routed row b0 from
+                    // registers (its codes, d and staged sum read once a unit), with no row test; the others from
+                    // shared memory at each row, at B <= 3 in the unrolled loop, at B = 4 and 5 through kq_out_c's
+                    // compact loop (SP4 H2's form). Each row's partial is gate_up_kernel's.
+                    using CD         = gu_codec<C::f>;
+                    const int32_t b0 = __ffs(static_cast<int32_t>(mask)) - 1;
+                    uint32_t      act1[8];
+                    {
+                        const uint4 * xb = reinterpret_cast<const uint4 *>(sv.xs + b0 * x_codes);
+                        const uint4   c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
+                        act1[0] = c0.x;
+                        act1[1] = c0.y;
+                        act1[2] = c0.z;
+                        act1[3] = c0.w;
+                        act1[4] = c1.x;
+                        act1[5] = c1.y;
+                        act1[6] = c1.z;
+                        act1[7] = c1.w;
+                    }
+                    const float4 xm1 = sv.xm[b0 * n_sub + j];
+                    if constexpr (B >= 4) {
+                        float *        red1 = red_buf + b0 * 64 * red_stride;
+                        const uint32_t rest = mask & (mask - 1u);
+                        chunks([&](const kq_row & kr, int32_t r) {
+                            kq_store(CD::part(kr, act1, xm1.x, xm1.y), red1 + r * red_stride + w, lane);
+                            kq_out_c<CD>(kr, sv.xs, sv.xm, j, rest, red_buf, r, w, lane);
+                        });
+                    } else {
+                        chunks([&](const kq_row & kr, int32_t r) {
+                            const int32_t bb = opaque(b0);
+                            kq_store(CD::part(kr, act1, xm1.x, xm1.y), red_buf + (bb * 64 + r) * red_stride + w, lane);
+                            const uint32_t rest = mask >> (bb + 1);  // bit k: row b0 + 1 + k
+#pragma unroll
+                            for (int32_t k = 0; k < B - 1; ++k) {
+                                if (((rest >> k) & 1u) == 0) {
+                                    continue;
+                                }
+                                const int32_t  b  = bb + 1 + k;
+                                const uint4 *  xb = reinterpret_cast<const uint4 *>(sv.xs + b * x_codes);
+                                const uint4    c0 = xb[fn::dense::swz(2 * j)], c1 = xb[fn::dense::swz(2 * j + 1)];
+                                const uint32_t ab[8] = { c0.x, c0.y, c0.z, c0.w, c1.x, c1.y, c1.z, c1.w };
+                                const float4   xmb   = sv.xm[b * n_sub + j];
+                                kq_store(CD::part(kr, ab, xmb.x, xmb.y), red_buf + (b * 64 + r) * red_stride + w, lane);
+                            }
+                        });
+                    }
                 } else {
                     constexpr bool SPLIT = C::f == fmt::iq2_xs || C::f == fmt::iq2_s;
                     constexpr bool SGN = signed_words(C::f);
@@ -439,12 +412,16 @@
             }
         });
     }
-    // the shared expert's pair: body(gate, up) as integral constants, this launch's (the IQ2 body: each pair's code
-    // behind one block-uniform switch, the ten pairs the IQ2 layers meet; the launcher admits only deployed triples)
+    // the shared expert's pair: body(gate, up) as integral constants, this launch's: each pair's code behind one
+    // block-uniform switch over the family's pairs (profiles.h; the launcher admits only profiled triples). The IQ2
+    // body's ten pairs stay written out (TTTS3: the generated switch, with_family_pair, changed its SASS); experts_gu.cuh
+    // checks the list against the profiles.
     const auto with_pair = [&](auto && body) {
         using std::integral_constant;
         if constexpr (!U) {
             body(integral_constant<dfmt, FG>{}, integral_constant<dfmt, FU>{});
+        } else if constexpr (!std::is_same_v<FAM, gu_iq2>) {
+            with_family_pair<FAM>(a.u_fg * 16 + a.u_fu, body);
         } else {
 #define FN_GU_PAIR(g, u)                                                                                               \
     case int32_t(dfmt::g) * 16 + int32_t(dfmt::u):                                                                     \
@@ -490,8 +467,10 @@
     case int32_t(dfmt::g) * 16 + int32_t(dfmt::u):                                                                     \
         shared_unit<dfmt::g, dfmt::u, B>(a, sh_g, sw, sl, x, sv.sgrid, sv.red);                                        \
         break;
-            if constexpr (FAM::iq3) {
-                // XB3 C1: the eight pairs the IQ3 layers meet (experts_inst.h)
+            if constexpr (!std::is_same_v<FAM, gu_iq2> && !std::is_same_v<FAM, gu_iq3>) {
+                family_shared_unit<FAM, B>(a.u_fg * 16 + a.u_fu, a, sh_g, sw, sl, x, sv.sgrid, sv.red);
+            } else if constexpr (std::is_same_v<FAM, gu_iq3>) {
+                // XB3 C1: the eight pairs the IQ3 layers meet (the IQ bodies' lists stay written out, as with_pair's)
                 switch (a.u_fg * 16 + a.u_fu) {
                     FN_GU_PAIR(iq4_xs, q6_k)
                     FN_GU_PAIR(iq3_s, iq3_s)

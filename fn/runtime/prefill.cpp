@@ -3,6 +3,7 @@
 #include "fn/kernels/ple/ple.h"
 #include "fn/model/pass.h"
 #include "fn/model/state.h"
+#include "fn/xchg/slow.h"
 
 #include <cuda_runtime.h>
 #include <pthread.h>
@@ -140,12 +141,17 @@ int32_t checkpoint_book::count_owner(int32_t owner) const {
     return n;
 }
 
-int32_t choose_checkpoint(checkpoint_book & book, const std::vector<int32_t> & all, int64_t n_reuse, int32_t owner) {
+int32_t choose_checkpoint(checkpoint_book &            book,
+                          const std::vector<int32_t> & all,
+                          int64_t                      n_reuse,
+                          int32_t                      owner,
+                          const image_rows *           images) {
     // at least the last token is processed, so its logits exist (FC-PF1's rule for nothing new)
     const int64_t keep = std::min<int64_t>(n_reuse, static_cast<int64_t>(all.size()) - 1);
     int32_t slot = -1;
     while (keep > 0 && (slot = book.latest(keep, owner)) >= 0) {
-        if (book.at(slot).key == token_key(all.data(), book.at(slot).pos)) {
+        const int64_t p = book.at(slot).pos;
+        if (book.at(slot).key == (images != nullptr ? images->key(all.data(), p) : token_key(all.data(), p))) {
             return slot;
         }
         book.drop(slot); // its prefix is not the prompt's
@@ -171,6 +177,12 @@ prefiller::~prefiller() {
         if (copy_[c] != nullptr) {
             cudaStreamSynchronize(static_cast<cudaStream_t>(copy_[c]));
             cudaStreamDestroy(static_cast<cudaStream_t>(copy_[c]));
+        }
+        for (void *& e : uev_[c]) {
+            if (e != nullptr) {
+                cudaEventDestroy(static_cast<cudaEvent_t>(e));
+                e = nullptr;
+            }
         }
     }
     for (float *& h : host_) {
@@ -237,6 +249,14 @@ bool prefiller::init(target & t, model::model & m, std::string & err) {
             uploaded_[k][c] = a;
             read_[k][c] = b;
             half_[k][c] = h;
+        }
+        // MUP2: the units' timing events (a step's unit boundaries on each card's compute stream)
+        for (void *& e : uev_[c]) {
+            cudaEvent_t ev = nullptr;
+            if (!cuda_ok(cudaEventCreate(&ev), "unit event", err)) {
+                return false;
+            }
+            e = ev;
         }
     }
     for (float *& h : host_) {
@@ -324,13 +344,13 @@ bool prefiller::run_short(target & t, pf_run_stats & s, std::string & err) {
             ++s.catchups;
         }
         const int64_t pos = t.slot().n;
-        if (checkpoint_due(pos, to)) {
+        if (checkpoint_due(pos, to) && !t.images().cuts(pos)) {  // VIS1: none inside an image
             const int32_t slot = book_.slot_for(pos, t.slot_index());
             if (!save(t, slot, err)) {
                 book_.drop(slot);
                 return false;
             }
-            book_.record(slot, pos, token_key(tok_.data(), pos), t.slot_index());
+            book_.record(slot, pos, t.prompt_key(tok_.data(), pos), t.slot_index());
             ++s.checkpoints;
         }
     }
@@ -547,7 +567,7 @@ bool prefiller::checkpoint_now(target & t, std::string & err) {
             return false;
         }
     }
-    book_.record(slot, l.n, token_key(l.tok.data(), l.n), t.slot_index());
+    book_.record(slot, l.n, t.prompt_key(l.tok.data(), l.n), t.slot_index());
     return true;
 }
 
@@ -558,7 +578,7 @@ bool prefiller::begin(target & t, const std::vector<int32_t> & all, int64_t n_re
         return fail(err, "prefill: no tokens");
     }
     const int32_t owner = t.slot_index(); // MU1: the slot's checkpoints only
-    const int32_t slot = choose_checkpoint(book_, all, n_reuse, owner);
+    const int32_t slot  = choose_checkpoint(book_, all, n_reuse, owner, t.images().empty() ? nullptr : &t.images());
     if (slot < 0) {
         book_.clear_owner(owner);
         if (!t.reset(err)) {
@@ -611,7 +631,12 @@ bool prefiller::run(target & t, pf_run_stats * st, std::string & err, const pref
     s.from = from;
     s.to = to;
     s.t0             = t0;
-    if (pf_short_read(from, to, short_read_, xs != nullptr, legacy_)) {
+    // VIS1: image rows read on the bulk prompt path only (the short read's and the forced path's rounds take no planes)
+    const bool img   = t.images().any_image(from, to);
+    if (img && !bulk_) {
+        return fail(err, "prefill: image rows on the forced path (the bulk path reads images)");
+    }
+    if (!img && pf_short_read(from, to, short_read_, xs != nullptr, legacy_)) {
         s.short_read = true;
         const bool ok = run_short(t, s, err);
         s.wall_s      = since(t0);
@@ -802,13 +827,13 @@ bool prefiller::run_forced(target &                      t,
             return fail(err,
                         "prefill: chunk at " + std::to_string(ch.start) + " did not end at " + std::to_string(pos));
         }
-        if (checkpoint_due(pos, to)) {
+        if (checkpoint_due(pos, to) && !t.images().cuts(pos)) {  // VIS1: none inside an image
             const int32_t slot = book_.slot_for(pos, t.slot_index());
             if (!save(t, slot, err)) {
                 book_.drop(slot);
                 return false;
             }
-            book_.record(slot, pos, token_key(tok_.data(), pos), t.slot_index());
+            book_.record(slot, pos, t.prompt_key(tok_.data(), pos), t.slot_index());
             cs.checkpoint = slot;
             ++s.checkpoints;
         }
@@ -895,7 +920,8 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
         pc.e[1]    = dev_[sl][1];
         pc.draft   = t.draft_on();
         pc.more    = k + 1 < plan.size();
-        if (!t.prompt_begin(err) || !chunk_window(t, *pp_, pc, err)) {
+        // MUP1 piece 5: rotary positions are cells plus the slot's offset; VIS1: the image ledger's planes and rows
+        if (!chunk_positions(t, 0, pc, false, err) || !t.prompt_begin(err) || !chunk_window(t, *pp_, pc, err)) {
             return false;
         }
         for (int32_t c = 0; c < nc; ++c) {
@@ -914,8 +940,8 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
             }
         }
         s.last_join_s    = since(t0);
-        const int32_t nh = ch.half[1] > 0 ? 2 : 1;
-        if (!pp_->check_errors(err) || !t.prompt_commit(ch.rows, nh, err) || !pp_->publish(pc, err)) {
+        if (!pp_->check_errors(err) || !t.prompt_commit(ch.rows, model::prompt_last_version(pc), err) ||
+            !pp_->publish(pc, err)) {
             return false;
         }
         ++s.rounds;
@@ -924,13 +950,13 @@ bool prefiller::run_bulk(target & t, pf_run_stats & s, const std::vector<pf_chun
             return fail(err,
                         "prefill: chunk at " + std::to_string(ch.start) + " did not end at " + std::to_string(pos));
         }
-        if (checkpoint_due(pos, to)) {
+        if (checkpoint_due(pos, to) && !t.images().cuts(pos)) {  // VIS1: none inside an image
             const int32_t slot = book_.slot_for(pos, t.slot_index());
             if (!save(t, slot, err)) {
                 book_.drop(slot);
                 return false;
             }
-            book_.record(slot, pos, token_key(tok_.data(), pos), t.slot_index());
+            book_.record(slot, pos, t.prompt_key(tok_.data(), pos), t.slot_index());
             cs.checkpoint = slot;
             ++s.checkpoints;
         }
@@ -1053,6 +1079,17 @@ bool prefiller::pump(std::string & err) {
 }
 
 bool prefiller::prefetch(target & t, const pf_job * now, const pf_job * next, std::string & err) {
+    // SSF1: the PLE host prefetch never waits by design; a slow one is a trace line
+    const auto   t0 = clk::now();
+    const bool   ok = prefetch_rows(t, now, next, err);
+    const double s  = since(t0);
+    if (fn::xchg::slow::due(s)) {
+        fn::xchg::slow::line("read prefetch", s, "next slot " + std::to_string(next != nullptr ? next->slot : -1));
+    }
+    return ok;
+}
+
+bool prefiller::prefetch_rows(target & t, const pf_job * now, const pf_job * next, std::string & err) {
     if (!resident(t)) {
         return true;
     }
@@ -1121,7 +1158,14 @@ void prefiller::forget_job(int64_t id) {
     }
 }
 
-bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, std::string & err) {
+bool prefiller::job_start(target &      t,
+                          pf_job &      j,
+                          int32_t       layers,
+                          pf_mode       mode,
+                          bool          budgeted,
+                          double        budget_ms,
+                          std::string & err) {
+    const auto       t0 = clk::now();
     const pf_chunk & ch = j.plan[j.chunk];
     const int32_t lane = busy_[0] < 0 && ch.rows <= lane_rows(0)                      ? 0
                          : busy_[1] < 0 && pp2_ != nullptr && ch.rows <= lane_rows(1) ? 1
@@ -1229,6 +1273,7 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
         }
         j.stage = -1;
     }
+    const double staging_s = since(t0);
     // the lane's arena holds this job's predecessor and PLE history only when its last chunk there was this job's
     // previous one; otherwise they are rebuilt from the slot's committed state (run_start, both cards drained). MXMU1:
     // a lent arena is the pool's between chunks, so every chunk rebuilds them
@@ -1247,6 +1292,15 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
     if (!t.prompt_begin(err)) {
         return false;
     }
+    // SSF1: the chunk's start (PLE staging, then the arena's run start) as a trace line when slow; its gather ahead
+    // below never waits on more than the pinned slot's upload
+    const double start_s = since(t0);
+    if (fn::xchg::slow::due(start_s)) {
+        fn::xchg::slow::line("read chunk start", start_s,
+                             "slot " + std::to_string(j.slot) + " chunk " + std::to_string(j.chunk) + " lane " +
+                                 std::to_string(lane) + ": PLE staging " + std::to_string(staging_s) +
+                                 " s, run start " + std::to_string(start_s - staging_s) + " s");
+    }
     model::prompt_chunk & c = j.pc;
     c = model::prompt_chunk();
     c.index = static_cast<int64_t>(j.chunk);
@@ -1259,16 +1313,34 @@ bool prefiller::job_start(target & t, pf_job & j, int32_t layers, pf_mode mode, 
     c.e[0] = e[0];
     c.e[1] = e[1];
     c.draft = t.draft_on();
+    // MUP1 piece 5: rotary positions are cells plus the slot's offset; VIS1: the image ledger's planes and rows
+    if (!chunk_positions(t, lane, c, true, err)) {
+        return false;
+    }
     // MXMU1: the loan ends with the chunk, so nothing is staged ahead for the next one
     c.more = xs == nullptr && j.chunk + 1 < j.plan.size();
     j.lane = lane;
     j.group = 0;
     // FMU1 (resident TP): the chunk's geometry by mode (pf_mode); else MU1's groups of `layers` layers. TTTS1: over the
-    // window's layers
+    // window's layers. MUP2: writers mode with a budget runs units, (layer, sublayer, piece) and the end; the pieces
+    // chosen here from the budget where the chunk's layers start (the whole model or the front), else from the crossing
+    // (the back). Writers mode without a budget keeps FMU1's 1-layer groups: the split's back runs a reader that has no
+    // writers (the server's shared mode, the leader's interleaved chunk) that way, as before MUP2
     const int32_t n_win     = m_->win.hi - m_->win.lo + 1;
+    j.units                 = res && mode == pf_mode::writers && budgeted;
     j.layers    = !res || mode == pf_mode::shared ? std::min(layers, n_win) : mode == pf_mode::lone ? n_win : 1;
     j.end_group = res && mode == pf_mode::writers;
-    j.groups    = (n_win + j.layers - 1) / j.layers + (j.end_group ? 1 : 0);
+    // (TEST: test_piece_rows sets the pieces in every mode, so a lone or shared read runs them too)
+    if ((j.units || piece_rows_test_ != 0) && m_->win.lo == 0) {
+        bool          below = false;
+        const int32_t r     = choose_piece_rows(ch, budget_ms, below);
+        // PRD1 item 12: serving's floor is on the pieces made (the test's sizes are correctness cases only)
+        if (!model::prompt_set_pieces(c, r, err, piece_rows_test_ != 0 ? 0 : pf_piece_floor_rows)) {
+            return false;
+        }
+        j.below_floor = j.below_floor || below;
+    }
+    j.groups    = j.units ? units_of(j) : (n_win + j.layers - 1) / j.layers + (j.end_group ? 1 : 0);
     busy_[lane] = j.slot;
     if (lane == 0) {
         live_stage_ = j.stage;
@@ -1305,8 +1377,9 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     done = false;
     const pf_chunk & ch = j.plan[j.chunk];
     model::prompt_path & pp = j.lane == 0 ? *pp_ : *pp2_;
-    const int32_t nh = ch.half[1] > 0 ? 2 : 1;
-    if (!pp.check_errors(err) || !t.prompt_commit(ch.rows, nh, err) || !pp.publish(j.pc, err)) {
+    // MUP2: the chunk commits its last piece's version (the halves' 1 or 2)
+    if (!pp.check_errors(err) || !t.prompt_commit(ch.rows, model::prompt_last_version(j.pc), err) ||
+        !pp.publish(j.pc, err)) {
         return false;
     }
     ++j.stats.rounds;
@@ -1316,13 +1389,20 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     }
     pf_chunk_stats cs;
     cs.c = ch;
-    if (checkpoint_due(pos, j.to)) {
+    if (checkpoint_due(pos, j.to) && !t.images().cuts(pos)) {  // VIS1: none inside an image
         const int32_t slot = book_.slot_for(pos, j.slot);
+        const auto    ts   = clk::now();
         if (!save(t, slot, err)) {
             book_.drop(slot);
             return false;
         }
-        book_.record(slot, pos, token_key(j.tok.data(), pos), j.slot);
+        const double save_s = since(ts);
+        if (fn::xchg::slow::due(save_s)) {
+            fn::xchg::slow::line("checkpoint save", save_s,
+                                 "slot " + std::to_string(j.slot) + " at " + std::to_string(pos) + " (entry " +
+                                     std::to_string(slot) + ")");
+        }
+        book_.record(slot, pos, t.prompt_key(j.tok.data(), pos), j.slot);
         cs.checkpoint = slot;
         ++j.checkpoints;
         ++j.stats.checkpoints;
@@ -1333,6 +1413,7 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     // restore, the other lane's chunk) runs on the same compute streams, and a reclaim or trim drains them first
     // (work/FMU1/notes/wait-account.md, W10)
     const bool res = resident(t);
+    const auto te  = clk::now();
     for (int32_t c = 0; c < 2 && !res; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "chunk end", err)) {
@@ -1367,6 +1448,12 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
         }
         cs.stall_s = since(tw);
     }
+    const double end_s = since(te);
+    if (fn::xchg::slow::due(end_s)) {
+        fn::xchg::slow::line("read chunk end", end_s,
+                             "slot " + std::to_string(j.slot) + " chunk " + std::to_string(j.chunk) +
+                                 ": the next chunk's PLE gather joined " + std::to_string(cs.stall_s) + " s");
+    }
     j.stats.chunks.push_back(cs);
     cont_job_[j.lane] = lent ? -1 : j.id;
     cont_pos_[j.lane] = pos;
@@ -1377,7 +1464,9 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     ++j.chunk;
     ++j.chunks_done;
     j.committed = pos;
-    if (j.chunk < j.plan.size()) {
+    // PRD1 item 14: a cancel due at the last chunk's end stops there as at any chunk's end (the chunk and its
+    // checkpoint kept, no handoff): the read ends cancelled, not done
+    if (j.chunk < j.plan.size() || j.cancel_due()) {
         return job_release(t, err); // MXMU1: the chunk's loan back before any other slot's work
     }
     // the handoff (FC-PF2): the last row's head (its logits retained), every row processed, the draft at N
@@ -1399,11 +1488,34 @@ bool prefiller::job_finish_chunk(target & t, pf_job & j, bool & done, std::strin
     return job_release(t, err); // MXMU1: after the head input, the arena's last reader
 }
 
-void prefiller::job_plan(int64_t from, int64_t to, bool cached, std::vector<pf_chunk> & plan, bool & short_read) const {
-    // as run(): MX3's one-half chunks with the expert service (not the base arm); ME3's short read
+void prefiller::job_plan(int64_t                 from,
+                         int64_t                 to,
+                         bool                    cached,
+                         std::vector<pf_chunk> & plan,
+                         bool &                  short_read,
+                         bool                    images) const {
+    // as run(): MX3's one-half chunks with the expert service (not the base arm); ME3's short read (VIS1: never over
+    // image rows)
     const int32_t split = cached && !legacy_ ? pf_cached_split_rows : pf_split_rows;
     plan = plan_chunks(from, to, legacy_ ? pf_chunk_rows : chunk_rows_, split);
-    short_read = pf_short_read(from, to, short_read_, cached, legacy_);
+    short_read          = !images && pf_short_read(from, to, short_read_, cached, legacy_);
+}
+
+bool prefiller::chunk_positions(target & t, int32_t lane, model::prompt_chunk & c, bool sliced, std::string & err) {
+    const image_rows & l = t.images();
+    if (l.empty()) {
+        c.rope_off = t.pos_offset();
+        return true;
+    }
+    l.chunk(c.start, c.rows, img_chunk_);
+    c.rope_off = img_chunk_.rope_off;
+    if (!img_chunk_.images) {
+        return true;
+    }
+    if (images_ == nullptr) {
+        return fail(err, "prefill: image rows at cell " + std::to_string(c.start) + " and no vision projector");
+    }
+    return images_->fill(t, lane, img_chunk_, c, sliced, err);
 }
 
 bool prefiller::job_hold(target & t, model::prompt_path & pp, const pf_chunk & ch, int32_t d, pf_job & j,
@@ -1457,14 +1569,328 @@ bool prefiller::job_release(target & t, std::string & err) {
     return pp_->hold(false, err);
 }
 
-pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t layers, std::string & err, pf_mode mode) {
+// ---- MUP2: a writers-mode chunk's units and their budget ----
+
+namespace {
+
+// the fixed part of a unit's time, which a piece pays whatever its rows: about 1.85 ms a layer a piece over two
+// sublayers [D, MUP1 Load 1's front fit: 89.7 ms + 0.131 ms a row over 26 layers, less the conversion], so a unit
+// predicted at other rows scales only the rest
+constexpr double unit_fixed_ms = 0.9;
+}  // namespace
+
+int32_t pf_piece_rows(int32_t rh, double budget_ms, const std::function<double(int32_t)> & worst, bool & below_floor) {
+    below_floor     = false;
+    const double wh = budget_ms < 0 ? -1.0 : worst(rh);
+    if (budget_ms < 0 || wh < 0 || wh <= budget_ms || rh <= pf_piece_floor_rows) {
+        return 0;
+    }
+    for (int32_t r = (rh - 1) / model::prompt_piece_grid * model::prompt_piece_grid; r >= pf_piece_floor_rows;
+         r -= model::prompt_piece_grid) {
+        const double w = worst(r);
+        if (w >= 0 && w <= budget_ms) {
+            return r;
+        }
+    }
+    below_floor = true;
+    return pf_piece_floor_rows;
+}
+
+const char * pf_unit_name(pf_unit u) {
+    switch (u) {
+        case pf_unit::gdn:
+            return "gdn";
+        case pf_unit::qsa:
+            return "qsa";
+        case pf_unit::ffn:
+            return "ffn";
+        default:
+            return "end";
+    }
+}
+
+double prefiller::predict(pf_unit k, int32_t rows) const {
+    const int32_t i = static_cast<int32_t>(k);
+    if (unit_ms_[i] < 0 || unit_rows_[i] < 1 || rows < 1) {
+        return -1.0;
+    }
+    const double c0 = std::min(unit_ms_[i], unit_fixed_ms);
+    return c0 + (unit_ms_[i] - c0) * double(rows) / double(unit_rows_[i]);
+}
+
+int32_t prefiller::units_of(const pf_job & j) const {
+    return (m_->win.hi - m_->win.lo + 1) * 2 * model::prompt_pieces(j.pc) + 1;
+}
+
+pf_unit prefiller::unit_at(const pf_job & j, int32_t u, int32_t & l, int32_t & sub, int32_t & piece) const {
+    const int32_t np = model::prompt_pieces(j.pc);
+    const int32_t nl = (m_->win.hi - m_->win.lo + 1) * 2 * np;
+    if (u >= nl) {
+        l     = m_->win.hi + 1;
+        sub   = 0;
+        piece = 0;
+        return pf_unit::end;
+    }
+    l     = m_->win.lo + u / (2 * np);
+    sub   = (u / np) % 2;
+    piece = u % np;
+    return sub == 1                                                 ? pf_unit::ffn :
+           l % fn::full_attn_interval == fn::full_attn_interval - 1 ? pf_unit::qsa :
+                                                                      pf_unit::gdn;
+}
+
+int32_t prefiller::choose_piece_rows(const pf_chunk & ch, double budget_ms, bool & below_floor) const {
+    below_floor = false;
+    if (piece_rows_test_ != 0) {
+        return piece_rows_test_ < 0 ? 0 : piece_rows_test_;
+    }
+    const auto worst = [&](int32_t r) {
+        return worst_unit(r);
+    };
+    return pf_piece_rows(std::max(ch.half[0], ch.half[1]), budget_ms, worst, below_floor);
+}
+
+double prefiller::worst_unit(int32_t rows) const {
+    double w = 0;
+    for (const pf_unit k : { pf_unit::gdn, pf_unit::qsa, pf_unit::ffn }) {
+        const double p = predict(k, rows);
+        if (p < 0) {
+            return -1.0;
+        }
+        w = std::max(w, p);
+    }
+    return w;
+}
+
+bool prefiller::units_step(target &          t,
+                           pf_job &          j,
+                           const pf_budget * budget,
+                           int32_t           max_units,
+                           int32_t &         ran,
+                           std::string &     err) {
+    ran                         = 0;
+    j.last_minimum              = false;
+    model::prompt_path & pp     = j.lane == 0 ? *pp_ : *pp2_;
+    const int32_t        nc     = 2;
+    const double         b      = budget != nullptr && !budget->floor ? budget->budget_ms : -1.0;
+    const int32_t        L0     = m_->win.lo;
+    const bool           split = !(L0 == 0 && m_->win.head);
+    // PRD1 item 8: the follower's idle drain (floor and lagged) launches one unit a call with no join: before unit
+    // i it waits for unit i - 2's end (at most two in flight); the units are joined and accounted by units_settle (a
+    // command's arrival, the chunk's end unit, a full event ring, or any other step of this job)
+    bool                 lagged = budget != nullptr && budget->floor && budget->lagged;
+    if (drain_n_ > 0 && (!lagged || drain_job_ != j.id || drain_n_ >= pf_max_step_units)) {
+        if (!units_settle(err)) {
+            return false;
+        }
+    }
+    double     planned = 0;
+    const auto mark    = [&](int32_t i) {
+        for (int32_t c = 0; c < nc; ++c) {
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+                !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(uev_[c][i]), static_cast<cudaStream_t>(t.stream(c))),
+                         "unit event", err)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (split && stage_ == nullptr) {
+        return fail(err, "prefill: a split stage without its crossing (set_stage)");
+    }
+    while (ran < pf_max_step_units && j.group < j.groups) {
+        if (j.group == 0) {
+            // the chunk's begin (its embedding, or the back's crossing, which names the pieces) before its first unit
+            if (!pp.chunk_begin(j.pc, err) || (L0 > 0 && !stage_->in(t, pp, j.pc, err))) {
+                return false;
+            }
+            j.groups = units_of(j);
+            for (int32_t q = 0; q < model::prompt_pieces(j.pc); ++q) {
+                const int32_t r = model::prompt_piece_rows(j.pc, q);
+                j.piece_min     = j.piece_min == 0 ? r : std::min(j.piece_min, r);
+                j.piece_max     = std::max(j.piece_max, r);
+                // PRD1 item 12: a budget miss, a half kept whole whose largest unit is predicted over B
+                const int32_t r0    = model::prompt_piece_r0(j.pc, q);
+                const bool    whole = (r0 == 0 && r == j.pc.half[0]) || (r0 == j.pc.half[0] && r == j.pc.half[1]);
+                const double  w     = b >= 0 && whole ? worst_unit(r) : -1.0;
+                j.budget_misses += w > b ? 1 : 0;
+            }
+        }
+        int32_t       l = 0, sub = 0, q = 0;
+        const pf_unit k = unit_at(j, j.group, l, sub, q);
+        const int32_t r = k == pf_unit::end ? j.pc.rows : model::prompt_piece_rows(j.pc, q);
+        const double  p = predict(k, r);
+        // the next unit runs while its prediction fits the budget's rest; the first always (measured if unknown).
+        // PRD1 item 8: with no budget (a chunk begun in units whose writers left) up to max_units, the server's slice
+        // (APF1: pace::unit_runs, the host-checked rule)
+        if (!pace::unit_runs(ran, budget != nullptr, b, planned, p, lagged, max_units)) {
+            break;
+        }
+        if (ran == 0 && budget != nullptr && !budget->floor) {
+            // APF1: the step's progress unit alone would already pass the budget (zero, unknown, or predicted over)
+            j.last_minimum = b < 0 || p < 0 || p > b;
+        }
+        if (lagged && k == pf_unit::end) {
+            // the chunk's end runs joined, as every finish: the drain's units first
+            if (drain_n_ > 0 && !units_settle(err)) {
+                return false;
+            }
+            lagged = false;
+        }
+        const int32_t i = (lagged ? drain_n_ : 0) + ran;  // the unit's place in the event ring
+        if (i == 0 && !mark(0)) {
+            return false;
+        }
+        if (lagged && i >= 2) {
+            // the lagged wait: unit i - 2 ended (its end event is boundary i - 1), so units i - 1 and i are in flight
+            for (int32_t c = 0; c < nc; ++c) {
+                if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+                    !cuda_ok(cudaEventSynchronize(static_cast<cudaEvent_t>(uev_[c][i - 1])), "drain wait", err)) {
+                    return false;
+                }
+            }
+        }
+        if (k == pf_unit::end) {
+            if (m_->win.head ? !pp.chunk_end(j.pc, err) : !stage_->out(t, pp, j.pc, err)) {
+                return false;
+            }
+            if (j.lane == 0 && j.stage >= 0) {
+                for (int32_t c = 0; c < nc; ++c) {
+                    // the staging slot's last readers: the device slot is overwritten only after them (upload)
+                    if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+                        !cuda_ok(cudaEventRecord(static_cast<cudaEvent_t>(read_[j.stage][c]),
+                                                 static_cast<cudaStream_t>(t.stream(c))),
+                                 "record readers", err)) {
+                        return false;
+                    }
+                }
+            }
+        } else if (!pp.chunk_piece(j.pc, l, sub, q, err)) {
+            return false;
+        }
+        step_kind_[i] = k;
+        step_rows_[i] = r;
+        planned += std::max(p, 0.0);
+        ++ran;
+        ++j.group;
+        if (!mark(i + 1)) {
+            return false;
+        }
+    }
+    if (lagged) {
+        drain_n_ += ran;
+        drain_job_ = ran > 0 || drain_n_ > 0 ? j.id : -1;
+        drain_     = &j;
+        drain_pp_  = &pp;
+        drain_t_   = &t;
+        drain_launched_ += ran;
+        return true;
+    }
+    return units_join(t, j, pp, ran, budget, err);
+}
+
+bool prefiller::units_settle(std::string & err) {
+    if (drain_n_ == 0) {
+        return true;
+    }
+    pf_budget fl;
+    fl.floor        = true;
+    const int32_t n = drain_n_;
+    drain_n_        = 0;
+    drain_job_      = -1;
+    return units_join(*drain_t_, *drain_, *drain_pp_, n, &fl, err);
+}
+
+int32_t prefiller::units_in_flight() const {
+    int32_t n = 0;
+    for (int32_t i = 0; i < drain_n_; ++i) {
+        bool busy = false;
+        for (int32_t c = 0; c < 2; ++c) {
+            cudaSetDevice(m_->device[c]);
+            busy = busy || cudaEventQuery(static_cast<cudaEvent_t>(uev_[c][i + 1])) == cudaErrorNotReady;
+        }
+        n += busy ? 1 : 0;
+    }
+    return n;
+}
+
+bool prefiller::units_join(target &             t,
+                           pf_job &             j,
+                           model::prompt_path & pp,
+                           int32_t              ran,
+                           const pf_budget *    budget,
+                           std::string &        err) {
+    const int32_t nc = 2;
+    // the step's work complete on both cards (compute and the lane's copy streams), then each unit's time: the slower
+    // card's between its boundary events, the next prediction of its kind. SSF1: the join is a trace line when slow
+    const auto tj = clk::now();
+    for (int32_t c = 0; c < nc && ran > 0; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+            !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "unit join", err) ||
+            !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(pp.copy_stream(c))), "unit join", err)) {
+            return false;
+        }
+    }
+    const double join_s = since(tj);
+    if (fn::xchg::slow::due(join_s)) {
+        fn::xchg::slow::line("read group join", join_s,
+                             "slot " + std::to_string(j.slot) + " chunk " + std::to_string(j.chunk) + ", " +
+                                 std::to_string(ran) + " units");
+    }
+    double gpu = 0;
+    for (int32_t i = 0; i < ran; ++i) {
+        float ms = 0;
+        for (int32_t c = 0; c < nc; ++c) {
+            float e = 0;
+            if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
+                !cuda_ok(cudaEventElapsedTime(&e, static_cast<cudaEvent_t>(uev_[c][i]),
+                                              static_cast<cudaEvent_t>(uev_[c][i + 1])),
+                         "unit time", err)) {
+                return false;
+            }
+            ms = std::max(ms, e);
+        }
+        unit_ms_[static_cast<int32_t>(step_kind_[i])]   = ms;
+        unit_rows_[static_cast<int32_t>(step_kind_[i])] = step_rows_[i];
+        gpu += ms;
+    }
+    if (ran > 0) {
+        j.units_run += ran;
+        j.unit_steps += 1;
+        j.most_units = std::max(j.most_units, ran);
+        j.unit_ms += gpu;
+        if (budget != nullptr && budget->floor) {
+            j.floor_units += ran;
+            j.floor_ms += gpu;
+        } else if (budget != nullptr && budget->budget_ms >= 1e29) {
+            // a lone step finishing a units chunk (no budget)
+        } else if (budget != nullptr && budget->budget_ms >= 0) {
+            j.budget_n += 1;
+            j.budget_ms_sum += budget->budget_ms;
+            j.budget_zero += budget->budget_ms <= 0 ? 1 : 0;
+            j.pause_ms = budget->pause_ms;
+        } else if (budget != nullptr) {
+            j.budget_unknown += 1;
+            j.pause_ms = budget->pause_ms;
+        }
+    }
+    return true;
+}
+
+pf_step prefiller::job_step(target &          t,
+                            pf_job &          j,
+                            int32_t           n_groups,
+                            int32_t           layers,
+                            std::string &     err,
+                            pf_mode           mode,
+                            const pf_budget * budget) {
     const auto t0 = clk::now();
     if (!j.live || j.slot != t.slot_index()) {
         err = "prefill: no live job on slot " + std::to_string(t.slot_index());
         return pf_step::error;
     }
     if (j.group < 0) {
-        if (j.cancel) {
+        if (j.cancel_due()) {
             return pf_step::cancelled; // BG1: no chunk started; the completed ones and their checkpoints stay
         }
         if (j.short_read && j.chunk == 0) {
@@ -1491,7 +1917,9 @@ pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t la
             j.checkpoints = j.stats.checkpoints;
             return pf_step::done;
         }
-        if (j.chunk >= j.plan.size() || !job_start(t, j, layers, mode, err)) {
+        if (j.chunk >= j.plan.size() ||
+            !job_start(t, j, layers, mode, budget != nullptr,
+                       budget != nullptr && !budget->floor ? budget->budget_ms : -1.0, err)) {
             if (err.empty()) {
                 err = "prefill: the job has no chunk left";
             }
@@ -1500,12 +1928,70 @@ pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t la
         }
     }
     model::prompt_path & pp = j.lane == 0 ? *pp_ : *pp2_;
+
+    // APF1 Part 4: the step's routes into the job's account, on every exit
+    struct route_acc {
+        pf_job &                               j;
+        const model::prompt_path &             pp;
+        const model::prompt_path::route_counts r0;
+
+        ~route_acc() {
+            const model::prompt_path::route_counts & r = pp.route_count();
+            model::prompt_path::route_counts &       d = j.routes;
+            const int64_t n = r.graph_units + r.eager_units - r0.graph_units - r0.eager_units;
+            d.add_since(r, r0);
+            if (n > 0) {
+                const int32_t g = pp.route().rung;
+                j.rung_min      = j.rung_min == 0 ? g : std::min(j.rung_min, g);
+                j.rung_max      = std::max(j.rung_max, g);
+            }
+        }
+    } racc{ j, pp, pp.route_count() };
     // FMU1 (resident TP): a lone step runs the chunk's remaining groups and its finish; a writers-mode chunk's end
     // group and finish are steps of their own (FMU2: a step of several 1-layer groups stops before the end group)
     const bool lone = mode == pf_mode::lone && resident(t);
+    // VIS1 Stage B: the chunk's images encode before its first group, a slice a step of as many encoder blocks as the
+    // step's groups have layers (writers' rounds run between the steps); a lone step encodes them all, then runs on
+    if (j.group == 0 && images_ != nullptr && images_->pending(j.lane)) {
+        bool ok = images_->encode_step(j.lane, lone ? INT32_MAX : std::max(1, n_groups) * j.layers, err);
+        while (ok && lone && images_->pending(j.lane)) {
+            ok = images_->encode_step(j.lane, INT32_MAX, err);
+        }
+        if (!ok) {
+            job_abandon(t, j);
+            return pf_step::error;
+        }
+        if (!lone) {
+            const double dt = since(t0);
+            ++j.steps;
+            j.service_s += dt;
+            j.longest_step_s = std::max(j.longest_step_s, dt);
+            j.last_group_s   = -1.0;
+            j.stats.wall_s   = j.service_s;
+            return pf_step::yielded;
+        }
+    }
     const int32_t n = lone ? j.groups : std::max(1, n_groups);
     int32_t ran = 0;
-    while (ran < n && j.group < j.groups) {
+    // MUP2: a units chunk's step (it joins both cards itself); a lone step finishes one that began in units
+    if (j.units && !lone && j.group < j.groups) {
+        if (!units_step(t, j, budget, n, ran, err)) {
+            job_abandon(t, j);
+            return pf_step::error;
+        }
+    } else if (j.units && lone) {
+        pf_budget whole;
+        whole.budget_ms = 1e30;
+        while (j.group < j.groups) {
+            int32_t r = 0;
+            if (!units_step(t, j, &whole, pf_max_step_units, r, err)) {
+                job_abandon(t, j);
+                return pf_step::error;
+            }
+            ran += r;
+        }
+    }
+    while (!j.units && ran < n && j.group < j.groups) {
         const bool end_only = j.end_group && j.group == j.groups - 1;
         if (end_only && ran > 0 && !lone) {
             break;
@@ -1544,14 +2030,23 @@ pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t la
         ++ran;
     }
     // the step's work complete on both cards: the compute streams and the lane's copy streams (TU3's completed step).
-    // FMU1: a finish-only step (writers mode) has no groups to join
-    for (int32_t c = 0; c < 2 && ran > 0; ++c) {
+    // FMU1: a finish-only step (writers mode) has no groups to join; MUP2: a units step joined them itself (and traced
+    // its join as SSF1's "read group join" there)
+    const auto tj = clk::now();
+    for (int32_t c = 0; c < 2 && ran > 0 && !j.units; ++c) {
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err) ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c))), "group join", err) ||
             !cuda_ok(cudaStreamSynchronize(static_cast<cudaStream_t>(pp.copy_stream(c))), "group join", err)) {
             job_abandon(t, j);
             return pf_step::error;
         }
+    }
+    const double join_s = since(tj);
+    if (fn::xchg::slow::due(join_s)) {
+        fn::xchg::slow::line("read group join", join_s,
+                             "slot " + std::to_string(j.slot) + " chunk " + std::to_string(j.chunk) + ", " +
+                                 std::to_string(ran) + " groups of " + std::to_string(j.layers) + " layers, step " +
+                                 std::to_string(since(t0)) + " s");
     }
     j.groups_done += ran;
     pf_step out = pf_step::yielded;
@@ -1562,7 +2057,7 @@ pf_step prefiller::job_step(target & t, pf_job & j, int32_t n_groups, int32_t la
             job_abandon(t, j);
             return pf_step::error;
         }
-        out = done ? pf_step::done : j.cancel ? pf_step::cancelled : pf_step::chunk_done;
+        out = done ? pf_step::done : j.cancel_due() ? pf_step::cancelled : pf_step::chunk_done;
     }
     const double dt = since(t0);
     ++j.steps;
@@ -1578,6 +2073,13 @@ void prefiller::job_abandon(target & t, pf_job & j) {
         cudaSetDevice(m_->device[c]);
         cudaStreamSynchronize(static_cast<cudaStream_t>(t.stream(c)));
         cudaStreamSynchronize(static_cast<cudaStream_t>(copy_[c]));
+    }
+    if (images_ != nullptr && j.lane >= 0 && busy_[j.lane] == j.slot) {
+        images_->forget(j.lane);  // VIS1: its queued images (fill drops them itself when it fails)
+    }
+    if (drain_job_ == j.id) {
+        drain_n_   = 0;  // PRD1 item 8: the drain's units ended with the streams above, unaccounted
+        drain_job_ = -1;
     }
     if (gather_tag_job_ == j.id) {
         join();

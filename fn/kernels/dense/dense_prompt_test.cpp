@@ -1,5 +1,7 @@
 #include "fn/kernels/dense/dense_prompt_test.h"
 
+#include "fn/borrowed/gguf_tensors.h"
+#include "fn/kernels/dense/dense_ladder.h"
 #include "fn/kernels/dense/dense_prompt.h"
 #include "fn/kernels/dense/dense_test.h"
 #include "fn/kernels/experts/experts.h"
@@ -15,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <set>
@@ -26,82 +29,14 @@ namespace fn::dense {
 namespace {
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "pd-test: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "pd-test", what);
 }
 
-// one device allocation
-struct dbuf {
-    uint8_t * p = nullptr;
-    size_t    n = 0;
-
-    explicit dbuf(size_t bytes) : n(std::max<size_t>(bytes, 256)) {
-        if (!cuda_ok(cudaMalloc(&p, n), "cudaMalloc")) {
-            p = nullptr;
-        }
-    }
-
-    ~dbuf() {
-        if (p != nullptr) {
-            cudaFree(p);
-        }
-    }
-
-    dbuf(const dbuf &)             = delete;
-    dbuf & operator=(const dbuf &) = delete;
-
-    template <typename T> T * as() const { return reinterpret_cast<T *>(p); }
-
-    bool put(const void * h, size_t bytes) const {
-        return p != nullptr && bytes <= n && cuda_ok(cudaMemcpy(p, h, bytes, cudaMemcpyHostToDevice), "put");
-    }
-
-    bool get(void * h, size_t bytes) const {
-        return p != nullptr && bytes <= n && cuda_ok(cudaMemcpy(h, p, bytes, cudaMemcpyDeviceToHost), "get");
-    }
-
-    bool poison() const { return p != nullptr && cuda_ok(cudaMemset(p, 0xff, n), "memset"); }
-};
-
-// splitmix64 with Box-Muller: the same values on every host
-struct rng {
-    uint64_t s;
-
-    explicit rng(uint64_t seed) : s(seed) {}
-
-    uint64_t next() {
-        uint64_t z = (s += 0x9e3779b97f4a7c15ull);
-        z          = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
-        z          = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
-        return z ^ (z >> 31);
-    }
-
-    double uniform() { return static_cast<double>(next() >> 11) * (1.0 / 9007199254740992.0); }
-
-    double normal() {
-        const double u1 = std::max(uniform(), 1e-300), u2 = uniform();
-        return std::sqrt(-2.0 * std::log(u1)) * std::cos(6.283185307179586 * u2);
-    }
-};
-
-template <typename F> void parallel_for(int32_t n, const F & fn) {
-    const int32_t            nt = std::max<int32_t>(1, std::min<int32_t>(n, 12));
-    std::atomic<int32_t>     next{ 0 };
-    std::vector<std::thread> th;
-    for (int32_t t = 0; t < nt; ++t) {
-        th.emplace_back([&]() {
-            for (int32_t i = next++; i < n; i = next++) {
-                fn(i);
-            }
-        });
-    }
-    for (auto & t : th) {
-        t.join();
-    }
-}
+// TFC: the prompt tests' shared device buffer, generator, work split and verdict (fn/tools/prompt_test_util.h)
+using fn::ptest::dbuf;
+using fn::ptest::parallel_for;
+using fn::ptest::rng;
+using fn::ptest::verdict;
 
 quant::wfmt wf(fmt f) {
     switch (f) {
@@ -127,25 +62,11 @@ quant::wfmt wf(fmt f) {
 }
 
 experts::fmt ef(fmt f) {
-    return f == fmt::q2_0 ? experts::fmt::q2_0 : experts::fmt::iq4_nl;
+    return f == fmt::q2_0 ? experts::fmt::q2_0 : f == fmt::q8_0 ? experts::fmt::q8_0 : experts::fmt::iq4_nl;  // TTTS2
 }
 
-struct verdict {
-    bool    all = true;
-    int32_t n   = 0;
-
-    void put(const std::string & name, bool ok, const std::string & what) {
-        printf("pd-test: %s: %s: %s\n", name.c_str(), ok ? "PASS" : "FAIL", what.c_str());
-        fflush(stdout);
-        all = all && ok;
-        ++n;
-    }
-};
-
 std::string fmt_e(double v) {
-    char b[32];
-    snprintf(b, sizeof(b), "%.3e", v);
-    return b;
+    return fn::ptest::e3(v);
 }
 
 // a weight matrix of a case: n GGUF rows of k (synthetic rows i % 1024), its decoded values and its device copy in the
@@ -241,8 +162,8 @@ void reference(const std::vector<float> & x,
 }
 
 // The codes of every weight against fn/quant's decoder: f x code - m in F32 must be its value bitwise; the distinct
-// codes seen
-bool check_codes(const matrix & m, const dbuf & w, const dbuf & grids, verdict & v) {
+// codes seen (domain: every code of the format must appear, as the synthetic rows give; a real matrix's are reported)
+bool check_codes(const matrix & m, const dbuf & w, const dbuf & grids, verdict & v, bool domain = true) {
     const size_t nk = size_t(m.n) * m.k;
     dbuf         c(nk * 4), s(nk * 4), mm(nk * 4);
     if (!c.poison() || !s.poison() || !mm.poison() ||
@@ -294,7 +215,7 @@ bool check_codes(const matrix & m, const dbuf & w, const dbuf & grids, verdict &
     }
     what += "; " + std::to_string(seen.size()) + " distinct codes of " + std::to_string(want) + " in [" +
             std::to_string(lo) + ", " + std::to_string(hi) + "]";
-    const bool ok = bad == 0 && static_cast<int32_t>(seen.size()) == want;
+    const bool ok = bad == 0 && (!domain || static_cast<int32_t>(seen.size()) == want);
     v.put(std::string("codes ") + fmt_name(m.f) + (m.lay == pd_layout::ex1_down ? " (EX1 down)" : ""), ok, what);
     return ok;
 }
@@ -410,6 +331,146 @@ bool check_two_segment(const matrix & m, const dbuf & w, const dbuf & grids, int
 // PB3: the conversion bitwise against fn/quant's decoder then FP16 rounding (round to nearest even), and pd_tc over
 // it: rows of activations (one segment, or eh_proj's two when positions > 0), the output split into segs column
 // segments, against FP64 on the FP16 weights at a loose tolerance (Amendment 2: layout, indexing and range errors)
+bool g_san = false;  // pd-test san: the ladder at two split counts
+
+// APF2: pl_tc of q (its pt_args' segments outs, at ends) on every tile and split count (san: 1 and the most): each
+// product's error err(output) (against FP64 of the same FP16 weights) within the loose tolerance (1e-2) and at most
+// twice the converted route's (e_conv), a rerun bitwise, at one split count every tile bitwise the others (each
+// split's K in the same order); with one segment the 8-row tile's FP16 output the F32 output rounded, the error word
+// clear. Reported: split 1 against the converted route's output conv (bitwise or not)
+bool ladder_sweep(const pq_args &                                          q,
+                  const std::vector<int32_t> &                             ends,
+                  const std::vector<std::unique_ptr<dbuf>> &               outs,
+                  const std::function<double(const std::vector<float> &)> & err,
+                  double                                                   e_conv,
+                  const std::vector<float> &                               conv,
+                  const std::string &                                      name,
+                  verdict &                                                v) {
+    const int32_t rows = q.t.rows, n = q.t.n, segs = static_cast<int32_t>(ends.size());
+    const int32_t steps = q.t.k / 32, max_s = std::min(pl_max_splits, steps);
+    int64_t       part = 0;
+    int32_t       cnt  = 0;
+    for (int32_t t = 0; t < pl_n_tiles; ++t) {
+        part = std::max(part, lad_split_floats(rows, n, t, max_s));
+        cnt  = std::max(cnt, lad_tile_count(rows, n, t));
+    }
+    dbuf  wsp(size_t(std::max<int64_t>(part, 1)) * 4), wsc(size_t(cnt) * 4);
+    pl_ws ws;
+    ws.part        = wsp.as<float>();
+    ws.part_floats = part;
+    ws.count       = wsc.as<int32_t>();
+    ws.count_len   = cnt;
+    if (!cuda_ok(cudaMemset(wsc.p, 0, wsc.n), "the ladder's counters")) {
+        return false;
+    }
+    const auto run_pl = [&](const pq_args & qq, int32_t t, int32_t sp, std::vector<float> & o) {
+        for (const auto & b : outs) {
+            if (!b->poison()) {
+                return false;
+            }
+        }
+        if (!pl_tc(qq, t, sp, ws, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "pl_tc")) {
+            return false;
+        }
+        o.assign(size_t(rows) * n, 0.0f);
+        int32_t st = 0;
+        for (int32_t i = 0; i < segs; ++i) {
+            const int64_t      ld = qq.t.seg[i].ld;
+            std::vector<float> sg(size_t(rows) * size_t(ld));
+            if (!outs[size_t(i)]->get(sg.data(), sg.size() * 4)) {
+                return false;
+            }
+            for (int32_t r = 0; r < rows; ++r) {
+                for (int32_t j = st; j < ends[size_t(i)]; ++j) {
+                    o[size_t(r) * n + j] = sg[size_t(r) * size_t(ld) + size_t(j - st)];
+                }
+            }
+            st = ends[size_t(i)];
+        }
+        return true;
+    };
+    const auto tile_name = [](int32_t t, int32_t sp) {
+        return "t" + std::to_string(pl_tiles[t].bm) + "x" + std::to_string(pl_tiles[t].bn) + " s" + std::to_string(sp);
+    };
+    std::vector<int32_t> sl;
+    for (int32_t sp = 1; sp <= max_s; ++sp) {
+        if (!g_san || sp == 1 || sp == max_s) {
+            sl.push_back(sp);
+        }
+    }
+    bool        bound_ok = true, rerun_ok = true, across = true, conv_same = true;
+    double      worst = 0.0;
+    std::string worst_at, fails;
+    for (const int32_t sp : sl) {
+        std::vector<float> first;
+        for (int32_t t = 0; t < pl_n_tiles; ++t) {
+            std::vector<float> o1, o2;
+            if (!run_pl(q, t, sp, o1) || !run_pl(q, t, sp, o2)) {
+                v.put(name + " ladder", false, "pl_tc launch failed at " + tile_name(t, sp));
+                return false;
+            }
+            const double e = err(o1);
+            const bool   r = std::memcmp(o1.data(), o2.data(), o1.size() * 4) == 0;
+            const bool   b = e <= 1e-2 && e <= 2.0 * e_conv + 1e-6;
+            if (e > worst) {
+                worst    = e;
+                worst_at = tile_name(t, sp);
+            }
+            if (!b || !r) {
+                fails += " " + tile_name(t, sp) + (b ? "" : " " + fmt_e(e)) + (r ? "" : " rerun");
+            }
+            bound_ok = bound_ok && b;
+            rerun_ok = rerun_ok && r;
+            if (t == 0) {
+                first     = o1;
+                conv_same = conv_same && (sp != 1 || std::memcmp(o1.data(), conv.data(), o1.size() * 4) == 0);
+            } else {
+                across = across && std::memcmp(o1.data(), first.data(), o1.size() * 4) == 0;
+            }
+        }
+    }
+    bool        l16 = true;
+    std::string l16_note;
+    // the FP16 output (out16) is pd_tc's contract with one segment and no column scale (BF16 weights carry one)
+    if (segs == 1 && q.t.col_scale == nullptr) {
+        const int64_t  ld16 = n + 8;
+        dbuf           o16(size_t(rows) * size_t(ld16) * 2), ew(4);
+        const uint32_t zero = 0;
+        pq_args        q16  = q;
+        q16.t.out16         = o16.as<uint16_t>();
+        q16.t.ld16          = ld16;
+        q16.t.err           = ew.as<uint32_t>();
+        q16.t.err_bit       = 1u << 26;
+        std::vector<float>    f32;
+        std::vector<uint16_t> got(size_t(rows) * size_t(ld16));
+        uint32_t              ev_word = 1;
+        if (!run_pl(q, 0, sl.back(), f32) || !o16.poison() || !ew.put(&zero, 4) ||
+            !pl_tc(q16, 0, sl.back(), ws, fn::ptest::test_stream()) ||
+            !cuda_ok(cudaDeviceSynchronize(), "pl_tc out16") || !o16.get(got.data(), got.size() * 2) ||
+            !ew.get(&ev_word, 4)) {
+            v.put(name + " ladder", false, "pl_tc out16 launch failed");
+            return false;
+        }
+        int64_t diff = 0;
+        for (int32_t r = 0; r < rows; ++r) {
+            for (int32_t j = 0; j < n; ++j) {
+                diff += got[size_t(r) * size_t(ld16) + size_t(j)] != quant::f32_to_f16(f32[size_t(r) * n + j]);
+            }
+        }
+        l16      = diff == 0 && ev_word == 0;
+        l16_note = "; FP16 output " + std::to_string(diff) + " differ, error word " + std::to_string(ev_word);
+    }
+    const bool ok = bound_ok && rerun_ok && across && l16;
+    v.put(name + " ladder", ok,
+          std::to_string(pl_n_tiles) + " tiles x " + std::to_string(sl.size()) + " split counts: worst error " +
+              fmt_e(worst) + " (" + worst_at + "), the converted route's " + fmt_e(e_conv) +
+              " (bound 1e-2 and 2x the converted route's)" + (rerun_ok ? "; reruns bitwise" : "; RERUN DIFFERS") +
+              (across ? "; at each split count every tile bitwise the others" : "; TILES DIFFER at a split count") +
+              (conv_same ? "; split 1 bitwise the converted route" : "; split 1 differs from the converted route") +
+              l16_note + (fails.empty() ? "" : "; failing:" + fails));
+    return ok;
+}
+
 bool check_tc(const matrix & m,
               const dbuf &   w,
               const dbuf &   grids,
@@ -536,6 +597,22 @@ bool check_tc(const matrix & m,
         return false;
     }
     const bool          same = std::memcmp(out.data(), out2.data(), out.size() * 4) == 0;
+    // MUP1 piece 2: at most 64 rows run on the 64 x 64 tile; the 128 x 128 tile's outputs must equal them bitwise
+    bool                tiles = true;
+    std::string         tiles_note;
+    if (r_all <= 64) {
+        std::vector<float> big;
+        a.big_tile     = true;
+        const bool ran = run(big);
+        a.big_tile     = false;
+        if (!ran) {
+            v.put(name, false, "128 x 128 tile launch failed");
+            return false;
+        }
+        tiles = std::memcmp(out.data(), big.data(), out.size() * 4) == 0;
+        tiles_note =
+            tiles ? "; the 64 x 64 tile bitwise the 128 x 128 tile's" : "; 64 x 64 TILE DIFFERS from 128 x 128";
+    }
     // PB3: one segment also written as FP16 (out16, the P payload): bitwise the F32 output rounded to nearest even,
     // the error word clear (every value is in range)
     bool p16 = true;
@@ -567,15 +644,119 @@ bool check_tc(const matrix & m,
         p16_note = "; FP16 output " + std::to_string(diff) + " differ from the F32 output rounded, error word " +
                    std::to_string(ev_word);
     }
+    // APF1 Part 4: the fused route (pq_tc) bitwise the converted route, from the packed matrix as one source and (DP2,
+    // N of at least 96) as three sources over its column tiles; with one segment its FP16 output too
+    bool        fused = true;
+    std::string fused_note;
+    {
+        pq_args q;
+        q.f     = m.f;
+        q.lay   = m.lay;
+        q.grids = grids.as<uint8_t>();
+        q.t     = a;
+        q.t.w   = nullptr;
+        const int64_t tile_bytes =
+            m.lay == pd_layout::dp2 ? int64_t(m.packed.size()) / (m.n / 8) : 0;  // a tile of 8 columns, all its steps
+        const auto run_pq = [&](int32_t n_src, std::vector<float> & o) {
+            q.n_src    = n_src;
+            int32_t c0 = 0;
+            for (int32_t i = 0; i < n_src; ++i) {
+                const int32_t cols = i + 1 < n_src ? (m.n / n_src) / 32 * 32 : m.n - c0;
+                q.src[i].w         = w.as<uint8_t>() + int64_t(c0 / 8) * tile_bytes;
+                q.src[i].n         = cols;
+                c0 += cols;
+            }
+            for (const auto & b : outs) {
+                if (!b->poison()) {
+                    return false;
+                }
+            }
+            if (!pq_tc(q, fn::ptest::test_stream()) || !cuda_ok(cudaDeviceSynchronize(), "pq_tc")) {
+                return false;
+            }
+            o.resize(size_t(r_all) * m.n);
+            int32_t st = 0;
+            for (int32_t i = 0; i < segs; ++i) {
+                const int64_t      ld = q.t.seg[i].ld;
+                std::vector<float> sg(size_t(r_all) * size_t(ld));
+                if (!outs[size_t(i)]->get(sg.data(), sg.size() * 4)) {
+                    return false;
+                }
+                for (int32_t r = 0; r < r_all; ++r) {
+                    for (int32_t j = st; j < ends[size_t(i)]; ++j) {
+                        o[size_t(r) * m.n + j] = sg[size_t(r) * size_t(ld) + size_t(j - st)];
+                    }
+                }
+                st = ends[size_t(i)];
+            }
+            return true;
+        };
+        std::vector<float> f1, f3;
+        const bool         three = m.lay == pd_layout::dp2 && m.n >= 96;
+        if (!run_pq(1, f1) || (three && !run_pq(3, f3))) {
+            v.put(name, false, "pq_tc launch failed");
+            return false;
+        }
+        fused      = std::memcmp(out.data(), f1.data(), out.size() * 4) == 0 &&
+                     (!three || std::memcmp(out.data(), f3.data(), out.size() * 4) == 0);
+        fused_note = fused ? "; fused route bitwise (one source" + std::string(three ? ", three sources)" : ")") :
+                             "; FUSED ROUTE DIFFERS from the converted route";
+        if (segs == 1) {
+            const int64_t  ld16 = m.n + 8;
+            dbuf           o16(size_t(r_all) * size_t(ld16) * 2), ew(4);
+            const uint32_t zero = 0;
+            pq_args        q16  = q;
+            q16.n_src           = 1;
+            q16.src[0].w        = w.as<uint8_t>();
+            q16.src[0].n        = m.n;
+            q16.t.out16         = o16.as<uint16_t>();
+            q16.t.ld16          = ld16;
+            q16.t.err           = ew.as<uint32_t>();
+            q16.t.err_bit       = 1u << 26;
+            std::vector<uint16_t> got(size_t(r_all) * size_t(ld16));
+            uint32_t              ev_word = 1;
+            if (!o16.poison() || !ew.put(&zero, 4) || !pq_tc(q16, fn::ptest::test_stream()) ||
+                !cuda_ok(cudaDeviceSynchronize(), "pq_tc out16") || !o16.get(got.data(), got.size() * 2) ||
+                !ew.get(&ev_word, 4)) {
+                v.put(name, false, "pq_tc out16 launch failed");
+                return false;
+            }
+            int64_t diff = 0;
+            for (int32_t r = 0; r < r_all; ++r) {
+                for (int32_t j = 0; j < m.n; ++j) {
+                    diff += got[size_t(r) * size_t(ld16) + size_t(j)] != quant::f32_to_f16(out[size_t(r) * m.n + j]);
+                }
+            }
+            fused = fused && diff == 0 && ev_word == 0;
+            fused_note += "; fused FP16 output " + std::to_string(diff) + " differ";
+        }
+    }
     std::vector<double> ref;
     reference(xv, r_all, m.k, wv, m.n, scaled ? &sc : nullptr, ref);
-    const bool loose = row_error(out, ref, r_all, m.n) <= 1e-2;
-    const bool ok = bad == 0 && loose && same && p16;
+    const double e_conv = row_error(out, ref, r_all, m.n);
+    // APF2: the ladder on every tile and split count from the packed matrix (ladder_sweep)
+    ladder_sweep(
+        [&]() {
+            pq_args q;
+            q.f        = m.f;
+            q.lay      = m.lay;
+            q.grids    = grids.as<uint8_t>();
+            q.t        = a;
+            q.t.w      = nullptr;
+            q.n_src    = 1;
+            q.src[0].w = w.as<uint8_t>();
+            q.src[0].n = m.n;
+            return q;
+        }(),
+        ends, outs, [&](const std::vector<float> & o) { return row_error(o, ref, r_all, m.n); }, e_conv, out, name,
+        v);
+    const bool loose = e_conv <= 1e-2;
+    const bool ok    = bad == 0 && loose && same && p16 && tiles && fused;
     v.put(name, ok,
           "conversion " + std::to_string(nk) + " weights, " + std::to_string(bad) +
               " differ from decode-then-FP16; product " + (loose ? "within" : "OUTSIDE") +
               " the loose bug-check tolerance (1e-2 a row, finite)" + (same ? "; rerun bitwise" : "; RERUN DIFFERS") +
-              p16_note);
+              p16_note + tiles_note + fused_note);
     return ok;
 }
 
@@ -698,13 +879,157 @@ bool check_bf16_tc(int32_t n, int32_t k, int32_t rows, const std::vector<int32_t
         worst = std::max(worst, mm > 0.0 ? em / mm : em);
     }
     const bool loose = worst <= 1e-2;
-    const bool ok = bad == 0 && loose && same;
+    // APF1 Part 4: pd_bf16_scales bitwise pd_convert_bf16's scales, and the fused BF16 route (the rows read as two
+    // bases split at the first segment's end) bitwise the converted route
+    dbuf               ps(size_t(n) * 4);
+    std::vector<float> prep(static_cast<size_t>(n));
+    std::vector<float> fo;
+    pq_args            q;
+    q.b0          = w.as<uint16_t>();
+    q.n0          = ends.size() > 1 ? ends[0] : n;
+    q.b1          = w.as<uint16_t>() + size_t(q.n0) * k;
+    q.n1          = n - q.n0;
+    q.b_scale     = ps.as<float>();
+    q.t           = a;
+    q.t.w         = nullptr;
+    bool fused_ok = ps.poison() && pd_bf16_scales(w.as<uint16_t>(), n, k, ps.as<float>(), fn::ptest::test_stream()) &&
+                    cuda_ok(cudaDeviceSynchronize(), "pd_bf16_scales") && ps.get(prep.data(), size_t(n) * 4);
+    const bool scales_same = fused_ok && std::memcmp(prep.data(), got_s.data(), size_t(n) * 4) == 0;
+    bool       fused_same  = false;
+    if (fused_ok) {
+        for (const auto & b : outs) {
+            fused_ok = fused_ok && b->poison();
+        }
+        fused_ok = fused_ok && pq_tc(q, fn::ptest::test_stream()) && cuda_ok(cudaDeviceSynchronize(), "pq_tc");
+        if (fused_ok) {
+            fo.assign(size_t(rows) * n, 0.0f);
+            int32_t st = 0;
+            for (size_t i = 0; i < ends.size() && fused_ok; ++i) {
+                const int64_t      ld = a.seg[i].ld;
+                std::vector<float> seg(size_t(rows) * size_t(ld));
+                fused_ok = outs[i]->get(seg.data(), seg.size() * 4);
+                for (int32_t r = 0; r < rows && fused_ok; ++r) {
+                    for (int32_t j = st; j < ends[i]; ++j) {
+                        fo[size_t(r) * n + j] = seg[size_t(r) * size_t(ld) + size_t(j - st)];
+                    }
+                }
+                st = ends[i];
+            }
+            fused_same = fused_ok && std::memcmp(fo.data(), out.data(), out.size() * 4) == 0;
+        }
+    }
+    const bool fused = scales_same && fused_same;
+    // APF2: the ladder on every tile and split count from the two BF16 bases (ladder_sweep), the column error
+    if (fused_ok) {
+        std::vector<double> refs(size_t(rows) * n, 0.0);
+        for (int32_t j = 0; j < n; ++j) {
+            for (int32_t r = 0; r < rows; ++r) {
+                double ref = 0.0;
+                for (int32_t i = 0; i < k; ++i) {
+                    ref += double(ev[size_t(r) * k + i]) * wv[size_t(j) * k + i];
+                }
+                refs[size_t(r) * n + j] = ref;
+            }
+        }
+        const auto col_err = [&](const std::vector<float> & o) {
+            double wst = 0.0;
+            for (int32_t j = 0; j < n; ++j) {
+                double em = 0.0, mm = 0.0;
+                for (int32_t r = 0; r < rows; ++r) {
+                    const double ref = refs[size_t(r) * n + j];
+                    const double x   = o[size_t(r) * n + j];
+                    em             = std::isfinite(x) ? std::max(em, std::fabs(x - ref)) : INFINITY;
+                    mm             = std::max(mm, std::fabs(ref));
+                }
+                wst = std::max(wst, mm > 0.0 ? em / mm : em);
+            }
+            return wst;
+        };
+        ladder_sweep(q, ends, outs, col_err, worst, out, name, v);
+    }
+    const bool ok    = bad == 0 && loose && same && fused;
     v.put(name, ok,
           "conversion " + std::to_string(nk) + " weights and " + std::to_string(n) + " scales, " + std::to_string(bad) +
               " differ; product " + (loose ? "within" : "OUTSIDE") +
               " the loose bug-check tolerance (1e-2 a column, finite)" +
-              (loose ? "" : " [" + fn::ptest::e3(worst) + "]") + (same ? "; rerun bitwise" : "; RERUN DIFFERS"));
+              (loose ? "" : " [" + fn::ptest::e3(worst) + "]") + (same ? "; rerun bitwise" : "; RERUN DIFFERS") +
+              (scales_same ? "; prepared scales bitwise" : "; PREPARED SCALES DIFFER") +
+              (fused_same ? "; fused route bitwise (two bases)" : "; FUSED ROUTE DIFFERS"));
     return ok;
+}
+
+// APF1 Part 4: the router's region as the prompt lays it out (fn/model/prompt.cpp): 512 router rows, the shared gate's
+// row, 7 zero rows with scale 0; the converted route (pd_convert_bf16 twice, the pad zeroed, pd_tc) against the fused
+// route reading the two BF16 bases with prepared scales (zero past row 513), bitwise, at rows rows
+bool check_router_tc(int32_t rows, verdict & v) {
+    constexpr int32_t     ne = 512, n = 520, k = 2560;
+    rng                   g(0x5047 + uint64_t(rows));
+    std::vector<uint16_t> rb(size_t(ne) * k), gb(k);
+    for (uint16_t & u : rb) {
+        u = quant::f32_to_bf16(static_cast<float>(g.normal() * 0.02));
+    }
+    for (uint16_t & u : gb) {
+        u = quant::f32_to_bf16(static_cast<float>(g.normal() * 0.5));
+    }
+    const std::string name = "tc router region " + std::to_string(rows) + " rows (512 + gate + 7 zero rows)";
+    dbuf              r(rb.size() * 2), gt(gb.size() * 2), wt(size_t(n) * k * 2), cs(size_t(n) * 4), ps(size_t(n) * 4);
+    std::vector<uint16_t> eb;
+    std::vector<float>    ev;
+    make_act(int64_t(rows) * k, 1.0, 0x5048 + uint64_t(rows), eb, ev);
+    dbuf               e(eb.size() * 2), o1(size_t(rows) * ne * 4), o2(size_t(rows) * 8 * 4);
+    const cudaStream_t st = static_cast<cudaStream_t>(fn::ptest::test_stream());
+    bool ok = r.put(rb.data(), rb.size() * 2) && gt.put(gb.data(), gb.size() * 2) && e.put(eb.data(), eb.size() * 2) &&
+              wt.poison() && cs.poison() && ps.poison() &&
+              pd_convert_bf16(r.as<uint16_t>(), ne, k, wt.as<uint16_t>(), cs.as<float>(), st) &&
+              pd_convert_bf16(gt.as<uint16_t>(), 1, k, wt.as<uint16_t>() + size_t(ne) * k, cs.as<float>() + ne, st) &&
+              cuda_ok(cudaMemsetAsync(wt.as<uint16_t>() + size_t(ne + 1) * k, 0, size_t(7) * k * 2, st), "pad") &&
+              cuda_ok(cudaMemsetAsync(cs.as<float>() + ne + 1, 0, 7 * 4, st), "pad") &&
+              cuda_ok(cudaMemsetAsync(ps.as<float>(), 0, size_t(n) * 4, st), "pad") &&
+              pd_bf16_scales(r.as<uint16_t>(), ne, k, ps.as<float>(), st) &&
+              pd_bf16_scales(gt.as<uint16_t>(), 1, k, ps.as<float>() + ne, st) &&
+              cuda_ok(cudaDeviceSynchronize(), "router conversion");
+    pt_args a;
+    a.w         = wt.as<uint16_t>();
+    a.n         = n;
+    a.k         = k;
+    a.rows      = rows;
+    a.x.a0      = e.as<uint16_t>();
+    a.x.ld0     = k;
+    a.x.k_split = k;
+    a.n_seg     = 2;
+    a.seg[0]    = { o1.as<float>(), ne, ne };
+    a.seg[1]    = { o2.as<float>(), 8, n };
+    a.col_scale = cs.as<float>();
+    std::vector<float> c1(size_t(rows) * ne), c2(size_t(rows) * 8), f1(c1.size()), f2(c2.size());
+    ok = ok && o1.poison() && o2.poison() && pd_tc(a, st) && cuda_ok(cudaDeviceSynchronize(), "pd_tc") &&
+         o1.get(c1.data(), c1.size() * 4) && o2.get(c2.data(), c2.size() * 4);
+    pq_args q;
+    q.b0          = r.as<uint16_t>();
+    q.n0          = ne;
+    q.b1          = gt.as<uint16_t>();
+    q.n1          = 1;
+    q.b_scale     = ps.as<float>();
+    q.t           = a;
+    q.t.w         = nullptr;
+    q.t.col_scale = ps.as<float>();
+    ok            = ok && o1.poison() && o2.poison() && pq_tc(q, st) && cuda_ok(cudaDeviceSynchronize(), "pq_tc") &&
+                    o1.get(f1.data(), f1.size() * 4) && o2.get(f2.data(), f2.size() * 4);
+    if (!ok) {
+        v.put(name, false, "launch failed");
+        return false;
+    }
+    const bool same =
+        std::memcmp(c1.data(), f1.data(), c1.size() * 4) == 0 && std::memcmp(c2.data(), f2.data(), c2.size() * 4) == 0;
+    bool pad_zero = true;
+    for (int32_t i = 0; i < rows; ++i) {
+        for (int32_t j = 1; j < 8; ++j) {
+            pad_zero = pad_zero && f2[size_t(i) * 8 + j] == 0.0f;
+        }
+    }
+    v.put(name, same && pad_zero,
+          std::string(same ? "fused bitwise the converted route" : "FUSED ROUTE DIFFERS") +
+              (pad_zero ? ", the pad columns zero" : ", PAD COLUMNS NOT ZERO"));
+    return same && pad_zero;
 }
 
 // BF16 products: identity rows, and the two-base mapping (period 2,560, half 1,280: PLE's key layout)
@@ -849,6 +1174,89 @@ bool check_route(int32_t rows, verdict & v) {
     return ok;
 }
 
+// TTTS3 item 7 (pd-test DEVICE q8=GGUF): TTTS2's EX1-down Q8_0 on UD-Q4_K_XL's real shared downs (ffn_down_shexp,
+// Q8_0 [2560][640]; card r's matrix the 2,560 rows' columns 320 r .. 320 r + 319, packed by pack_down as the loader
+// does) of layers 0, 25 and 47: the codes bitwise the CPU decoder, the products at 1, 65 (scaled, rerun bitwise) and
+// 129 rows against FP64, and the conversion bitwise with pd_tc over it (the prompt's path)
+bool real_ex1_q8(const std::string & model, const dbuf & grids, verdict & v) {
+    std::vector<std::string>   shards;
+    std::vector<fnfl_gguf_dir> dirs;
+    std::string                err;
+    bool                       ok = fnfl_gguf_shard_paths(model, shards, err);
+    for (size_t i = 0; ok && i < shards.size(); ++i) {
+        dirs.emplace_back();
+        ok = fnfl_gguf_read_dir(shards[i], dirs.back(), err);
+    }
+    if (!ok) {
+        v.put("real EX1 down", false, err);
+        return false;
+    }
+    constexpr int32_t N = 2560, K = 320;
+    const size_t      rb = size_t(K / 32 * 34), full = 2 * rb;
+    for (const int32_t layer : { 0, 25, 47 }) {
+        const std::string        name = "blk." + std::to_string(layer) + ".ffn_down_shexp.weight";
+        const fnfl_gguf_tensor * t    = nullptr;
+        const fnfl_gguf_dir *    td   = nullptr;
+        for (const fnfl_gguf_dir & d : dirs) {
+            for (const fnfl_gguf_tensor & x : d.tensors) {
+                if (x.name == name) {
+                    t  = &x;
+                    td = &d;
+                }
+            }
+        }
+        std::vector<uint8_t> all(full * N);
+        FILE *               fp   = t != nullptr ? fopen(td->path.c_str(), "rb") : nullptr;
+        const bool           read = fp != nullptr && t->type_name == "q8_0" && t->bytes == all.size() &&
+                                    fseeko(fp, static_cast<off_t>(t->offset), SEEK_SET) == 0 &&
+                                    fread(all.data(), 1, all.size(), fp) == all.size();
+        if (fp != nullptr) {
+            fclose(fp);
+        }
+        if (!read) {
+            v.put(name, false, "missing, not Q8_0 [2560][640] or unreadable");
+            ok = false;
+            continue;
+        }
+        for (int32_t card = 0; card < 2; ++card) {
+            printf("pd-test: real EX1 down: layer %d card %d (%s columns %d .. %d)\n", layer, card, name.c_str(),
+                   K * card, K * card + K - 1);
+            matrix m;
+            m.f   = fmt::q8_0;
+            m.lay = pd_layout::ex1_down;
+            m.n   = N;
+            m.k   = K;
+            std::vector<uint8_t> rows(rb * N);
+            for (int32_t n = 0; n < N; ++n) {
+                std::memcpy(rows.data() + rb * size_t(n), all.data() + full * size_t(n) + rb * size_t(card), rb);
+            }
+            m.deq.assign(size_t(N) * K, 0.0f);
+            bool dec = true;
+            for (int32_t n = 0; n < N; ++n) {
+                dec = dec && quant::decode_row(quant::wfmt::q8_0, rows.data() + rb * size_t(n),
+                                               m.deq.data() + size_t(n) * K, K);
+            }
+            m.packed.assign(size_t(experts::down_bytes(experts::fmt::q8_0)), 0);
+            dbuf w(m.packed.size());
+            if (!dec || !experts::pack_down(experts::fmt::q8_0, rows.data(), rb, m.packed.data()) ||
+                !w.put(m.packed.data(), m.packed.size())) {
+                v.put(name, false, "decode or pack_down");
+                ok = false;
+                continue;
+            }
+            ok = check_codes(m, w, grids, v, false) && ok;
+            for (const int32_t r : { 1, 65, 129 }) {
+                ok = check_product(m, w, grids, r, 0x7100 + uint64_t(layer) * 17 + uint64_t(card) * 5 + uint64_t(r),
+                                   r == 65, r == 65, v) &&
+                     ok;
+            }
+            ok = check_tc(m, w, grids, 129, 0, 1, true, 0x7900 + uint64_t(layer) * 3 + uint64_t(card), v) && ok;
+            ok = check_tc(m, w, grids, 56, 0, 1, true, 0x7a00 + uint64_t(layer) * 3 + uint64_t(card), v) && ok;  // MUP1
+        }
+    }
+    return ok;
+}
+
 }  // namespace
 
 }  // namespace fn::dense
@@ -859,7 +1267,7 @@ int fnfl_pd_test(int device, const char * mode) {
     if (!cuda_ok(cudaSetDevice(device), "cudaSetDevice")) {
         return 1;
     }
-    verdict              v;
+    verdict              v("pd-test");
     std::vector<uint8_t> gt;
     if (!grid_buffer(gt)) {
         fprintf(stderr, "pd-test: grid buffer\n");
@@ -869,7 +1277,18 @@ int fnfl_pd_test(int device, const char * mode) {
     if (!grids.put(gt.data(), gt.size())) {
         return 1;
     }
+    if (mode != nullptr && std::strncmp(mode, "q8=", 3) == 0) {  // TTTS3 item 7: real Q8_0 shared downs only
+        printf("pd-test: device %d, real EX1-down Q8_0 from %s\n", device, mode + 3);
+        real_ex1_q8(std::string(mode + 3), grids, v);
+        printf("pd-test: %s (%d checks)\n", v.all ? "PASS" : "FAIL", v.n);
+        return v.all ? 0 : 1;
+    }
     printf("pd-test: device %d, mode %s\n", device, san ? "san" : "full");
+    g_san = san;
+    if (!pl_attributes()) {
+        fprintf(stderr, "pd-test: the ladder's shared memory opt-in\n");
+        return 1;
+    }
     const fmt dp2[] = { fmt::q4_k, fmt::q5_k, fmt::q6_k, fmt::iq4_xs, fmt::iq3_s, fmt::q8_0 };
     for (const fmt f : dp2) {
         // the codes over 512 columns of K 2,560 (every lane position of 64 tiles); the products at row counts that
@@ -890,7 +1309,16 @@ int fnfl_pd_test(int device, const char * mode) {
         for (const int32_t r : rows) {
             check_product(m, w, grids, r, 0x5000 + uint64_t(f) * 131 + r, false, r == 65, v);
         }
-        for (const int32_t r : san ? std::vector<int32_t>{ 65 } : std::vector<int32_t>{ 1, 129, 300 }) {
+        // MUP1 piece 2: 33 and 64 rows (the 64 x 64 tile against the 128 x 128 tile); APF1 Part 4: each also the fused
+        // route, and around the fused tile's 64 rows and the ladder's 512-row dense crossover (fn/model/prompt.h)
+        std::vector<int32_t> tr = san ? std::vector<int32_t>{ 33, 65 } : std::vector<int32_t>{ 1, 33, 64, 129, 300 };
+        if (!san && f == fmt::q8_0) {
+            // APF2: just below, at and above each ladder tile's rows (Q4's dense format)
+            for (const int32_t r : { 7, 8, 9, 15, 16, 17, 31, 32, 63, 65, 127, 128, 255, 256, 257, 511, 512, 513 }) {
+                tr.push_back(r);
+            }
+        }
+        for (const int32_t r : tr) {
             check_tc(m, w, grids, r, 0, r == 300 ? 3 : 1, false, 0x5800 + uint64_t(f) * 131 + r, v);
         }
     }
@@ -921,8 +1349,8 @@ int fnfl_pd_test(int device, const char * mode) {
             }
         }
     }
-    // the shared expert's down in EX1's layout
-    for (const fmt f : { fmt::iq4_nl, fmt::q2_0 }) {
+    // the shared expert's down in EX1's layout (TTTS3 item 7: TTTS2's Q8_0 too)
+    for (const fmt f : { fmt::iq4_nl, fmt::q2_0, fmt::q8_0 }) {
         matrix m;
         if (!make_matrix(f, pd_layout::ex1_down, 2560, 320, 5, m)) {
             v.put(std::string("matrix ") + fmt_name(f), false, "synthetic rows");
@@ -946,12 +1374,30 @@ int fnfl_pd_test(int device, const char * mode) {
         check_bf16_tc(640, 2560, 129, {512, 640}, v);
         check_bf16_tc(512, 2560, 300, {512}, v);
     }
+    // APF1 Part 4: the router's region (two bases and zero rows), around the fused tile's rows and the crossover
+    for (const int32_t r : san ? std::vector<int32_t>{ 3 } : std::vector<int32_t>{ 1, 64, 65, 512 }) {
+        check_router_tc(r, v);
+    }
+    if (!san) {
+        check_bf16_tc(640, 2560, 513, { 512, 640 }, v);
+    }
     check_glu(san ? 3 : 200, 320, v);
     check_route(san ? 3 : 1536, v);
     pd_resources pr{};
     if (pd_tc_resources(pr)) {
         // reported, not judged (PB3 Amendment 3: resources are a cost)
         printf("pd-test: pd_tc resources: %d regs, %d B local, %d B shared, %d CTA/SM\n", pr.regs, pr.local_bytes,
+               pr.shared_bytes, pr.ctas_per_sm);
+    }
+    // APF1 Part 4: the fused route's instances (reported, not judged)
+    for (const fmt f : { fmt::q8_0, fmt::q4_k, fmt::q5_k, fmt::q6_k, fmt::iq4_xs, fmt::iq3_s }) {
+        if (pq_tc_resources(false, f, pd_layout::dp2, pr)) {
+            printf("pd-test: pq_tc %s resources: %d regs, %d B local, %d B shared, %d CTA/SM\n", fmt_name(f), pr.regs,
+                   pr.local_bytes, pr.shared_bytes, pr.ctas_per_sm);
+        }
+    }
+    if (pq_tc_resources(true, fmt::bf16, pd_layout::dp2, pr)) {
+        printf("pd-test: pq_tc BF16 resources: %d regs, %d B local, %d B shared, %d CTA/SM\n", pr.regs, pr.local_bytes,
                pr.shared_bytes, pr.ctas_per_sm);
     }
     printf("pd-test: %s (%d checks)\n", v.all ? "PASS" : "FAIL", v.n);

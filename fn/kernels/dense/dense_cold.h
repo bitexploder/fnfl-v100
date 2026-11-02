@@ -51,4 +51,8 @@ bool l2keep_stream(void * ef, int64_t ef_bytes, void * normal, int64_t normal_by
 bool l2keep_walk(const uint32_t * keep, int32_t n_walks, int32_t n_steps, uint32_t * cycles, uint32_t * walk_cycles,
                  void * stream);
 
+// TTTS6 (dpj-test): every SM's shared memory, 96 KB a block, one block an SM, set to 0xff bytes, so a launch after it
+// that read shared memory it did not write reads NaN scales and -1 codes (item 2's staging); stream may be null
+bool poison_smem(void * stream);
+
 } // namespace fn::dense

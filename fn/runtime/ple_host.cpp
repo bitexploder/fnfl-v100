@@ -7,6 +7,7 @@
 
 #include <cuda_runtime_api.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,6 +17,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <string>
@@ -216,6 +218,166 @@ void ple_pin::release() {
     n_ = 0;
     populated_ = false;
     pinned_ = false;
+}
+
+int64_t ple_resident_pages(const uint8_t * p, uint64_t n) {
+    const long page_l = sysconf(_SC_PAGESIZE);
+    if (p == nullptr || n == 0 || page_l <= 0) {
+        return -1;
+    }
+    const uintptr_t page = static_cast<uintptr_t>(page_l);
+    // reason: page arithmetic on the mapping's addresses
+    const uintptr_t first = reinterpret_cast<uintptr_t>(p) & ~(page - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(p) + n + page - 1) & ~(page - 1);
+    std::vector<unsigned char> v((end - first) / page);
+    // reason: mincore takes the range as a mutable pointer; it writes nothing there
+    if (mincore(reinterpret_cast<void *>(first), size_t(end - first), v.data()) != 0) {
+        return -1;
+    }
+    int64_t r = 0;
+    for (const unsigned char c : v) {
+        r += c & 1;
+    }
+    return r;
+}
+
+namespace {
+
+// a "Key:   N kB" line of /proc/meminfo, in bytes; -1 when absent
+int64_t meminfo_bytes(const char * key) {
+    std::ifstream f("/proc/meminfo");
+    std::string k;
+    int64_t v = 0;
+    std::string unit;
+    const std::string want = std::string(key) + ":";
+    while (f >> k >> v) {
+        std::getline(f, unit);
+        if (k == want) {
+            return v * 1024;
+        }
+    }
+    return -1;
+}
+
+double gib(int64_t b) {
+    return double(b) / 1073741824.0;
+}
+
+} // namespace
+
+ple_warm::~ple_warm() {
+    stop();
+    if (r_.locked) {
+        munlock(a_, n_);
+    }
+}
+
+bool ple_warm::start(const uint8_t * table, uint64_t bytes, bool log, bool lock) {
+    const long page_l = sysconf(_SC_PAGESIZE);
+    if (th_.joinable() || done() || table == nullptr || bytes == 0 || page_l <= 0) {
+        return false;
+    }
+    const uintptr_t page = static_cast<uintptr_t>(page_l);
+    // reason: page arithmetic on the mapping's addresses
+    const uintptr_t first = reinterpret_cast<uintptr_t>(table) & ~(page - 1);
+    const uintptr_t end = (reinterpret_cast<uintptr_t>(table) + bytes + page - 1) & ~(page - 1);
+    // reason: madvise, mlock and mincore take the range as a mutable pointer; none writes it
+    a_ = reinterpret_cast<uint8_t *>(first);
+    n_ = uint64_t(end - first);
+    log_ = log;
+    lock_ = lock;
+    r_ = report();
+    r_.bytes = n_;
+    r_.pages = int64_t(n_ / page);
+    if (log_) {
+        fprintf(stderr,
+                "FNFL: PLE warm: reading the lazy table's %.2f GiB into the page cache on a background thread (STALL; "
+                "--fnfl-ple-warm off disables it); the server does not wait\n",
+                gib(int64_t(n_)));
+        fflush(stderr);
+    }
+    th_ = std::thread([this] { run(); });
+    return true;
+}
+
+void ple_warm::stop() {
+    stop_.store(true, std::memory_order_release);
+    if (th_.joinable()) {
+        th_.join();
+    }
+}
+
+void ple_warm::run() {
+    const auto t0 = std::chrono::steady_clock::now();
+    bool ok = true;
+    // the next piece's readahead is queued before this piece is mapped: POPULATE_READ alone faults with the small
+    // fault-path readahead, WILLNEED reads a piece in large requests
+    madvise(a_, std::min(piece_bytes, n_), MADV_WILLNEED);
+    for (uint64_t off = 0; ok && off < n_; off += piece_bytes) {
+        if (stop_.load(std::memory_order_acquire)) {
+            r_.stopped = true;
+            break;
+        }
+        const uint64_t len = std::min(piece_bytes, n_ - off);
+        if (off + len < n_) {
+            madvise(a_ + off + len, std::min(piece_bytes, n_ - off - len), MADV_WILLNEED);
+        }
+        if (madvise(a_ + off, len, MADV_POPULATE_READ) != 0) {
+            r_.err = std::string("madvise(MADV_POPULATE_READ) at ") + std::to_string(off) + ": " + std::strerror(errno);
+            ok = false;
+        }
+    }
+    r_.populated = ok && !r_.stopped;
+    r_.populate_s = seconds_since(t0);
+    struct rlimit rl = {};
+    getrlimit(RLIMIT_MEMLOCK, &rl);
+    r_.memlock_limit = uint64_t(rl.rlim_cur);
+    r_.mem_total = meminfo_bytes("MemTotal");
+    r_.mem_available = meminfo_bytes("MemAvailable");
+    // the table's own cached pages count in MemAvailable; locking takes them out of it
+    const bool room = r_.mem_available >= 0 && uint64_t(r_.mem_available) >= n_ + lock_margin;
+    if (r_.populated && lock_ && room) {
+        const auto t1 = std::chrono::steady_clock::now();
+        if (mlock(a_, n_) == 0) {
+            r_.locked = true;
+        } else {
+            r_.err = std::string("mlock: ") + std::strerror(errno);
+        }
+        r_.lock_s = seconds_since(t1);
+    }
+    r_.resident = ple_resident_pages(a_, n_);
+    r_.total_s = seconds_since(t0);
+    done_.store(true, std::memory_order_release);
+    if (log_) {
+        fprintf(stderr, "FNFL: PLE warm: %s\n", line().c_str());
+        fflush(stderr);
+    }
+}
+
+std::string ple_warm::line() const {
+    if (!done()) {
+        return "in progress";
+    }
+    const report & r = r_;
+    const bool full = r.resident == r.pages;
+    const std::string lim = r.memlock_limit == uint64_t(RLIM_INFINITY) ? std::string("unlimited") :
+                                                                          std::to_string(r.memlock_limit) + " bytes";
+    const bool room = r.mem_available >= 0 && uint64_t(r.mem_available) >= r.bytes + lock_margin;
+    const char * lock_why = r.locked    ? "locked (mlock)" :
+                            !lock_      ? "not locked (lock disabled)" :
+                            !r.populated ? "not locked (populate incomplete)" :
+                            !room       ? "not locked (MemAvailable less the table is under the 16 GiB margin)" :
+                                          "not locked (mlock refused)";
+    char b[640];
+    snprintf(b, sizeof b,
+             "the table is %s: %lld of %lld pages (%.1f%%) of %.2f GiB after %.1f s (populate %.1f s, lock %.1f s); "
+             "%s; MemTotal %.1f GiB, MemAvailable %.1f GiB before the lock, RLIMIT_MEMLOCK %s%s%s%s",
+             full ? "resident 100%" : "partly resident", static_cast<long long>(r.resident),
+             static_cast<long long>(r.pages), r.pages > 0 ? 100.0 * double(r.resident) / double(r.pages) : 0.0,
+             gib(int64_t(r.bytes)), r.total_s, r.populate_s, r.lock_s, lock_why, gib(r.mem_total),
+             gib(r.mem_available), lim.c_str(), r.stopped ? "; stopped before the end" : "",
+             r.err.empty() ? "" : "; ", r.err.c_str());
+    return b;
 }
 
 // set_input's loop body for one row (qwen4exp.cpp 1934-1957), with the predecessors passed in (-1: missing)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // ple-pin-test (PN1): the PLE table's residency setting on a temporary file, no model load.
 //   probe: a 64 MiB file mapped PROT_READ, MAP_SHARED: cudaDevAttrHostRegisterReadOnlySupported on both cards; the
 //          mapping populated (MADV_POPULATE_READ) and registered with cudaHostRegister, without and then with
@@ -10,4 +12,10 @@
 //          the bytes, and ple_prefetch reports 0 ranges; an invalid range fails with the named error; lazy pins
 //          nothing and still hints. Prints "ple-pin-test: PASS" and returns 0 when every check passes.
 // dir: where the temporary file goes (removed before return); device: the card whose context registers.
+//   warm:  STALL's background warm (ple_warm) on a cold 64 MiB file: every page resident, locked exactly when
+//          RLIMIT_MEMLOCK and the margin allow, the bytes unchanged, stop() ends it, a second start refused.
 int fnfl_ple_pin_test(const char * mode, const char * dir, int device);
+
+// ple-pin-test warm-file PATH OFFSET BYTES (STALL): the warm on a real file's range (the PLE table in its shard) with
+// its log lines and mincore residency before and after; 0 when every page ends resident. Reads the range from disk.
+int fnfl_ple_warm_file(const char * path, uint64_t off, uint64_t bytes);

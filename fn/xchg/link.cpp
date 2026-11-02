@@ -1,5 +1,9 @@
 #include "fn/xchg/link.h"
 
+#include "fn/xchg/life.h"
+#include "fn/xchg/link_fault.h"
+#include "fn/xchg/slow.h"
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
@@ -11,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -26,6 +31,10 @@ using clk = std::chrono::steady_clock;
 constexpr int32_t   n_ops     = 256;  // operation slots (in flight at once)
 constexpr uint32_t  q_cap     = 512;  // submission queue entries (a power of two)
 constexpr ucp_tag_t full_mask = ~ucp_tag_t(0);
+// TTTS7: the link thread keeps polling this long after its last activity before it sleeps, so a post or an arrival
+// between a serving round's messages finds it awake (no eventfd write, no epoll wake-up); about the length of a round's
+// stage (TTTS4 measured about 19 ms at U = 4) [estimated], so a serving split never sleeps and an idle one does
+constexpr double    idle_spin_s = 0.025;
 
 double since(clk::time_point t0) {
     return std::chrono::duration<double>(clk::now() - t0).count();
@@ -42,19 +51,50 @@ void relax() {
 #endif
 }
 
-// an operation's states: the runtime allocates a free slot and queues it; the link thread posts it and publishes its
-// completion (release); the runtime acquires that and frees the slot. An abandoned op (a wait that timed out) becomes
-// reclaimable only once the link thread has seen its request end, so its buffer is never written after reuse
-enum op_state : int32_t { st_free = 0, st_queued = 1, st_posted = 2, st_ok = 3, st_err = 4, st_reclaim = 5 };
+// TTTSBS: an operation slot's word: its use's generation (20 bits) above its state (8 bits), one atomic, so every
+// hand-off between the runtime and the link thread is one acquire/release pair on it and a stale party is refused:
+//   free -> queued      the runtime (its fields written first, then the word released; the post entry follows)
+//   queued -> posted    the link thread (CAS): it owns the transport request from here
+//   queued -> dropped   the runtime (CAS), cancelling before the post: the transport never saw the buffer
+//   posted -> ok | err  the link thread, once the transport ended the request (completed, failed or cancelled): the
+//                       transport is done with the buffer; the status fields are written before the release
+//   ok | err | dropped -> free   the runtime, observing the end (acquire): the buffer and the slot are released
+// Only the runtime frees a slot, and only after it acquired a terminal state, so a buffer is never written after the
+// runtime gave it back. The runtime's handle carries the generation: a handle of an earlier use is refused, never
+// taken for the slot's current operation.
+enum op_state : uint32_t { st_free = 0, st_queued = 1, st_posted = 2, st_ok = 3, st_err = 4, st_dropped = 5 };
+
+constexpr uint32_t gen_mask = 0xfffffu;
+
+uint32_t pack(uint32_t gen, uint32_t st) {
+    return (gen & gen_mask) << 8 | st;
+}
+
+uint32_t gen_of(uint32_t w) {
+    return w >> 8;
+}
+
+uint32_t st_of(uint32_t w) {
+    return w & 0xffu;
+}
+
+bool terminal(uint32_t st) {
+    return st == st_ok || st == st_err || st == st_dropped;
+}
 
 // submission entries: kind in the top 4 bits, the op's generation (20 bits) and its index (8 bits) below, so an entry
 // queued for an earlier use of a slot is recognized and skipped
-enum sub_kind : uint32_t { sub_post = 1, sub_cancel = 2, sub_job = 3, sub_stop = 4 };
+enum sub_kind : uint32_t { sub_post = 1, sub_cancel = 2, sub_job = 3, sub_stop = 4, sub_quiesce = 5 };
 
-static_assert(n_ops <= 256, "an entry carries the op index in 8 bits");
+static_assert(n_ops <= 256, "an entry and a handle carry the op index in 8 bits");
 
 uint32_t sub(sub_kind k, uint32_t i, uint32_t gen = 0) {
-    return (uint32_t(k) << 28) | ((gen & 0xfffffu) << 8) | (i & 0xffu);
+    return (uint32_t(k) << 28) | ((gen & gen_mask) << 8) | (i & 0xffu);
+}
+
+// the runtime's handle of a use: its generation above its index (non-negative)
+int32_t handle(int32_t i, uint32_t gen) {
+    return int32_t((gen & gen_mask) << 8 | uint32_t(i));
 }
 
 }  // namespace
@@ -139,19 +179,22 @@ std::string hello_mismatch(const hello & a, const hello & b) {
 
 struct link::impl {
     struct op {
-        std::atomic<int32_t> state{ st_free };
-        bool                 is_send = false;
-        uint64_t             tag     = 0;
-        void *               p       = nullptr;
-        size_t               n       = 0;
-        // written by the link thread before the state's release store
-        ucs_status_t         status  = UCS_OK;
-        size_t               got     = 0;
-        uint64_t             got_tag = 0;
-        void *               req     = nullptr;
-        bool     abandoned = false;  // set by the runtime before it queues a cancel (the link thread reads it after)
-        uint32_t gen       = 0;      // the slot's use count (the queue entries carry it)
-        ucp_tag_recv_info_t info = {};
+        std::atomic<uint32_t>       word{ 0 };  // generation | state (above)
+        // the runtime's, written before the queued word's release, read by the link thread after its acquire
+        bool                        is_send   = false;
+        uint64_t                    tag       = 0;
+        void *                      p         = nullptr;
+        size_t                      n         = 0;
+        // the link thread's, written before a terminal word's release, read by the runtime after its acquire
+        ucs_status_t                status    = UCS_OK;
+        size_t                      got       = 0;
+        uint64_t                    got_tag   = 0;
+        ucp_tag_recv_info_t         info      = {};
+        void *                      req       = nullptr;  // the link thread's only: the transport request while posted
+        // the runtime's only
+        bool                        abandoned = false;  // given up by a failed wait (retire): reaped once ended
+        std::shared_ptr<const void> keep;               // the buffer's owner, held until the end is observed
+        uint64_t                    life = 0;  // the lifetime ledger's user (fn/xchg/life.h; 0 outside a test build)
     };
 
     options            o;
@@ -185,9 +228,23 @@ struct link::impl {
         ucp_mem_h h;
     };
 
-    std::vector<mapped> maps;             // link thread only once running (map runs as a job)
-    int32_t             outstanding = 0;  // link thread only
+    std::vector<mapped> maps;                   // link thread only once running (map runs as a job)
     counters            tot;
+    hello               hello_mine, hello_got;  // X-HELLO's buffers: the link's own (a failed exchange's may linger)
+    bool                quiesce_asked = false;  // the runtime's: one quiesce entry
+
+#if defined(FNFL_TEST_HOOKS)
+    // fn/xchg/link_fault.h: the in-process network in place of UCX, and the hooks
+    std::shared_ptr<fault::net> fk;
+    int32_t                     side = 0;
+    std::atomic<bool>           hold{ false }, parked{ false };
+    int32_t                     fail_nth = 0;  // the runtime's: the n-th submission from now is refused
+    std::function<void()>       cancel_hook;   // set before the pair starts or while the thread is parked
+    void                        fake_post(int32_t i);
+    void                        fake_cancel(int32_t i);
+    void                        fake_close();
+    int32_t                     fake_progress();
+#endif
 
     // ---- the link thread's side ----
     static void ep_error(void * arg, ucp_ep_h e, ucs_status_t st) {
@@ -213,7 +270,8 @@ struct link::impl {
         }
     }
 
-    void complete(op & x, ucs_status_t st) {
+    // the link thread: a posted op's end published (its word was posted; only this thread moves it on)
+    static void complete(op & x, ucs_status_t st) {
         x.status = st;
         bool ok  = st == UCS_OK;
         if (ok && !x.is_send) {
@@ -221,15 +279,13 @@ struct link::impl {
             x.got_tag = x.info.sender_tag;
             ok        = x.got == x.n;
         }
-        x.req = nullptr;
-        x.state.store(x.abandoned ? st_reclaim : (ok ? st_ok : st_err), std::memory_order_release);
+        x.req            = nullptr;
+        const uint32_t g = gen_of(x.word.load(std::memory_order_relaxed));
+        x.word.store(pack(g, ok ? st_ok : st_err), std::memory_order_release);
     }
 
     static void send_cb(void * req, ucs_status_t st, void * user) {
-        op & x   = *static_cast<op *>(user);
-        x.status = st;
-        x.req    = nullptr;
-        x.state.store(x.abandoned ? st_reclaim : (st == UCS_OK ? st_ok : st_err), std::memory_order_release);
+        complete(*static_cast<op *>(user), st);
         ucp_request_free(req);
     }
 
@@ -238,15 +294,7 @@ struct link::impl {
         if (info != nullptr) {
             x.info = *info;
         }
-        bool ok = st == UCS_OK;
-        if (ok) {
-            x.got     = x.info.length;
-            x.got_tag = x.info.sender_tag;
-            ok        = x.got == x.n;
-        }
-        x.status = st;
-        x.req    = nullptr;
-        x.state.store(x.abandoned ? st_reclaim : (ok ? st_ok : st_err), std::memory_order_release);
+        complete(x, st);
         ucp_request_free(req);
     }
 
@@ -260,7 +308,7 @@ struct link::impl {
         return nullptr;
     }
 
-    void post(int32_t i) {
+    void post(int32_t i, uint32_t gen) {
         op &                x   = ops[i];
         ucp_request_param_t prm = {};
         prm.op_attr_mask        = UCP_OP_ATTR_FIELD_CALLBACK | UCP_OP_ATTR_FIELD_USER_DATA;
@@ -270,10 +318,20 @@ struct link::impl {
             prm.memh = h;
         }
         ucs_status_ptr_t r      = nullptr;
-        int32_t          expect = st_queued;
-        if (!x.state.compare_exchange_strong(expect, st_posted, std::memory_order_acq_rel)) {
-            return;  // abandoned before it was posted (reclaimed by the runtime)
+        uint32_t         expect = pack(gen, st_queued);
+        if (!x.word.compare_exchange_strong(expect, pack(gen, st_posted), std::memory_order_acq_rel)) {
+            return;  // dropped by the runtime before its post, or a stale entry
         }
+#if defined(FNFL_TEST_HOOKS)
+        if (fk != nullptr) {
+            if (lost_flag.load(std::memory_order_acquire)) {
+                complete(x, UCS_ERR_CONNECTION_RESET);
+            } else {
+                fake_post(i);
+            }
+            return;
+        }
+#endif
         if (lost_flag.load(std::memory_order_acquire) || ep == nullptr) {
             complete(x, UCS_ERR_CONNECTION_RESET);
             return;
@@ -298,53 +356,143 @@ struct link::impl {
 
     bool any_posted() const {
         for (const op & x : ops) {
-            if (x.state.load(std::memory_order_relaxed) == st_posted) {
+            if (st_of(x.word.load(std::memory_order_relaxed)) == st_posted) {
                 return true;
             }
         }
         return false;
     }
 
+    // the link thread: every posted request cancelled and the endpoint closed (forced: the transport stops touching
+    // memory; a lost peer's requests end with errors), then progress until no request is posted, bounded. The link
+    // is lost after it (no new operation)
+    void quiesce_now(const char * why_now) {
+        {
+            std::lock_guard<std::mutex> g(why_mu);
+            if (why.empty()) {
+                why = why_now;
+            }
+        }
+        lost_flag.store(true, std::memory_order_release);
+#if defined(FNFL_TEST_HOOKS)
+        if (fk != nullptr) {
+            fake_close();
+            fake_progress();
+            return;
+        }
+#endif
+        for (op & x : ops) {
+            if (st_of(x.word.load(std::memory_order_relaxed)) == st_posted && x.req != nullptr) {
+                ucp_request_cancel(worker, x.req);
+            }
+        }
+        close_ep(true);
+        const auto t0 = clk::now();
+        while (any_posted() && since(t0) < o.retire_s) {
+            ucp_worker_progress(worker);
+        }
+    }
+
+    // the link thread: the endpoint closed, bounded (forced: no flush)
+    void close_ep(bool force) {
+        if (ep == nullptr) {
+            return;
+        }
+        ucp_request_param_t prm = {};
+        prm.op_attr_mask        = UCP_OP_ATTR_FIELD_FLAGS;
+        prm.flags               = force ? UCP_EP_CLOSE_FLAG_FORCE : 0;
+        ucs_status_ptr_t r      = ucp_ep_close_nbx(ep, &prm);
+        const auto       t0     = clk::now();
+        if (r != nullptr && UCS_PTR_IS_PTR(r)) {
+            while (ucp_request_check_status(r) == UCS_INPROGRESS && since(t0) < 2.0) {
+                ucp_worker_progress(worker);
+            }
+            ucp_request_free(r);
+        }
+        ep = nullptr;
+    }
+
     void run() {
         epoll_event ev[2];
+        auto        busy = clk::now();  // the last activity: an entry taken, progress, or a request outstanding
         while (!stopping.load(std::memory_order_acquire)) {
+#if defined(FNFL_TEST_HOOKS)
+            if (hold.load(std::memory_order_acquire)) {
+                parked.store(true, std::memory_order_release);
+                while (hold.load(std::memory_order_acquire) && !stopping.load(std::memory_order_acquire)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                parked.store(false, std::memory_order_release);
+                continue;
+            }
+#endif
             uint32_t h = q_head.load(std::memory_order_acquire);
             uint32_t t = q_tail.load(std::memory_order_relaxed);
+            if (t != h) {
+                busy = clk::now();
+            }
             while (t != h) {
                 const uint32_t e = q[t & (q_cap - 1)];
                 t++;
                 q_tail.store(t, std::memory_order_release);
                 const uint32_t k = e >> 28, i = e & 0xffu, gen = (e >> 8) & 0xfffffu;
                 if (k == sub_post) {
-                    if ((ops[i].gen & 0xfffffu) == gen) {
-                        post(int32_t(i));
-                    }
+                    post(int32_t(i), gen);
                 } else if (k == sub_cancel) {
+#if defined(FNFL_TEST_HOOKS)
+                    if (cancel_hook) {
+                        cancel_hook();
+                        if (fk != nullptr) {
+                            fake_progress();  // what the hook released completes before the cancel is acted on
+                        }
+                    }
+#endif
                     op & x = ops[i];
-                    if ((x.gen & 0xfffffu) != gen) {
-                        // a stale entry: the slot was reused
-                    } else if (x.req != nullptr) {
-                        ucp_request_cancel(worker, x.req);
-                    } else if (x.state.load(std::memory_order_relaxed) != st_posted) {
-                        x.state.store(st_reclaim, std::memory_order_release);
+                    // only a posted request of this use is cancelled (an ended one, or a stale entry: nothing);
+                    // the request's end (completed or cancelled) is published by its callback as any end
+                    if (x.word.load(std::memory_order_acquire) == pack(gen, st_posted) && x.req != nullptr) {
+#if defined(FNFL_TEST_HOOKS)
+                        if (fk != nullptr) {
+                            fake_cancel(int32_t(i));
+                        } else
+#endif
+                        {
+                            ucp_request_cancel(worker, x.req);
+                        }
                     }
                 } else if (k == sub_job) {
                     job();
                     job_done.store(true, std::memory_order_release);
+                } else if (k == sub_quiesce) {
+                    quiesce_now("the link was quiesced (an operation's end could not be observed)");
                 } else if (k == sub_stop) {
                     stopping.store(true, std::memory_order_release);
                 }
                 h = q_head.load(std::memory_order_acquire);
             }
             int progressed = 0;
+#if defined(FNFL_TEST_HOOKS)
+            if (fk != nullptr) {
+                progressed = fake_progress();
+                if (progressed == 0) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
+                continue;
+            }
+#endif
             while (ucp_worker_progress(worker) != 0) {
                 ++progressed;
             }
             if (progressed > 0 || any_posted()) {
+                busy = clk::now();
                 relax();
                 continue;
             }
-            // idle: arm the worker, publish that this thread sleeps, recheck the queue, then sleep
+            if (since(busy) < idle_spin_s) {
+                relax();
+                continue;
+            }
+            // idle for idle_spin_s: arm the worker, publish that this thread sleeps, recheck the queue, then sleep
             const ucs_status_t st = ucp_worker_arm(worker);
             if (st == UCS_ERR_BUSY) {
                 continue;
@@ -365,20 +513,25 @@ struct link::impl {
                 }
             }
         }
-        // stopping: flush and close the endpoint, bounded
-        if (ep != nullptr) {
-            ucp_request_param_t prm = {};
-            prm.op_attr_mask        = UCP_OP_ATTR_FIELD_FLAGS;
-            prm.flags               = lost_flag.load() ? UCP_EP_CLOSE_FLAG_FORCE : 0;
-            ucs_status_ptr_t r      = ucp_ep_close_nbx(ep, &prm);
-            const auto       t0     = clk::now();
-            if (r != nullptr && UCS_PTR_IS_PTR(r)) {
-                while (ucp_request_check_status(r) == UCS_INPROGRESS && since(t0) < 2.0) {
-                    ucp_worker_progress(worker);
-                }
-                ucp_request_free(r);
+        // stopping (TTTSBS): every operation still posted ends before the thread does: the receives cancelled, the
+        // endpoint flushed and closed (forced when lost, or when a flush leaves requests), bounded; stop() then
+        // destroys the worker and only then unmaps
+#if defined(FNFL_TEST_HOOKS)
+        if (fk != nullptr) {
+            fake_close();
+            fake_progress();
+            return;
+        }
+#endif
+        for (op & x : ops) {
+            if (st_of(x.word.load(std::memory_order_relaxed)) == st_posted && x.req != nullptr && !x.is_send) {
+                ucp_request_cancel(worker, x.req);
             }
-            ep = nullptr;
+        }
+        close_ep(lost_flag.load(std::memory_order_acquire));
+        const auto t0 = clk::now();
+        while (any_posted() && since(t0) < o.retire_s) {
+            ucp_worker_progress(worker);
         }
     }
 
@@ -413,10 +566,23 @@ struct link::impl {
         }
     }
 
+    // an abandoned op whose end is now visible: released without a result (its owner's reference dropped)
+    void reap(int32_t i) {
+        op &           x = ops[i];
+        const uint32_t w = x.word.load(std::memory_order_acquire);
+        if (x.abandoned && terminal(st_of(w))) {
+            life::done(x.life, st_of(w) == st_dropped ? "dropped before its post" : "ended after it was given up");
+            x.life      = 0;
+            x.abandoned = false;
+            x.keep.reset();
+            x.word.store(pack(gen_of(w), st_free), std::memory_order_release);
+        }
+    }
+
     int32_t alloc(std::string & err) {
         for (int32_t i = 0; i < n_ops; ++i) {
-            int32_t s = ops[i].state.load(std::memory_order_acquire);
-            if (s == st_free || s == st_reclaim) {
+            reap(i);
+            if (st_of(ops[i].word.load(std::memory_order_acquire)) == st_free) {
                 return i;
             }
         }
@@ -424,34 +590,52 @@ struct link::impl {
         return -1;
     }
 
-    int32_t submit(bool is_send, uint64_t tag, void * p, size_t n, std::string & err) {
+    int32_t submit(bool                        is_send,
+                   uint64_t                    tag,
+                   void *                      p,
+                   size_t                      n,
+                   std::shared_ptr<const void> keep,
+                   std::string &               err) {
         if (lost_flag.load(std::memory_order_acquire)) {
             err = "split stage lost: " + tag_str(tag) + ": " + lost_why();
             return -1;
         }
+#if defined(FNFL_TEST_HOOKS)
+        if (fail_nth > 0 && --fail_nth == 0) {
+            err = "link: TEST: submission refused (" + tag_str(tag) + ")";
+            return -1;
+        }
+#endif
         const int32_t i = alloc(err);
         if (i < 0) {
             return -1;
         }
-        op & x      = ops[i];
-        x.is_send   = is_send;
-        x.tag       = tag;
-        x.p         = p;
-        x.n         = n;
-        x.status    = UCS_OK;
-        x.got       = 0;
-        x.got_tag   = 0;
-        x.req       = nullptr;
-        x.abandoned = false;
-        x.info      = {};
-        ++x.gen;
-        x.state.store(st_queued, std::memory_order_release);
-        if (!push(sub(sub_post, uint32_t(i), x.gen))) {
-            x.state.store(st_free, std::memory_order_relaxed);
+        op &           x   = ops[i];
+        const uint32_t gen = (gen_of(x.word.load(std::memory_order_relaxed)) + 1) & gen_mask;
+        x.is_send          = is_send;
+        x.tag              = tag;
+        x.p                = p;
+        x.n                = n;
+        x.status           = UCS_OK;
+        x.got              = 0;
+        x.got_tag          = 0;
+        x.info             = {};
+        x.abandoned        = false;
+        x.keep             = std::move(keep);
+        if constexpr (life::on) {
+            x.life = life::next_id();
+            life::use(x.life, p, n, is_send ? "link send" : "link receive");
+        }
+        x.word.store(pack(gen, st_queued), std::memory_order_release);
+        if (!push(sub(sub_post, uint32_t(i), gen))) {
+            life::done(x.life, "never queued");
+            x.life = 0;
+            x.keep.reset();
+            x.word.store(pack(gen, st_free), std::memory_order_release);
             err = "link: the submission queue is full";
             return -1;
         }
-        return i;
+        return handle(i, gen);
     }
 
     std::string lost_why() {
@@ -459,12 +643,32 @@ struct link::impl {
         return why.empty() ? std::string("the peer is lost") : why;
     }
 
-    // the outcome of a completed op (state ok or err), then the slot freed
-    bool finish(int32_t i, int32_t s, std::string & err) {
-        op & x  = ops[i];
-        bool ok = s == st_ok;
+    // the op of a handle when it is the slot's current use and not given up; nullptr with err otherwise
+    op * of(int32_t h, std::string & err) {
+        if (h < 0) {
+            err = "link: bad operation " + std::to_string(h);
+            return nullptr;
+        }
+        const int32_t  i = h & 0xff;
+        const uint32_t g = uint32_t(h) >> 8;
+        op &           x = ops[i];
+        const uint32_t w = x.word.load(std::memory_order_acquire);
+        if (gen_of(w) != g || st_of(w) == st_free || x.abandoned) {
+            err = "link: a stale operation handle " + std::to_string(h) + " (its slot " + std::to_string(i) +
+                  " is finished or reused)";
+            return nullptr;
+        }
+        return &x;
+    }
+
+    // the outcome of an op whose terminal state the runtime acquired, then the slot freed (its owner released)
+    bool finish(op & x, uint32_t w, std::string & err) {
+        const uint32_t s  = st_of(w);
+        bool           ok = s == st_ok;
         if (!ok) {
-            if (x.status == UCS_OK && !x.is_send) {
+            if (s == st_dropped) {
+                err = "cancelled before its post: " + tag_str(x.tag);
+            } else if (x.status == UCS_OK && !x.is_send) {
                 err = "refused: " + tag_str(x.tag) + ": received " + std::to_string(x.got) + " bytes, expected " +
                       std::to_string(x.n);
             } else if (x.status == UCS_ERR_MESSAGE_TRUNCATED) {
@@ -483,23 +687,126 @@ struct link::impl {
             ++tot.recv_msgs;
             tot.recv_bytes += x.got;
         }
-        x.state.store(st_free, std::memory_order_release);
+        life::done(x.life, ok ? "completed" : "failed");
+        x.life      = 0;
+        x.abandoned = false;
+        x.keep.reset();
+        x.word.store(pack(gen_of(w), st_free), std::memory_order_release);
         return ok;
     }
 
-    void abandon(int32_t i) {
-        ops[i].abandoned = true;
-        std::atomic_thread_fence(std::memory_order_release);
-        // the cancel entry is ordered after abandoned by the queue's release; the link thread reclaims the slot
-        int32_t expect = st_queued;
-        if (ops[i].state.compare_exchange_strong(expect, st_reclaim)) {
-            return;  // never posted: nothing to cancel (the post entry finds it reclaimed and skips it)
+    // give up an op: before its post, dropped here (the transport never saw it); after, its cancel queued. Its end
+    // is observed later (retire, reap)
+    void abandon(op & x, int32_t i) {
+        x.abandoned           = true;
+        const uint32_t w      = x.word.load(std::memory_order_acquire);
+        uint32_t       expect = pack(gen_of(w), st_queued);
+        if (x.word.compare_exchange_strong(expect, pack(gen_of(w), st_dropped), std::memory_order_acq_rel)) {
+            return;  // its post entry finds it dropped and skips it
         }
-        while (!push(sub(sub_cancel, uint32_t(i), ops[i].gen))) {
-            relax();
+        if (st_of(expect) == st_posted) {
+            while (!push(sub(sub_cancel, uint32_t(i), gen_of(w)))) {
+                relax();
+            }
         }
     }
+
+    void quiesce(const std::string & why_now) {
+        if (!running.load()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> g(why_mu);
+            if (why.empty()) {
+                why = why_now;
+            }
+        }
+        if (!quiesce_asked) {
+            quiesce_asked = true;
+            while (!push(sub(sub_quiesce, 0))) {
+                relax();
+            }
+        }
+    }
+
+    // TTTSBS: end every op of hs (handles; -1 and stale ones skipped): each cancelled, its end observed within
+    // retire_s, else the link quiesced and its ends awaited once more; then each ended op finished (ok_out: the one
+    // that completed with its bytes, when ok_out names it). Returns how many could not be observed ended: those stay
+    // given up with their owners held (reaped once they end, or at stop)
+    int32_t retire(const int32_t * hs,
+                   int32_t         n,
+                   int32_t         ok_of  = -1,
+                   bool *          ok_out = nullptr,
+                   std::string *   err    = nullptr) {
+        std::vector<int32_t>  idx;
+        std::vector<uint32_t> gens;
+        for (int32_t k = 0; k < n; ++k) {
+            std::string e;
+            op *        x = hs[k] < 0 ? nullptr : of(hs[k], e);
+            idx.push_back(x == nullptr ? -1 : int32_t(hs[k] & 0xff));
+            gens.push_back(x == nullptr ? 0 : uint32_t(hs[k]) >> 8);
+            if (x != nullptr && !terminal(st_of(x->word.load(std::memory_order_acquire)))) {
+                abandon(*x, idx.back());
+            }
+        }
+        const auto ended = [&]() {
+            for (int32_t i : idx) {
+                if (i >= 0 && !terminal(st_of(ops[i].word.load(std::memory_order_acquire)))) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const auto await = [&](double bound) {
+            const auto t0 = clk::now();
+            while (!ended() && since(t0) < bound) {
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            }
+        };
+        await(o.retire_s);
+        if (!ended()) {
+            quiesce("split stage lost: an operation's end was not observed within " + std::to_string(o.retire_s) +
+                    " s of its cancel; the link was quiesced");
+            await(o.retire_s);
+        }
+        int32_t held = 0;
+        for (size_t k = 0; k < idx.size(); ++k) {
+            if (idx[k] < 0) {
+                continue;
+            }
+            op &           x = ops[idx[k]];
+            const uint32_t w = x.word.load(std::memory_order_acquire);
+            if (!terminal(st_of(w))) {
+                x.abandoned = true;
+                ++held;
+                continue;
+            }
+            std::string e;
+            const bool  ok = finish(x, w, e);
+            if (int32_t(k) == ok_of && ok_out != nullptr) {
+                *ok_out = ok;
+                if (!ok && err != nullptr && err->empty()) {
+                    *err = e;
+                }
+            }
+        }
+        return held;
+    }
+
+    // given-up ops not ended (each reaped first when it has)
+    int32_t held() {
+        int32_t h = 0;
+        for (int32_t i = 0; i < n_ops; ++i) {
+            reap(i);
+            h += ops[i].abandoned ? 1 : 0;
+        }
+        return h;
+    }
 };
+
+#if defined(FNFL_TEST_HOOKS)
+bool fault_unexpected(link::impl & m, uint64_t & tag, size_t & bytes);
+#endif
 
 link::link() : p_(std::make_unique<impl>()) {}
 
@@ -525,6 +832,10 @@ std::string link::lost_why() const {
 
 counters link::totals() const {
     return p_->tot;
+}
+
+int32_t link::held() {
+    return p_->held();
 }
 
 bool link::start(const options & o, std::string & err) {
@@ -580,24 +891,35 @@ bool link::start(const options & o, std::string & err) {
         };
         const auto t0       = clk::now();
         // the hello exchange on this thread (the link thread does not exist yet, so this thread owns the worker)
+        // TTTSBS: its buffers are the link's (hello_mine, hello_got), so a request a failed attempt leaves cannot
+        // outlive them; a request that does not end after its cancel refuses the start
         const auto exchange = [&](std::string & e) -> bool {
-            hello      mine = m.o.me;
-            hello      got;
+            hello & mine   = m.hello_mine;
+            hello & got    = m.hello_got;
+            mine           = m.o.me;
+            got            = hello();
             impl::op & rs  = m.ops[0];
             impl::op & ss  = m.ops[1];
-            const auto arm = [&](impl::op & x, bool snd, void * p) {
-                x.is_send   = snd;
-                x.tag       = make_tag(kind::hello, 0, 0, 0);
-                x.p         = p;
-                x.n         = sizeof(hello);
-                x.abandoned = false;
-                x.info      = {};
-                x.state.store(st_queued);
-                m.post(snd ? 1 : 0);
+            const auto arm = [&](impl::op & x, int32_t i, bool snd, void * p) {
+                x.is_send        = snd;
+                x.tag            = make_tag(kind::hello, 0, 0, 0);
+                x.p              = p;
+                x.n              = sizeof(hello);
+                x.status         = UCS_OK;
+                x.info           = {};
+                const uint32_t g = (gen_of(x.word.load()) + 1) & gen_mask;
+                x.word.store(pack(g, st_queued));
+                m.post(i, g);
             };
-            arm(rs, false, &got);
+            const auto st_now = [](impl::op & x) {
+                return st_of(x.word.load());
+            };
+            const auto unarm = [](impl::op & x) {
+                x.word.store(pack(gen_of(x.word.load()), st_free));
+            };
+            arm(rs, 0, false, &got);
             if (o.leader) {
-                arm(ss, true, &mine);
+                arm(ss, 1, true, &mine);
             }
             bool sent = o.leader;  // the leader sent its X-HELLO above; the follower answers once it has the leader's
             const auto tw = clk::now();
@@ -606,29 +928,33 @@ bool link::start(const options & o, std::string & err) {
                 if (m.lost_flag.load()) {
                     break;
                 }
-                if (!o.leader && rs.state.load() == st_ok && !sent) {
-                    arm(ss, true, &mine);  // the follower answers after it has read the leader's
+                if (!o.leader && st_now(rs) == st_ok && !sent) {
+                    arm(ss, 1, true, &mine);  // the follower answers after it has read the leader's
                     sent = true;
                 }
-                const int32_t a = rs.state.load(), b = ss.state.load();
+                const uint32_t a = st_now(rs), b = st_now(ss);
                 if ((a == st_ok || a == st_err) && sent && (b == st_ok || b == st_err)) {
                     break;
                 }
             }
-            const bool ok = rs.state.load() == st_ok && ss.state.load() == st_ok;
+            const bool ok = st_now(rs) == st_ok && st_now(ss) == st_ok;
             if (!ok) {
+                const auto t1 = clk::now();
                 if (rs.req != nullptr) {
                     ucp_request_cancel(m.worker, rs.req);
-                    for (int i = 0; i < 1000 && rs.req != nullptr; ++i) {
-                        ucp_worker_progress(m.worker);
-                    }
                 }
-                rs.state.store(st_free);
-                ss.state.store(st_free);
+                while ((rs.req != nullptr || ss.req != nullptr) && since(t1) < std::max(2.0, o.retire_s)) {
+                    ucp_worker_progress(m.worker);
+                }
+                if (rs.req != nullptr || ss.req != nullptr) {
+                    return fail(e, "refused to start: an X-HELLO request did not end after its cancel");
+                }
+                unarm(rs);
+                unarm(ss);
                 return fail(e, m.lost_flag.load() ? m.lost_why() : "no X-HELLO answer");
             }
-            rs.state.store(st_free);
-            ss.state.store(st_free);
+            unarm(rs);
+            unarm(ss);
             m.theirs             = got;
             const std::string mm = hello_mismatch(mine, got);
             if (!mm.empty()) {
@@ -760,9 +1086,17 @@ bool link::map(void * p, size_t n, std::string & err) {
         mp.field_mask           = UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH;
         mp.address              = p;
         mp.length               = n;
-        st                      = ucp_mem_map(m.ctx, &mp, &h);
+#if defined(FNFL_TEST_HOOKS)
+        if (m.fk != nullptr) {
+            m.maps.push_back({ static_cast<uint8_t *>(p), n, nullptr });
+            life::map(p, n);
+            return;
+        }
+#endif
+        st = ucp_mem_map(m.ctx, &mp, &h);
         if (st == UCS_OK) {
             m.maps.push_back({ static_cast<uint8_t *>(p), n, h });
+            life::map(p, n);
         }
     });
     if (st != UCS_OK) {
@@ -771,24 +1105,26 @@ bool link::map(void * p, size_t n, std::string & err) {
     return true;
 }
 
-int32_t link::send(uint64_t tag, const void * p, size_t n, std::string & err) {
-    return p_->submit(true, tag, const_cast<void *>(p), n, err);
+int32_t link::send(uint64_t tag, const void * p, size_t n, std::string & err, std::shared_ptr<const void> keep) {
+    return p_->submit(true, tag, const_cast<void *>(p), n, std::move(keep), err);
 }
 
-int32_t link::recv(uint64_t tag, void * p, size_t n, std::string & err) {
-    return p_->submit(false, tag, p, n, err);
+int32_t link::recv(uint64_t tag, void * p, size_t n, std::string & err, std::shared_ptr<const void> keep) {
+    return p_->submit(false, tag, p, n, std::move(keep), err);
 }
 
 bool link::test(int32_t op, bool & done, std::string & err) {
     impl & m = *p_;
     done     = false;
-    if (op < 0 || op >= n_ops) {
-        return fail(err, "link: bad operation " + std::to_string(op));
+    impl::op * x = m.of(op, err);
+    if (x == nullptr) {
+        done = true;  // a stale handle: nothing of it is left to wait for
+        return false;
     }
-    const int32_t s = m.ops[op].state.load(std::memory_order_acquire);
-    if (s == st_ok || s == st_err) {
+    const uint32_t w = x->word.load(std::memory_order_acquire);
+    if (terminal(st_of(w))) {
         done = true;
-        return m.finish(op, s, err);
+        return m.finish(*x, w, err);
     }
     return true;
 }
@@ -804,23 +1140,58 @@ bool link::wait_any(const int32_t * ops, int32_t n, int32_t & which, std::string
     if (n < 1 || n > 8) {
         return fail(err, "link: wait_any of 1 .. 8 operations");
     }
+    impl::op * x[8] = {};
     for (int32_t k = 0; k < n; ++k) {
-        if (ops[k] < 0 || ops[k] >= n_ops) {
-            return fail(err, "link: bad operation " + std::to_string(ops[k]));
+        x[k] = m.of(ops[k], err);
+        if (x[k] == nullptr) {
+            return false;  // a stale handle: refused, the slot's current use untouched
         }
     }
     const double    bound = timeout_s < 0 ? m.o.timeout_s : timeout_s;
+    const uint64_t  tag0  = x[0]->tag;  // the give-up's line names it (retire releases the slot)
     const auto      t0    = clk::now();
     int64_t         spins = 0;
     clk::time_point lost_at;
     bool            saw_lost = false;
+    // TTTSBS: a wait that gives up retires its operations (each cancelled and its end observed) before it returns,
+    // so the caller may release or reuse their buffers; a completion that won the race with the cancel is the
+    // wait's success. One whose end cannot be observed is held by the link with its owner (retire)
+    // SSF1: a wait of slow::threshold_s or more while writers generate is a trace line (its tag and how it ended)
+    const auto      report   = [&](const char * how, uint64_t tag) {
+        const double s = since(t0);
+        m.tot.wait_s += s;
+        if (slow::due(s)) {
+            slow::line(
+                "link wait", s,
+                std::string(how) + ": " + tag_str(tag) + " (" + std::to_string(n) + " op" + (n == 1 ? "" : "s") + ")");
+        }
+    };
+    const auto give_up = [&](const char * how) {
+        bool          ok = false;
+        std::string   e2;
+        const int32_t held = m.retire(ops, n, n == 1 ? 0 : -1, &ok, &e2);
+        if (n == 1 && ok) {
+            report("completed after a give-up", tag0);
+            err.clear();
+            which = 0;
+            return true;
+        }
+        report(how, tag0);
+        if (held > 0) {
+            err += " (" + std::to_string(held) + " operation" + (held == 1 ? "" : "s") +
+                   " given up whose end was not observed: held, the link quiesced)";
+        }
+        return false;
+    };
     for (;;) {
         for (int32_t k = 0; k < n; ++k) {
-            const int32_t s = m.ops[ops[k]].state.load(std::memory_order_acquire);
-            if (s == st_ok || s == st_err) {
-                which = k;
-                m.tot.wait_s += since(t0);
-                return m.finish(ops[k], s, err);
+            const uint32_t w = x[k]->word.load(std::memory_order_acquire);
+            if (terminal(st_of(w))) {
+                which              = k;
+                const uint64_t tag = x[k]->tag;  // before finish releases the slot
+                const bool     ok  = m.finish(*x[k], w, err);
+                report(ok ? "completed" : "failed", tag);
+                return ok;
             }
         }
         if (m.lost_flag.load(std::memory_order_acquire)) {
@@ -830,35 +1201,40 @@ bool link::wait_any(const int32_t * ops, int32_t n, int32_t & which, std::string
                 lost_at  = clk::now();
             } else if (since(lost_at) > 0.5) {
                 which = 0;
-                err   = "split stage lost: " + tag_str(m.ops[ops[0]].tag) + ": " + m.lost_why();
-                for (int32_t k = 0; k < n; ++k) {
-                    m.abandon(ops[k]);
-                }
-                m.tot.wait_s += since(t0);
-                return false;
+                err   = "split stage lost: " + tag_str(x[0]->tag) + ": " + m.lost_why();
+                return give_up("lost");
             }
         }
         if ((++spins & 1023) == 0 && since(t0) > bound) {
             which       = 0;
-            err         = "no completion in " + std::to_string(bound) + " s: " + tag_str(m.ops[ops[0]].tag);
+            err         = "no completion in " + std::to_string(bound) + " s: " + tag_str(x[0]->tag);
             uint64_t ut = 0;
             size_t   ub = 0;
             if (unexpected(ut, ub)) {
                 err += " (refused: an unexpected " + tag_str(ut) + " of " + std::to_string(ub) + " bytes is waiting)";
             }
-            for (int32_t k = 0; k < n; ++k) {
-                m.abandon(ops[k]);
-            }
-            m.tot.wait_s += since(t0);
-            return false;
+            return give_up("timed out");
         }
         relax();
     }
 }
 
+int32_t link::retire(const int32_t * ops, int32_t n) {
+    return p_->retire(ops, n);
+}
+
+void link::quiesce(const std::string & why) {
+    p_->quiesce(why);
+}
+
 bool link::unexpected(uint64_t & tag, size_t & bytes) {
     impl & m     = *p_;
     bool   found = false;
+#if defined(FNFL_TEST_HOOKS)
+    if (m.fk != nullptr) {
+        return fault_unexpected(m, tag, bytes);  // the test network's probe (no job: its thread may be held)
+    }
+#endif
     m.run_job([&]() {
         ucp_tag_recv_info_t info = {};
         ucp_tag_message_h   h    = ucp_tag_probe_nb(m.worker, 0, 0, 0, &info);
@@ -882,12 +1258,46 @@ void link::stop() {
         }
         m.running.store(false);
     }
-    if (m.worker != nullptr) {
-        // requests still posted end with the worker; their slots are not reused after stop
+    // TTTSBS: the link thread ended what it could before it returned; every op that ended is released now, and one
+    // still posted ends with the worker, destroyed before any range is unmapped and before any owner is released
+    const auto release_ended = [&]() {
+        for (impl::op & x : m.ops) {
+            const uint32_t w = x.word.load(std::memory_order_acquire);
+            if (terminal(st_of(w)) || st_of(w) == st_queued) {  // queued: never posted (the thread is gone)
+                life::done(x.life, "ended at stop");
+                x.life      = 0;
+                x.abandoned = false;
+                x.keep.reset();
+                x.word.store(pack(gen_of(w), st_free), std::memory_order_release);
+            }
+        }
+    };
+    const auto release_rest = [&](const char * how) {
+        for (impl::op & x : m.ops) {
+            const uint32_t w = x.word.load(std::memory_order_acquire);
+            if (st_of(w) != st_free) {
+                life::done(x.life, how);
+                x.life      = 0;
+                x.abandoned = false;
+                x.req       = nullptr;
+                x.keep.reset();
+                x.word.store(pack(gen_of(w), st_free), std::memory_order_release);
+            }
+        }
+    };
+    release_ended();
+#if defined(FNFL_TEST_HOOKS)
+    if (m.fk != nullptr) {
+        m.fk.reset();  // no thread progresses the test network now: nothing is copied after this
+        release_rest("ended with the test network");
         for (const impl::mapped & x : m.maps) {
-            ucp_mem_unmap(m.ctx, x.h);
+            life::unmap(x.p, x.n);
         }
         m.maps.clear();
+        return;
+    }
+#endif
+    if (m.worker != nullptr) {
         if (m.listener != nullptr) {
             ucp_listener_destroy(m.listener);
             m.listener = nullptr;
@@ -895,6 +1305,12 @@ void link::stop() {
         ucp_worker_destroy(m.worker);
         m.worker = nullptr;
     }
+    release_rest("ended with the worker");
+    for (const impl::mapped & x : m.maps) {
+        life::unmap(x.p, x.n);
+        ucp_mem_unmap(m.ctx, x.h);
+    }
+    m.maps.clear();
     if (m.ctx != nullptr) {
         ucp_cleanup(m.ctx);
         m.ctx = nullptr;
@@ -906,5 +1322,334 @@ void link::stop() {
         }
     }
 }
+
+#if defined(FNFL_TEST_HOOKS)
+
+// ---- the test hooks' in-process network (fn/xchg/link_fault.h) ----
+
+struct fault::net {
+    struct msg {  // a posted send, sent to the other side
+        int32_t      op  = 0;
+        uint32_t     gen = 0;
+        uint64_t     tag = 0;
+        const void * p   = nullptr;
+        size_t       n   = 0;
+    };
+
+    struct rcv {  // a posted receive
+        int32_t  op   = 0;
+        uint32_t gen  = 0;
+        uint64_t tag  = 0;
+        void *   p    = nullptr;
+        size_t   n    = 0;
+        uint64_t life = 0;
+    };
+
+    struct xfer {  // matched, its copy not run yet (run by the receiver's link thread)
+        rcv  r;
+        msg  m;
+        bool held = false, stuck = false;
+    };
+
+    struct fin {  // an end for a side's own operation, published by that side's link thread
+        int32_t      op  = 0;
+        uint32_t     gen = 0;
+        ucs_status_t st  = UCS_OK;
+        size_t       got = 0;
+        uint64_t     tag = 0;
+    };
+
+    struct gate {
+        uint64_t mask = 0, value = 0;
+        bool     stuck = false;
+    };
+
+    std::mutex        mu;
+    link::impl *      side[2] = { nullptr, nullptr };
+    std::deque<msg>   incoming[2];  // sent to side s, no receive matched yet (unexpected)
+    std::deque<rcv>   posted[2];    // side s's receives, not matched yet
+    std::deque<xfer>  matched[2];   // side s's matched receives, copy pending
+    std::deque<fin>   done[2];      // side s's ends to publish
+    std::vector<gate> gates[2];     // side s's holds on its receives
+    bool              lost_seen[2] = { false, false };
+    bool              lost         = false;
+    int64_t           copies[2] = { 0, 0 }, dropped[2] = { 0, 0 };
+
+    bool gated(int32_t s, uint64_t tag, bool & stuck) const {
+        for (const gate & g : gates[s]) {
+            if ((tag & g.mask) == g.value) {
+                stuck = g.stuck;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // every operation of side s not stuck ends with st (a forced close, a lost peer); the peer's halves of side s's
+    // transfers end with a reset. Under mu
+    void end_side(int32_t s, ucs_status_t st) {
+        const int32_t o = 1 - s;
+        for (const rcv & r : posted[s]) {
+            done[s].push_back({ r.op, r.gen, st, 0, 0 });
+        }
+        posted[s].clear();
+        for (auto it = incoming[o].begin(); it != incoming[o].end();) {  // s's unmatched sends
+            done[s].push_back({ it->op, it->gen, st, 0, 0 });
+            it = incoming[o].erase(it);
+        }
+        for (int32_t q = 0; q < 2; ++q) {
+            for (auto it = matched[q].begin(); it != matched[q].end();) {
+                if (it->stuck) {
+                    ++it;
+                    continue;
+                }
+                // a transfer into side q from side 1 - q: both halves end, no copy
+                done[q].push_back({ it->r.op, it->r.gen, q == s ? st : UCS_ERR_CONNECTION_RESET, 0, 0 });
+                done[1 - q].push_back({ it->m.op, it->m.gen, 1 - q == s ? st : UCS_ERR_CONNECTION_RESET, 0, 0 });
+                ++dropped[q];
+                it = matched[q].erase(it);
+            }
+        }
+    }
+};
+
+struct fault_access {
+    static link::impl & of(link & l) { return *l.p_; }
+};
+
+void link::impl::fake_post(int32_t i) {
+    op &                        x = ops[i];
+    std::lock_guard<std::mutex> g(fk->mu);
+    if (x.is_send) {
+        fault::net::msg m;
+        m.op  = i;
+        m.gen = gen_of(x.word.load(std::memory_order_relaxed));
+        m.tag = x.tag;
+        m.p   = x.p;
+        m.n   = x.n;
+        fk->incoming[1 - side].push_back(m);
+    } else {
+        fault::net::rcv r;
+        r.op   = i;
+        r.gen  = gen_of(x.word.load(std::memory_order_relaxed));
+        r.tag  = x.tag;
+        r.p    = x.p;
+        r.n    = x.n;
+        r.life = x.life;
+        fk->posted[side].push_back(r);
+    }
+    x.req = &x;  // a request outstanding (the cancel path's test); never freed
+}
+
+void link::impl::fake_cancel(int32_t i) {
+    op &                        x = ops[i];
+    std::lock_guard<std::mutex> g(fk->mu);
+    auto &                      pr = fk->posted[side];
+    const uint32_t              gn = gen_of(x.word.load(std::memory_order_relaxed));
+    for (auto it = pr.begin(); it != pr.end(); ++it) {
+        if (it->op == i && it->gen == gn) {
+            fk->done[side].push_back({ i, gn, UCS_ERR_CANCELED, 0, 0 });
+            pr.erase(it);
+            return;
+        }
+    }
+    // matched (its copy pending) or a send: not cancellable, as UCP's in-progress receives and sends
+}
+
+void link::impl::fake_close() {
+    std::lock_guard<std::mutex> g(fk->mu);
+    fk->lost = true;
+    fk->end_side(side, UCS_ERR_CANCELED);
+    fk->end_side(1 - side, UCS_ERR_CONNECTION_RESET);
+}
+
+int32_t link::impl::fake_progress() {
+    std::vector<fault::net::fin> fins;
+    bool                         lost_now = false;
+    {
+        std::lock_guard<std::mutex> g(fk->mu);
+        fault::net &                f = *fk;
+        const int32_t               s = side;
+        if (f.lost && !f.lost_seen[s]) {
+            f.lost_seen[s] = true;
+            lost_now       = true;
+        }
+        // match: messages in arrival order, each to the first posted receive of its tag
+        for (auto mi = f.incoming[s].begin(); mi != f.incoming[s].end();) {
+            auto ri = f.posted[s].begin();
+            while (ri != f.posted[s].end() && ri->tag != mi->tag) {
+                ++ri;
+            }
+            if (ri == f.posted[s].end()) {
+                ++mi;
+                continue;
+            }
+            fault::net::xfer x;
+            x.r    = *ri;
+            x.m    = *mi;
+            x.held = f.gated(s, x.r.tag, x.stuck);
+            f.matched[s].push_back(x);
+            f.posted[s].erase(ri);
+            mi = f.incoming[s].erase(mi);
+        }
+        // run: the delayed copy, reading the sender's buffer now
+        for (auto xi = f.matched[s].begin(); xi != f.matched[s].end();) {
+            if (xi->held) {
+                ++xi;
+                continue;
+            }
+            const size_t c = std::min(xi->r.n, xi->m.n);
+            life::publish(xi->r.life);
+            std::memcpy(xi->r.p, xi->m.p, c);
+            f.copies[s] += int64_t(c);
+            const ucs_status_t rs = xi->m.n > xi->r.n ? UCS_ERR_MESSAGE_TRUNCATED : UCS_OK;
+            f.done[s].push_back({ xi->r.op, xi->r.gen, rs, xi->m.n, xi->m.tag });
+            f.done[1 - s].push_back({ xi->m.op, xi->m.gen, UCS_OK, 0, 0 });
+            xi = f.matched[s].erase(xi);
+        }
+        fins.assign(f.done[s].begin(), f.done[s].end());
+        f.done[s].clear();
+    }
+    if (lost_now) {
+        {
+            std::lock_guard<std::mutex> g(why_mu);
+            if (why.empty()) {
+                why = "the peer is lost (TEST: killed)";
+            }
+        }
+        lost_flag.store(true, std::memory_order_release);
+    }
+    for (const fault::net::fin & e : fins) {
+        op &           x = ops[e.op];
+        const uint32_t w = x.word.load(std::memory_order_relaxed);
+        if (w != pack(e.gen, st_posted) || x.req == nullptr) {
+            fprintf(stderr, "link: TEST: a stale end for operation %d (generation %u, word %#x) dropped\n", e.op, e.gen,
+                    w);
+            continue;
+        }
+        if (!x.is_send) {
+            x.info.length     = e.got;
+            x.info.sender_tag = e.tag;
+        }
+        complete(x, e.st);
+    }
+    return int32_t(fins.size());
+}
+
+bool fault_unexpected(link::impl & m, uint64_t & tag, size_t & bytes) {
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    const auto &                in = m.fk->incoming[m.side];
+    if (in.empty()) {
+        return false;
+    }
+    tag   = in.front().tag;
+    bytes = in.front().n;
+    return true;
+}
+
+namespace fault {
+
+bool pair(link & a, link & b, const options & oa, const options & ob, std::string & err) {
+    auto            f     = std::make_shared<net>();
+    link::impl *    im[2] = { &fault_access::of(a), &fault_access::of(b) };
+    const options * o[2]  = { &oa, &ob };
+    for (int32_t s = 0; s < 2; ++s) {
+        link::impl & m = *im[s];
+        if (m.running.load()) {
+            err = "link: TEST: pair of a started link";
+            return false;
+        }
+        m.o         = *o[s];
+        m.o.leader  = s == 0;
+        m.o.me.role = s;
+        m.fk        = f;
+        m.side      = s;
+        m.transport = "test/in-process";
+        f->side[s]  = &m;
+    }
+    im[0]->theirs = im[1]->o.me;
+    im[1]->theirs = im[0]->o.me;
+    for (int32_t s = 0; s < 2; ++s) {
+        link::impl & m = *im[s];
+        m.running.store(true);
+        m.th = std::thread([&m]() { m.run(); });
+    }
+    return true;
+}
+
+void hold_transfers(link & receiver, uint64_t mask, uint64_t value, bool stuck) {
+    link::impl &                m = fault_access::of(receiver);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    m.fk->gates[m.side].push_back({ mask, value, stuck });
+}
+
+void release_transfers(link & receiver) {
+    link::impl &                m = fault_access::of(receiver);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    m.fk->gates[m.side].clear();
+    for (net::xfer & x : m.fk->matched[m.side]) {
+        x.held  = false;
+        x.stuck = false;
+    }
+}
+
+int32_t held_transfers(link & receiver) {
+    link::impl &                m = fault_access::of(receiver);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    int32_t                     n = 0;
+    for (const net::xfer & x : m.fk->matched[m.side]) {
+        n += x.held ? 1 : 0;
+    }
+    return n;
+}
+
+int32_t unexpected_count(link & receiver) {
+    link::impl &                m = fault_access::of(receiver);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    return int32_t(m.fk->incoming[m.side].size());
+}
+
+void hold_thread(link & l, bool on) {
+    fault_access::of(l).hold.store(on, std::memory_order_release);
+}
+
+void wait_parked(link & l) {
+    link::impl & m = fault_access::of(l);
+    while (!m.parked.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
+void fail_submit(link & l, int32_t nth) {
+    fault_access::of(l).fail_nth = nth;
+}
+
+void on_cancel(link & l, std::function<void()> f) {
+    fault_access::of(l).cancel_hook = std::move(f);
+}
+
+void kill(link & l) {
+    link::impl &                m = fault_access::of(l);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    m.fk->lost = true;
+    m.fk->end_side(0, UCS_ERR_CONNECTION_RESET);
+    m.fk->end_side(1, UCS_ERR_CONNECTION_RESET);
+}
+
+int64_t copies(link & l) {
+    link::impl &                m = fault_access::of(l);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    return m.fk->copies[m.side];
+}
+
+int64_t dropped(link & l) {
+    link::impl &                m = fault_access::of(l);
+    std::lock_guard<std::mutex> g(m.fk->mu);
+    return m.fk->dropped[m.side];
+}
+
+}  // namespace fault
+
+#endif
 
 }  // namespace fn::xchg::link

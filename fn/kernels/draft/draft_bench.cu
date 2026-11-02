@@ -5,6 +5,7 @@
 #include "fn/kernels/qsa/attend.h"
 #include "fn/proto/xp1/timing.h"
 #include "fn/xchg/xchg.h"
+#include "fn/tools/test_cuda.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -36,11 +37,7 @@ constexpr double ramp_us = 1.949;         // HX2 B1's fixed term
 constexpr int64_t flush_bytes = 12 << 20; // the L2 flush (XP1 Amendment 4)
 
 bool cuda_ok(cudaError_t e, const char * what) {
-    if (e != cudaSuccess) {
-        fprintf(stderr, "draft-kernel-bench: %s: %s\n", what, cudaGetErrorString(e));
-        return false;
-    }
-    return true;
+    return fn::test::cuda_ok(e, "draft-kernel-bench", what);
 }
 
 std::string utc_now() {

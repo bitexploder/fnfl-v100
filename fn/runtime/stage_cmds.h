@@ -20,6 +20,10 @@ struct fnfl_split {
     fn::runtime::stage::crossing                  cross;
     std::unique_ptr<fn::runtime::stage::leader>   lead;
     std::unique_ptr<fn::runtime::stage::follower> follow;
+
+    // TTTSBS: the link stops first (every operation ended, the ranges unmapped after the transport's quiescence),
+    // then the members go: the crossing's and the slots' pinned buffers are freed with no operation left on them
+    ~fnfl_split() { link.stop(); }
 };
 
 // before the engine: the boundary buffers (pinned, not yet mapped) and the engine's stage fields
