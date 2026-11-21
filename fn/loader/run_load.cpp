@@ -39,7 +39,10 @@ double since(std::chrono::steady_clock::time_point t0) {
 
 void file_state_params(const model::model & m, model::state_params & sp) {
     const int32_t t_out = model::model::find("output.weight");
-    sp.head_q8          = t_out >= 0 && std::strcmp(m.tp(t_out).format, "Q8_0") == 0;  // TTTS2
+    sp.head_fmt         = t_out < 0 ? fn::head::draft_fmt::q5_k
+                        : std::strcmp(m.tp(t_out).format, "Q8_0") == 0 ? fn::head::draft_fmt::q8_0
+                        : std::strcmp(m.tp(t_out).format, "Q6_K") == 0 ? fn::head::draft_fmt::q6_k
+                                                                       : fn::head::draft_fmt::q5_k;  // TTTS2, IQ3S
     sp.ple_kv           = model::ple_kv_of(m);                                         // TTTS3
     sp.ple_conv32       = model::ple_conv32_of(m);
 }

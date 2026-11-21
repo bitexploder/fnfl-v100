@@ -156,6 +156,7 @@ bool ex1_fmt(const char * name, experts::fmt & f) {
         {"IQ3_XXS", experts::fmt::iq3_xxs}, {"IQ3_S", experts::fmt::iq3_s},   {"Q2_0", experts::fmt::q2_0},
         {"IQ4_NL", experts::fmt::iq4_nl},   {"Q8_0", experts::fmt::q8_0},     {"Q4_K", experts::fmt::q4_k},
         {"Q5_K", experts::fmt::q5_k},       {"Q5_1", experts::fmt::q5_1}, // ME1: the Q4 candidate's routed formats
+        {"IQ4_XS", experts::fmt::iq4_xs},  // IQ3S: the Swift IQ3_S file's layer 47 routed gate/up
     };
     for (const auto & e : table) {
         if (std::strcmp(e.first, name) == 0) {
@@ -616,7 +617,47 @@ bool resolve_format(model::model & m, int32_t t, const fnfl_gguf_tensor & g, std
     src.src_bb                 = g.block_bytes;
     src.conv                   = model::src_conv::none;
     const char * gf            = format_name(g.type_name);
+    // IQ3S: the routers (every layer's ffn_gate_inp and ffn_gate_inp_shexp) are BF16 resident whatever the placement
+    // lists (layer.h: the prompt's and the decode's router products read BF16). An F32 file's are narrowed exactly
+    // (TTTS2's f32_bf16, which refuses a value with a nonzero low half): the Swift IQ3_S file's placement, generated
+    // from that file, names them F32, so without this they were read as BF16 bytes of F32 values (garbage routing)
+    if (gf != nullptr && std::strcmp(gf, "F32") == 0 && std::strcmp(tp.format, "F32") == 0 && tp.lay == layout::gguf) {
+        const size_t n = g.name.size();
+        const auto   ends = [&](const char * e) {
+            const size_t k = std::strlen(e);
+            return n > k && g.name.compare(n - k, k, e) == 0;
+        };
+        if (ends(".ffn_gate_inp.weight") || ends(".ffn_gate_inp_shexp.weight")) {
+            tp.format      = "BF16";
+            tp.block_elems = 1;
+            tp.block_bytes = 2;
+        }
+    }
     if (gf != nullptr && std::strcmp(gf, tp.format) == 0) {
+        // IQ3S: the placed format, but an EX1 tensor's card bytes are its packed layout's (gate_up_bytes /
+        // down_bytes), which the placement's GGUF bytes need not be (IQ4_XS's K-quant tile is 148 bytes a 256, GGUF's
+        // 136); for every other EX1 format the two agree, so this changes nothing for them
+        if (tp.lay == layout::ex1_gate || tp.lay == layout::ex1_up || tp.lay == layout::ex1_down) {
+            experts::fmt f{};
+            if (!ex1_fmt(gf, f)) {
+                err = "GGUF tensor '" + g.name + "' (" + g.type_name + "): not an EX1 expert format";
+                return false;
+            }
+            for (int32_t card = 0; card < 2; ++card) {
+                model::card_place & cp = tp.card[card];
+                if (cp.row_count == 0) {
+                    continue;
+                }
+                const int64_t bytes = fn::n_expert * (tp.lay == layout::ex1_down ? experts::down_bytes(f)
+                                                                                 : experts::gate_up_bytes(f) / 2);
+                if (bytes <= 0) {
+                    err = "GGUF tensor '" + g.name + "': no packed size for its layout";
+                    return false;
+                }
+                m.placed_card_bytes[card] += bytes - cp.bytes;
+                cp.bytes = bytes;
+            }
+        }
         return true;
     }
     const auto refuse = [&](const char * why) {

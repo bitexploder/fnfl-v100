@@ -133,6 +133,7 @@ bool embed(pass_card & p, const int32_t * tok, int32_t rows, std::string & err) 
     a.hx = p.emb_hx;
     a.err = p.c.rings->err(p.c.card);
     a.q8    = p.embd_q8;
+    a.iq4xs = p.embd_iq4xs;
     return fn::embed::embed(rows, a, p.c.stream) ? true : fail(err, "draft embed");
 }
 
@@ -467,7 +468,8 @@ bool pick(pass_card & p, draft_card & d, int32_t j, bool decide, const use_count
                                                NV,
                                                lg,
                                                d.logits_work,
-                                               d.head_q8 };
+                                               d.head_fmt == fn::head::draft_fmt::q8_0,
+                                               d.head_fmt == fn::head::draft_fmt::q6_k };
             if (!fn::head::logits(1, la, p.c.stream) || !fn::samp::pick_stage(p.samp, io, 0, p.c.stream)) {
                 return fail(err, "draft logits / sampled pick select");
             }
@@ -488,7 +490,8 @@ bool pick(pass_card & p, draft_card & d, int32_t j, bool decide, const use_count
                                            NV,
                                            lg,
                                            d.logits_work,
-                                           d.head_q8 };
+                                           d.head_fmt == fn::head::draft_fmt::q8_0,
+                                           d.head_fmt == fn::head::draft_fmt::q6_k };
         fn::head::reduce_args ra = {lg, NV, 0, p.pair_own, rg.slot(1 - r, fn::xchg::msg::greedy, 0), p.greedy_work};
         ra.ids = d.head_ids;
         if (!fn::head::logits(1, la, p.c.stream) || !fn::head::greedy_reduce(1, ra, p.c.stream)) {
@@ -825,7 +828,8 @@ bool joint_pick(draft_joint & J, int32_t j, bool decide, int32_t rows, const use
                                                NV,
                                                d.logits,
                                                d.logits_work,
-                                               d.head_q8 };
+                                               d.head_fmt == fn::head::draft_fmt::q8_0,
+                                               d.head_fmt == fn::head::draft_fmt::q6_k };
             if (!fn::head::logits(J.lanes, la, p.c.stream)) {
                 return fail(err, "joint draft logits");
             }
@@ -840,7 +844,8 @@ bool joint_pick(draft_joint & J, int32_t j, bool decide, int32_t rows, const use
                                            NV,
                                            d.logits,
                                            d.logits_work,
-                                           d.head_q8 };
+                                           d.head_fmt == fn::head::draft_fmt::q8_0,
+                                           d.head_fmt == fn::head::draft_fmt::q6_k };
         fn::head::reduce_args ra = {d.logits,     NV, 0, p.pair_own, rg.slot(1 - r, fn::xchg::msg::greedy, 0),
                                     p.greedy_work};
         ra.ids = d.head_ids;
@@ -1298,11 +1303,16 @@ bool draft_head_fill(model & m, const std::vector<int32_t> & subset, std::string
     const tensor_source & src = m.sources[size_t(oi)];
     const uint8_t * vocab = src.file != nullptr ? src.file->data() + src.offset : nullptr;
     const bool            q8    = std::strcmp(m.tp(oi).format, "Q8_0") == 0;  // TTTS2: UD-Q4_K_XL
-    const int64_t         hb    = fn::head::draft_head_bytes(NV, q8);
+    const bool            q6    = std::strcmp(m.tp(oi).format, "Q6_K") == 0;  // IQ3S: GSQ-RCO IQ3_S
+    const fn::head::draft_fmt hf = q8 ? fn::head::draft_fmt::q8_0
+                                 : q6 ? fn::head::draft_fmt::q6_k
+                                      : fn::head::draft_fmt::q5_k;
+    const int64_t         hb    = fn::head::draft_head_bytes(NV, hf);
     if (vocab != nullptr &&
-        (src.row_bytes != fn::dense::row_bytes(q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k, D) ||
+        (src.row_bytes != fn::dense::row_bytes(
+                              q8 ? fn::dense::fmt::q8_0 : q6 ? fn::dense::fmt::q6_k : fn::dense::fmt::q5_k, D) ||
          src.offset + uint64_t(src.row_bytes) * fn::head::n_vocab > src.file->size())) {
-        return fail(err, "draft head: output.weight is not Q5_K or Q8_0 rows of 2,560 in its file");
+        return fail(err, "draft head: output.weight is not Q5_K, Q8_0 or Q6_K rows of 2,560 in its file");
     }
     std::vector<int32_t> ids(size_t(NV), 0);
     std::vector<uint8_t> rows(size_t(hb), 0);
@@ -1312,15 +1322,15 @@ bool draft_head_fill(model & m, const std::vector<int32_t> & subset, std::string
         }
         std::fill(rows.begin(), rows.end(), uint8_t(0));
         if (vocab != nullptr &&
-            !fn::head::pack_draft_head(vocab, size_t(src.row_bytes), ids.data(), NV, rows.data(), q8)) {
+            !fn::head::pack_draft_head(vocab, size_t(src.row_bytes), ids.data(), NV, rows.data(), hf)) {
             return fail(err, "draft head: pack_draft_head");
         }
-        uint8_t * w = class_part(m, "draft head copy (DR1)", "draft head rows (Q5_K, packed)", card, err);
+        uint8_t * w = class_part(m, "draft head copy (DR1)", "draft head rows (packed)", card, err);
         uint8_t * map = class_part(m, "draft head copy (DR1)", "draft head ID map", card, err);
         if (w == nullptr || map == nullptr) {
             return false;
         }
-        if (class_part_bytes(m, "draft head copy (DR1)", "draft head rows (Q5_K, packed)", card) != hb) {
+        if (class_part_bytes(m, "draft head copy (DR1)", "draft head rows (packed)", card) != hb) {
             return fail(err, "draft head: the reservation's copy is not draft_head_bytes(32,768)");
         }
         if (!cuda_ok(cudaSetDevice(m.device[card]), "cudaSetDevice", err) ||
@@ -1339,7 +1349,7 @@ bool draft_init(model & m, const pass_card & p, draft_card & d, std::string & er
         return false;
     }
     const char * R = "draft round (DR1)";
-    d.head_w = class_part(m, "draft head copy (DR1)", "draft head rows (Q5_K, packed)", card, err);
+    d.head_w = class_part(m, "draft head copy (DR1)", "draft head rows (packed)", card, err);
     d.head_ids =
         reinterpret_cast<const int32_t *>(class_part(m, "draft head copy (DR1)", "draft head ID map", card, err));
     d.k_cache = reinterpret_cast<uint16_t *>(class_part(m, "draft KV (F16)", "L48 K", card, err));
@@ -1361,8 +1371,12 @@ bool draft_init(model & m, const pass_card & p, draft_card & d, std::string & er
         return false;
     }
     const int32_t oi = model::find("output.weight");
-    d.head_q8        = oi >= 0 && std::strcmp(m.tp(oi).format, "Q8_0") == 0;  // TTTS2
-    d.logits_work    = fn::head::logits_work_bytes(NV, d.head_q8) > 0 ? work : nullptr;
+    d.head_fmt       = oi < 0 ? fn::head::draft_fmt::q5_k
+                                 : std::strcmp(m.tp(oi).format, "Q8_0") == 0 ? fn::head::draft_fmt::q8_0
+                                 : std::strcmp(m.tp(oi).format, "Q6_K") == 0 ? fn::head::draft_fmt::q6_k
+                                                                            : fn::head::draft_fmt::q5_k;  // TTTS2, IQ3S
+    d.logits_work    = fn::head::logits_work_bytes(NV, d.head_fmt == fn::head::draft_fmt::q8_0,
+                                                     d.head_fmt == fn::head::draft_fmt::q6_k) > 0 ? work : nullptr;
     if (!draft_index_init(m, card, d, err)) {
         return false;
     }

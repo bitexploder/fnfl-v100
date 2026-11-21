@@ -1,5 +1,6 @@
 #include "fn/kernels/dense/iq3s.cuh"
 #include "fn/kernels/embed/embed.h"
+#include "fn/kernels/embed/iq4xs_embed.cuh"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -129,6 +130,43 @@ __global__ void __launch_bounds__(n_threads) embed_q8_kernel(const uint8_t * __r
     }
 }
 
+// IQ3S: the IQ4_XS table. Block b: row b; thread t: stream t / 20, superblock (t % 20) / 4, quarter t % 4, as
+// embed_kernel
+__global__ void __launch_bounds__(n_threads) embed_iq4xs_kernel(const uint8_t * __restrict__ table,
+                                                                const int32_t * __restrict__ tok,
+                                                                float * __restrict__ hres,
+                                                                float * __restrict__ hpost,
+                                                                float * __restrict__ hx,
+                                                                uint32_t * err) {
+    const int32_t b  = blockIdx.x;
+    const int32_t t  = threadIdx.x;
+    const int32_t id = __ldg(tok + b);
+    if (id < 0 || id >= n_vocab) {
+        if (t == 0) {
+            atomicOr(err, err_token);
+        }
+        return;
+    }
+    const int32_t s  = t / (n_super * n_quarter);
+    const int32_t sb = (t % (n_super * n_quarter)) / n_quarter;
+    const int32_t q  = t % n_quarter;
+    float4        o[16];
+    iq4xs_quarter(table + int64_t(id) * iq4xs_row_bytes + sb * iq4xs_super_bytes, q, o);
+    float * out = hres + (int64_t(b) * n_stream + s) * n_own + sb * 256 + 64 * q;
+#pragma unroll
+    for (int32_t k = 0; k < 16; ++k) {
+        reinterpret_cast<float4 *>(out)[k] = o[k];
+    }
+    const float4 z = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int32_t k = 0; k < n_own / 4 / n_threads; ++k) {
+        reinterpret_cast<float4 *>(hx + int64_t(b) * n_own)[t + k * n_threads] = z;
+    }
+    if (t == 0) {
+        reinterpret_cast<float4 *>(hpost)[b] = z;
+    }
+}
+
 } // namespace
 
 bool check_tokens(const int32_t * tok, int32_t rows) {
@@ -146,10 +184,15 @@ bool check_tokens(const int32_t * tok, int32_t rows) {
 }
 
 bool embed(int32_t rows, const args & a, void * stream) {
-    if (rows < 1 || rows > max_rows || a.table == nullptr || (!a.q8 && !al16(a.grids)) || a.tok == nullptr ||
+    if (rows < 1 || rows > max_rows || a.table == nullptr || (a.q8 && a.iq4xs) || (!a.q8 && !a.iq4xs && !al16(a.grids)) || a.tok == nullptr ||
         !al16(a.hres) || !al16(a.hpost) || !al16(a.hx) || a.err == nullptr || stream == nullptr) {
         fprintf(stderr, "embed: rejected (rows %d, or a null or misaligned pointer)\n", rows);
         return false;
+    }
+    if (a.iq4xs) {
+        embed_iq4xs_kernel<<<rows, n_threads, 0, static_cast<cudaStream_t>(stream)>>>(a.table, a.tok, a.hres,
+                                                                                      a.hpost, a.hx, a.err);
+        return cudaPeekAtLastError() == cudaSuccess;
     }
     if (a.q8) {
         embed_q8_kernel<<<rows, n_threads, 0, static_cast<cudaStream_t>(stream)>>>(a.table, a.tok, a.hres, a.hpost,

@@ -1,4 +1,5 @@
 #pragma once
+#include "draft_fmt.h"
 
 // Every buffer FNFL reserves at load beside the weights (R1), as classes of named parts with their per-card bytes.
 // Each part's size is arithmetic from its kernel's size function or the design's formula, named beside it in
@@ -91,7 +92,7 @@ struct state_params {
     bool kv_q8 = false;
     window  win;  // TTTS1: the box's layers and extras (whole by default)
     // TTTS2: output.weight is Q8_0 (UD-Q4_K_XL): the draft head copy holds Q8_0 rows (head::draft_head_bytes)
-    bool            head_q8    = false;
+    fn::head::draft_fmt head_fmt = fn::head::draft_fmt::q5_k;  // Q6K: Q6_K too
     // TTTS3: the PLE key and value's format (UD-Q4_K_XL: Q8_0 as stored) and TTTS2's F32 taps: their prompt replicas'
     // bytes (prompt_replica_bytes)
     fn::ple::kv_fmt ple_kv     = fn::ple::kv_fmt::bf16;

@@ -82,6 +82,7 @@ bool embed(pass_card & p, int32_t rows, std::string & err) {
     a.hx = p.emb_hx;
     a.err = p.c.rings->err(p.c.card);
     a.q8    = p.embd_q8;
+    a.iq4xs = p.embd_iq4xs;
     return set_device(p, err) && (fn::embed::embed(rows, a, p.c.stream) ? true : fail(err, "embed"));
 }
 
@@ -361,7 +362,8 @@ bool head_part(pass_card & p, int32_t rows, int32_t part, const use_counters & u
                                            fn::head::n_vocab_card,
                                            p.logits,
                                            nullptr,
-                                           p.out_q8 };
+                                           p.out_q8,
+                                           p.out_q6k };
         // SM1: the decision's start in context (stamp_logits), only with a sampler, so TG1's graphs are unchanged
         ok = fn::head::logits(rows, la, p.c.stream) &&
              (o.sampling == nullptr || fn::round::stamp_logits(p.rstate, p.c.stream));
@@ -432,6 +434,12 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
     p.token_embd = tensor_ptr(m, "token_embd.weight", card, err);
     const int32_t te = model::find("token_embd.weight");
     p.embd_q8        = te >= 0 && std::strcmp(m.tp(te).format, "Q8_0") == 0;  // TTTS2
+    p.embd_iq4xs     = te >= 0 && std::strcmp(m.tp(te).format, "IQ4_XS") == 0;  // IQ3S
+    // IQ3S: the embed kernels decode Q8_0, IQ4_XS or IQ3_S only; any other table would be misread silently
+    if (te >= 0 && !p.embd_q8 && !p.embd_iq4xs && std::strcmp(m.tp(te).format, "IQ3_S") != 0) {
+        return fail(err, std::string("token_embd.weight: ") + m.tp(te).format +
+                             " (the embedding decodes Q8_0, IQ4_XS or IQ3_S)");
+    }
     if (p.token_embd == nullptr) {
         return false;
     }
@@ -471,6 +479,12 @@ bool pass_init(model & m, int32_t card, void * stream, const fn::round::desc * h
         }
         const int32_t oi = model::find("output.weight");
         p.out_q8         = oi >= 0 && std::strcmp(m.tp(oi).format, "Q8_0") == 0;
+        p.out_q6k        = oi >= 0 && std::strcmp(m.tp(oi).format, "Q6_K") == 0;  // IQ3S
+        // IQ3S: the head's product takes Q8_0, Q6_K or Q5_K rows only; any other would be misread silently
+        if (oi >= 0 && !p.out_q8 && !p.out_q6k && std::strcmp(m.tp(oi).format, "Q5_K") != 0) {
+            return fail(err, std::string("output.weight: ") + m.tp(oi).format +
+                                 " (the head decodes Q8_0, Q6_K or Q5_K)");
+        }
         if (oi < 0 || oi >= (int32_t) m.dense_packed.size() || m.dense_packed[size_t(oi)] == 0) {
             return fail(err, "output.weight: not in DP2's packed layout (pack_dense_all)");
         }
@@ -903,7 +917,8 @@ bool joint_logits(joint_pass & jp, const use_counters & u, std::string & err) {
                           fn::head::n_vocab_card,
                           p.logits,
                           nullptr,
-                          p.out_q8 };
+                          p.out_q8,
+                          p.out_q6k };
     }
     pass_card & p0 = *jp.lane[0];
     if (!set_device(p0, err)) {

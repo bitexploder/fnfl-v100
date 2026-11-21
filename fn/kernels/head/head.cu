@@ -206,7 +206,7 @@ fn::dense::product_args vocab_args(const logits_args & a) {
     fn::dense::product_args p;
     p.k = k_in;
     p.n_mats = 1;
-    p.mats[0].f      = a.q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k;
+    p.mats[0].f      = a.q8 ? fn::dense::fmt::q8_0 : a.q6k ? fn::dense::fmt::q6_k : fn::dense::fmt::q5_k;
     p.mats[0].m = a.n;
     p.mats[0].w = a.w;
     p.mats[0].out = a.logits;
@@ -219,7 +219,7 @@ fn::dense::product_args vocab_args(const logits_args & a) {
 
 bool logits_ok(const logits_args & a, const void * stream) {
     return stream != nullptr && a.n >= 8 && a.n % 8 == 0 && a.n <= n_vocab_card && aligned(a.hmix, 16) &&
-           a.err != nullptr && (a.card == 0 || a.card == 1) && aligned(a.w, 16) && aligned(a.logits, 16);
+           a.err != nullptr && !(a.q8 && a.q6k) && (a.card == 0 || a.card == 1) && aligned(a.w, 16) && aligned(a.logits, 16);
 }
 
 template <int B> bool launch_reduce(const reduce_args & a, cudaStream_t st) {
@@ -229,13 +229,14 @@ template <int B> bool launch_reduce(const reduce_args & a, cudaStream_t st) {
 
 } // namespace
 
-size_t logits_work_bytes(int32_t n, bool q8) {
+size_t logits_work_bytes(int32_t n, bool q8, bool q6k) {
     if (n < 8 || n % 8 != 0 || n > n_vocab_card) {
         return 0;
     }
     logits_args a = {};
     a.n = n;
     a.q8          = q8;
+    a.q6k         = q6k;
     return fn::dense::work_bytes(vocab_args(a));
 }
 
@@ -260,16 +261,30 @@ bool draft_ids(const int32_t * subset, int32_t n, int32_t card, int32_t * ids) {
 }
 
 int64_t draft_head_bytes(int32_t m, bool q8) {
+    return draft_head_bytes(m, q8 ? draft_fmt::q8_0 : draft_fmt::q5_k);
+}
+
+int64_t draft_head_bytes(int32_t m, draft_fmt f) {
     if (m < 0) {
         return 0;
     }
-    return fn::dense::row_bytes(q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k, k_in) * m;
+    const fn::dense::fmt ff = f == draft_fmt::q8_0 ? fn::dense::fmt::q8_0
+                            : f == draft_fmt::q6_k ? fn::dense::fmt::q6_k
+                                                   : fn::dense::fmt::q5_k;
+    return fn::dense::row_bytes(ff, k_in) * m;
 }
 
 // one 8-row tile at a time: the tile's rows gathered contiguously, then dense::pack's layout of those 8 rows (pack
 // lays out each 8-row tile on its own, so packing tile by tile equals packing the gathered m rows at once)
 bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * ids, int32_t m, uint8_t * dst, bool q8) {
-    const fn::dense::fmt f  = q8 ? fn::dense::fmt::q8_0 : fn::dense::fmt::q5_k;
+    return pack_draft_head(vocab, row_bytes, ids, m, dst, q8 ? draft_fmt::q8_0 : draft_fmt::q5_k);
+}
+
+bool pack_draft_head(const uint8_t * vocab, size_t row_bytes, const int32_t * ids, int32_t m, uint8_t * dst,
+                     draft_fmt fsel) {
+    const fn::dense::fmt f  = fsel == draft_fmt::q8_0 ? fn::dense::fmt::q8_0
+                            : fsel == draft_fmt::q6_k ? fn::dense::fmt::q6_k
+                                                      : fn::dense::fmt::q5_k;
     const size_t         rb = static_cast<size_t>(fn::dense::row_bytes(f, k_in));
     if (vocab == nullptr || ids == nullptr || dst == nullptr || m < 8 || m % 8 != 0 || m > n_vocab_card ||
         row_bytes < rb) {

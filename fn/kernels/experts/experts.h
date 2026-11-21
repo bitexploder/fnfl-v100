@@ -87,8 +87,9 @@
 
 namespace fn::experts {
 
-// q8_0: gate/up and down. ME1: q4_k, q5_k (gate/up) and q5_1 (down), the Unsloth Q4 candidate's routed formats
-enum class fmt : int32_t { iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, q2_0, iq4_nl, q8_0, q4_k, q5_k, q5_1 };
+// q8_0: gate/up and down. ME1: q4_k, q5_k (gate/up) and q5_1 (down), the Unsloth Q4 candidate's routed formats.
+// IQ3S: iq4_xs (gate/up), the Swift IQ3_S file's layer 47, on the K-quant tile (codec.cuh gu_codec<fmt::iq4_xs>)
+enum class fmt : int32_t { iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, q2_0, iq4_nl, q8_0, q4_k, q5_k, q5_1, iq4_xs };
 
 constexpr int32_t n_ff_card = 320; // channels a card owns per expert
 constexpr int32_t max_rows = 5;     // SP2: the five-row verification pass
@@ -356,6 +357,11 @@ constexpr int32_t n_draft_q2_gate_up_inst = 1;
 constexpr int32_t n_draft_q2_down_inst = 1;
 bool draft_q2_gate_up_inst(int32_t i, fmt & f, fn::dense::fmt & fg, fn::dense::fmt & fu, int32_t & first_layer);
 bool draft_q2_down_inst(int32_t i, fmt & f, fmt & fs, int32_t & first_layer);
+// IQ3S: the Swift IQ3_S file's instantiations beyond the deployed ones (experts_inst.h FN_EXPERTS_IQ3S_EXTRA_*, its
+// layers' triples and pairs the deployed lists lack) and its layer 47's IQ4_XS triple (FN_EXPERTS_IQ4XS_*)
+constexpr int32_t n_iq3s_extra_gate_up_inst = 25;
+constexpr int32_t n_iq3s_extra_down_inst    = 1;
+constexpr int32_t n_iq4xs_gate_up_inst      = 1;
 
 const char * fmt_name(fmt f);
 

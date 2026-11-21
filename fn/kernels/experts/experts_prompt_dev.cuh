@@ -70,7 +70,7 @@ static_assert(d_off(fmt::iq3_xxs) + 10 * 128 == tile_bytes(fmt::iq3_xxs) &&
 // 4 qh bytes a row, bit t = bit 4 of weight t), then sm [rec] 16 B (byte 2 m: row m's 6-bit scale, 2 m + 1 its min),
 // then d and dmin, each [j / 8][rs] 16 B
 __host__ __device__ constexpr bool is_kq(fmt f) {
-    return f == fmt::q4_k || f == fmt::q5_k;
+    return f == fmt::q4_k || f == fmt::q5_k || f == fmt::iq4_xs;  // IQ3S: IQ4_XS on Q4_K's tile (codec.cuh)
 }
 __host__ __device__ constexpr int32_t kq_sm_off(fmt f) {
     return (f == fmt::q5_k ? 10 : 8) * nt_threads * 16;
@@ -371,6 +371,15 @@ __device__ __forceinline__ gu_scale kq_scale(const kq_raw & r) {
     const float d = half_lo(r.d), dm = half_lo(r.d >> 16);
     return {h2_of(d * static_cast<float>(r.s & 0xffu)), h2_of(-(dm * static_cast<float>(r.s >> 8)))};
 }
+// IQ3S: IQ4_XS's sub-block scale d (ls - 32) (exact in F32, rounded once to FP16) and no min term
+template <fmt F> __device__ __forceinline__ gu_scale kq_scale_of(const kq_raw & r) {
+    if constexpr (F == fmt::iq4_xs) {
+        const float d = half_lo(r.d);
+        return {h2_of(d * static_cast<float>(static_cast<int32_t>(r.s & 0x3fu) - 32)), 0u};
+    } else {
+        return kq_scale(r);
+    }
+}
 __host__ __device__ constexpr int32_t task_rows_of(fmt f) {
     return f == fmt::iq3_xxs || f == fmt::iq2_xxs || f == fmt::iq2_xs || f == fmt::iq2_s || f == fmt::iq3_s ||
                    is_kq(f)
@@ -431,7 +440,31 @@ __device__ __forceinline__ uint4 gu_chunk(const gu_raw & r, const gu_scale & p, 
 
 // ME1: chunk l of a K-quant sub-block, weights 8 l .. 8 l + 7: code q (5 bits with qh) under 0x64 is 1024 + q exactly,
 // minus 1024 is q; q x s + c rounds once
-template <fmt F> __device__ __forceinline__ uint4 kq_chunk(const kq_raw & r, const gu_scale & p, int32_t l) {
+// IQ3S: kvalues_iq4nl + 128 (kvb, the biased table as unsigned bytes) of q's eight nibbles, the low nibbles' values in
+// lo and the high ones' in hi (ggml's get_int_from_table_16; table16 below, for the down path, is the same)
+__device__ __forceinline__ void kq_table16(uint32_t q, const uint32_t * t, uint32_t & lo, uint32_t & hi) {
+    const uint32_t sel = 0x32103210u | ((q & 0x88888888u) >> 1);
+    const uint32_t l0 = __byte_perm(t[0], t[1], q), h0 = __byte_perm(t[2], t[3], q);
+    const uint32_t l1 = __byte_perm(t[0], t[1], q >> 16), h1 = __byte_perm(t[2], t[3], q >> 16);
+    const uint32_t x0 = __byte_perm(l0, h0, sel), x1 = __byte_perm(l1, h1, sel >> 16);
+    lo = __byte_perm(x0, x1, 0x6420);
+    hi = __byte_perm(x0, x1, 0x7531);
+}
+// kvb: IQ4_XS's biased table (kq_table16), unused by the K-quants (the ladder's Q4_K / Q5_K pass none)
+template <fmt F>
+__device__ __forceinline__ uint4 kq_chunk(const kq_raw & r, const gu_scale & p, int32_t l,
+                                          const uint32_t * kvb = nullptr) {
+    if constexpr (F == fmt::iq4_xs) {
+        // IQ3S: Q4_K's chunk order (chunk l: words x, y (l even) or z, w (odd), low nibbles for l < 2, high after),
+        // each code's kvalue + 128 under 0x64 is 1152 + kvalue exactly; minus 1152 is the kvalue; times s rounds once
+        uint32_t lo0, hi0, lo1, hi1;
+        kq_table16(l & 1 ? r.q.z : r.q.x, kvb, lo0, hi0);
+        kq_table16(l & 1 ? r.q.w : r.q.y, kvb, lo1, hi1);
+        const uint32_t     v0 = l >= 2 ? hi0 : lo0, v1 = l >= 2 ? hi1 : lo1;
+        constexpr uint32_t c64 = 0x64646464u, c1152 = 0x64806480u;
+        const auto hw = [&](uint32_t v, uint32_t sel) { return hmul2(hsub2(__byte_perm(v, c64, sel), c1152), p.s); };
+        return make_uint4(hw(v0, 0x4140), hw(v0, 0x4342), hw(v1, 0x4140), hw(v1, 0x4342));
+    }
     const int32_t sh = l >= 2 ? 4 : 0;
     uint32_t v0 = ((l & 1 ? r.q.z : r.q.x) >> sh) & 0x0f0f0f0fu;
     uint32_t v1 = ((l & 1 ? r.q.w : r.q.y) >> sh) & 0x0f0f0f0fu;

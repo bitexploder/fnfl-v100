@@ -35,7 +35,7 @@ FORMATS = {
     'IQ2_S': (256, 82), 'Q4_K': (256, 144), 'Q5_K': (256, 176), 'Q6_K': (256, 210),
 }
 # the EX1 packed layout's formats (experts.h)
-EX1_GATE_UP = {'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'Q8_0'}
+EX1_GATE_UP = {'IQ2_XXS', 'IQ2_XS', 'IQ2_S', 'IQ3_XXS', 'IQ3_S', 'Q8_0', 'IQ4_XS'}  # IQ3S: layer 47
 EX1_DOWN = {'Q2_0', 'IQ4_NL', 'Q8_0'}
 # the HC layouts' formats (hc.h: BF16, and DR1's Q8_0 planar int8 codes then FP16 scales)
 HC_FORMATS = {'BF16', 'Q8_0'}

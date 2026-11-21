@@ -834,7 +834,7 @@ static_assert(sizeof(q2d_dn_table) / sizeof(q2d_dn_table[0]) == n_draft_q2_down_
 
 // GGUF's bytes of 256 weights (the packed layout's but for the K-quants, whose scales are unpacked)
 int32_t gguf_block_bytes(fmt f) {
-    return f == fmt::q4_k ? 144 : f == fmt::q5_k ? 176 : gu_layout_k(f).block_bytes;
+    return f == fmt::q4_k ? 144 : f == fmt::q5_k ? 176 : f == fmt::iq4_xs ? 136 : gu_layout_k(f).block_bytes;
 }
 // get_scale_min_k4 (ggml-quants.c): sub-block j's 6-bit scale and min from a K-quant superblock's 12 scale bytes
 void scale_min_k4(int32_t j, const uint8_t * q, uint8_t & sc, uint8_t & mn) {
@@ -878,6 +878,8 @@ const char * fmt_name(fmt f) {
             return "Q5_K";
         case fmt::q5_1:
             return "Q5_1";
+        case fmt::iq4_xs:
+            return "IQ4_XS";
     }
     return "?";
 }
@@ -1046,6 +1048,24 @@ bool pack_gate_up(fmt f, const uint8_t * gate, const uint8_t * up, size_t row_by
                         put(tile + sm_off(f) + int64_t(rec) * 16 + 2 * mrow, sm, 2);
                         if (ib == 0) {
                             put(tile + dmin_off(f) + (sbk * 8 + rs) * 16 + 2 * mrow, blk + 2, 2); // dmin
+                        }
+                        break;
+                    }
+                    case fmt::iq4_xs: {
+                        // IQ3S: block_iq4_xs = FP16 d | scales_h (u16) | scales_l[4] | qs[128], on Q4_K's tile.
+                        // Sub-block ib's 16 qs bytes are already Q4_K's chunk order (byte t: weight t low, t + 16
+                        // high), so chunk m is a copy; the scale plane's byte 2m row m's 6-bit ls = scales_l nibble ib
+                        // | scales_h bits 2 ib, 2 ib + 1 << 4 (ggml's dequantize_row_iq4_xs), its min byte 0; dmin 0.
+                        // The shared tail writes d (the block's first two bytes, as Q4_K's)
+                        put(mc(mrow, 0), blk + 8 + 16 * ib, 16);
+                        const uint32_t sh = uint32_t(blk[2]) | (uint32_t(blk[3]) << 8);
+                        const uint8_t  sm[2] = { static_cast<uint8_t>(((blk[4 + ib / 2] >> (4 * (ib & 1))) & 0xf) |
+                                                                     (((sh >> (2 * ib)) & 3u) << 4)),
+                                                 0 };
+                        put(tile + sm_off(f) + int64_t(rec) * 16 + 2 * mrow, sm, 2);
+                        if (ib == 0) {
+                            const uint8_t z[2] = { 0, 0 };
+                            put(tile + dmin_off(f) + (sbk * 8 + rs) * 16 + 2 * mrow, z, 2);  // dmin
                         }
                         break;
                     }
@@ -1254,6 +1274,8 @@ bool gate_up_lanes(fmt                        f,
             return detail::gate_up_lanes_q4_k(f, fg, fu, lanes, rows, a, st);
         case fmt::q5_k:
             return detail::gate_up_lanes_q5_k(f, fg, fu, lanes, rows, a, st);
+        case fmt::iq4_xs:  // IQ3S
+            return detail::gate_up_lanes_iq4_xs(f, fg, fu, lanes, rows, a, st);
         default:
             return detail::gate_up_lanes_iq2(f, fg, fu, lanes, rows, a, st);
     }
@@ -1284,6 +1306,8 @@ bool gate_up(fmt f, fn::dense::fmt fg, fn::dense::fmt fu, int32_t rows, const ga
             return detail::gate_up_q4_k(fg, fu, rows, a, st);
         case fmt::q5_k:
             return detail::gate_up_q5_k(fg, fu, rows, a, st);
+        case fmt::iq4_xs:  // IQ3S: the Swift IQ3_S file's layer 47
+            return detail::gate_up_iq4_xs(fg, fu, rows, a, st);
         default:
             return false;
     }
@@ -1380,7 +1404,7 @@ bool down(fmt f, fmt fs, int32_t rows, const down_args & a, void * stream) {
     if (f == fmt::rf && fs == fmt::sf) {                                                                               \
         return down_rows<fmt::rf, fmt::sf>(rows, a, st);                                                               \
     }
-    FN_EXPERTS_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)
+    FN_EXPERTS_TARGET_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)  // IQ3S: with the Swift IQ3_S file's extra pair
     FN_EXPERTS_Q4_DOWN_INSTANCES(FN_EXPERTS_DN_CASE) // ME1: the Q4 candidate's (Q8_0's entry is the deployed one's)
     FN_EXPERTS_DRAFT_Q2_DOWN_INSTANCES(FN_EXPERTS_DN_CASE) // ME7: the Q2 draft's
 #undef FN_EXPERTS_DN_CASE
@@ -1497,7 +1521,7 @@ bool down_lanes_send(fmt                     f,
             return down_lanes_of<fmt::rf, fmt::sf>(lanes, rows, k, st); \
         }                                                               \
     }
-    FN_EXPERTS_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)
+    FN_EXPERTS_TARGET_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)  // IQ3S: with the Swift IQ3_S file's extra pair
     FN_EXPERTS_Q4_DOWN_INSTANCES(FN_EXPERTS_DN_CASE)  // TTTS3 item 4: Q5_1 (Q8_0's entry is the deployed one's)
 #undef FN_EXPERTS_DN_CASE
     return false;

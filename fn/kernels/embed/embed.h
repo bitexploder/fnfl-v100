@@ -50,6 +50,9 @@ struct args {
     // TTTS2: the table is Q8_0 (UD-Q4_K_XL), [V][1360] bytes (40 blocks of an FP16 d and 32 int8 q a card's row), each
     // value d * q, one exact product (fn/quant's decode_q8_0); grids unused
     bool            q8    = false;
+    // IQ3S: the table is IQ4_XS (the Swift IQ3_S file's token_embd), [V][680] bytes (5 block_iq4_xs a card's row),
+    // decoded as ggml's dequantize_row_iq4_xs (iq4xs_embed.cuh); grids unused. Exclusive with q8
+    bool            iq4xs = false;
 };
 
 // Host check before upload: every ID in [0, V). False (with a message naming the row and ID) otherwise.
@@ -78,6 +81,7 @@ struct rows_args {
     float *         streams = nullptr;  // [rows][4][2560]
     uint32_t *      err     = nullptr;
     bool            q8      = false;    // TTTS2: as args::q8
+    bool            iq4xs   = false;    // IQ3S: as args::iq4xs
 };
 
 constexpr int32_t q8_row_bytes = n_own / 32 * 34;  // TTTS2: a card's Q8_0 row

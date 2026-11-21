@@ -48,6 +48,78 @@
     X(iq4_nl, q2_0, 4)   /* layers 4 */                                                                                \
     X(q8_0, q8_0, 48)    /* layer 48 (the MTP draft, DR1) */
 
+// IQ3S: the Swift IQ3_S file's expert instances (its GGUF headers, layers 0-47): its profile's full lists
+#define FN_EXPERTS_IQ3S_GATE_UP_INSTANCES(X)                                                                             \
+    X(iq3_xxs, q4_k, iq4_xs, 0) /* layers 0,38 */                                                                        \
+    X(iq2_s, iq4_xs, q4_k, 1) /* layers 1,3,8 */                                                                         \
+    X(iq2_s, q4_k, q6_k, 2) /* layers 2,11 */                                                                            \
+    X(iq2_s, q6_k, q5_k, 4) /* layers 4 */                                                                               \
+    X(iq2_s, iq4_xs, q6_k, 5) /* layers 5 */                                                                             \
+    X(iq2_s, q6_k, q4_k, 6) /* layers 6,32 */                                                                            \
+    X(iq3_xxs, iq4_xs, iq4_xs, 7) /* layers 7,14 */                                                                      \
+    X(iq2_s, q4_k, iq4_xs, 9) /* layers 9,13 */                                                                          \
+    X(iq2_s, q4_k, q4_k, 10) /* layers 10,39 */                                                                          \
+    X(iq3_xxs, q6_k, q6_k, 12) /* layers 12,43 */                                                                        \
+    X(iq2_s, q6_k, iq4_xs, 15) /* layers 15 */                                                                           \
+    X(iq3_xxs, q4_k, q4_k, 16) /* layers 16,41 */                                                                        \
+    X(iq3_s, iq4_xs, q4_k, 17) /* layers 17 */                                                                           \
+    X(iq3_xxs, q5_k, q5_k, 18) /* layers 18 */                                                                           \
+    X(iq2_s, q6_k, q6_k, 19) /* layers 19,26,36 */                                                                       \
+    X(iq3_xxs, iq4_xs, q4_k, 20) /* layers 20,30,33 */                                                                   \
+    X(iq3_s, q4_k, iq4_xs, 21) /* layers 21 */                                                                           \
+    X(iq3_xxs, q6_k, iq4_xs, 22) /* layers 22,42 */                                                                      \
+    X(iq2_s, q5_k, q5_k, 23) /* layers 23 */                                                                             \
+    X(iq2_s, iq4_xs, q5_k, 24) /* layers 24 */                                                                           \
+    X(iq3_s, iq4_xs, q6_k, 25) /* layers 25,35 */                                                                        \
+    X(iq3_s, iq4_xs, iq4_xs, 27) /* layers 27 */                                                                         \
+    X(iq3_s, q6_k, q6_k, 28) /* layers 28 */                                                                             \
+    X(iq3_s, q5_k, iq4_xs, 29) /* layers 29,40 */                                                                        \
+    X(iq3_xxs, iq4_xs, q5_k, 31) /* layers 31 */                                                                         \
+    X(iq2_s, q4_k, q5_k, 34) /* layers 34 */                                                                             \
+    X(iq3_xxs, q6_k, q5_k, 37) /* layers 37 */                                                                           \
+    X(iq3_s, q4_k, q4_k, 44) /* layers 44 */                                                                             \
+    X(iq3_s, q4_k, q6_k, 45) /* layers 45 */                                                                             \
+    X(iq3_xxs, q4_k, q6_k, 46) /* layers 46 */                                                                           \
+    X(iq4_xs, q4_k, q5_k, 47) /* layers 47 */                                                                           
+#define FN_EXPERTS_IQ3S_DOWN_INSTANCES(X)                                                                                \
+    X(iq4_nl, iq4_nl, 0) /* layers 0,2,3,4,5,6,7,9,11,14,15,16,17,18,19,22,23,24,25,26,27,28,29,31,32,33,34,35,37,38,39,40,41,42,43,44,45,46 */ \
+    X(q2_0, iq4_nl, 1) /* layers 1,8,10,12,13,20,21,30,36 */                                                             \
+    X(iq4_nl, q8_0, 47) /* layers 47 */                                                                                 
+// IQ3S: of those, the entries the deployed lists lack (instantiated beside them; the routed IQ4_XS one apart)
+#define FN_EXPERTS_IQ3S_EXTRA_GATE_UP_INSTANCES(X)                                                                       \
+    X(iq3_xxs, q4_k, iq4_xs, 0) /* layers 0,38 */                                                                        \
+    X(iq2_s, iq4_xs, q4_k, 1) /* layers 1,3,8 */                                                                         \
+    X(iq2_s, q4_k, q6_k, 2) /* layers 2,11 */                                                                            \
+    X(iq2_s, q6_k, q5_k, 4) /* layers 4 */                                                                               \
+    X(iq2_s, iq4_xs, q6_k, 5) /* layers 5 */                                                                             \
+    X(iq2_s, q6_k, q4_k, 6) /* layers 6,32 */                                                                            \
+    X(iq2_s, q4_k, iq4_xs, 9) /* layers 9,13 */                                                                          \
+    X(iq2_s, q4_k, q4_k, 10) /* layers 10,39 */                                                                          \
+    X(iq3_xxs, q6_k, q6_k, 12) /* layers 12,43 */                                                                        \
+    X(iq2_s, q6_k, iq4_xs, 15) /* layers 15 */                                                                           \
+    X(iq3_xxs, q4_k, q4_k, 16) /* layers 16,41 */                                                                        \
+    X(iq3_xxs, q5_k, q5_k, 18) /* layers 18 */                                                                           \
+    X(iq2_s, q6_k, q6_k, 19) /* layers 19,26,36 */                                                                       \
+    X(iq3_xxs, iq4_xs, q4_k, 20) /* layers 20,30,33 */                                                                   \
+    X(iq3_xxs, q6_k, iq4_xs, 22) /* layers 22,42 */                                                                      \
+    X(iq2_s, q5_k, q5_k, 23) /* layers 23 */                                                                             \
+    X(iq2_s, iq4_xs, q5_k, 24) /* layers 24 */                                                                           \
+    X(iq3_s, q6_k, q6_k, 28) /* layers 28 */                                                                             \
+    X(iq3_s, q5_k, iq4_xs, 29) /* layers 29,40 */                                                                        \
+    X(iq3_xxs, iq4_xs, q5_k, 31) /* layers 31 */                                                                         \
+    X(iq2_s, q4_k, q5_k, 34) /* layers 34 */                                                                             \
+    X(iq3_xxs, q6_k, q5_k, 37) /* layers 37 */                                                                           \
+    X(iq3_s, q4_k, q4_k, 44) /* layers 44 */                                                                             \
+    X(iq3_s, q4_k, q6_k, 45) /* layers 45 */                                                                             \
+    X(iq3_xxs, q4_k, q6_k, 46) /* layers 46 */                                                                          
+#define FN_EXPERTS_IQ3S_EXTRA_DOWN_INSTANCES(X)                                                                          \
+    X(iq4_nl, q8_0, 47) /* layers 47 */                                                                                 
+// IQ3S: the routed IQ4_XS triple (layer 47), on the K-quant path as the Q4 candidate's
+#define FN_EXPERTS_IQ4XS_GATE_UP_INSTANCES(X)                                                                            \
+    X(iq4_xs, q4_k, q5_k, 47) /* layers 47 */                                                                           
+// IQ3S: the target layers' instantiated lists (the deployed and the IQ3_S file's extras)
+#define FN_EXPERTS_TARGET_GATE_UP_INSTANCES(X) FN_EXPERTS_GATE_UP_INSTANCES(X) FN_EXPERTS_IQ3S_EXTRA_GATE_UP_INSTANCES(X)
+#define FN_EXPERTS_TARGET_DOWN_INSTANCES(X) FN_EXPERTS_DOWN_INSTANCES(X) FN_EXPERTS_IQ3S_EXTRA_DOWN_INSTANCES(X)
 // ME1: the Unsloth UD-Q4_K_XL candidate's routed pairs (tickets/ME1/unsloth-q4-header-inventory.json, revision
 // 766911a6): gate/up Q4_K with down Q5_1 (43 layers), Q4_K with Q8_0 (layers 4, 30, 46, 47), Q5_K with Q8_0 (layer
 // 2); its shared expert is Q8_0 (gate, up and down) in every layer. Not the deployed model's: the kernels and the

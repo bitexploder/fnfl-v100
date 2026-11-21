@@ -48,7 +48,9 @@
     // sectors). Thread i < 80 B takes run (b, j) = (i / 80, i % 80) of the rows. They land in shared memory after the
     // first weight chunks are issued.
     // the routed table (run-time data in the IQ2 body): a signed table is copied after the ring is primed
-    const gu_layout gl = gu_layout_of(U ? static_cast<fmt>(a.u_f) : F);
+    // IQ3S: IQ4_XS's kvalues table is the K-quant chain's (gu_layout_k), out of the IQ bodies' run-time chain
+    constexpr bool  kv_table = U ? FAM::f0 == fmt::iq4_xs : F == fmt::iq4_xs;
+    const gu_layout gl       = kv_table ? gu_layout_k(fmt::iq4_xs) : gu_layout_of(U ? static_cast<fmt>(a.u_f) : F);
     const bool ex_iq3s = U ? a.u_fg == int32_t(dfmt::iq3_s) || a.u_fu == int32_t(dfmt::iq3_s) : extra_iq3s<F, FG, FU>();
     const int32_t n_grid16 = gl.grid_len / 16;
     const int32_t n_sgrid16 = ex_iq3s ? 2048 / 16 : 0;
@@ -438,6 +440,14 @@
                 FN_GU_PAIR(q5_k, q4_k)
                 FN_GU_PAIR(iq4_xs, q4_k)
                 FN_GU_PAIR(iq4_xs, iq4_xs)
+                FN_GU_PAIR(q4_k, q6_k)
+                FN_GU_PAIR(q6_k, q5_k)
+                FN_GU_PAIR(q6_k, q4_k)
+                FN_GU_PAIR(q4_k, iq4_xs)
+                FN_GU_PAIR(q6_k, iq4_xs)
+                FN_GU_PAIR(q6_k, q6_k)
+                FN_GU_PAIR(q5_k, q5_k)
+                FN_GU_PAIR(iq4_xs, q5_k)
                 default:
                     break;
             }
@@ -480,6 +490,14 @@
                     FN_GU_PAIR(iq4_xs, iq4_xs)
                     FN_GU_PAIR(iq4_xs, q4_k)
                     FN_GU_PAIR(q4_k, iq4_xs)
+                    FN_GU_PAIR(q6_k, q6_k)
+                    FN_GU_PAIR(q4_k, q4_k)
+                    FN_GU_PAIR(q5_k, q5_k)
+                    FN_GU_PAIR(q6_k, iq4_xs)
+                    FN_GU_PAIR(q5_k, iq4_xs)
+                    FN_GU_PAIR(iq4_xs, q5_k)
+                    FN_GU_PAIR(q6_k, q5_k)
+                    FN_GU_PAIR(q4_k, q6_k)
                     default:
                         break;
                 }
@@ -495,6 +513,14 @@
                     FN_GU_PAIR(q5_k, q4_k)
                     FN_GU_PAIR(iq4_xs, q4_k)
                     FN_GU_PAIR(iq4_xs, iq4_xs)
+                    FN_GU_PAIR(q4_k, q6_k)
+                    FN_GU_PAIR(q6_k, q5_k)
+                    FN_GU_PAIR(q6_k, q4_k)
+                    FN_GU_PAIR(q4_k, iq4_xs)
+                    FN_GU_PAIR(q6_k, iq4_xs)
+                    FN_GU_PAIR(q6_k, q6_k)
+                    FN_GU_PAIR(q5_k, q5_k)
+                    FN_GU_PAIR(iq4_xs, q5_k)
                     default:
                         break;
                 }

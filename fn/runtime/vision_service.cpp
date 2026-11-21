@@ -193,6 +193,7 @@ bool vision_service::token_row(target & t, bool drafts, std::string & err) {
         a[k].streams          = reinterpret_cast<float *>(p[k] + model::vtr_streams);
         a[k].err              = reinterpret_cast<uint32_t *>(p[k] + model::vtr_err);
         a[k].q8               = pc.embd_q8;
+        a[k].iq4xs            = pc.embd_iq4xs;
         if (!ok(cudaSetDevice(d[k]), "device", err) ||
             !ok(cudaMemcpy(p[k] + model::vtr_tok, &tok, 4, cudaMemcpyHostToDevice), "token row", err) ||
             !ok(cudaMemset(p[k] + model::vtr_err, 0, 4), "token row", err)) {

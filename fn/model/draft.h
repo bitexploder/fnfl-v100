@@ -1,4 +1,5 @@
 #pragma once
+#include "draft_fmt.h"
 
 // DR1 Stage C: the MTP draft block on both cards (FC-DR1, FC-DR2), framed by the round as the target pass is
 // (fn/model/pass.h), in two round kinds (fn/kernels/round/round.h):
@@ -42,7 +43,7 @@ constexpr int32_t draft_max_steps = 4; // d (SP2: 1..4)
 struct draft_card {
     draft_weights w;
     const uint8_t * head_w = nullptr;   // the draft head copy: 32,768 Q5_K rows, DP2's packed layout
-    bool                head_q8     = false;     // TTTS2: its rows Q8_0 (UD-Q4_K_XL's output.weight)
+    fn::head::draft_fmt head_fmt    = fn::head::draft_fmt::q5_k;  // Q6K: Q6_K too
     const int32_t * head_ids = nullptr; // their global IDs
     uint16_t * k_cache = nullptr;       // F16 [max_cells][256] (layer 48's KV head of this card)
     uint16_t * v_cache = nullptr;

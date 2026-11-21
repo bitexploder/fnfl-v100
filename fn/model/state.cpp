@@ -241,9 +241,9 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     if (p.win.head) {
         out.push_back({
             "draft head copy (DR1)",
-            "head.h: 32,768 Q5_K rows of 2,560 (head::draft_head_bytes, 57,671,680 bytes) and their ID map, "
+            "head.h: 32,768 rows of 2,560 (Q5_K/Q8_0/Q6_K; head::draft_head_bytes) and their ID map, "
             "I32 [32,768], on each card",
-            { both("draft head rows (Q5_K, packed)", fn::head::draft_head_bytes(fn::head::n_draft_card, p.head_q8)),
+            { both("draft head rows (packed)", fn::head::draft_head_bytes(fn::head::n_draft_card, p.head_fmt)),
               both("draft head ID map", int64_t(fn::head::n_draft_card) * 4) }
         });
     }
@@ -331,7 +331,8 @@ std::vector<buffer_class> state_classes(const state_params & p) {
               both("DA-TC partials", (int64_t) fn::draft::part_bytes()),
               both("draft logits", int64_t(fn::samp::max_drafts) * fn::head::n_draft_card * 4),
               both("draft head work", std::max<int64_t>(256, (int64_t) fn::head::logits_work_bytes(
-                                                                 fn::head::n_draft_card, p.head_q8))) }
+                                                                 fn::head::n_draft_card, p.head_fmt == fn::head::draft_fmt::q8_0,
+                                                                 p.head_fmt == fn::head::draft_fmt::q6_k))) }
         });
     }
     // SM1: the sampler's per-slot state (samp.h): the options and decision record, the bias table and penalty counts

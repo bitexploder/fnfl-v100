@@ -732,6 +732,91 @@ template <> struct gu_codec<fmt::q4_k> {
     }
 };
 
+// IQ3S: IQ4_XS (the Swift IQ3_S file's layer 47 routed gate/up) on Q4_K's tile: chunk m = row m's 16 qs bytes of
+// sub-block j as GGUF stores them (byte t: weight t low, t + 16 high, Q4_K's order), the scale plane's byte 2m row m's
+// 6-bit ls (byte 2m + 1 zero), d the block's FP16 d, dmin zero. Weight t is d (ls - 32) kvalues_iq4nl[code]
+// (ggml's dequantize_row_iq4_xs): the codes become the table's signed bytes (kv16), f = d (ls - 32) is exact in F32
+// (an FP16 times an integer of at most 2^5), mn = 0, so part is Q4_K's (f da_b) is with a zero min term. The table is
+// the grid buffer's 16 kvalues bytes (grid_off kvalues_off), four words in shared memory.
+__device__ __forceinline__ void kv16(uint32_t q, const uint32_t * t, uint32_t & lo, uint32_t & hi) {
+    // ggml's get_int_from_table_16: x0/x1 the values of q's eight nibbles in nibble order, then split low/high nibbles
+    const uint32_t sel = 0x32103210u | ((q & 0x88888888u) >> 1);
+    const uint32_t l0 = __byte_perm(t[0], t[1], q), h0 = __byte_perm(t[2], t[3], q);
+    const uint32_t l1 = __byte_perm(t[0], t[1], q >> 16), h1 = __byte_perm(t[2], t[3], q >> 16);
+    const uint32_t x0 = __byte_perm(l0, h0, sel), x1 = __byte_perm(l1, h1, sel >> 16);
+    lo = __byte_perm(x0, x1, 0x6420);
+    hi = __byte_perm(x0, x1, 0x7531);
+}
+
+template <> struct gu_codec<fmt::iq4_xs> {
+    static constexpr fmt     f           = fmt::iq4_xs;
+    static constexpr int32_t block_bytes = 148, chunks = 8, grid_off = kvalues_off, grid_len = 16;
+    static constexpr bool    aux8 = false, sc8 = false, kq = true;
+    static constexpr int32_t NA = 2, CC = 1 + NA + chunks;
+    static constexpr int64_t T = int64_t(gu_threads) * block_bytes, aux8_off = int64_t(chunks) * gu_threads * 16,
+                             sc8_off = aux8_off, sm_off = aux8_off, d_off = sc8_off + gu_threads * 16,
+                             dmin_off = d_off + 10 * 8 * 16;
+    static constexpr bool    split = false, sgn = false, int_rows = false, code_sums = false, b4_two_copies = false;
+    static constexpr int32_t max_b  = 5;
+    static constexpr int32_t body_b = 1;
+    using row                       = kq_row;
+
+    static __device__ __forceinline__ int64_t chunk_off(int32_t q, int32_t rec, int32_t j, int32_t sb, int32_t rs) {
+        return q == 0 ? d_off + ((j >> 3) * 8 + rs) * 16 :
+               q == 1 ? dmin_off + ((j >> 3) * 8 + rs) * 16 :
+               q == 2 ? sm_off + rec * 16 :
+                        (int64_t(q - 3) * gu_threads + rec) * 16;
+    }
+
+    static __device__ __forceinline__ uint4
+    load(const uint8_t * tl, int32_t q, uint32_t z, int32_t rec, int32_t j, int32_t sb, int32_t rs) {
+        return __ldcs(reinterpret_cast<const uint4 *>(tl + chunk_off(q, rec, j, sb, rs) + z));
+    }
+
+    template <typename O>
+    static __device__ __forceinline__ void take(int32_t       q,
+                                                const uint4 & v,
+                                                float (&dh8)[8],
+                                                float (&mn8)[8],
+                                                bytes8 &         ax8,
+                                                bytes8 &         sc8,
+                                                uint4 &          held,
+                                                row_dec &        rd,
+                                                const uint32_t * grid,
+                                                int32_t          j,
+                                                int32_t          rs,
+                                                O &&             out) {
+        if (q == 1) {  // the (zero) dmin chunk: no min term
+#pragma unroll
+            for (int32_t mr = 0; mr < 8; ++mr) {
+                mn8[mr] = 0.0f;
+            }
+            return;
+        }
+        if (q == 2) {  // the scale plane's byte 2m: row m's ls; f = d (ls - 32), exact
+#pragma unroll
+            for (int32_t mr = 0; mr < 8; ++mr) {
+                const uint32_t sw = word_of(v, mr >> 1) >> (16 * (mr & 1));
+                dh8[mr] *= static_cast<float>(static_cast<int32_t>(sw & 0x3fu) - 32);
+            }
+            return;
+        }
+        const int32_t mrow = q - 1 - NA;  // chunk c is row c
+        kq_row        kr;
+#pragma unroll
+        for (int32_t k = 0; k < 4; ++k) {
+            kv16(word_of(v, k), grid, kr.q[k], kr.q[4 + k]);  // weights 4k.. (low nibbles), 16 + 4k.. (high)
+        }
+        kr.f  = dh8[mrow];
+        kr.mn = 0.0f;
+        out(kr, rs + 8 * mrow);
+    }
+
+    static __device__ __forceinline__ float part(const kq_row & kr, const uint32_t (&act)[8], float da, float xs) {
+        return kq_part(kr, act, da, xs);
+    }
+};
+
 // Q5_K (ME1, UD-Q4_K_XL's layer 2): Q4_K's with each row's high bits, 4 B a row (bit t: bit 4 of weight t): main chunks
 // [qh of rows 0..3][r0][r1][r2][r3] [qh of rows 4..7][r4]..[r7]; the qh chunks are held for their quad
 template <> struct gu_codec<fmt::q5_k> {
@@ -831,14 +916,16 @@ __host__ __device__ constexpr gu_layout gu_layout_of(fmt f) {
                                gu_layout{ 0, 0, false, false, 0, 0 };
 }
 
+// the K-quant tile (Q4_K's planes); IQ3S: IQ4_XS takes it too (its codec)
 __host__ __device__ constexpr bool is_kq(fmt f) {
-    return f == fmt::q4_k || f == fmt::q5_k;
+    return f == fmt::q4_k || f == fmt::q5_k || f == fmt::iq4_xs;
 }
 
 __host__ __device__ constexpr gu_layout gu_layout_k(fmt f) {
     return f == fmt::q4_k ? gu_layout_c<fmt::q4_k>() :
            f == fmt::q5_k ? gu_layout_c<fmt::q5_k>() :
            f == fmt::q2_0 ? gu_layout_c<fmt::q2_0>() :
+           f == fmt::iq4_xs ? gu_layout_c<fmt::iq4_xs>() :
                             gu_layout_of(f);
 }
 
@@ -884,7 +971,8 @@ template <fmt F> constexpr bool gu_codec_ok() {
 
 static_assert(gu_codec_ok<fmt::iq2_xxs>() && gu_codec_ok<fmt::iq2_xs>() && gu_codec_ok<fmt::iq2_s>() &&
                   gu_codec_ok<fmt::iq3_xxs>() && gu_codec_ok<fmt::iq3_s>() && gu_codec_ok<fmt::q8_0>() &&
-                  gu_codec_ok<fmt::q2_0>() && gu_codec_ok<fmt::q4_k>() && gu_codec_ok<fmt::q5_k>(),
+                  gu_codec_ok<fmt::q2_0>() && gu_codec_ok<fmt::q4_k>() && gu_codec_ok<fmt::q5_k>() &&
+                  gu_codec_ok<fmt::iq4_xs>(),
               "the codecs' offsets are the layout's");
 static_assert(d_off(fmt::iq2_xxs) + 10 * 8 * 16 == tile_bytes(fmt::iq2_xxs), "IQ2_XXS tile bytes");
 static_assert(d_off(fmt::iq2_xs) + 10 * 8 * 16 == tile_bytes(fmt::iq2_xs), "IQ2_XS tile bytes");
@@ -896,6 +984,9 @@ static_assert(dmin_off(fmt::q4_k) + 10 * 8 * 16 == tile_bytes(fmt::q4_k), "Q4_K 
 static_assert(d_off(fmt::q2_0) + (n_sub / 2) * 8 * 16 == tile_bytes(fmt::q2_0) && tile_bytes(fmt::q2_0) == 46080,
               "Q2_0 tile bytes: 64 rows of 2,560 weights at GGUF's 18 bytes a 64");
 static_assert(dmin_off(fmt::q5_k) + 10 * 8 * 16 == tile_bytes(fmt::q5_k), "Q5_K tile bytes");
+static_assert(dmin_off(fmt::iq4_xs) + 10 * 8 * 16 == tile_bytes(fmt::iq4_xs) &&
+                  tile_bytes(fmt::iq4_xs) == tile_bytes(fmt::q4_k),
+              "IQ4_XS on Q4_K's tile");
 
 // routed format f's family body's smallest B (its codec's body_b; 0: no family body, so no lanes), for the host's
 // checks: one switch over the codecs
@@ -919,6 +1010,8 @@ constexpr int32_t gu_body_b(fmt f) {
             return gu_codec<fmt::q4_k>::body_b;
         case fmt::q5_k:
             return gu_codec<fmt::q5_k>::body_b;
+        case fmt::iq4_xs:
+            return gu_codec<fmt::iq4_xs>::body_b;
         default:
             return 0;
     }

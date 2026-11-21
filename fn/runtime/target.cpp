@@ -907,7 +907,8 @@ bool target::prompt_head(std::string & err) {
                                                    fn::head::n_vocab_card,
                                                    p.logits,
                                                    nullptr,
-                                                   p.out_q8 };
+                                                   p.out_q8,
+                                                   p.out_q6k };
                 ok = fn::head::logits(1, la, st_[c]);
             }
             if (!ok) {

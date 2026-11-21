@@ -616,7 +616,20 @@ fn::model::lad_cfg prompt_path::lad_route(const fn::model::lad_key & key, int32_
     }
     // the table is the UD-Q4_K_XL file's (prompt-tune's calibration): another file (IQ3_XXS) runs the retained routes
     // wherever its keys would match. The pick at the rung, the retained route where its split does not fit the
-    // workspace at these rows
+    // workspace at these rows.
+    // IQ3S: a routed expert format the ladder has no kernel for (IQ4_XS) must not take a retained route: the ladder's
+    // launches take Q4_K/Q5_K gate/up and Q5_1/Q8_0 down only, so the route would fail at every row (ep_gate_up_ladder
+    // refuses the format). The layer runs the regular expert path instead.
+    if (key.fam == fn::model::lad_fam::ex_gate_up || key.fam == fn::model::lad_fam::ex_down) {
+        // the ladder's expert launches take Q4_K/Q5_K gate/up and Q5_1/Q8_0 down (el_takes_gate_up / el_takes_down),
+        // by the key's GGUF format name
+        const std::string & fn_ = key.fmt;
+        const bool gate_up = key.fam == fn::model::lad_fam::ex_gate_up;
+        const bool takes   = gate_up ? (fn_ == "Q4_K" || fn_ == "Q5_K") : (fn_ == "Q5_1" || fn_ == "Q8_0");
+        if (!takes) {
+            return {};
+        }
+    }
     return lad_on_ ? fn::model::lad_lookup(key, rows, lad_model_of(key)) : fn::model::lad_cfg{};
 }
 
@@ -1479,6 +1492,7 @@ bool prompt_path::chunk_begin(const prompt_chunk & c, std::string & err) {
             ea.streams = a.S;
             ea.err = a.err;
             ea.q8      = p_[k]->embd_q8;  // TTTS2
+            ea.iq4xs   = p_[k]->embd_iq4xs;  // IQ3S
             if (phase == 0) {
                 if (!m_->single && lk.any_copied[k] &&
                     !cuda_ok(cudaStreamWaitEvent(s, static_cast<cudaEvent_t>(lk.copied[k]), 0), "emb reuse", err)) {

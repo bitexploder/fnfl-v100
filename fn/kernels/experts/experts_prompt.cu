@@ -61,6 +61,15 @@ template <bool X, fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gat
     if constexpr (G.entries > 0) { // ME1: the K-quants have no table
         build_tables<F>(tb, a.grids);
     }
+    // IQ3S: IQ4_XS's kvalues_iq4nl + 128 (kq_chunk's biased table), four words in registers
+    uint32_t kvb[4] = {0, 0, 0, 0};
+    if constexpr (F == fmt::iq4_xs) {
+        const uint4 t = __ldg(reinterpret_cast<const uint4 *>(a.grids + kvalues_off));
+        kvb[0] = t.x ^ 0x80808080u;
+        kvb[1] = t.y ^ 0x80808080u;
+        kvb[2] = t.z ^ 0x80808080u;
+        kvb[3] = t.w ^ 0x80808080u;
+    }
     {
         const task_t tk = task_of(a.route.tasks, task);
         const int32_t nt = (tk.n + 7) >> 3;
@@ -122,9 +131,9 @@ template <bool X, fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gat
                         x_stage(x_load(j + 2), srow_a + ((T + 2) & 3) * a_tile);
                     }
                     const a_rows ar = {arow.even + T * a_tile, arow.odd + T * a_tile};
-                    const gu_scale sc = kq_scale(raw[P]);
-                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 0), ar, 0);
-                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 2), ar, 2);
+                    const gu_scale sc = kq_scale_of<F>(raw[P]);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 0, kvb), ar, 0);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 2, kvb), ar, 2);
                     if (j + 1 < n_steps) {
                         const int4 o = ld_ofs(ofs + 16 * tid);
                         raw[P ^ 1] = raw_load<F>(wb, o, j + 1);
@@ -132,8 +141,8 @@ template <bool X, fmt F> __global__ void __launch_bounds__(nt_threads, 1) ep_gat
                             raw_prefetch<F>(wb, o, j + 2);
                         }
                     }
-                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 1), ar, 1);
-                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 3), ar, 3);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 1, kvb), ar, 1);
+                    mma_chunk<NT>(acc, kq_chunk<F>(raw[P], sc, 3, kvb), ar, 3);
                     if constexpr ((T & 1) != 0) {
                         __syncthreads();
                     }
@@ -664,6 +673,7 @@ bool ep_prompt_attributes() {
     return gate_up_attr<false, fmt::iq2_xxs>() && gate_up_attr<false, fmt::iq2_xs>() &&
            gate_up_attr<false, fmt::iq2_s>() && gate_up_attr<false, fmt::iq3_xxs>() &&
            gate_up_attr<false, fmt::iq3_s>() && gate_up_attr<false, fmt::q4_k>() && gate_up_attr<false, fmt::q5_k>() &&
+           gate_up_attr<false, fmt::iq4_xs>() &&
            down_attr<false, fmt::q2_0>() && down_attr<false, fmt::iq4_nl>() && down_attr<false, fmt::q5_1>() &&
            down_attr<false, fmt::q8_0>();
 }
@@ -757,6 +767,8 @@ bool ep_gate_up(fmt f, int32_t rows, const ep_gate_up_args & a, void * stream) {
             return launch_gate_up<fmt::q4_k>(a, st);
         case fmt::q5_k:
             return launch_gate_up<fmt::q5_k>(a, st);
+        case fmt::iq4_xs:  // IQ3S: the Swift IQ3_S file's layer 47
+            return launch_gate_up<fmt::iq4_xs>(a, st);
         default:
             return false;
     }

@@ -58,6 +58,9 @@ inline constexpr gu_inst q4_gu[]       = { FN_EXPERTS_Q4_GATE_UP_INSTANCES(FN_EX
 inline constexpr dn_inst q4_dn[]       = { FN_EXPERTS_Q4_DOWN_INSTANCES(FN_EXPERTS_PROFILE_DN) };
 inline constexpr gu_inst q2d_gu[]      = { FN_EXPERTS_DRAFT_Q2_GATE_UP_INSTANCES(FN_EXPERTS_PROFILE_GU) };
 inline constexpr dn_inst q2d_dn[]      = { FN_EXPERTS_DRAFT_Q2_DOWN_INSTANCES(FN_EXPERTS_PROFILE_DN) };
+// IQ3S: the Swift IQ3_S file's whole lists (its triples instantiated by the deployed, extra and IQ4_XS lists)
+inline constexpr gu_inst iq3s_gu[]     = { FN_EXPERTS_IQ3S_GATE_UP_INSTANCES(FN_EXPERTS_PROFILE_GU) };
+inline constexpr dn_inst iq3s_dn[]     = { FN_EXPERTS_IQ3S_DOWN_INSTANCES(FN_EXPERTS_PROFILE_DN) };
 #undef FN_EXPERTS_PROFILE_GU
 #undef FN_EXPERTS_PROFILE_DN
 
@@ -90,6 +93,8 @@ inline constexpr expert_profile expert_profiles[] = {
     { "UD-Q4_K_XL", profile_src::gu_of(profile_src::q4_gu,       -1), profile_src::dn_of(profile_src::q4_dn,       -1) },
     { "Q8_0 draft", profile_src::gu_of(profile_src::deployed_gu, 1),  profile_src::dn_of(profile_src::deployed_dn, 1)  },
     { "Q2_0 draft", profile_src::gu_of(profile_src::q2d_gu,      -1), profile_src::dn_of(profile_src::q2d_dn,      -1) },
+    // IQ3S: last, so the earlier profiles' family pairs keep their order (family_pairs; the IQ bodies' written lists)
+    { "Swift IQ3_S", profile_src::gu_of(profile_src::iq3s_gu,    -1), profile_src::dn_of(profile_src::iq3s_dn,     -1) },
 };
 inline constexpr int32_t n_expert_profiles = int32_t(sizeof(expert_profiles) / sizeof(expert_profiles[0]));
 static_assert(expert_profiles[0].gu.n + expert_profiles[2].gu.n == n_gate_up_inst &&
@@ -97,6 +102,7 @@ static_assert(expert_profiles[0].gu.n + expert_profiles[2].gu.n == n_gate_up_ins
                   expert_profiles[1].gu.n == n_q4_gate_up_inst && expert_profiles[1].dn.n == n_q4_down_inst &&
                   expert_profiles[3].gu.n == n_draft_q2_gate_up_inst && expert_profiles[3].dn.n == n_draft_q2_down_inst,
               "the profiles hold every listed instance");
+static_assert(expert_profiles[4].gu.n == 31 && expert_profiles[4].dn.n == 3, "IQ3S: the Swift IQ3_S file's profile");
 
 constexpr bool profile_has_gu(const expert_profile & p, fmt f, fn::dense::fmt g, fn::dense::fmt u) {
     for (int32_t i = 0; i < p.gu.n; ++i) {
@@ -128,9 +134,9 @@ constexpr int32_t profile_of(fmt f, fn::dense::fmt g, fn::dense::fmt u, fmt d, f
 
 // every compiled profile's gate/up triples and down pairs as flat sets, built at compile time: the launches' checks
 // are one indexed read (TTTS3 Amendment 1 line 3: no search over the profiles a launch)
-constexpr int32_t n_fmts  = int32_t(fmt::q5_1) + 1;
+constexpr int32_t n_fmts  = int32_t(fmt::iq4_xs) + 1;  // IQ3S: iq4_xs the last member
 constexpr int32_t n_dfmts = int32_t(fn::dense::fmt::f32) + 1;
-static_assert(n_fmts == 11 && n_dfmts == 10, "the format enums (experts.h, dense.h)");
+static_assert(n_fmts == 12 && n_dfmts == 10, "the format enums (experts.h, dense.h)");
 
 struct compiled_sets {
     bool gu[n_fmts][n_dfmts][n_dfmts] = {};
@@ -167,7 +173,7 @@ constexpr bool compiled_dn(fmt f, fmt s) {
 // ---- a gate/up family's shared pairs --------------------------------------------------------------------------------
 // The (shared gate, shared up) pairs of every profiled triple whose routed format is one of a family's, each once, in
 // the order the profiles list them; key = gate x 16 + up (the family body's switch), unused slots -1 - i (no pair's)
-constexpr int32_t gu_max_pairs = 12;
+constexpr int32_t gu_max_pairs = 18;  // IQ3S: the IQ2 family's 18 with the Swift IQ3_S file's pairs
 
 struct gu_pairs {
     int32_t        n                 = 0;

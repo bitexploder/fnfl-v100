@@ -495,6 +495,7 @@ using gu_iq3  = gu_family<fmt::iq3_xxs, fmt::iq3_s>;
 // TTTS3 item 3: the K-quants (UD-Q4_K_XL's routed gate/up), one format a family, B = 1-5
 using gu_q4_k = gu_family<fmt::q4_k>;
 using gu_q5_k = gu_family<fmt::q5_k>;
+using gu_iq4_xs = gu_family<fmt::iq4_xs>;  // IQ3S: the Swift IQ3_S file's layer 47
 static_assert(gu_iq2::table == gu_u_table && gu_iq3::table == gu_u3_table && gu_iq2::b_min == 1 && gu_iq3::b_min == 4,
               "the IQ bodies' table regions and B");
 // the IQ bodies' pair switches (experts_gu_u_body.inc) list exactly their profiles' pairs, in order
@@ -503,13 +504,21 @@ static_assert(pairs_are(gu_iq2::pairs,
                           pair_key(dfmt::iq4_xs, dfmt::q6_k), pair_key(dfmt::iq3_s, dfmt::iq4_xs),
                           pair_key(dfmt::iq3_s, dfmt::iq3_s), pair_key(dfmt::q4_k, dfmt::iq3_s),
                           pair_key(dfmt::q4_k, dfmt::q5_k), pair_key(dfmt::q5_k, dfmt::q4_k),
-                          pair_key(dfmt::iq4_xs, dfmt::q4_k), pair_key(dfmt::iq4_xs, dfmt::iq4_xs) }),
+                          pair_key(dfmt::iq4_xs, dfmt::q4_k), pair_key(dfmt::iq4_xs, dfmt::iq4_xs),
+                          pair_key(dfmt::q4_k, dfmt::q6_k), pair_key(dfmt::q6_k, dfmt::q5_k),
+                          pair_key(dfmt::q6_k, dfmt::q4_k), pair_key(dfmt::q4_k, dfmt::iq4_xs),
+                          pair_key(dfmt::q6_k, dfmt::iq4_xs), pair_key(dfmt::q6_k, dfmt::q6_k),
+                          pair_key(dfmt::q5_k, dfmt::q5_k), pair_key(dfmt::iq4_xs, dfmt::q5_k) }),
               "the IQ2 body's pairs");
 static_assert(pairs_are(gu_iq3::pairs,
                         { pair_key(dfmt::iq4_xs, dfmt::q6_k), pair_key(dfmt::iq3_s, dfmt::iq3_s),
                           pair_key(dfmt::q4_k, dfmt::iq3_s), pair_key(dfmt::iq3_s, dfmt::q4_k),
                           pair_key(dfmt::q6_k, dfmt::iq3_s), pair_key(dfmt::iq4_xs, dfmt::iq4_xs),
-                          pair_key(dfmt::iq4_xs, dfmt::q4_k), pair_key(dfmt::q4_k, dfmt::iq4_xs) }),
+                          pair_key(dfmt::iq4_xs, dfmt::q4_k), pair_key(dfmt::q4_k, dfmt::iq4_xs),
+                          pair_key(dfmt::q6_k, dfmt::q6_k), pair_key(dfmt::q4_k, dfmt::q4_k),
+                          pair_key(dfmt::q5_k, dfmt::q5_k), pair_key(dfmt::q6_k, dfmt::iq4_xs),
+                          pair_key(dfmt::q5_k, dfmt::iq4_xs), pair_key(dfmt::iq4_xs, dfmt::q5_k),
+                          pair_key(dfmt::q6_k, dfmt::q5_k), pair_key(dfmt::q4_k, dfmt::q6_k) }),
               "the IQ3 body's pairs");
 
 // the family's shared pair for key (gate x 16 + up): body(gate, up) as integral constants, one block-uniform switch
@@ -576,6 +585,42 @@ template <typename FAM, typename Body> __device__ __forceinline__ void with_fami
             if constexpr (11 < FAM::pairs.n) {
                 body(std::integral_constant<dfmt, FAM::pairs.g[11]>{},
                      std::integral_constant<dfmt, FAM::pairs.u[11]>{});
+            }
+            break;
+        case FAM::pairs.key[12]:
+            if constexpr (12 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[12]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[12]>{});
+            }
+            break;
+        case FAM::pairs.key[13]:
+            if constexpr (13 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[13]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[13]>{});
+            }
+            break;
+        case FAM::pairs.key[14]:
+            if constexpr (14 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[14]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[14]>{});
+            }
+            break;
+        case FAM::pairs.key[15]:
+            if constexpr (15 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[15]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[15]>{});
+            }
+            break;
+        case FAM::pairs.key[16]:
+            if constexpr (16 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[16]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[16]>{});
+            }
+            break;
+        case FAM::pairs.key[17]:
+            if constexpr (17 < FAM::pairs.n) {
+                body(std::integral_constant<dfmt, FAM::pairs.g[17]>{},
+                     std::integral_constant<dfmt, FAM::pairs.u[17]>{});
             }
             break;
         default:
@@ -652,6 +697,36 @@ __device__ __forceinline__ void family_shared_unit(int32_t                key,
         case FAM::pairs.key[11]:
             if constexpr (11 < FAM::pairs.n) {
                 shared_unit<FAM::pairs.g[11], FAM::pairs.u[11], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[12]:
+            if constexpr (12 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[12], FAM::pairs.u[12], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[13]:
+            if constexpr (13 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[13], FAM::pairs.u[13], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[14]:
+            if constexpr (14 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[14], FAM::pairs.u[14], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[15]:
+            if constexpr (15 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[15], FAM::pairs.u[15], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[16]:
+            if constexpr (16 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[16], FAM::pairs.u[16], B>(a, g, w, lane, x, grid, red);
+            }
+            break;
+        case FAM::pairs.key[17]:
+            if constexpr (17 < FAM::pairs.n) {
+                shared_unit<FAM::pairs.g[17], FAM::pairs.u[17], B>(a, g, w, lane, x, grid, red);
             }
             break;
         default:
@@ -1520,6 +1595,14 @@ __global__ void __launch_bounds__(gp_threads, 1) gate_up_kernel_p(gate_up_args a
                     FN_GU_PAIR(q5_k, q4_k)
                     FN_GU_PAIR(iq4_xs, q4_k)
                     FN_GU_PAIR(iq4_xs, iq4_xs)
+                    FN_GU_PAIR(q4_k, q6_k)
+                    FN_GU_PAIR(q6_k, q5_k)
+                    FN_GU_PAIR(q6_k, q4_k)
+                    FN_GU_PAIR(q4_k, iq4_xs)
+                    FN_GU_PAIR(q6_k, iq4_xs)
+                    FN_GU_PAIR(q6_k, q6_k)
+                    FN_GU_PAIR(q5_k, q5_k)
+                    FN_GU_PAIR(iq4_xs, q5_k)
                     default:
                         break;
                 }
@@ -1738,7 +1821,7 @@ template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gat
             bool deployed = false;
 #define FN_EXPERTS_GU_CASE(rf, sgf, suf, layer)                                                                        \
     deployed = deployed || (F == fmt::rf && fg == dfmt::sgf && fu == dfmt::suf);
-            FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+            FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
             if (!deployed) {
                 return false;
@@ -1760,7 +1843,7 @@ template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gat
                              : launch_gate_up_p<false, fmt::rf, dfmt::sgf, dfmt::suf, 5>(a, st);                       \
         }                                                                                                              \
     }
-                FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+                FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
                 return false;
             }
@@ -1775,14 +1858,14 @@ template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gat
                              : launch_gate_up<fmt::rf, dfmt::sgf, dfmt::suf, 5>(a, st);                                \
         }                                                                                                              \
     }
-            FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+            FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
             return false;
         }
         bool deployed = false;
 #define FN_EXPERTS_GU_CASE(rf, sgf, suf, layer)                                                                        \
     deployed = deployed || (F == fmt::rf && fg == dfmt::sgf && fu == dfmt::suf);
-        FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+        FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
         if (!deployed) {
             return false;
@@ -1811,7 +1894,7 @@ template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gat
                 bool deployed = false;
 #define FN_EXPERTS_GU_CASE(rf, sgf, suf, layer)                                                                        \
     deployed = deployed || (F == fmt::rf && fg == dfmt::sgf && fu == dfmt::suf);
-                FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+                FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
                 if (!deployed) {
                     return false;
@@ -1829,7 +1912,7 @@ template <fmt F> bool gate_up_deployed(dfmt fg, dfmt fu, int32_t rows, const gat
             return gate_up_rows<fmt::rf, dfmt::sgf, dfmt::suf>(rows, a, st);                                           \
         }                                                                                                              \
     }
-        FN_EXPERTS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+        FN_EXPERTS_TARGET_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
 #undef FN_EXPERTS_GU_CASE
         return false;
     }
@@ -1854,6 +1937,7 @@ template <fmt F> bool gate_up_for(dfmt fg, dfmt fu, int32_t rows, const gate_up_
         }                                                                                                              \
     }
         FN_EXPERTS_Q4_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)
+        FN_EXPERTS_IQ4XS_GATE_UP_INSTANCES(FN_EXPERTS_GU_CASE)  // IQ3S: IQ4_XS on the K-quant path
 #undef FN_EXPERTS_GU_CASE
         return false;
     } else {

@@ -101,8 +101,10 @@ struct pass_card {
     // the head (FC-HEAD1..3)
     hc_module head;                  // w_down [4][320][1280], w_up, gamma
     const uint8_t * out_w = nullptr; // output.weight's card rows, DP2's packed layout
-    bool                out_q8      = false;   // TTTS2: output.weight Q8_0 (UD-Q4_K_XL), else Q5_K
-    bool                embd_q8     = false;   // TTTS2: token_embd Q8_0 (UD-Q4_K_XL), else IQ3_S
+    bool                out_q8      = false;   // TTTS2: output.weight Q8_0 (UD-Q4_K_XL)
+    bool                out_q6k     = false;   // IQ3S: output.weight Q6_K (Swift IQ3_S); neither flag: Q5_K
+    bool                embd_q8     = false;   // TTTS2: token_embd Q8_0 (UD-Q4_K_XL)
+    bool                embd_iq4xs  = false;   // IQ3S: token_embd IQ4_XS (Swift IQ3_S); neither flag: IQ3_S
     float * carry = nullptr;         // [5][4][1280] the hidden carry (FC-HEAD3)
     float * head_mom = nullptr;      // [5][1300]
     uint32_t * pair_own = nullptr;   // [5][2]
