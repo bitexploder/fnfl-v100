@@ -52,7 +52,7 @@ int server_queue::post(std::vector<server_task> && tasks, bool front) {
     bool reset_timer = false;
     for (auto & task : tasks) {
         if (task.id == -1) {
-            task.id = id++;
+            task.id = next_id();
         }
         // if this is cancel task make sure to clean up pending tasks
         if (task.type == SERVER_TASK_TYPE_CANCEL) {
@@ -92,8 +92,31 @@ void server_queue::defer(server_task && task) {
 
 int server_queue::get_new_id() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
-    int new_id = id++;
-    return new_id;
+    return next_id();
+}
+
+int server_queue::next_id() {
+    const auto queued = [this](int x) {
+        const auto is_x = [x](const server_task & t) { return t.id == x; };
+        return std::any_of(queue_tasks.begin(), queue_tasks.end(), is_x) ||
+               std::any_of(queue_tasks_deferred.begin(), queue_tasks_deferred.end(), is_x) ||
+               std::any_of(queue_tasks_unhandled.begin(), queue_tasks_unhandled.end(), is_x);
+    };
+    for (;;) {
+        const int new_id = id;
+        if (id >= id_max) {
+            id         = 0;
+            id_wrapped = true;
+        } else {
+            id += 1;
+        }
+        // before the first wrap every id is new; after it a long-lived task may still own its id
+        // (mutex_results is taken inside mutex_tasks here and nowhere the other way round)
+        if (!id_wrapped || (!queued(new_id) && (results == nullptr || !results->is_waiting(new_id)))) {
+            n_ids += 1;
+            return new_id;
+        }
+    }
 }
 
 void server_queue::pop_deferred_task(int id_slot) {
@@ -444,6 +467,11 @@ void server_response::remove_waiting_task_id(int id_task) {
             return res->id == id_task;
         }),
         queue_results.end());
+}
+
+bool server_response::is_waiting(int id_task) {
+    std::unique_lock<std::mutex> lock(mutex_results);
+    return waiting_task_ids.count(id_task) > 0;
 }
 
 void server_response::remove_waiting_task_ids(const std::unordered_set<int> & id_tasks) {

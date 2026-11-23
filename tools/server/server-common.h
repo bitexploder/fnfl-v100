@@ -14,6 +14,7 @@
 #include <cinttypes>
 #include <cstdio>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -91,6 +92,10 @@ struct server_grammar_trigger {
 };
 
 json format_error_response(const std::string & message, const enum error_type type);
+
+// IFR1: the error for an exception a route lets escape (the HTTP handlers' ex_wrapper): std::invalid_argument is the
+// client's (400), any other the server's (500); its "message" is the exception's
+json format_exception_response(const std::exception_ptr & ep);
 
 //
 // random string / id
@@ -183,6 +188,10 @@ llama_tokens tokenize_mixed(const llama_vocab * vocab, const json & json_prompt,
 // if validate_utf8(text) == text.size(), then the whole text is valid utf8
 size_t validate_utf8(const std::string& text);
 
+// IFR1 R3: text with each invalid UTF-8 sequence replaced by U+FFFD, as the JSON output replaces it; an incomplete
+// character at the end is kept (its bytes may still come)
+std::string utf8_replace_invalid(const std::string & text);
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * this supports these cases:
@@ -246,6 +255,75 @@ json oaicompat_completion_params_parse(const json & body);
 // used by /chat/completions endpoint
 // VIS1 Stage B: out_files (null: images refused) receives each image part's bytes in order, its part replaced by the
 // media marker; data URLs only (data:image/...;base64,...)
+// GLFL16 thinking budget: the request's reasoning budget from reasoning_budget_tokens, thinking_budget_tokens,
+// reasoning_budget, thinking_budget and (FBH1 A3) the OpenRouter object's reasoning.max_tokens (null is absent; each
+// given one an integer -1 .. INT32_MAX, -1 unlimited; given more than once they must agree), else def (the server's
+// --reasoning-budget). Throws std::invalid_argument
+int32_t reasoning_budget_from(const json & body, int32_t def);
+
+// FBH1 A2: the most tokens a reasoning budget message may have (the engine's limit)
+constexpr int32_t think_message_max = 256;
+
+// FBH1 A2: a request's "reasoning_budget_message": a string (empty: no message), else std::invalid_argument
+std::string reasoning_budget_message_from(const json & v);
+
+// FBH1 A2: the budget message's tokens: its text as plain text (no control tokens parsed), empty for an empty text.
+// False with err: more than think_message_max tokens, or the text holds one of tags (the reasoning tags' texts: the
+// parser would end or reopen the reasoning there, and a user-defined tag such as Qwen's </think> tokenizes to itself)
+bool think_message_ids(const llama_vocab * vocab, const std::string & text, const std::vector<std::string> & tags,
+                       std::vector<int32_t> & ids, std::string & err);
+
+// IFR1 R1: one budget field's value (name as the error names it): an integer from -1 to INT32_MAX, else
+// std::invalid_argument
+int32_t reasoning_budget_value(const std::string & name, const json & v);
+
+// IFR1 R1: a request's "reasoning_format": a string naming a supported format, else std::invalid_argument
+common_reasoning_format reasoning_format_from(const json & v);
+
+// IFR1 R2: std::invalid_argument for a reasoning budget the server would otherwise ignore, naming the field to use.
+// OpenAI bodies (anthropic false): "max_reasoning_tokens", a budget key in "chat_template_kwargs" and Anthropic's
+// "thinking.budget_tokens". Anthropic Messages bodies: the OpenAI budget fields (FBH1 A3: reasoning.max_tokens among
+// them) and a budget key in "chat_template_kwargs". A null value is absent, as for every optional field.
+void reasoning_controls_check(const json & body, bool anthropic);
+
+// GLFL16 thinking budget: the chat template's reasoning tags as its analysis finds them for a thinking request (the
+// parser's thinking_start_tag, empty when none, and its thinking_end_tags, whitespace stripped, empty ones and repeats
+// dropped: the first is the closing tag a spent budget forces, any others end reasoning too, as Qwen3-Coder's
+// <tool_call>); false with err on a failure
+bool think_tag_texts(const server_chat_params & opt, std::string & open_tag, std::vector<std::string> & end_tags,
+                     std::string & err);
+// a tag's tokens (special tokens parsed), empty for an empty tag
+std::vector<int32_t> think_tag_ids(const llama_vocab * vocab, const std::string & tag);
+// the prompt ends inside reasoning: its last opening sequence ends after the last of any of its ending sequences (a
+// template that opens reasoning for the answer); false without an opening sequence
+bool prompt_opens_reasoning(const llama_tokens & prompt, const std::vector<int32_t> & open,
+                            const std::vector<std::vector<int32_t>> & ends);
+// FBH1 K1: the model's own form of its close around the closing sequence: a newline before it (lead) and a blank line
+// after it (tail), tokenized as plain text. Both empty without a closing sequence, or when a lead token is one of an
+// ending's or a tail token one of the opening sequence's (the engine would refuse them: the close then goes alone)
+void think_form_ids(const llama_vocab * vocab, const std::vector<int32_t> & open, const std::vector<int32_t> & close,
+                    const std::vector<std::vector<int32_t>> & ends, std::vector<int32_t> & lead,
+                    std::vector<int32_t> & tail);
+
+// FBH1 K2: after a forced close the model sometimes writes the closing tag itself before its answer, and the parser,
+// whose reasoning has ended, would show it in the content. From a forced closing token until the first other text, a
+// closing token of the model's own is given no text; the forced blank line and whitespace change nothing. The token
+// stays a token of the slot. For a one-token closing sequence (each supported model's); off otherwise, and for the
+// routes that return the raw text
+struct think_close_hide {
+    int32_t close = -1; // the closing token; -1: off
+    bool    armed = false;
+
+    void reset(const std::vector<int32_t> & close_seq, bool chat_route);
+    // true: the token's text (piece, as the shell renders it) is not shown
+    bool hide(int32_t tok, bool forced, const std::string & piece);
+};
+
+// IFR1 R3: the vocabulary's tokens that are not whole UTF-8 characters, each token's piece (rendered as the server
+// renders output, special or not) given to entry (the engine's fnfl_think_utf8_entry; 0: whole, left out)
+std::shared_ptr<const std::vector<uint32_t>> think_utf8_table(const llama_vocab * vocab, bool special,
+                                                              uint32_t (*entry)(int32_t, const char *, size_t));
+
 json oaicompat_chat_params_parse(json &                     body, /* openai api json semantics */
                                  const server_chat_params & opt,
                                  std::vector<raw_buffer> *  out_files = nullptr);
@@ -265,6 +343,14 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+
+    // GLFL16 thinking budget: the request's effective budget (-1: none, nothing counted), the reasoning tokens counted
+    // against it and the tokens it forced: the message, the close's lead, the closing sequence and its tail (the
+    // engine's fnfl_step_result::think_add, think_forced)
+    int32_t  think_budget   = -1;
+    uint64_t n_think        = 0;
+    uint64_t n_think_forced = 0;
+    uint64_t n_think_extra  = 0; // IFR1 R3: reasoning tokens past the budget, finishing a UTF-8 character
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

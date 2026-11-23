@@ -133,8 +133,8 @@ int64_t bytes_per_cell(int32_t card, bool kv_q8, const window & w) {
     return kv + draft_kv + index + draft_index;
 }
 
-bool host_class(const std::string & name, bool single, bool kv_host) {
-    return name == "vision staging (VIS1)" || (single && name == "prefill checkpoints (PF1)") ||
+bool host_class(const std::string & name, bool /* single */, bool kv_host) {
+    return name == "vision staging (VIS1)" || name == "prefill checkpoints (PF1)" ||
            (kv_host && (name == "target KV (K0)" || name == "draft KV (F16)" || name == "target index keys (ME6)" ||
                         name == "draft index keys (ME6)"));
 }
@@ -351,14 +351,18 @@ std::vector<buffer_class> state_classes(const state_params & p) {
     // PF1: the slot's checkpoints at multiples of 8,192 and prompt ends (FC-ST1; KV, index keys and summaries are
     // restored by their valid lengths, so they are not copied), and two device PLE staging slots of one chunk's rows
     // each (one being read by the chunk's rounds, the next chunk's uploading)
+    // BG3: pinned host memory (host_class), one book a slot of prefill_checkpoints_per_slot entries, slot-major
     buffer_class ck{"prefill checkpoints (PF1)",
-                    "FC-ST1: 36 GDN states 24 x 128 x 128 F32 with up to 5 records (ME11), 36 GDN histories 5,120 x 3 "
-                    "F32, the PLE history "
-                    "5,120 x (conv_kernel - 1) x ngram F32 and the draft's retained carry [4][1280] F32, a checkpoint "
-                    "a card; 8 a slot",
+                    "FC-ST1: the window's GDN states 24 x 128 x 128 F32 with up to 5 records (ME11) and histories "
+                    "5,120 x 3 F32, the PLE history 5,120 x (conv_kernel - 1) x ngram F32 and the draft's retained "
+                    "carry [4][1280] F32, a checkpoint a card; BG3: a slot n_cells / 8,192 + 1, in host memory",
                     {}};
-    for (int32_t i = 0; i < prefill_checkpoints; ++i) {
-        ck.parts.push_back(both("checkpoint " + std::to_string(i), checkpoint_bytes(p)));
+    const int32_t per_slot = prefill_checkpoints_per_slot(p.n_cells);
+    for (int32_t s = 0; s < std::max(p.n_slots, 1); ++s) {
+        for (int32_t i = 0; i < per_slot; ++i) {
+            ck.parts.push_back(
+                both("slot " + std::to_string(s) + " checkpoint " + std::to_string(i), checkpoint_bytes(p)));
+        }
     }
     out.push_back(ck);
     const int64_t pf_slot = int64_t(prefill_stage_rows) * 2560 * 4;

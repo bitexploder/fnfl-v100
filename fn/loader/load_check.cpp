@@ -122,12 +122,19 @@ bool reserve(model::model & m, const model::buffer_class & plan, account_row & r
         row.requested[c] = plan.requested(c);
         row.allocation[c] = plan.allocation(c);
         std::string err;
-        if (!out->buf[c].allocate(m.device[c], (size_t)row.allocation[c], err)) {
+        // BG3: a host class (the checkpoint books) in pinned host memory, as the run load places it
+        const bool host = model::host_class(plan.name, m.single, m.kv_host);
+        if (!(host ? out->buf[c].allocate_host(m.device[c], (size_t)row.allocation[c], err, false)
+                   : out->buf[c].allocate(m.device[c], (size_t)row.allocation[c], err))) {
             fprintf(stderr, "load-check: %s: %s\n", plan.name.c_str(), err.c_str());
             return false;
         }
         // initialize all state (STANDARDS): the QSA flags and every valid length start at zero
         if (row.allocation[c] == 0) {
+            continue;
+        }
+        if (host) {
+            std::memset(out->buf[c].data(), 0, (size_t)row.allocation[c]);
             continue;
         }
         if (!cuda_check(cudaSetDevice(m.device[c]), "cudaSetDevice") ||
@@ -787,9 +794,10 @@ bool plan_stage(const std::string & model_path,
         p.weights[c] = m.weight_alloc[c];
         p.pool[c]    = model::bytes_per_cell(c, kv_q8, m.win) * int64_t(pool_cells);
     }
+    sp.n_slots = n_slots; // BG3: a checkpoint book a slot
     for (const model::buffer_class & b : model::state_classes(sp)) {
-        if (model::pooled_class(b.name)) {
-            continue;  // the pool's, at pool_cells
+        if (model::pooled_class(b.name) || model::host_class(b.name, false, false)) {
+            continue; // the pool's, at pool_cells; BG3: host memory (the checkpoint books), not a card's
         }
         for (int32_t c = 0; c < 2; ++c) {
             (model::slot_class(b.name) ? p.slots[c] : p.engine[c]) +=

@@ -59,17 +59,25 @@ struct pf_chunk {
     int32_t half[2] = {0, 0}; // half[1] = 0 for a chunk of at most split_rows rows (plan_chunks)
 };
 
+// BG3: a prompt's end checkpoint sits at to - 1, so a follow-up that keeps all but the prompt's last token (a client
+// re-rendering the turn's end differently) restores there; a chunk ends at to - 1 and the last token is its own chunk
+inline int64_t pf_end_cut(int64_t from, int64_t to) {
+    return to - 1 > from && (to - 1) % pf_span != 0 ? to - 1 : -1;
+}
+
 // the chunks over positions [from, to); ME3: of at most max_rows rows (--ex-prompt-chunk); MX3: one half up to
-// split_rows rows (pf_split_rows, or pf_cached_split_rows with the expert cache)
+// split_rows rows (pf_split_rows, or pf_cached_split_rows with the expert cache); BG3: end_cut, a read's plan (every
+// runtime caller), a chunk ends at to - 1 (pf_end_cut)
 inline std::vector<pf_chunk> plan_chunks(int64_t from, int64_t to, int32_t max_rows = pf_chunk_rows,
-                                         int32_t split_rows = pf_split_rows) {
+                                         int32_t split_rows = pf_split_rows, bool end_cut = true) {
     std::vector<pf_chunk> out;
     int64_t pos = std::max<int64_t>(from, 0);
     const int64_t most = std::min<int64_t>(std::max(max_rows, 1), pf_chunk_rows);
+    const int64_t cut = end_cut ? pf_end_cut(pos, to) : -1;
     while (pos < to) {
-        // the tiling restarts at every multiple of 8,192 and at from
+        // the tiling restarts at every multiple of 8,192 and at from; BG3: a chunk also ends at to - 1
         const int64_t span_end = (pos / pf_span + 1) * pf_span;
-        const int64_t end = std::min({pos + most, span_end, to});
+        const int64_t end = std::min({pos + most, span_end, pos < cut ? cut : to, to});
         pf_chunk c;
         c.start = pos;
         c.rows = static_cast<int32_t>(end - pos);
@@ -94,15 +102,17 @@ inline bool pf_short_read(int64_t from, int64_t to, int32_t short_read, bool ser
     return service && !legacy && short_read > 0 && to - from <= short_read;
 }
 // ME3: a short read's next forced round at position n with u tokens left: at most five rows (the target windows'
-// largest), none crossing a multiple of 8,192 (its checkpoint)
+// largest), none crossing a multiple of 8,192 (its checkpoint) or, BG3, the prompt's last token (u > 1: it stops at
+// one token before the end, the end checkpoint's position)
 inline int32_t pf_short_rows(int64_t n, int64_t u) {
     const int64_t span_end = (n / pf_span + 1) * pf_span;
-    return static_cast<int32_t>(std::min<int64_t>({5, u, span_end - n}));
+    return static_cast<int32_t>(std::min<int64_t>({5, u > 1 ? u - 1 : u, span_end - n}));
 }
 
-// a checkpoint is taken at pos (a chunk's end) when pos is a multiple of 8,192 or the prompt's end
+// a checkpoint is taken at pos (a chunk's end) when pos is a multiple of 8,192 or, BG3, one token before the prompt's
+// end (a one-token prompt has none there)
 inline bool checkpoint_due(int64_t pos, int64_t prompt_end) {
-    return pos > 0 && (pos % pf_span == 0 || pos == prompt_end);
+    return pos > 0 && (pos % pf_span == 0 || pos == prompt_end - 1);
 }
 
 namespace pplan {
@@ -371,7 +381,10 @@ inline bool make(const options & o, const pool & pl, int64_t from, int64_t to, a
         return true;
     }
     out.p = path::bulk;
-    const std::vector<pf_chunk> cs = plan_chunks(from, to, o.chunk_rows, o.me3 ? pf_split_rows : o.split_rows);
+    // the policy's chunk shapes over [from, to): BG3's one-row tail of a read (end_cut) is not modelled; it stages
+    // through the ring like any one-half chunk
+    const std::vector<pf_chunk> cs =
+        plan_chunks(from, to, o.chunk_rows, o.me3 ? pf_split_rows : o.split_rows, /* end_cut */ false);
     bool two = false;
     for (const pf_chunk & c : cs) {
         out.rc = std::max(out.rc, c.rows);

@@ -780,6 +780,99 @@ bool c_reuse(std::string & d) {
     return lm.clean(d) && tag_ok && buf_ok;
 }
 
+// GLFL16 thinking budget: set_sampling's reasoning settings packed and unpacked (Qwen's <tool_call> ending, GLM's
+// single close, none), and payloads that do not add up refused. IFR1 R3: the UTF-8 table with them (a budget's only).
+// FBH1: the budget message with them (a budget's only), cut short or over its limit refused; K1: the forced close's
+// lead and tail with them (a budget's only), cut short or sent twice refused
+bool c_think_wire(std::string & d) {
+    const auto table = [](const fn::think::config & t) {
+        return t.budget >= 0 && t.utf8 ? *t.utf8 : std::vector<uint32_t>();
+    };
+    const auto message = [](const fn::think::config & t) {
+        return t.budget >= 0 ? t.message : std::vector<int32_t>();
+    };
+    const auto form = [](const fn::think::config & t, bool lead) {
+        return t.budget >= 0 ? (lead ? t.lead : t.tail) : std::vector<int32_t>();
+    };
+    const auto same = [&](const fn::think::config & a, const fn::think::config & b) {
+        return a.budget == b.budget && a.open == b.open && a.close == b.close && a.ends == b.ends &&
+               a.open_at_start == b.open_at_start && table(a) == table(b) &&
+               (b.utf8 != nullptr) == !table(a).empty() && message(a) == b.message && form(a, true) == b.lead &&
+               form(a, false) == b.tail;
+    };
+    const auto utf8 = std::make_shared<std::vector<uint32_t>>(
+        std::vector<uint32_t>{ 1000u | 8u << 24, 1001u | 33u << 24, 248000u | 0x40u << 24 });
+    fn::think::config qwen;
+    qwen.budget        = 64;
+    qwen.open          = { 248068 };
+    qwen.close         = { 248069 };
+    qwen.ends          = { { 248058 }, { 5, 6, 7 } };
+    qwen.open_at_start = true;
+    qwen.utf8          = utf8;
+    qwen.message       = { 271, 62268, 1040, 13 };
+    qwen.lead          = { 198 };
+    qwen.tail          = { 271 };
+    fn::think::config glm;
+    glm.budget = 0;
+    glm.open   = { 154841 };
+    glm.close  = { 154842 };
+    glm.utf8   = utf8;
+    glm.tail   = { 11, 12 }; // a tail without a lead
+    fn::think::config unlimited = qwen;
+    unlimited.budget            = -1;
+    fn::think::config said      = glm; // a message without endings or a table
+    said.budget                 = 64;
+    said.utf8                   = nullptr;
+    said.message                = { 1, 2, 3 };
+    fn::think::config led       = said; // a lead without a tail, before the message
+    led.lead                    = { 21, 22 };
+    bool ok    = true;
+    for (const fn::think::config & t : { qwen, glm, fn::think::config{}, unlimited, said, led }) {
+        st::ctrl             c;
+        std::vector<int32_t> pay;
+        st::think_pack(t, c, pay);
+        fn::think::config back;
+        ok = ok && st::think_unpack(c, pay.data(), int32_t(pay.size()), back) && same(t, back);
+    }
+    st::ctrl             c;
+    std::vector<int32_t> pay;
+    st::think_pack(qwen, c, pay);
+    fn::think::config back;
+    const bool short_end  = st::think_unpack(c, pay.data(), int32_t(pay.size()) - 1, back);  // an ending cut short
+    pay[2]                = 0;                                                               // an empty ending
+    const bool empty_end  = st::think_unpack(c, pay.data(), int32_t(pay.size()), back);
+    c.think_close_n       = 5;                                                               // past the payload
+    const bool long_close = st::think_unpack(c, pay.data(), 3, back);
+    st::think_pack(qwen, c, pay);
+    c.think_utf8_n        = int32_t(pay.size()) + 1;                                         // a table past it
+    const bool long_utf8  = st::think_unpack(c, pay.data(), int32_t(pay.size()), back);
+    st::think_pack(said, c, pay);
+    const bool short_msg  = st::think_unpack(c, pay.data(), int32_t(pay.size()) - 1, back);  // a message cut short
+    said.message.assign(size_t(fn::think::max_message) + 1, 1);                              // over its limit
+    st::think_pack(said, c, pay);
+    const bool long_msg   = st::think_unpack(c, pay.data(), int32_t(pay.size()), back);
+    // K1: glm's payload is its sequences, the form word, its 2 tail tokens and the table: the tail cut short, and the
+    // form word a second time
+    st::think_pack(glm, c, pay);
+    const bool whole_form = st::think_unpack(c, pay.data(), int32_t(pay.size()), back) && back.tail == glm.tail;
+    std::vector<int32_t> cut(pay.begin(), pay.begin() + 4);
+    cut.insert(cut.end(), pay.end() - c.think_utf8_n, pay.end());
+    const bool short_form = st::think_unpack(c, cut.data(), int32_t(cut.size()), back);
+    std::vector<int32_t> twice(pay.begin(), pay.begin() + 5);
+    twice.insert(twice.end(), pay.begin() + 2, pay.end());
+    const bool two_forms  = st::think_unpack(c, twice.data(), int32_t(twice.size()), back);
+    d = "round trips (2 endings, a 1-token lead and tail, a 4-token message and a 3-entry UTF-8 table, 1 close, a "
+        "2-token tail and the table, none, unlimited: no table, message, lead or tail sent, a message alone, a "
+        "2-token lead and a message) " +
+        std::string(ok ? "equal" : "DIFFER") + "; refused: cut ending " + (short_end ? "NO" : "yes") +
+        ", empty ending " + (empty_end ? "NO" : "yes") + ", close past the payload " + (long_close ? "NO" : "yes") +
+        ", table past the payload " + (long_utf8 ? "NO" : "yes") + ", cut message " + (short_msg ? "NO" : "yes") +
+        ", message over 256 tokens " + (long_msg ? "NO" : "yes") + ", cut tail " +
+        (!whole_form || short_form ? "NO" : "yes") + ", a second lead and tail " + (two_forms ? "NO" : "yes");
+    return ok && !short_end && !empty_end && !long_close && !long_utf8 && !short_msg && !long_msg && whole_form &&
+           !short_form && !two_forms;
+}
+
 }  // namespace
 
 int fnfl_safety_test(const std::string & cases) {
@@ -818,6 +911,8 @@ int fnfl_safety_test(const std::string & cases) {
         { "reuse",
          "slot 3: generation 1 answered and dropped, stale duplicate then generation 2; then a follower "
           "group with card 0's copy held, wait_all 0.2 s, buffer refilled, copy released",                                     c_reuse                                            },
+        { "think-wire", "set_sampling's reasoning settings packed and unpacked; payloads that do not add up refused",
+         c_think_wire },
     };
     int32_t failed = 0, ran = 0;
     for (const entry & e : list) {

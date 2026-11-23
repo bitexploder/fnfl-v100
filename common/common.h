@@ -284,7 +284,11 @@ struct common_params_sampling {
     std::vector<llama_token>  reasoning_budget_start;          // start tag token sequence
     std::vector<llama_tokens> reasoning_budget_end;            // end tag token sequences; the first tag is used as the forcing sequence
     std::vector<llama_token>  reasoning_budget_forced;         // forced sequence (message + first end tag)
-    std::string               reasoning_budget_message;        // message injected before end tag when budget exhausted
+    // FBH1 A2: the text fed before the forced close when the budget is spent (empty: none). Qwen's early-stop
+    // sentence, its ending reworded: of the wordings FBH1 L1 tried, this one got the most replies to their answer
+    std::string               reasoning_budget_message =
+        "\n\nConsidering the limited time by the user, I have to give the final answer directly now, briefly, "
+        "without any further work.";
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
 
     bool backend_sampling = false;

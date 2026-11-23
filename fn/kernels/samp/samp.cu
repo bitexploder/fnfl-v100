@@ -545,8 +545,11 @@ __device__ void write_record(const kargs & a, int32_t n, const int32_t * tok, in
 __device__ void verdict(const kargs & a, const rowres_t * rr, bool resid_later) {
     fn::round::desc & d = *a.desc;
     if (!is_verify(a)) {
-        d.argmax[0] = rr[0].draw;
-        write_record(a, 1, &rr[0].draw, 0);
+        // GLFL16 thinking budget: the forced token in place of the draw (the same on both cards, so the records agree)
+        const int32_t f = a.v.prm->force;
+        const int32_t tok = f >= 0 ? f : rr[0].draw;
+        d.argmax[0] = tok;
+        write_record(a, 1, &tok, 0);
         return;
     }
     const int32_t nd = a.rows - 1;
@@ -2244,6 +2247,7 @@ params make_params(const options & o, int32_t n_ctx) {
     p.req_lo = static_cast<uint32_t>(o.request);
     p.req_hi = static_cast<uint32_t>(o.request >> 32);
     p.eos = o.eos;
+    p.force = -1;
     return p;
 }
 
@@ -2455,6 +2459,15 @@ bool write_params(const card_view & v, const params & p, const options & o, void
     return cudaMemcpyAsync(v.prm, &p, sizeof(p), cudaMemcpyHostToDevice, st) == cudaSuccess &&
            cudaMemcpyAsync(v.bias, table.data(), table.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
            cudaStreamSynchronize(st) == cudaSuccess;
+}
+
+bool write_force(const card_view & v, int32_t token, void * stream) {
+    if (!view_ok(v) || stream == nullptr || token < -1 || token >= n_vocab) {
+        return false;
+    }
+    // from pageable memory: the call returns once the word is staged, so a local is safe
+    return cudaMemcpyAsync(&v.prm->force, &token, sizeof(token), cudaMemcpyHostToDevice,
+                           static_cast<cudaStream_t>(stream)) == cudaSuccess;
 }
 
 bool load_window(const card_view & v, int32_t cap, const std::vector<int32_t> & ledger, void * stream) {

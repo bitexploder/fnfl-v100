@@ -31,6 +31,21 @@
 #include <unistd.h>
 #endif
 
+json format_exception_response(const std::exception_ptr & ep) {
+    try {
+        std::rethrow_exception(ep);
+    } catch (const std::invalid_argument & e) {
+        return format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST);
+    } catch (const common_json_error & e) {
+        // FBH1 L5: a JSON error at a route is the request's (a body that is not JSON, a value of the wrong type)
+        return format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST);
+    } catch (const std::exception & e) {
+        return format_error_response(e.what(), ERROR_TYPE_SERVER);
+    } catch (...) {
+        return format_error_response("unknown error", ERROR_TYPE_SERVER);
+    }
+}
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;
@@ -97,6 +112,13 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+    }
+
+    if (think_budget >= 0) {
+        base["reasoning_budget"]   = think_budget;
+        base["reasoning_n"]        = n_think;
+        base["reasoning_forced_n"] = n_think_forced;
+        base["reasoning_extra_n"]  = n_think_extra;
     }
 
     return base;
@@ -370,6 +392,36 @@ size_t validate_utf8(const std::string& text) {
     return len;
 }
 
+std::string utf8_replace_invalid(const std::string & text) {
+    static const char fffd[] = "\xEF\xBF\xBD";
+    std::string out;
+    out.reserve(text.size());
+    size_t i = 0;
+    while (i < text.size()) {
+        const auto c = (unsigned char) text[i];
+        const size_t len = c < 0x80 ? 1 : c >= 0xC2 && c <= 0xDF ? 2 : c >= 0xE0 && c <= 0xEF ? 3 :
+                           c >= 0xF0 && c <= 0xF4 ? 4 : 0;
+        if (len == 0) {
+            out += fffd; // a continuation byte or a byte no character begins with
+            ++i;
+            continue;
+        }
+        size_t j = i + 1;
+        while (j < i + len && j < text.size() && ((unsigned char) text[j] & 0xC0) == 0x80) {
+            ++j;
+        }
+        if (j == i + len) {
+            out.append(text, i, len);
+        } else if (j == text.size()) {
+            out.append(text, i, j - i); // incomplete at the end: kept
+        } else {
+            out += fffd; // cut short by a byte that cannot continue it
+        }
+        i = j;
+    }
+    return out;
+}
+
 /**
  * break the input "prompt" object into multiple prompt if needed, then tokenize them
  * use tokenize_input_prompts() if the input could be an array.
@@ -507,6 +559,9 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
                                  std::vector<raw_buffer> *  out_files) {
     json llama_params;
 
+    // IFR1 R2: a budget where this endpoint would ignore it is refused
+    reasoning_controls_check(body, false);
+
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
@@ -617,9 +672,16 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
     common_chat_templates_inputs inputs;
-    inputs.messages               = common_chat_msgs_parse_oaicompat(messages);
-    inputs.tools                  = common_chat_tools_parse_oaicompat(tools);
-    inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(tool_choice);
+    // FBH1 L5: messages, tools or a tool choice that do not parse are the request's fault (400), not the server's
+    try {
+        inputs.messages    = common_chat_msgs_parse_oaicompat(messages);
+        inputs.tools       = common_chat_tools_parse_oaicompat(tools);
+        inputs.tool_choice = common_chat_tool_choice_parse_oaicompat(tool_choice);
+    } catch (const std::invalid_argument &) {
+        throw;
+    } catch (const std::exception & e) {
+        throw std::invalid_argument(e.what());
+    }
     inputs.json_schema            = json_schema.is_null() ? "" : json_schema.dump();
     inputs.grammar                = grammar;
     inputs.use_jinja              = opt.use_jinja;
@@ -646,8 +708,8 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
         throw std::invalid_argument("Cannot continue an assistant message that contains tool calls.");
     }
     inputs.reasoning_format = opt.reasoning_format;
-    if (body.contains("reasoning_format")) {
-        inputs.reasoning_format = common_reasoning_format_from_name(body.at("reasoning_format").get<std::string>());
+    if (body.contains("reasoning_format") && !body.at("reasoning_format").is_null()) {
+        inputs.reasoning_format = reasoning_format_from(body.at("reasoning_format"));
     }
     inputs.enable_thinking = opt.enable_thinking;
     if (!inputs.tools.empty() && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
@@ -688,7 +750,15 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
-    auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    // FBH1 L5: the template was rendered at startup, so a failure here comes from this request's messages (400)
+    common_chat_params chat_params;
+    try {
+        chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+    } catch (const std::invalid_argument &) {
+        throw;
+    } catch (const std::exception & e) {
+        throw std::invalid_argument(e.what());
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
@@ -714,22 +784,9 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
 
     llama_params["message_delimiters"] = chat_params.message_delimiters.to_json();
 
-    // Reasoning budget: pass parameters through to sampling layer
-    {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
-            reasoning_budget = opt.reasoning_budget;
-        }
-
-        if (!chat_params.thinking_end_tags.empty()) {
-            llama_params["reasoning_budget_tokens"] = reasoning_budget;
-            llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
-            llama_params["reasoning_budget_end_tags"] = chat_params.thinking_end_tags;
-            llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
-            llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
-        }
-    }
+    // GLFL16 thinking budget: the request's (its aliases validated), else the server's default; the engine counts the
+    // reasoning and feeds the model's own closing sequence (the server resolves it from this template at load)
+    llama_params["reasoning_budget_tokens"] = reasoning_budget_from(body, opt.reasoning_budget);
 
     // Handle "logprobs" field
     // TODO: The response format of this option is not yet OAI-compatible, but seems like no one really using it; We may need to fix it in the future
@@ -753,6 +810,266 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
     }
 
     return llama_params;
+}
+
+int32_t reasoning_budget_from(const json & body, int32_t def) {
+    static const char * const names[] = {
+        "reasoning_budget_tokens", "thinking_budget_tokens", "reasoning_budget", "thinking_budget" };
+    const char * first = nullptr;
+    int64_t value = def;
+    for (const char * n : names) {
+        if (!body.contains(n) || body.at(n).is_null()) {
+            continue;
+        }
+        const int64_t x = reasoning_budget_value(n, body.at(n));
+        if (first != nullptr && x != value) {
+            throw std::invalid_argument(std::string("conflicting reasoning budgets: \"") + first + "\" is " +
+                                        std::to_string(value) + ", \"" + n + "\" is " + std::to_string(x));
+        }
+        if (first == nullptr) {
+            first = n;
+        }
+        value = x;
+    }
+    // FBH1 A3: the OpenRouter object, {"reasoning": {"max_tokens": N}}; its other keys are not read
+    if (body.contains("reasoning") && !body.at("reasoning").is_null()) {
+        const json & r = body.at("reasoning");
+        if (!r.is_object()) {
+            throw std::invalid_argument("\"reasoning\" must be an object (its \"max_tokens\" is the reasoning "
+                                        "budget), got " + r.dump());
+        }
+        if (r.contains("max_tokens") && !r.at("max_tokens").is_null()) {
+            const int64_t x = reasoning_budget_value("reasoning.max_tokens", r.at("max_tokens"));
+            if (first != nullptr && x != value) {
+                throw std::invalid_argument(std::string("conflicting reasoning budgets: \"") + first + "\" is " +
+                                            std::to_string(value) + ", \"reasoning.max_tokens\" is " +
+                                            std::to_string(x));
+            }
+            value = x;
+        }
+    }
+    return (int32_t) value;
+}
+
+std::string reasoning_budget_message_from(const json & v) {
+    if (!v.is_string()) {
+        throw std::invalid_argument("\"reasoning_budget_message\" must be a string (the text fed before the forced "
+                                    "close; an empty string turns it off), got " + v.dump());
+    }
+    return v.get<std::string>();
+}
+
+bool think_message_ids(const llama_vocab * vocab, const std::string & text, const std::vector<std::string> & tags,
+                       std::vector<int32_t> & ids, std::string & err) {
+    ids.clear();
+    for (const std::string & t : tags) {
+        if (!t.empty() && text.find(t) != std::string::npos) {
+            err = "the reasoning budget message holds the reasoning tag '" + t + "'";
+            return false;
+        }
+    }
+    if (text.empty()) {
+        return true;
+    }
+    for (const llama_token x : common_tokenize(vocab, text, false, false)) {
+        ids.push_back(x);
+    }
+    if (ids.size() > (size_t) think_message_max) {
+        err = "the reasoning budget message is " + std::to_string(ids.size()) + " tokens, more than " +
+              std::to_string(think_message_max);
+        ids.clear();
+        return false;
+    }
+    return true;
+}
+
+int32_t reasoning_budget_value(const std::string & name, const json & v) {
+    if (!v.is_number_integer()) {
+        throw std::invalid_argument("\"" + name + "\" must be an integer (-1 for unlimited, or a number of reasoning "
+                                    "tokens), got " + v.dump());
+    }
+    // the range through a double first, so no huge integer wraps into it
+    const double d = v.get<double>();
+    const int64_t x = d < -1.0 || d > (double) INT32_MAX ? INT64_MIN : v.get<int64_t>();
+    if (x < -1 || x > INT32_MAX) {
+        throw std::invalid_argument("\"" + name + "\" must be between -1 and " + std::to_string(INT32_MAX) +
+                                    ", got " + v.dump());
+    }
+    return (int32_t) x;
+}
+
+common_reasoning_format reasoning_format_from(const json & v) {
+    static const char * const supported = "\"none\", \"auto\", \"deepseek\" or \"deepseek-legacy\"";
+    if (!v.is_string()) {
+        throw std::invalid_argument(std::string("\"reasoning_format\" must be a string, ") + supported + ", got " +
+                                    v.dump());
+    }
+    try {
+        return common_reasoning_format_from_name(v.get<std::string>());
+    } catch (const std::exception &) {
+        throw std::invalid_argument(std::string("\"reasoning_format\" must be ") + supported + ", got " + v.dump());
+    }
+}
+
+void reasoning_controls_check(const json & body, bool anthropic) {
+    static const char * const budgets[] = { "reasoning_budget_tokens", "thinking_budget_tokens", "reasoning_budget",
+                                            "thinking_budget", "max_reasoning_tokens" };
+    const std::string oai = "the reasoning budget is the top-level \"reasoning_budget_tokens\" (aliases "
+                            "\"thinking_budget_tokens\", \"reasoning_budget\", \"thinking_budget\"): -1 unlimited, or "
+                            "the reasoning tokens a response may generate";
+    const std::string anth = "this endpoint (POST /v1/messages) takes the reasoning budget as "
+                             "\"thinking.budget_tokens\" (\"thinking\": {\"type\": \"enabled\", \"budget_tokens\": N})";
+    const auto given = [](const json & o, const char * n) {
+        return o.is_object() && o.contains(n) && !o.at(n).is_null();
+    };
+    for (const char * n : budgets) {
+        const bool top = anthropic ? given(body, n) : std::string(n) == "max_reasoning_tokens" && given(body, n);
+        if (top) {
+            throw std::invalid_argument(std::string("\"") + n + "\" is not a supported field: " +
+                                        (anthropic ? anth : oai));
+        }
+        if (given(body, "chat_template_kwargs") && given(body.at("chat_template_kwargs"), n)) {
+            throw std::invalid_argument(std::string("\"chat_template_kwargs.") + n + "\" is not a template setting: " +
+                                        (anthropic ? anth : oai));
+        }
+    }
+    // FBH1 A3: the OpenRouter object's budget is an OpenAI field too
+    if (anthropic && given(body, "reasoning") && given(body.at("reasoning"), "max_tokens")) {
+        throw std::invalid_argument("\"reasoning.max_tokens\" is not a supported field: " + anth);
+    }
+    if (!anthropic && given(body, "thinking") && given(body.at("thinking"), "budget_tokens")) {
+        throw std::invalid_argument("\"thinking.budget_tokens\" is the Anthropic Messages field (POST /v1/messages); " +
+                                    oai);
+    }
+}
+
+std::shared_ptr<const std::vector<uint32_t>> think_utf8_table(const llama_vocab * vocab, bool special,
+                                                              uint32_t (*entry)(int32_t, const char *, size_t)) {
+    auto t = std::make_shared<std::vector<uint32_t>>();
+    const int32_t n = llama_vocab_n_tokens(vocab);
+    for (int32_t id = 0; id < n; ++id) {
+        const std::string p = common_token_to_piece(vocab, id, special);
+        const uint32_t e = entry(id, p.data(), p.size());
+        if (e != 0) {
+            t->push_back(e);
+        }
+    }
+    return t;
+}
+
+bool think_tag_texts(const server_chat_params & opt, std::string & open_tag, std::vector<std::string> & end_tags,
+                     std::string & err) {
+    open_tag.clear();
+    end_tags.clear();
+    try {
+        common_chat_templates_inputs in;
+        common_chat_msg m;
+        m.role    = "user";
+        m.content = "x";
+        in.messages             = {m};
+        in.use_jinja            = opt.use_jinja;
+        in.enable_thinking      = true;
+        in.reasoning_format     = opt.reasoning_format;
+        in.chat_template_kwargs = opt.chat_template_kwargs;
+        const common_chat_params cp = common_chat_templates_apply(opt.tmpls.get(), in);
+        // the tags without the whitespace a template writes around them (Qwen's end tag is "\n</think>"): the model
+        // closes with the tag token after any text, and a prompt with reasoning off holds "\n\n</think>", whose
+        // newlines are another token
+        open_tag = string_strip(cp.thinking_start_tag);
+        for (const std::string & t : cp.thinking_end_tags) {
+            const std::string s = string_strip(t);
+            if (!s.empty() && std::find(end_tags.begin(), end_tags.end(), s) == end_tags.end()) {
+                end_tags.push_back(s);
+            }
+        }
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+
+void think_form_ids(const llama_vocab * vocab, const std::vector<int32_t> & open, const std::vector<int32_t> & close,
+                    const std::vector<std::vector<int32_t>> & ends, std::vector<int32_t> & lead,
+                    std::vector<int32_t> & tail) {
+    lead.clear();
+    tail.clear();
+    if (close.empty()) {
+        return;
+    }
+    const auto holds = [](const std::vector<int32_t> & seq, int32_t t) {
+        return std::find(seq.begin(), seq.end(), t) != seq.end();
+    };
+    bool ok = true;
+    for (const llama_token x : common_tokenize(vocab, "\n", false, false)) {
+        lead.push_back(x);
+        ok = ok && !holds(close, x);
+        for (const std::vector<int32_t> & e : ends) {
+            ok = ok && !holds(e, x);
+        }
+    }
+    for (const llama_token x : common_tokenize(vocab, "\n\n", false, false)) {
+        tail.push_back(x);
+        ok = ok && !holds(open, x);
+    }
+    if (!ok) {
+        lead.clear();
+        tail.clear();
+    }
+}
+
+void think_close_hide::reset(const std::vector<int32_t> & close_seq, bool chat_route) {
+    close = chat_route && close_seq.size() == 1 ? close_seq[0] : -1;
+    armed = false;
+}
+
+bool think_close_hide::hide(int32_t tok, bool forced, const std::string & piece) {
+    if (close < 0) {
+        return false;
+    }
+    if (forced) {
+        armed = armed || tok == close; // the forced close arms; its forced blank line follows
+        return false;
+    }
+    if (!armed) {
+        return false;
+    }
+    if (tok == close) {
+        return true;
+    }
+    armed = piece.find_first_not_of(" \t\r\n") == std::string::npos;
+    return false;
+}
+
+std::vector<int32_t> think_tag_ids(const llama_vocab * vocab, const std::string & tag) {
+    std::vector<int32_t> v;
+    if (!tag.empty()) {
+        for (const llama_token x : common_tokenize(vocab, tag, false, true)) {
+            v.push_back(x);
+        }
+    }
+    return v;
+}
+
+bool prompt_opens_reasoning(const llama_tokens & prompt, const std::vector<int32_t> & open,
+                            const std::vector<std::vector<int32_t>> & ends) {
+    const auto last_end = [&](const std::vector<int32_t> & seq) -> int64_t {
+        if (seq.empty() || prompt.size() < seq.size()) {
+            return -1;
+        }
+        for (int64_t e = (int64_t) prompt.size(); e >= (int64_t) seq.size(); --e) {
+            if (std::equal(seq.begin(), seq.end(), prompt.begin() + (e - (int64_t) seq.size()))) {
+                return e;
+            }
+        }
+        return -1;
+    };
+    const int64_t o = last_end(open);
+    int64_t       e = -1;
+    for (const std::vector<int32_t> & seq : ends) {
+        e = std::max(e, last_end(seq));
+    }
+    return o >= 0 && o > e;
 }
 
 //

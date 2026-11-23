@@ -32,9 +32,12 @@ constexpr int64_t gdn_record_step_bytes = 16512; // fn::gdn::rec_step_floats * 4
 constexpr int64_t gdn_record_bytes = int64_t(2) * fn::round::gdn_max_steps * gdn_record_step_bytes;
 constexpr int32_t round_rows = 5; // SP2: the most rows a round carries ([p, d1..d4]; fn::round::max_rows)
 constexpr int32_t ple_channels_card = 5120; // four streams x 1,280 own features
-// PF1: the prefill driver's checkpoints a slot (FC-ST1) and the rows of a device PLE staging slot (one chunk, FC-PF3)
-constexpr int32_t prefill_checkpoints = 8;
+// PF1: the rows of a device PLE staging slot (one chunk, FC-PF3)
 constexpr int32_t prefill_stage_rows = 8192;
+// BG3: a slot's checkpoints (FC-ST1): every multiple of 8,192 within its context and one prompt-end checkpoint
+inline int32_t prefill_checkpoints_per_slot(int32_t n_cells) {
+    return (n_cells > 0 ? n_cells / 8192 : 0) + 1;
+}
 
 // TTTS1: the layers and extras one box holds (the split's stage). The whole model by default. The split's front holds
 // layers 0 .. k - 1, the back layers k .. 47 with the head (the HC head, output.weight) and the MTP draft (layer 48);
@@ -74,6 +77,7 @@ struct buffer_class {
 
 struct state_params {
     int32_t n_cells = 0;    // capacity a slot
+    int32_t n_slots = 1;    // BG3: the slots the prefill checkpoints' class holds a book for
     int32_t chunk_rows = 0; // prefill rows a chunk: 3,072 (two 1,536-row tiles) or 1,536 (one)
     int32_t ple_conv_kernel = 0;
     int32_t ple_ngram = 0;
@@ -121,8 +125,8 @@ constexpr int32_t kv_q8_scale_stride = 64;
 // the draft head copy (DR1: 57,671,680 + 131,072 bytes a card), GDN state, convolution histories, kernel workspaces
 // and constants, the round and pass (TG1), the sampler (SM1), the prefill checkpoints and PLE staging (PF1)
 std::vector<buffer_class> state_classes(const state_params & p);
-// ME1: whether a class is allocated in pinned host memory: on one device the prefill checkpoints (PF1), and with the
-// host-backed KV tier (kv_host) the target and draft KV (mapped: the tier's gathers and the draft's prompt K/V writes
+// ME1: whether a class is allocated in pinned host memory: the prefill checkpoints (PF1; BG3: on every configuration,
+// one book a slot), and with the host-backed KV tier (kv_host) the target and draft KV (mapped: the tier's gathers and the draft's prompt K/V writes
 // reach it from the device); ME6: and the target and draft index keys (mapped, the tier's key history); VIS1: the
 // vision staging (not mapped)
 bool host_class(const std::string & name, bool single, bool kv_host);

@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -127,6 +128,27 @@ struct fnfl_sampling {
     int32_t max_tokens = -1; // the request's n_predict; -1: unlimited, which becomes the context room
     int32_t n_ctx = 0;       // the shell's slot context (the room is n_ctx less the tokens the slot holds)
     bool ignore_eos = false; // VBENCH: end only at the budget; an end-of-generation token is returned (vLLM's)
+    // GLFL16 thinking budget (the request's, or the server's --reasoning-budget): the reasoning tokens this assistant
+    // turn may generate (-1: unlimited), the model's opening and closing sequences (its chat template's reasoning tags,
+    // tokenized by the shell) and whether the prompt ends inside reasoning. At the budget the engine's decision is the
+    // closing sequence's next token, fed through the model like any generated token (fn/runtime/think_budget.h).
+    // FBH1 A3: with the sequences and no budget the reasoning tokens are still counted (think_add), nothing forced
+    int32_t reasoning_budget = -1;
+    std::vector<int32_t> think_open, think_close;
+    // C2: the other sequences the model's parser ends reasoning with (Qwen's <tool_call>): natural ends, never forced
+    std::vector<std::vector<int32_t>> think_ends;
+    bool think_open_at_start = false;
+    // IFR1 R3: the vocabulary's tokens that are not whole UTF-8 characters (fnfl_think_utf8_entry, ascending by token;
+    // the shell's, shared by its requests): a budget spent inside a character waits for its bytes, at most 3 tokens
+    std::shared_ptr<const std::vector<uint32_t>> think_utf8;
+    // FBH1: the budget message's tokens (the shell's text, tokenized as plain text; empty: none), fed before the forced
+    // close and reserved inside the budget: with budget >= 4 x its tokens the free reasoning stops that many tokens
+    // early; a smaller budget closes alone. At most 256 tokens, holding no sequence that ends reasoning
+    std::vector<int32_t> think_message;
+    // FBH1 K1: the model's own form of its close, tokenized by the shell: the tokens before the closing sequence (its
+    // newline: reasoning, reserved inside the budget and counted) and after it (its blank line: not reasoning). A
+    // forced close feeds them around the closing sequence, at every budget; empty: the sequence alone
+    std::vector<int32_t> think_lead, think_tail;
 };
 
 // what the server reports and renders with, read from the GGUF on the CPU
@@ -155,7 +177,18 @@ struct fnfl_step_result {
     int32_t tokens[5] = {};
     int32_t n_tokens = 0;
     bool end = false;
+    // GLFL16 thinking budget: the reasoning tokens tokens[i] added to the request's count (think_add[i]; 0 when the
+    // request named no reasoning sequences) and whether the budget forced it (bit i of think_forced: a token of the
+    // message, of the forced close's lead, of the closing sequence or of the forced close's tail)
+    int32_t think_add[5] = {};
+    uint32_t think_forced = 0;
+    // IFR1 R3: the reasoning tokens tokens[i] added past the budget to finish a UTF-8 character (not counted in it)
+    int32_t think_extra[5] = {};
 };
+
+// IFR1 R3: a token's entry in fnfl_sampling::think_utf8 from its bytes (as the shell renders it); 0 for whole UTF-8
+// characters, which the table leaves out
+uint32_t fnfl_think_utf8_entry(int32_t token, const char * bytes, size_t n);
 
 const char * fnfl_status_str(fnfl_status status);
 

@@ -198,6 +198,7 @@ Measured speeds are in the [README](../../README.md#which-setup-for-your-cards).
   - `POST /slots/0?action=save` and `restore`
 
   `action=erase` works and empties the slot.
+- **Errors:** a request the server cannot read answers 400 with an `invalid_request_error` naming the fault: a body that is not JSON, a field of the wrong type, messages or tools that do not parse, or messages the chat template rejects. An unknown path answers 404. A refused feature's endpoint answers 501. 500 means a fault in the server.
 
 ### Sampling per request
 
@@ -226,7 +227,6 @@ The request is refused with `not supported by FNFL: ...`, naming each field, if 
 - DRY, XTC, `typical_p`, `top_n_sigma`, mirostat, dynamic temperature or `adaptive_target`
 - `min_keep`
 - a custom sampler order
-- a reasoning budget (`thinking_budget_tokens`)
 - `n` greater than 1
 
 **Constrained output is refused as well.** A request with `grammar`, `json_schema`, or a `response_format` of type `json_object` or `json_schema` gets the error `grammar and JSON-schema constrained output are not supported by FNFL`. The engine's sampler has no grammar stage.
@@ -260,6 +260,23 @@ The engine reads prompts in chunks of 8,192 tokens at about 3,600 tokens/s on a 
 - With `"return_progress": true`, it also gets a progress event at the end of each chunk.
 - If the client disconnects mid-prompt, the engine stops at the next chunk's end. It keeps what it has read, so a retry of the same prompt resumes there.
 
+### Reasoning budget
+
+A request can cap its reasoning. The cap is the most reasoning tokens the reply may generate before the engine closes the reasoning and the model answers.
+
+- **The field** is `reasoning_budget_tokens`. These name the same budget: `thinking_budget_tokens`, `reasoning_budget`, `thinking_budget`, the OpenRouter object `reasoning.max_tokens` (its other keys are not read), and `thinking.budget_tokens` on the Anthropic route `/v1/messages`. Each is an integer from -1 to 2147483647, and names given together must agree. `-1` is unlimited, `0` closes the reasoning at once, and a request that names none takes the launch's `--reasoning-budget`.
+- **At the budget** the engine feeds a budget message and then the model's close, all as real tokens through the model, so the model reads its own decision to stop and then writes the answer or tool calls.
+- **The close's form.** A forced close is written as the model writes its own: a newline, the closing sequence (`</think>`), then a blank line. This holds at every budget, with or without a message. The newline is reasoning: one token is reserved for it inside the budget (free reasoning stops at budget - 1, or at budget - m - 1 with a message of m tokens) and it is counted. At a budget of 0, or when the model reopens reasoning after the budget is spent, the newline is fed all the same and not counted. A newline the model has just written itself is not fed twice. The blank line after the closing sequence is not reasoning and is not shown in `content`. A close the model writes on its own is left as it is.
+- **A second closing tag.** After a forced close the model sometimes writes `</think>` itself before its answer. On the chat, Responses and Anthropic routes, streamed or not, a closing tag the model writes before any other content text is not shown in `content`. The token stays in the slot's context. The raw completion routes return the text as generated.
+- **The message** is the launch's `--reasoning-budget-message`. Its default is a blank line and the sentence `Considering the limited time by the user, I have to give the final answer directly now, briefly, without any further work.` A request's `reasoning_budget_message` (a string, on the chat, completions and Anthropic routes) replaces it, and an empty string turns it off for that request. A value that is not a string is refused with 400 naming the field, as is a message that holds a reasoning tag, runs past 256 tokens, or ends with tokens that begin the closing sequence.
+- **The reserve rule.** The message is reserved inside the budget: with a message of m tokens and a budget of at least 4m, free reasoning stops at budget - m - 1 (the 1 is the close's newline), and the message's tokens are reasoning tokens counted against the budget. A budget below 4m gets no message: reasoning runs to budget - 1 and the close follows. A budget of 0 closes at once with no message.
+- **The sentence-end rule.** A message that cuts a sentence in half reads as an interruption, and the model tends to pick the sentence up again in its answer. So over the last min(64, budget / 4) free tokens before the reserve, the message starts right after the first token that ends a sentence: a token whose text ends with `.`, `!` or `?` (or the CJK forms), or with a newline. If none comes, it starts at the reserve. The message only ever starts earlier, so the counts above still hold. A request with no message closes at its budget.
+- **A character split across tokens** is finished before the message or the close: at most 3 more tokens, reported apart (below).
+- **What usage reports.** `usage.completion_tokens_details.reasoning_tokens` is the reasoning tokens of the reply, with or without a budget: the model's own, the message's, the forced close's newline, and the up to 3 that finished a character. It never exceeds the budget plus 3. The opening and closing sequences are not reasoning tokens. With a budget, `timings` adds `reasoning_budget`, `reasoning_n` (counted against the budget, never above it), `reasoning_extra_n` (those that finished a character) and `reasoning_forced_n` (the tokens the engine fed: the message's, the close's newline, the closing sequence and the blank line after it).
+- **Limits still apply.** Reasoning, the message and the close count toward `max_tokens` and the context, so a reply can still end with the length reason inside its reasoning.
+
+Refused with 400, naming the field to use: `max_reasoning_tokens`, a budget name inside `chat_template_kwargs`, `thinking.budget_tokens` in an OpenAI body, and `reasoning.max_tokens` on the Anthropic route.
+
 ## Reading the log
 
 The server writes to standard error. Besides llama.cpp's usual request lines, the engine adds three lines per request.
@@ -282,6 +299,18 @@ FNFL request: ended eog; steps 8098 (bootstrap 1, speculative 8097, generate 0);
   - the median and 90th-percentile step time
   - the depth range
   - the decode rate
+- **`admission:`** is the shell's line for each request, written when its prompt is admitted:
+
+  ```
+  slot launch_slot_: id  6 | task 1042 | admission: slot 6, 5086 tokens kept, read from 0 (token 0), 5317 tokens to read, first 16 new tokens' hash 9c1f0a52e4b7d310
+  ```
+
+  - `tokens kept`: the prompt's leading tokens the slot already held (the common prefix with what it held before).
+  - `read from`: where the engine's read starts: `in place` (it continues the slot), `a checkpoint` (the position restored) or `token 0` (the slot was cleared and the whole prompt read).
+  - `tokens to read`: the prompt's tokens from that position.
+  - the hash: FNV-1a (64-bit) over the first 16 tokens after the kept prefix, each as four bytes, low byte first. Hash the same tokens of the request you suspect to check that the line is its admission.
+
+  If a reply looks like another conversation's, this line shows what the slot kept from before and whether the read started from a clean slot.
 - **Failures** end the request with an error whose message starts with the engine's status: `FNFL_ERROR: ...` or `FNFL_BAD_REQUEST: ...`. After a failed step, the next request re-reads its prompt from the start.
 
 ## Memory
@@ -313,7 +342,7 @@ The script's model, draft, subset and lock paths are written for the development
 - **The KV pool:** 1,343,488 cells of 8-bit KV, shared by the slots. Each slot's conversation can reach 262,144 tokens. `CTX` sets another pool.
 - **The writers' pause:** 100 ms. While a prompt is read beside generating slots, each machine runs read units only before the latest start that keeps every group of generating users' next completed step within P ms of its last one. It is a best-effort target, not a bound: the smallest read unit, a small prompt read whole or a mispredicted unit can pass it, and the logs count each overrun with its reason. Set it at launch with `EXTRA_ARGS="--fnfl-writer-pause-ms P"` (an integer from 10 to 1000), or live with `POST /props` and `{"tu": {"writer_pause_ms": P}}`.
 - **Small prompts:** beside generating slots, a read of at most 512 new tokens runs in one step on each machine; the writers pause once for it (`--fnfl-small-read-rows N`, 0 turns it off).
-- **`/metrics`:** always on (`--metrics` is passed).
+- **`/metrics`:** always on (`--metrics` is passed). `llamacpp:task_ids_total` counts the task ids the server's queue has drawn; an idle server draws none, and a rate of thousands a second means a poll is posting tasks.
 
 The startup line `fnfl-serve: 8 slots, KV pool 1343488 cells, each slot's context 262144, ...` echoes the settings, and `start.txt` in `SERVE_DIR` records them.
 

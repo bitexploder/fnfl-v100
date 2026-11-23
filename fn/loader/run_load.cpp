@@ -153,23 +153,20 @@ bool reserve_vision(model::model &               m,
     return true;
 }
 
-bool reserve_state(model::model &               m,
-                   const model::state_params &  sp,
-                   int32_t                      n_slots,
-                   int64_t &                    host_bytes,
-                   std::string &                err,
-                   int32_t                      pool_cells,
-                   const model::vision_params * vision) {
+bool reserve_state(model::model & m, const model::state_params & sp_in, int32_t n_slots, int64_t & host_bytes,
+                   std::string & err, int32_t pool_cells, const model::vision_params * vision) {
     // TTTS1: a split stage (a window) serves up to 8 slots; one box up to 4
     const int32_t max_slots = m.win.whole() ? 4 : 8;
     if (n_slots < 1 || n_slots > max_slots) {
         err = "reserve: " + std::to_string(n_slots) + " slots (1 .. " + std::to_string(max_slots) + ")";
         return false;
     }
-    if (sp.kv_q8 && (m.single || m.kv_host)) {
+    if (sp_in.kv_q8 && (m.single || m.kv_host)) {
         err = "reserve: the 8-bit KV (KV8) is resident TP on two devices only";
         return false;
     }
+    model::state_params sp = sp_in;
+    sp.n_slots = n_slots; // BG3: the checkpoint class holds a book a slot
     m.n_slots = n_slots;
     m.kv_q8 = sp.kv_q8;
     m.n_cells = sp.n_cells;
@@ -209,6 +206,29 @@ bool reserve_state(model::model &               m,
                   " bytes (" + std::to_string(n_slots) + " x " + std::to_string(slot_host) + " + " +
                   std::to_string(engine_host) + "), the host has " + std::to_string(avail) +
                   " available (MemAvailable" + (avail < 0 ? ", unreadable" : "") + "): launch with -np 1 or less -c";
+            return false;
+        }
+    }
+    // BG3: the checkpoint books in pinned host memory: refused with the arithmetic when the host cannot hold them
+    // (the one-card form's ledger above counts them with the histories)
+    for (const model::buffer_class & plan : plans) {
+        if (plan.name != "prefill checkpoints (PF1)" || one_card) {
+            continue;
+        }
+        const int64_t need = plan.allocation(0) + plan.allocation(1);
+        const int64_t avail = host_available_bytes();
+        const int32_t per = model::prefill_checkpoints_per_slot(sp.n_cells);
+        std::fprintf(stderr,
+                     "FNFL: BG3 checkpoint books: pinned host memory, %d slots x %d checkpoints x %.1f / %.1f MiB "
+                     "(cards 0 / 1) = %.3f GiB; MemAvailable %.3f GiB\n",
+                     n_slots, per, plan.parts.empty() ? 0.0 : double(plan.parts[0].bytes[0]) / 1048576.0,
+                     plan.parts.empty() ? 0.0 : double(plan.parts[0].bytes[1]) / 1048576.0, double(need) / 1073741824.0,
+                     double(avail) / 1073741824.0);
+        if (avail < 0 || need > avail) {
+            err = "reserve: the checkpoint books need " + std::to_string(need) + " bytes of pinned host memory (" +
+                  std::to_string(n_slots) + " slots x " + std::to_string(per) + " checkpoints), the host has " +
+                  std::to_string(avail) + " available (MemAvailable" + (avail < 0 ? ", unreadable" : "") +
+                  "): launch with fewer slots or less -c";
             return false;
         }
     }

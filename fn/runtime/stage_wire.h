@@ -13,6 +13,7 @@
 // round; that round follows the group's end (its sends finished or retired).
 
 #include "fn/runtime/stage_msg.h"
+#include "fn/runtime/think_budget.h"
 #include "fn/xchg/link.h"
 
 #include <cstdint>
@@ -34,9 +35,18 @@ uint64_t crossing_tag(int64_t n, int32_t piece);
 // FNFL_SPLIT_TRACE=1: one stderr line a command and a step group's phase on either side (the protocol's order)
 void trace(const char * who, const std::string & what);
 
+// GLFL16 thinking budget: set_sampling's reasoning settings on the wire. think_pack sets c's think fields and fills
+// pay with the opening sequence, the closing one, each other ending as its length and its tokens, then (with a
+// budget) FBH1 K1's forced-close lead and tail, FBH1's budget message and (IFR1 R3) the UTF-8 table's c.think_utf8_n
+// entries; think_unpack reads them back from a payload of n tokens, false when it does not add up (the follower
+// refuses the command)
+void think_pack(const fn::think::config & t, ctrl & c, std::vector<int32_t> & pay);
+bool think_unpack(const ctrl & c, const int32_t * pay, int32_t n, fn::think::config & t);
+
 struct leader_stats {
     int64_t groups = 0, members = 0, boundaries = 0, boundary_bytes = 0, crossings = 0, crossing_bytes = 0;
     double  back_wait_s = 0;  // the leader's time waiting for X-STEP and acknowledgments
+    int64_t restarts = 0;     // BG3: reads whose stages' restore points differed, both restarted from token 0
 };
 
 // wait for every operation in ops (-1 entries skipped); on the first failure the rest are retired. Each entry is

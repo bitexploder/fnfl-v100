@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -100,7 +101,7 @@ bool extend_ledger(target & t, const int32_t * tokens, int32_t n, std::string & 
 }
 
 bool step(target & t, int32_t budget, int32_t d_max, const std::vector<int32_t> & eog, step_info & s,
-          std::string & err, const after_draft_fn * after_draft) {
+          std::string & err, const after_draft_fn * after_draft, const fn::think::tracker * think) {
     s = step_info();
     const auto t0 = clk::now();
     s.n_before = t.slot().n;
@@ -135,11 +136,10 @@ bool step(target & t, int32_t budget, int32_t d_max, const std::vector<int32_t> 
         if (!step_propose(t, budget, d_max, t0, s, err, after_draft)) {
             return false;
         }
-        round_result rv;
-        if (!t.verify(s.d, s.prop, budget, rv, err)) {
-            return false;
+        if (think != nullptr) {
+            think_cut(*think, s);
         }
-        return step_close(t, eog, rv, t0, s, err);
+        return step_rest(t, budget, eog, t0, s, err);
     }
     s.end = is_eog(eog, s.out[s.n_out - 1]);
     s.wall_s = since(t0);
@@ -162,6 +162,41 @@ bool step_propose(target & t, int32_t budget, int32_t d_max, std::chrono::steady
     for (int32_t j = 0; j < d; ++j) {
         s.prop[j] = r.argmax[0][j];
     }
+    return true;
+}
+
+bool draft_level(target & t, std::string & err) {
+    if (!t.draft_on() || t.stage_front() || t.slot().u == 0 || t.draft_n() >= t.slot().n) {
+        return true;
+    }
+    // one row behind a generate round's commit (each such round is followed by this before the next round)
+    round_result r;
+    return t.draft_catchup(static_cast<int32_t>(t.slot().n - t.draft_n()), r, err);
+}
+
+void think_cut(const fn::think::tracker & think, step_info & s) {
+    if (think.active() && s.d > 0) {
+        s.d = std::min(s.d, think.cap(s.prop, s.d) - 1);
+    }
+}
+
+bool step_rest(target & t, int32_t budget, const std::vector<int32_t> & eog, std::chrono::steady_clock::time_point t0,
+               step_info & s, std::string & err) {
+    if (s.d > 0) {
+        round_result rv;
+        return t.verify(s.d, s.prop, budget, rv, err) && step_close(t, eog, rv, t0, s, err);
+    }
+    round_result r;
+    if (!t.generate(r, err)) {
+        return false;
+    }
+    s.kind = 1;
+    s.n_out = 1;
+    s.out[0] = r.out[0];
+    s.waits = 2; // the draft step and the round
+    s.to_one_s = after(t0, r.t_done_s);
+    s.end = is_eog(eog, s.out[0]);
+    s.wall_s = since(t0);
     return true;
 }
 
@@ -515,6 +550,27 @@ int32_t engine::budget(const slot_rt & x) const {
     return static_cast<int32_t>(std::max<int64_t>(-1, std::min<int64_t>(left, 1 << 30)));
 }
 
+int32_t engine::think_budget(const slot_rt & x, int32_t b) const {
+    if (!x.think.active()) {
+        return b;
+    }
+    if (x.think.forced() >= 0) {
+        return std::min(b, 1);
+    }
+    return std::min(b, std::max(1, x.think.room()));
+}
+
+void engine::think_step(int32_t slot, int32_t * add, uint32_t & forced, int32_t * extra) const {
+    forced = 0;
+    for (int32_t j = 0; j < max_step_tokens; ++j) {
+        add[j] = slot_ok(slot) ? s_[size_t(slot)].think_add[j] : 0;
+        extra[j] = slot_ok(slot) ? s_[size_t(slot)].think_extra[j] : 0;
+    }
+    if (slot_ok(slot)) {
+        forced = s_[size_t(slot)].think_forced;
+    }
+}
+
 void engine::finish(slot_rt & x, const char * ended) {
     if (!x.open) {
         return;
@@ -648,10 +704,14 @@ run_status engine::set_sampling(int32_t slot, const request_options & o) {
         return failed(run_status::bad_request, "set_sampling: slot " + std::to_string(slot) + "'s read is in progress");
     }
     finish(x, "the next request");
+    if (!fn::think::check(o.think, err_)) {
+        return failed(run_status::bad_request, "set_sampling: " + err_);
+    }
     if (!x.t->set_sampling(o.sampling, err_)) {
         return failed(run_status::bad_request, err_);
     }
     x.req = o;
+    x.think.reset(o.think);
     return run_status::ok;
 }
 
@@ -953,6 +1013,7 @@ run_status engine::step_enter(int32_t slot, const int32_t * out, int32_t & b) {
         }
         b = 1; // a request's first step (the bootstrap) always returns its token
     }
+    b = think_budget(x, b);
     if (m_->pool != nullptr && int64_t(x.t->slot().tok.size()) + step_cells > x.cells) {
         // MU1: the step's cells mapped before its rounds (the pool's growth, reclaiming idle slots when full); FMU1:
         // only when the slot's mapped cells (cached) do not cover them
@@ -960,6 +1021,16 @@ run_status engine::step_enter(int32_t slot, const int32_t * out, int32_t & b) {
         if (!ensure_cells(slot, int64_t(x.t->slot().tok.size()) + step_cells, capacity, err_)) {
             return failed(capacity ? run_status::no_context : run_status::error, "step: " + err_);
         }
+    }
+    // GLFL16 thinking budget: the step's decisions forced to the message's or the close's next token or freed (the back
+    // decides on a split; a front stage writes nothing), and the draft caught up after a boundary's generate round
+    if (!x.t->set_force(x.think.forced(), err_) || !draft_level(*x.t, err_)) {
+        const std::string what = "step: " + err_;
+        lost(x);
+        x.open = false;
+        x.unchecked = false;
+        x.steps.clear();
+        return failed(run_status::error, what);
     }
     if (x.steps.empty()) {
         x.t_first = clk::now();
@@ -979,7 +1050,8 @@ run_status engine::step(int32_t slot, int32_t * out, int32_t & n_out, bool & end
         return rs;
     }
     step_info s;
-    const bool ran = runtime::step(*s_[size_t(slot)].t, b, c_.spec_d, eog(slot), s, err_);
+    const bool ran = runtime::step(*s_[size_t(slot)].t, b, c_.spec_d, eog(slot), s, err_, nullptr,
+                                   &s_[size_t(slot)].think);
     const run_status st   = step_leave(slot, ran, s, out, n_out, end);
     const bool       left = st != run_status::ok || end;
     pace_steps(&slot, 1, t0, &left);
@@ -1026,6 +1098,11 @@ void engine::step_joint(const int32_t * slots, int32_t n, joint_step_out * res) 
 
 run_status engine::step_leave(int32_t slot, bool ran, const step_info & s, int32_t * out, int32_t & n_out, bool & end) {
     slot_rt & x = s_[size_t(slot)];
+    x.think_forced = 0;
+    for (int32_t j = 0; j < max_step_tokens; ++j) {
+        x.think_add[j] = 0;
+        x.think_extra[j] = 0;
+    }
     if (!ran) {
         const std::string what = "step: " + err_;
         lost(x);
@@ -1039,6 +1116,16 @@ run_status engine::step_leave(int32_t slot, bool ran, const step_info & s, int32
     x.unchecked = true;
     x.n_gen += s.n_out;
     x.steps.push_back(s);
+    // GLFL16 thinking budget: the step's tokens counted (each emitted token once: a rejected proposal never is);
+    // FBH1 A3: counted without a budget too, when the request names the reasoning sequences
+    for (int32_t j = 0; j < s.n_out && x.think.tracks(); ++j) {
+        if (x.think.forced() == s.out[j]) {
+            x.think_forced |= 1u << uint32_t(j);
+        }
+        const int32_t e0 = x.think.extra_n();
+        x.think_add[j] = x.think.observe(s.out[j]);
+        x.think_extra[j] = x.think.extra_n() - e0;
+    }
     if (c_.record_hash && !x.t->stage_front()) {
         // TTTS1: the step's decision hash (spec run's records; a front stage's comes from the back)
         uint64_t    h = 0;
@@ -1165,6 +1252,19 @@ void engine::step_joint_body(const int32_t * slots, int32_t n, joint_step_out * 
             }
             go.push_back(k);
         }
+        // GLFL16 thinking budget: a member whose proposals the budget cut finishes its step alone (the joint round
+        // takes one d)
+        for (size_t i = 0; i < go.size();) {
+            const int32_t k = go[i];
+            think_cut(s_[size_t(slots[k])].think, s[k]);
+            if (s[k].d == c_.spec_d) {
+                ++i;
+                continue;
+            }
+            const bool ran = step_rest(*s_[size_t(slots[k])].t, b[k], eog(slots[k]), t0, s[k], err_);
+            leave(k, ran, s[k]);
+            go.erase(go.begin() + std::ptrdiff_t(i));
+        }
         const int32_t g = static_cast<int32_t>(go.size());
         target * tt[fn::xchg::max_lanes] = {};
         int32_t d[fn::xchg::max_lanes] = {}, bud[fn::xchg::max_lanes] = {};
@@ -1252,7 +1352,8 @@ void engine::step_joint_body(const int32_t * slots, int32_t n, joint_step_out * 
     }
     for (int32_t k : alone) {
         step_info s;
-        const bool ran = runtime::step(*s_[size_t(slots[k])].t, b[k], c_.spec_d, eog(slots[k]), s, err_);
+        slot_rt &  x   = s_[size_t(slots[k])];
+        const bool ran = runtime::step(*x.t, b[k], c_.spec_d, eog(slots[k]), s, err_, nullptr, &x.think);
         leave(k, ran, s);
     }
 }
@@ -1289,7 +1390,8 @@ int32_t engine::split_budget(int32_t slot) const {
     }
     const slot_rt & x = s_[size_t(slot)];
     const int32_t   b = budget(x);
-    return b < 1 && x.steps.empty() ? 1 : b;  // a request's first step (the bootstrap) always returns its token
+    // a request's first step (the bootstrap) always returns its token; GLFL16: the reasoning budget's limit
+    return think_budget(x, b < 1 && x.steps.empty() ? 1 : b);
 }
 
 run_status engine::truncate(int32_t slot, int32_t n_keep) {
@@ -1678,6 +1780,54 @@ int32_t engine::read_begin(int32_t                           slot,
     if (j.plan.empty()) {
         j.live = false;
         failed(run_status::error, "read_begin: no rows to read");
+        return -1;
+    }
+    return 0;
+}
+
+int32_t engine::read_restart(int32_t slot, int32_t & n_processed) {
+    n_processed = 0;
+    if (n_slots() < 2 || !slot_ok(slot)) {
+        failed(run_status::bad_request, "read_restart: slot " + std::to_string(slot) + " (a multi-slot engine's)");
+        return -1;
+    }
+    slot_rt & x = s_[size_t(slot)];
+    pf_job & j = x.job;
+    if (!j.live || j.group >= 0 || j.chunks_done > 0 || j.chunk != 0 || j.committed != j.from) {
+        failed(run_status::bad_request, "read_restart: slot " + std::to_string(slot) + " has no prepared read");
+        return -1;
+    }
+    target & t = *x.t;
+    const std::vector<int32_t> all = j.tok;
+    if (resident_tp()) {
+        pf_->forget_job(j.id); // FMU1: its staging was planned from the old start
+    }
+    pf_->drop_owner(slot);
+    if (!t.reset(err_)) {
+        t.drop_pixels();
+        j.live = false;
+        failed(run_status::error, "read_restart: " + err_);
+        return -1;
+    }
+    t.set_prompt(all);
+    if (!t.images().empty()) {
+        t.set_pos_offset(t.images().offset_at(0)); // VIS1: the read's offset at its new start
+    }
+    j.id = next_job_++;
+    j.from = 0;
+    j.committed = 0;
+    j.plan.clear();
+    pf_->job_plan(j.from, j.to, ex_ != nullptr, j.plan, j.short_read, t.images().any_image(j.from, j.to));
+    j.stats = pf_run_stats();
+    j.stats.from = j.from;
+    j.stats.to = j.to;
+    j.stats.bulk = true;
+    j.stats.t0 = clk::now();
+    x.job_how = "from token 0";
+    n_processed = static_cast<int32_t>(j.to);
+    if (j.plan.empty()) {
+        j.live = false;
+        failed(run_status::error, "read_restart: no rows to read");
         return -1;
     }
     return 0;

@@ -3633,7 +3633,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_EFFORT"));
     add_opt(common_arg(
         {"--reasoning-budget"}, "N",
-        "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",
+        "default reasoning budget of each response (a request's reasoning_budget_tokens overrides it): -1 unlimited,\n"
+        "0 closes reasoning at once, N > 0 feeds the model's closing sequence after N reasoning tokens (default: -1)",
         [](common_params & params, int value) {
             if (value < -1) { throw std::invalid_argument("invalid value"); }
             params.sampling.reasoning_budget_tokens = value;
@@ -3641,7 +3642,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET"));
     add_opt(common_arg(
         {"--reasoning-budget-message"}, "MESSAGE",
-        "message injected before the end-of-thinking tag when reasoning budget is exhausted (default: none)",
+        "text fed to the model before the closing sequence when the reasoning budget is spent, reserved inside the\n"
+        "budget (a request's reasoning_budget_message overrides it; '' turns it off; default: a blank line and\n"
+        "'Considering the limited time by the user, I have to give the final answer directly now, briefly, without\n"
+        "any further work.')",
         [](common_params & params, const std::string & value) {
             params.sampling.reasoning_budget_message = value;
         }

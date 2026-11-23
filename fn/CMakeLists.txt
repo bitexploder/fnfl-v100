@@ -104,6 +104,8 @@ add_library(fnfl-runtime STATIC
     runtime/runtime.h
     runtime/target.cpp
     runtime/target.h
+    runtime/think_budget.cpp
+    runtime/think_budget.h
     runtime/versions.cpp
     runtime/versions.h
     runtime/vision_service.cpp
@@ -618,6 +620,8 @@ add_library(fnfl-drive-checks OBJECT
     model/ladder_test.h
     tools/prompt_tune.cpp
     tools/prompt_tune.h
+    tools/think_test.cpp
+    tools/think_test.h
     runtime/rollback_test.cpp
     runtime/mx7_check.cpp
     runtime/mx7_check.h

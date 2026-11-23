@@ -268,14 +268,19 @@ std::string check_plan(int64_t from, int64_t to, int32_t split = rt::pf_split_ro
                      c.half[0] > rt::pf_half_rows || c.half[1] < 1))) {
             return "halves " + std::to_string(c.half[0]) + " + " + std::to_string(c.half[1]);
         }
-        // the tiling restarts only at from and at multiples of 8,192: a short chunk ends at one or at the end
-        if (c.rows < rt::pf_chunk_rows && end % rt::pf_span != 0 && end != to) {
+        // the tiling restarts only at from and at multiples of 8,192: a short chunk ends at one, at the end or, BG3,
+        // one token before the end (its checkpoint), after which the last token is its own chunk
+        if (c.rows < rt::pf_chunk_rows && end % rt::pf_span != 0 && end != to && end != to - 1) {
             return "a short chunk " + std::to_string(c.start) + "+" + std::to_string(c.rows) + " inside a span";
         }
         pos = end;
     }
     if (pos != to) {
         return "ends at " + std::to_string(pos);
+    }
+    // BG3: a chunk ends at to - 1 when that is past from (the last token alone)
+    if (to - 1 > from && (p.back().start != to - 1 || p.back().rows != 1)) {
+        return "the last token is not its own chunk";
     }
     // the plan from each multiple of 8,192 inside is this plan's suffix (a restore repeats the partition)
     for (int64_t k = (from / rt::pf_span + 1) * rt::pf_span; k < to; k += rt::pf_span) {
@@ -322,8 +327,10 @@ int plan_mode(verdicts & v) {
                 bad = "0 .. " + std::to_string(to) + ": " + e;
             }
         }
-        const std::vector<rt::pf_chunk> c2049 = rt::plan_chunks(0, 2049, rt::pf_chunk_rows, split);
-        const bool one2049 = c2049.size() == 1 && (c2049[0].half[1] == 0) == (split == rt::pf_cached_split_rows);
+        // BG3: a 2,050-token read is 2,049 rows and the last token alone
+        const std::vector<rt::pf_chunk> c2049 = rt::plan_chunks(0, 2050, rt::pf_chunk_rows, split);
+        const bool one2049 = c2049.size() == 2 && c2049[0].rows == 2049 &&
+                             (c2049[0].half[1] == 0) == (split == rt::pf_cached_split_rows);
         const std::string rule = split == rt::pf_split_rows ? "uncached" : "cached (MX3)";
         v.put("chunk rules " + rule, bad.empty() && one2049,
               bad.empty() ? std::to_string(cases) +
@@ -331,7 +338,8 @@ int plan_mode(verdicts & v) {
                                 "multiple of 8,192, one half up to " +
                                 std::to_string(split) +
                                 " rows, above it two halves within 128 rows (the first a multiple of 64, <= 4,096), "
-                                "short chunks only at a multiple or the end, every plan from a multiple its suffix; "
+                                "short chunks only at a multiple, the end or one before it (BG3: the last token its "
+                                "own chunk), every plan from a multiple its suffix; "
                                 "2,049 rows " +
                                 (one2049 ? (split == rt::pf_split_rows ? "two halves" : "one half") : "UNEXPECTED")
                           : bad);
@@ -356,10 +364,13 @@ int plan_mode(verdicts & v) {
         }
     }
     {
-        const bool ok = rt::checkpoint_due(8192, 9000) && rt::checkpoint_due(9000, 9000) &&
-                        !rt::checkpoint_due(8191, 9000) && !rt::checkpoint_due(0, 9000) &&
-                        rt::checkpoint_due(16384, 16384) && !rt::checkpoint_due(3072, 9000);
-        v.put("checkpoint positions", ok, "multiples of 8,192 and the prompt's end only");
+        const bool ok = rt::checkpoint_due(8192, 9000) && rt::checkpoint_due(8999, 9000) &&
+                        !rt::checkpoint_due(9000, 9000) && !rt::checkpoint_due(8191, 9000) &&
+                        !rt::checkpoint_due(0, 9000) && rt::checkpoint_due(16384, 16384) &&
+                        rt::checkpoint_due(16383, 16384) && !rt::checkpoint_due(3072, 9000) &&
+                        !rt::checkpoint_due(0, 1) && !rt::checkpoint_due(1, 1);
+        v.put("checkpoint positions", ok,
+              "multiples of 8,192 and one token before the prompt's end only (BG3); a one-token prompt none");
     }
     // MUP2 piece 1: every planned chunk shape in pieces of every grid size: refining the halves, on the grid, evened
     // out, the fewest pieces a half, the versions chained 0 -> 1 -> 2 -> 1 ..., the commit the last piece's
@@ -620,28 +631,34 @@ int plan_mode(verdicts & v) {
         v.put("book B (a mismatched prefix: none)", ok,
               "chose " + std::to_string(s) + ", " + std::to_string(b.count()) + " held (8,192 dropped)");
     }
-    // C: the cap: 12 multiples then 100,000; the last 8 written stay
+    // C: BG3's keep rule in a slot's book of 14 (110,000 cells: 13 multiples and a prompt end): 12 multiples, the
+    // prompt ends 50,000 then 99,999: every multiple stays, the newer prompt end replaces the older
     {
-        rt::checkpoint_book b;
+        rt::checkpoint_book b(1, fn::model::prefill_checkpoints_per_slot(110000));
         for (int64_t k = 1; k <= 12; ++k) {
             rec(b, T, k * 8192);
         }
-        rec(b, T, 100000);
+        rec(b, T, 50000);
+        rec(b, T, 99999);
         std::vector<int64_t> held;
-        for (int32_t i = 0; i < rt::pf_max_checkpoints; ++i) {
+        for (int32_t i = 0; i < b.entries(); ++i) {
             if (b.at(i).pos >= 0) {
                 held.push_back(b.at(i).pos);
             }
         }
         std::sort(held.begin(), held.end());
-        const std::vector<int64_t> want = {49152, 57344, 65536, 73728, 81920, 90112, 98304, 100000};
+        std::vector<int64_t> want;
+        for (int64_t k = 1; k <= 12; ++k) {
+            want.push_back(k * 8192);
+        }
+        want.push_back(99999);
         std::string h;
         for (const int64_t p : held) {
             h += (h.empty() ? "" : " ") + std::to_string(p);
         }
-        const bool latest_ok =
-            b.latest(49151) < 0 && b.at(b.latest(70000)).pos == 65536 && b.at(b.latest(200000)).pos == 100000;
-        v.put("book C (8 a slot, the oldest written dropped)", held == want && latest_ok, "held " + h);
+        const bool latest_ok = b.entries() == 14 && b.latest(8191) < 0 && b.at(b.latest(70000)).pos == 65536 &&
+                               b.at(b.latest(200000)).pos == 99999;
+        v.put("book C (BG3: every multiple and the newest prompt end a slot)", held == want && latest_ok, "held " + h);
     }
     // D: a checkpoint written again at its position reuses its slot (a re-prefill through it)
     {
@@ -654,42 +671,46 @@ int plan_mode(verdicts & v) {
         v.put("book D (the same position, the same slot)", s0 == s1 && b.count() == 2 && b.latest(8192) == s0,
               std::to_string(b.count()) + " held");
     }
-    // E: append: 7,001 (a prompt's end), then the extension to 17,000; a later prompt keeping 7,500 restores 7,001
+    // E: append: the prompt end 7,000, then the extension's 8,192, 16,384 and prompt end 16,999 (BG3: it replaces
+    // 7,000); a later prompt keeping 7,500 finds none; one keeping 17,000 restores 16,999
     {
         rt::checkpoint_book b;
-        for (const int64_t p : {int64_t(7001), int64_t(8192), int64_t(16384), int64_t(17000)}) {
+        for (const int64_t p : {int64_t(7000), int64_t(8192), int64_t(16384), int64_t(16999)}) {
             rec(b, T, p);
         }
         std::vector<int32_t> a = prefix(7500);
         a.push_back(1);
-        const int32_t s = rt::choose_checkpoint(b, a, 7500);
-        const bool ok = s >= 0 && b.at(s).pos == 7001;
-        b.drop_after(7001);
-        v.put("book E (append, then restore at the prompt end 7,001)", ok && b.count() == 1,
-              "chose " + std::to_string(s >= 0 ? b.at(s).pos : -1) + ", " + std::to_string(b.count()) +
-                  " held after drop_after");
+        const int32_t s0 = rt::choose_checkpoint(b, a, 7500);
+        std::vector<int32_t> a2 = prefix(17000);
+        a2.push_back(1);
+        const int32_t s = rt::choose_checkpoint(b, a2, 17000);
+        const int64_t sp = s >= 0 ? b.at(s).pos : -1;
+        const bool ok = s0 < 0 && b.count() == 3 && sp == 16999;
+        b.drop_after(8192);
+        v.put("book E (append: the newest prompt end replaces the older; restore at 16,999)", ok && b.count() == 1,
+              "chose " + std::to_string(sp) + ", " + std::to_string(b.count()) + " held after drop_after");
     }
-    // F: n_reuse 0 resets; G: the same prompt again (n_reuse = L) re-processes its last token: the prompt end's
-    // checkpoint does not fit, the one before it does
+    // F: n_reuse 0 resets; G: the same prompt again (n_reuse = L) re-processes its last token: BG3: the prompt
+    // end's checkpoint at L - 1 serves it
     {
         rt::checkpoint_book b;
-        for (const int64_t p : {int64_t(8192), int64_t(16384), int64_t(17000)}) {
+        for (const int64_t p : {int64_t(8192), int64_t(16384), int64_t(16999)}) {
             rec(b, T, p);
         }
         const std::vector<int32_t> a = prefix(17000);
         const int32_t s0 = rt::choose_checkpoint(b, a, 0);
         const int32_t s1 = rt::choose_checkpoint(b, a, 17000);
         v.put("book F (n_reuse 0: none)", s0 < 0 && b.count() == 3, "chose " + std::to_string(s0));
-        v.put("book G (the same prompt: 16,384, not its end)", s1 >= 0 && b.at(s1).pos == 16384,
+        v.put("book G (the same prompt: its end checkpoint at L - 1, 16,999)", s1 >= 0 && b.at(s1).pos == 16999,
               "chose " + std::to_string(s1 >= 0 ? b.at(s1).pos : -1));
     }
-    // H: a restore at a prompt end below a multiple; the re-prefill's plan starts there and its next chunk ends at
-    // 8,192
+    // H: a restore at a prompt end below a multiple; the re-prefill's plan starts there, its next chunk ends at
+    // 8,192, then at 8,999 (BG3: one before the end) and the last token alone
     {
         const std::vector<rt::pf_chunk> p = rt::plan_chunks(7001, 9000);
-        const bool ok =
-            p.size() == 2 && p[0].start == 7001 && p[0].rows == 1191 && p[1].start == 8192 && p[1].rows == 808;
-        v.put("plan H (7,001 .. 9,000)", ok, "7001+1191 8192+808");
+        const bool ok = p.size() == 3 && p[0].start == 7001 && p[0].rows == 1191 && p[1].start == 8192 &&
+                        p[1].rows == 807 && p[2].start == 8999 && p[2].rows == 1;
+        v.put("plan H (7,001 .. 9,000)", ok, "7001+1191 8192+807 8999+1");
     }
     return v.all ? 0 : 1;
 }
@@ -1029,8 +1050,13 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
             pf.set_bulk(false);
             ok = ok && pf.begin(t, P, 0, from, err) && pf.run(t, &st, err) && snapshot(t, *m, hf);
             pf.set_bulk(true);
+            int32_t forced = 0; // the forced path's slices of at most 4 rows a half (BG3: the last token alone)
+            for (const rt::pf_chunk & c : rt::plan_chunks(0, n)) {
+                forced += (c.half[0] + rt::pf_slice_rows - 1) / rt::pf_slice_rows +
+                          (c.half[1] + rt::pf_slice_rows - 1) / rt::pf_slice_rows;
+            }
             v.put("dry fresh prompt (forced reference)",
-                  ok && !st.bulk && compare(hd, hf) == "equal" && st.rounds == (n + 3) / 4 && handoff(t, n).empty(),
+                  ok && !st.bulk && compare(hd, hf) == "equal" && st.rounds == forced && handoff(t, n).empty(),
                   ok ? std::to_string(st.rounds) + " rounds; against the decode path: " + compare(hd, hf) : err);
         }
         // D2: a pure extension of 8 tokens
@@ -1038,7 +1064,8 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         ok = ok && pf.begin(t, P, 0, from, err) && pf.run(t, &st, err) && rt::extend_ledger(t, X.data(), 8, err) &&
              pf.run(t, &st, err);
         h = ok ? handoff(t, n + 8) : err;
-        v.put("dry pure extension", ok && h.empty() && pf.book().count() == 2 && st.from == n,
+        // BG3: the extension's prompt end (n + 7) replaces the prompt's (n - 1): one held
+        v.put("dry pure extension", ok && h.empty() && pf.book().count() == 1 && st.from == n,
               ok ? "chunks " + chunk_list(st) + (h.empty() ? "" : "; " + h) : err);
         if (brief) {
             return v.all ? 0 : 1;
@@ -1067,27 +1094,26 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
                        "; restored at " +
                        std::to_string(from) + ", chunks " + chunk_list(st)
                  : err);
-        // D4: a prompt keeping n + 2 tokens restores the prompt end n and drops the later checkpoints
-        std::vector<int32_t> b(P);
-        b.push_back(pool[size_t(n)]);
-        b.push_back(pool[size_t(n) + 1]);
+        // D4 (BG3): a prompt keeping all but the last token of the last read (n + 9 of its n + 10) restores that
+        // read's end checkpoint at n + 9; its own end checkpoint (n + 10) then replaces it
+        std::vector<int32_t> b(all.begin(), all.begin() + n + 9);
         b.push_back(11);
         b.push_back(12);
-        ok = ok && pf.begin(t, b, n + 2, from, err) && pf.run(t, &st, err);
-        h = ok ? handoff(t, n + 4) : err;
-        v.put("dry restore at the prompt end", ok && from == n && h.empty() && pf.book().count() == 2,
-              ok ? "restored at " + std::to_string(from) + " (n_reuse " + std::to_string(n + 2) + "), chunks " +
+        ok = ok && pf.begin(t, b, n + 9, from, err) && pf.run(t, &st, err);
+        h = ok ? handoff(t, n + 11) : err;
+        v.put("dry restore at the prompt end", ok && from == n + 9 && h.empty() && pf.book().count() == 1,
+              ok ? "restored at " + std::to_string(from) + " (n_reuse " + std::to_string(n + 9) + "), chunks " +
                        chunk_list(st) + ", " + std::to_string(pf.book().count()) + " held"
                  : err);
         // D5: a token below every checkpoint differs: from token 0, the book cleared
         std::vector<int32_t> c(b);
         c[5] ^= 1;
-        ok = ok && pf.begin(t, c, n + 2, from, err) && pf.run(t, &st, err);
-        v.put("dry mismatched prefix", ok && from == 0 && pf.book().count() == 1 && handoff(t, n + 4).empty(),
+        ok = ok && pf.begin(t, c, n + 10, from, err) && pf.run(t, &st, err);
+        v.put("dry mismatched prefix", ok && from == 0 && pf.book().count() == 1 && handoff(t, n + 11).empty(),
               ok ? "from " + std::to_string(from) + ", " + std::to_string(pf.book().count()) + " held" : err);
         // D6: n_reuse 0
         ok = ok && pf.begin(t, c, 0, from, err) && pf.run(t, &st, err);
-        v.put("dry n_reuse 0", ok && from == 0 && handoff(t, n + 4).empty(), ok ? "from 0" : err);
+        v.put("dry n_reuse 0", ok && from == 0 && handoff(t, n + 11).empty(), ok ? "from 0" : err);
         if (!ok) {
             printf("prefill-test: dry: %s\n", err.c_str());
         }
@@ -1102,7 +1128,7 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
             ok = ok && pf.begin(t, P9, 0, from, err) && pf.run(t, &st, err) && snapshot(t, *m, h9f);
             pf.set_bulk(true);
             v.put("dry 9,000: tail, 8,192 boundary, successive chunks",
-                  ok && ch9 == "0+8192* 8192+808*" && compare(h9, h9f) == "equal" && handoff(t, L9).empty(),
+                  ok && ch9 == "0+8192* 8192+807* 8999+1" && compare(h9, h9f) == "equal" && handoff(t, L9).empty(),
                   ok ? "chunks " + ch9 + "; against the forced reference: " + compare(h9, h9f) : err);
             // B1b (PB1's determinism follow-up): every arena byte poisoned with NaN, then the same prompt, fresh and
             // restored from 8,192: a run that read what an earlier run left in the arena would carry the NaN
@@ -1121,22 +1147,24 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
                  pf.run(t, &s0, err) && rt::extend_ledger(t, P9.data() + 7001, L9 - 7001, err) && pf.run(t, &st, err) &&
                  snapshot(t, *m, hx);
             v.put("dry append 7,001 -> 9,000 across 8,192",
-                  ok && chunk_list(s0) == "0+7001*" && chunks_are(st, "7001+1191* 8192+808*") &&
+                  ok && chunk_list(s0) == "0+7000* 7000+1" && chunks_are(st, "7001+1191* 8192+807* 8999+1") &&
                       compare(h9, hx) == "equal" && handoff(t, L9).empty(),
                   ok ? "chunks " + chunk_list(s0) + " | " + chunk_list(st) + "; against fresh: " + compare(h9, hx)
                      : err);
-            // B3: restore at 7,001 and re-prefill across 8,192 (A keeps 7,500 of P9, then 1,500 others)
+            // B3: a 7,001-token read (its end checkpoint at 7,000), then a restore there and a re-prefill across
+            // 8,192 (A keeps the 7,001 of P9 the slot holds, then 499 more of P9 and 1,500 others)
             std::vector<int32_t> A(P9.begin(), P9.begin() + 7500);
             A.insert(A.end(), pool.begin() + L9, pool.begin() + L9 + 1500);
-            ok = ok && pf.begin(t, A, 7500, from, err) && pf.run(t, &st, err) && snapshot(t, *m, hr);
+            ok = ok && pf.begin(t, std::vector<int32_t>(P9.begin(), P9.begin() + 7001), 0, from, err) &&
+                 pf.run(t, &st, err) && pf.begin(t, A, 7001, from, err) && pf.run(t, &st, err) && snapshot(t, *m, hr);
             const int64_t     from_r = from;
             const std::string chr    = ok ? chunk_list(st) : "";
             ok = ok && pf.begin(t, A, 0, from, err) && pf.run(t, &st, err) && snapshot(t, *m, hrf);
-            v.put("dry restore at 7,001 across 8,192",
-                  ok && from_r == 7001 && chr == "7001+1191* 8192+808*" && compare(hr, hrf) == "equal",
+            v.put("dry restore at 7,000 across 8,192",
+                  ok && from_r == 7000 && chr == "7000+1192* 8192+807* 8999+1" && compare(hr, hrf) == "equal",
                   ok ? "from " + std::to_string(from_r) + ", chunks " + chr +
-                           "; against A from token 0: " + compare(hr, hrf) :
-                       err);
+                           "; against A from token 0: " + compare(hr, hrf)
+                     : err);
             // B4: cancellation at a chunk end through the callback (8,192), then the resend from its checkpoint
             const rt::prefill_progress stop_8192 = [](int64_t, int64_t done, int64_t) {
                 return done < 8192;
@@ -1248,10 +1276,11 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         ok = ok && steps(3) && e.truncate(0, h) == rt::run_status::ok;
         ok = ok && e.prefill(0, pool.data() + h, n - h, h, np) == rt::run_status::ok;
         held.assign(pool.begin(), pool.begin() + n);
-        expect("restore after a deep truncate", ok && np == n - h && e.last_prefill().from == h,
-               "n_processed " + std::to_string(np) + " (expected " + std::to_string(n - h) + "), from " +
+        // BG3: the prompt's end checkpoint is at h - 1
+        expect("restore after a deep truncate", ok && np == n - h + 1 && e.last_prefill().from == h - 1,
+               "n_processed " + std::to_string(np) + " (expected " + std::to_string(n - h + 1) + "), from " +
                    std::to_string(e.last_prefill().from) + ", chunks " + chunk_list(e.last_prefill()));
-        phase("restore", n - h, h);
+        phase("restore", n - h + 1, h - 1);
         // E2: 2 steps; a truncate to h - 5 with other tokens: no checkpoint at or below it, from token 0
         const int32_t other[3] = { 21, 22, 23 };
         ok                     = ok && steps(2) && e.truncate(0, h - 5) == rt::run_status::ok &&
@@ -1260,16 +1289,19 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         held.insert(held.end(), other, other + 3);
         expect("no checkpoint fits: from token 0", ok && np == h - 2 && e.last_prefill().from == 0,
                "n_processed " + std::to_string(np) + " (expected " + std::to_string(h - 2) + ")");
-        // E3: nothing new (n_tokens = 0): the last kept token processed again; its prompt end's checkpoint does not fit
+        // E3: nothing new (n_tokens = 0): the last kept token processed again; BG3: from its prompt end's checkpoint
+        // at L - 1 (h - 3), one token
         ok = ok && e.prefill(0, nullptr, 0, h - 2, np) == rt::run_status::ok;
-        expect("nothing new", ok && np == h - 2 && e.last_prefill().from == 0,
-               "n_processed " + std::to_string(np) + " (expected " + std::to_string(h - 2) + ")");
+        expect("nothing new", ok && np == 1 && e.last_prefill().from == h - 3,
+               "n_processed " + std::to_string(np) + " (expected 1), from " + std::to_string(e.last_prefill().from));
         // E4: steps, then a truncate back to the prompt (the bootstrap's step and one more: within the last step or a
         // restore at the prompt end, both from h - 2) and a next turn
         ok = ok && steps(2) && e.truncate(0, h - 2) == rt::run_status::ok;
         ok = ok && e.prefill(0, other, 2, h - 2, np) == rt::run_status::ok;
         held.insert(held.end(), other, other + 2);
-        expect("next turn after steps", ok && np == 2 && e.last_prefill().from == h - 2,
+        // BG3: in place (a pure extension at h - 2), or the restore at the prompt end's checkpoint h - 3
+        expect("next turn after steps",
+               ok && ((np == 2 && e.last_prefill().from == h - 2) || (np == 3 && e.last_prefill().from == h - 3)),
                "n_processed " + std::to_string(np) + ", from " + std::to_string(e.last_prefill().from));
         // E5: a pure extension (the kept length is the processed length)
         ok = ok && e.prefill(0, other + 2, 1, h, np) == rt::run_status::ok;
@@ -1277,16 +1309,16 @@ int dry_mode(const fnfl_target_args & a, const std::vector<int32_t> & pool, verd
         expect("pure extension", ok && np == 1 && e.last_prefill().from == h,
                "n_processed " + std::to_string(np) + ", from " + std::to_string(e.last_prefill().from));
         phase("pure extension", 1, -1);
-        // E6 (PB1): a truncate inside the last prompt chunk is not cut within it (its versions are half ends): the
-        // next prefill restores 8,192's checkpoint
+        // E6 (PB1): a truncate inside the last prompt chunk is not cut within it (its versions are half ends): BG3:
+        // the next prefill restores the prompt end's checkpoint at L9 - 1, the cut's point
         ok = ok && e.truncate(0, 0) == rt::run_status::ok &&
              e.prefill(0, pool.data(), L9, 0, np) == rt::run_status::ok &&
              e.truncate(0, L9 - 1) == rt::run_status::ok &&
              e.prefill(0, pool.data() + L9 - 1, 1, L9 - 1, np) == rt::run_status::ok;
         held.assign(pool.begin(), pool.begin() + L9);
-        expect("truncate inside the last prompt chunk", ok && np == L9 - 8192 && e.last_prefill().from == 8192,
+        expect("truncate inside the last prompt chunk", ok && np == 1 && e.last_prefill().from == L9 - 1,
                "n_processed " + std::to_string(np) + ", from " + std::to_string(e.last_prefill().from));
-        phase("restore at 8,192", L9 - 8192, 8192);
+        phase("restore at 8,999", 1, L9 - 1);
         // E7 (PB1, BG1's seam): cancellation at a chunk end through the callback; the resend restores its checkpoint
         const rt::prefill_progress stop_8192 = [](int64_t, int64_t done, int64_t) {
             return done < 8192;

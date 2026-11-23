@@ -934,6 +934,42 @@ void draft_pick(tester & T, int32_t N) {
                std::to_string(differ) + ", q lists differing from the reference " + std::to_string(qbad));
 }
 
+// GLFL16 thinking budget: params::force replaces each generate decision's draw on the path of o (both cards alike, no
+// error word: the records' hashes agree), and -1 restores the same draws as before it
+void forced(tester & T, const options & o, const std::vector<float> & row, const std::string & name) {
+    if (!wanted(name)) {
+        return;
+    }
+    constexpr int32_t want = 4242;
+    std::vector<dec_in> in(8);
+    for (int32_t i = 0; i < 8; ++i) {
+        in[size_t(i)].n_before = 8 * i;
+        in[size_t(i)].tok[0] = 1;
+    }
+    std::vector<fn::round::desc> before[2], with[2], after[2];
+    bool ok = T.set_options(o, {}) && T.put_logits({row}) && T.run(in, before, 0, true);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        cudaSetDevice(T.c[r]->dev);
+        ok = write_force(T.c[r]->v, want, T.st(r));
+    }
+    ok = ok && T.run(in, with, 0, true);
+    for (int32_t r = 0; r < 2 && ok; ++r) {
+        cudaSetDevice(T.c[r]->dev);
+        ok = write_force(T.c[r]->v, -1, T.st(r));
+    }
+    ok = ok && T.run(in, after, 0, true);
+    uint32_t e[2] = {0, 0};
+    ok = ok && T.errs(e) && e[0] == 0 && e[1] == 0;
+    int32_t forced_n = 0, same = 0;
+    for (size_t i = 0; ok && i < in.size(); ++i) {
+        forced_n += with[0][i].argmax[0] == want && with[1][i].argmax[0] == want ? 1 : 0;
+        same += after[0][i].argmax[0] == before[0][i].argmax[0] && after[1][i].argmax[0] == before[1][i].argmax[0];
+    }
+    expect(ok && forced_n == 8 && same == 8, name + ": " + std::to_string(forced_n) + " of 8 decisions forced to " +
+                                                 std::to_string(want) + " on both cards, " + std::to_string(same) +
+                                                 " of 8 equal to the unforced draws after the force is cleared");
+}
+
 // a row whose top-p cut falls on a single-member bin (a cut on a bin edge): five strong tokens 1/4 logit apart
 std::vector<float> edge_row() {
     std::vector<float> l = gauss_row(31, 1.0f, 0);
@@ -1013,6 +1049,13 @@ int fnfl_samp_test(int dev0, int dev1, const char * mode, const char * recorded,
             run_case("greedy (T = 0, V1's kernels with the hash)", o, g1, san ? 4 : 2000);
             o.bias = {{5, 30.0f}};
             run_case("greedy with a bias (top-k 1, greedy mode)", o, g1, san ? 4 : 2000);
+            o.bias.clear();
+            forced(T, o, g1, "forced token (GLFL16 thinking budget), greedy path");
+            options k = base;
+            forced(T, k, g1, "forced token (GLFL16 thinking budget), top-k path (defaults)");
+            k.top_k = 0;
+            k.top_p = 0.95f;
+            forced(T, k, g2, "forced token (GLFL16 thinking budget), full path (top-p 0.95)");
         }
         {
             options o = base; // the pinned server's defaults

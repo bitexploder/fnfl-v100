@@ -395,6 +395,7 @@ struct server_task_result_metrics : server_task_result {
     // these are immediate stats, not accumulated (server_metrics is cumulative)
     int n_processing_slots = 0;
     int n_tasks_deferred = 0;
+    uint64_t n_task_ids = 0; // FBH1 B2: task ids drawn since the start
 
     server_metrics metrics;
 

@@ -239,7 +239,7 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_str("reasoning_format"))
         ->set_desc("Reasoning format for chain-of-thought models")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
-            auto reasoning_format = common_reasoning_format_from_name(data.at("reasoning_format").get<std::string>());
+            auto reasoning_format = reasoning_format_from(data.at("reasoning_format"));
             ctx.params.chat_parser_params.reasoning_format = reasoning_format;
             ctx.params.chat_parser_params.reasoning_in_content = ctx.params.stream && (reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY);
         }));
@@ -321,9 +321,25 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 
+    // GLFL16 thinking budget: every alias given validated together (reasoning_budget_from)
     add((new field_num("reasoning_budget_tokens", params.sampling.reasoning_budget_tokens))
-        ->set_hard_limits(-1, INT32_MAX)
-        ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
+        ->add_alias("thinking_budget_tokens")
+        ->add_alias("reasoning_budget")
+        ->add_alias("thinking_budget")
+        ->set_desc("Reasoning tokens this response may generate before the model's closing sequence is fed "
+                   "(-1 = unlimited)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_budget_tokens =
+                reasoning_budget_from(data, ctx.params.sampling.reasoning_budget_tokens);
+        }));
+
+    // FBH1 A3: the OpenRouter object alone names the budget too (validated with the aliases, as above)
+    add((new field_json("reasoning"))
+        ->set_desc("The OpenRouter reasoning object: its max_tokens is the reasoning budget (other keys are not read)")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.sampling.reasoning_budget_tokens =
+                reasoning_budget_from(data, ctx.params.sampling.reasoning_budget_tokens);
+        }));
 
     add((new field_str("reasoning_budget_start_tag"))
         ->set_desc("Token string marking the start of the reasoning budget section")
@@ -353,19 +369,20 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    // FBH1 A2: the text the engine feeds before the forced close (an empty string: none; absent or null: the
+    // server's --reasoning-budget-message); its reasoning tags are checked when the request is admitted
     add((new field_str("reasoning_budget_message"))
-        ->set_desc("Message to prepend to the reasoning budget end tag when forcing it")
+        ->set_desc("Text fed to the model before the forced closing sequence when the reasoning budget is spent "
+                   "(empty: none)")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
             GGML_ASSERT(ctx.vocab != nullptr);
-            if (!ctx.params.sampling.reasoning_budget_end.empty()) {
-                llama_tokens end_tag = ctx.params.sampling.reasoning_budget_end.front();
-                std::string message = json_value(data, "reasoning_budget_message", std::string());
-                if (!message.empty()) {
-                    llama_tokens message_tokens = common_tokenize(ctx.vocab, message, false, true);
-                    end_tag.insert(end_tag.begin(), message_tokens.begin(), message_tokens.end());
-                }
-                ctx.params.sampling.reasoning_budget_forced = std::move(end_tag);
+            const std::string    text = reasoning_budget_message_from(data.at("reasoning_budget_message"));
+            std::vector<int32_t> ids;
+            std::string          err;
+            if (!think_message_ids(ctx.vocab, text, {}, ids, err)) {
+                throw std::invalid_argument(err);
             }
+            ctx.params.sampling.reasoning_budget_message = text;
         }));
 
     add((new field_json("logit_bias"))
@@ -472,6 +489,9 @@ task_params eval_llama_cmpl_schema(
     params.verbose       = params_base.verbosity > 9;
 
     params.chat_parser_params.reasoning_format = params_base.reasoning_format;
+
+    // IFR1 R2: a budget where this endpoint would ignore it is refused
+    reasoning_controls_check(data, false);
 
     // create context and schema
     field_eval_context ctx(params);

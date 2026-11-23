@@ -30,6 +30,8 @@
 //            norms and the rope and attention keys read from MODEL's file, no model load; FIXTURE: QA1's HX7 case)
 //        fnfl-drive qa2-bench [DEVICE] [all|ncu] [FIXTURE]   (QA2 steps 4-5)
 //        fnfl-drive ladder-test   (APF2: the kernel-size ladder's selector against hand-computed costs; host only)
+//        fnfl-drive think-test   (GLFL16: the reasoning budget's tracker on scripted models, scalar and speculative;
+//            host only)
 //        fnfl-drive prompt-tune MODEL DRAFT OUT [DEVICE]   (APF2: the ladder's calibration, fn/tools/prompt_tune.h)
 //        fnfl-drive kv-tier-test [DEVICE] [all|san]   (ME1: the host-backed KV tier against a resident cache, bitwise;
 //            synthetic, no model data; san: 32,768 cells for Compute Sanitizer)
@@ -229,6 +231,7 @@
 #include "fn/runtime/vision_service_test.h"
 #include "fn/tools/cases.h"
 #include "fn/tools/prompt_tune.h"
+#include "fn/tools/think_test.h"
 #include "fn/xchg/link_test.h"
 #include "fn/xchg/x16_test.h"
 #include "fn/xchg/xchg2_test.h"
@@ -837,6 +840,10 @@ int main(int argc, char ** argv) {
     }
     if (argc >= 2 && strcmp(argv[1], "ladder-test") == 0) {  // APF2: the selector's host checks
         return fn::model::fnfl_ladder_test();
+    }
+    if (argc >= 2 && strcmp(argv[1], "think-test") == 0) {  // GLFL16: the reasoning budget's host checks
+        // IFR1 R3: any further arguments are fixtures fnfl-chat-check wrote with the model's tokenizer
+        return fn::tools::think_test(std::vector<std::string>(argv + 2, argv + argc)) == 0 ? 0 : 1;
     }
     if (argc >= 2 && strcmp(argv[1], "prompt-tune") == 0) {  // APF2: the ladder's calibration (one model load)
         return fn::tools::fnfl_prompt_tune(argc, argv);

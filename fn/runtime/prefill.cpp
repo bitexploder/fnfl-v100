@@ -27,7 +27,6 @@ constexpr int64_t rec_step_bytes = model::gdn_record_step_bytes;
 constexpr int64_t conv_bytes = int64_t(model::gdn_conv_channels_card) * model::gdn_conv_history * 4;
 constexpr int64_t ple_hist_bytes = fn::ple::hist_version_floats * 4;
 constexpr int64_t carry_bytes = int64_t(4) * 1280 * 4;
-static_assert(pf_max_checkpoints == model::prefill_checkpoints, "the checkpoint class holds pf_max_checkpoints");
 static_assert(pf_chunk_rows == model::prefill_stage_rows, "a staging slot holds one chunk");
 static_assert(pf_chunk_rows == 2 * pf_half_rows && pf_chunk_rows <= pf_span, "FC-PF3's chunk and halves");
 static_assert(pf_split_rows <= pf_half_rows && pf_cached_split_rows <= pf_half_rows && pf_half_rows % 64 == 0,
@@ -66,33 +65,61 @@ uint64_t token_key(const int32_t * tok, int64_t n) {
     return h;
 }
 
+checkpoint_book::checkpoint_book(int32_t owners, int32_t per_owner)
+    : owners_(std::max(owners, 1)), per_(std::max(per_owner, 1)), e_(size_t(owners_) * size_t(per_)) {
+    for (size_t i = 0; i < e_.size(); ++i) {
+        e_[i].owner = static_cast<int32_t>(i / size_t(per_));
+    }
+}
+
 int32_t checkpoint_book::slot_for(int64_t pos, int32_t owner) const {
-    int32_t empty = -1, oldest = 0;
-    for (int32_t i = 0; i < pf_max_checkpoints; ++i) {
-        if (e_[i].pos == pos && e_[i].owner == owner) {
-            return i;
+    if (!owned(owner)) {
+        return -1;
+    }
+    const int32_t lo = owner * per_;
+    int32_t at = -1, end = -1, empty = -1, oldest = lo;
+    for (int32_t i = lo; i < lo + per_; ++i) {
+        const pf_checkpoint & c = e_[size_t(i)];
+        if (c.pos == pos) {
+            at = i;
         }
-        if (e_[i].pos < 0 && empty < 0) {
+        if (c.pos >= 0 && c.pos % pf_span != 0) {
+            end = i;
+        }
+        if (c.pos < 0 && empty < 0) {
             empty = i;
         }
-        if (e_[i].age < e_[oldest].age) {
+        if (c.age < e_[size_t(oldest)].age) {
             oldest = i;
         }
+    }
+    if (at >= 0) {
+        return at;
+    }
+    if (pos % pf_span != 0 && end >= 0) {
+        return end; // the keep rule: one prompt-end checkpoint, the newest
     }
     return empty >= 0 ? empty : oldest;
 }
 
 void checkpoint_book::record(int32_t slot, int64_t pos, uint64_t key, int32_t owner) {
-    e_[slot].pos = pos;
-    e_[slot].key = key;
-    e_[slot].age = next_age_++;
-    e_[slot].owner = owner;
+    if (slot < 0 || slot >= entries() || slot / per_ != owner) {
+        return;
+    }
+    pf_checkpoint & c = e_[size_t(slot)];
+    c.pos = pos;
+    c.key = key;
+    c.age = next_age_++;
 }
 
 int32_t checkpoint_book::latest(int64_t n, int32_t owner) const {
+    if (!owned(owner)) {
+        return -1;
+    }
     int32_t best = -1;
-    for (int32_t i = 0; i < pf_max_checkpoints; ++i) {
-        if (e_[i].pos >= 0 && e_[i].owner == owner && e_[i].pos <= n && (best < 0 || e_[i].pos > e_[best].pos)) {
+    for (int32_t i = owner * per_; i < (owner + 1) * per_; ++i) {
+        const pf_checkpoint & c = e_[size_t(i)];
+        if (c.pos >= 0 && c.pos <= n && (best < 0 || c.pos > e_[size_t(best)].pos)) {
             best = i;
         }
     }
@@ -100,29 +127,29 @@ int32_t checkpoint_book::latest(int64_t n, int32_t owner) const {
 }
 
 void checkpoint_book::drop(int32_t slot) {
-    e_[slot] = pf_checkpoint();
+    if (slot >= 0 && slot < entries()) {
+        e_[size_t(slot)].pos = -1;
+        e_[size_t(slot)].key = 0;
+        e_[size_t(slot)].age = 0;
+    }
 }
 
 void checkpoint_book::drop_after(int64_t n, int32_t owner) {
-    for (pf_checkpoint & c : e_) {
-        if (c.pos > n && c.owner == owner) {
-            c = pf_checkpoint();
+    for (int32_t i = owned(owner) ? owner * per_ : 0; owned(owner) && i < (owner + 1) * per_; ++i) {
+        if (e_[size_t(i)].pos > n) {
+            drop(i);
         }
     }
 }
 
 void checkpoint_book::clear() {
-    for (pf_checkpoint & c : e_) {
-        c = pf_checkpoint();
+    for (int32_t i = 0; i < entries(); ++i) {
+        drop(i);
     }
 }
 
 void checkpoint_book::clear_owner(int32_t owner) {
-    for (pf_checkpoint & c : e_) {
-        if (c.owner == owner) {
-            c = pf_checkpoint();
-        }
-    }
+    drop_after(-1, owner);
 }
 
 int32_t checkpoint_book::count() const {
@@ -135,8 +162,8 @@ int32_t checkpoint_book::count() const {
 
 int32_t checkpoint_book::count_owner(int32_t owner) const {
     int32_t n = 0;
-    for (const pf_checkpoint & c : e_) {
-        n += c.pos >= 0 && c.owner == owner ? 1 : 0;
+    for (int32_t i = owned(owner) ? owner * per_ : 0; owned(owner) && i < (owner + 1) * per_; ++i) {
+        n += e_[size_t(i)].pos >= 0 ? 1 : 0;
     }
     return n;
 }
@@ -201,10 +228,17 @@ bool prefiller::init(target & t, model::model & m, std::string & err) {
     m_ = &m;
     const model::reserved_class * ck = m.state_class("prefill checkpoints (PF1)");
     const model::reserved_class * st = m.state_class("prefill staging (PF1)");
-    if (ck == nullptr || st == nullptr || (int32_t)ck->plan.parts.size() != pf_max_checkpoints ||
+    // BG3: the checkpoint class holds each slot's book (model::prefill_checkpoints_per_slot entries a slot)
+    const int32_t per_slot = model::prefill_checkpoints_per_slot(m.n_cells);
+    const int32_t n_owner = std::max(m.n_slots, 1);
+    if (ck == nullptr || st == nullptr || (int64_t)ck->plan.parts.size() != int64_t(n_owner) * per_slot ||
         st->plan.parts.size() != 2) {
-        return fail(err, "prefill: the checkpoint and staging classes (PF1) are not reserved");
+        return fail(err, "prefill: the checkpoint and staging classes (PF1) are not reserved (" +
+                             std::to_string(n_owner) + " slots x " + std::to_string(per_slot) + " checkpoints)");
     }
+    book_ = checkpoint_book(n_owner, per_slot);
+    ck_.assign(size_t(n_owner) * size_t(per_slot), std::array<uint8_t *, 2>{nullptr, nullptr});
+    ck_gdn_steps_.assign(ck_.size(), 0);
     model::state_params sp;
     sp.ple_conv_kernel = m.ple_conv_kernel;
     sp.ple_ngram = m.ple_ngram;
@@ -215,9 +249,9 @@ bool prefiller::init(target & t, model::model & m, std::string & err) {
         return fail(err, "prefill: a checkpoint's size is not the PLE history's and the GDN states' (FC-ST1)");
     }
     for (int32_t c = 0; c < 2; ++c) {
-        for (int32_t i = 0; i < pf_max_checkpoints; ++i) {
-            ck_[i][c] = ck->part_ptr(i, c);
-            if (ck_[i][c] == nullptr || ck->plan.parts[i].bytes[c] != ck_bytes_) {
+        for (int32_t i = 0; i < int32_t(ck_.size()); ++i) {
+            ck_[size_t(i)][size_t(c)] = ck->part_ptr(i, c);
+            if (ck_[size_t(i)][size_t(c)] == nullptr || ck->plan.parts[size_t(i)].bytes[c] != ck_bytes_) {
                 return fail(err, "prefill: checkpoint " + std::to_string(i) + " is not reserved on card " +
                                      std::to_string(c));
             }
@@ -455,16 +489,19 @@ bool prefiller::upload(int32_t s, int32_t rows, std::string & err) {
 }
 
 bool prefiller::save(target & t, int32_t slot, std::string & err) {
+    if (slot < 0 || size_t(slot) >= ck_.size()) {
+        return fail(err, "prefill: checkpoint entry " + std::to_string(slot) + " (the slot's book)");
+    }
     const uint32_t cur = t.slot().cur; // version 0 is slot cur (SR1)
     // ME11: the committed GDN matrix is the selector's bank with its k live records; both are copied with k
     const uint32_t gsel = t.slot().gdn;
     const int64_t bank = fn::round::gdn_bank(gsel), set = fn::round::gdn_set(gsel);
     const int32_t steps = fn::round::gdn_steps(gsel);
-    ck_gdn_steps_[slot] = steps;
+    ck_gdn_steps_[size_t(slot)] = steps;
     for (int32_t c = 0; c < 2; ++c) {
         model::pass_card & p = t.card(c);
         cudaStream_t s = static_cast<cudaStream_t>(t.stream(c));
-        uint8_t * q = ck_[slot][c];
+        uint8_t * q = ck_[size_t(slot)][size_t(c)];
         int64_t off = 0;
         int32_t gdn = 0;
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err)) {
@@ -509,12 +546,16 @@ bool prefiller::save(target & t, int32_t slot, std::string & err) {
 }
 
 bool prefiller::load(target & t, int32_t slot, std::string & err) {
+    if (slot < 0 || size_t(slot) >= ck_.size()) {
+        return fail(err, "prefill: checkpoint entry " + std::to_string(slot) + " (the slot's book)");
+    }
     const uint32_t cur = t.slot().cur; // 0 after rewind
-    const int32_t steps = ck_gdn_steps_[slot]; // ME11: into bank 0 and set 0 (target::restored sets the selector)
+    const int32_t steps =
+        ck_gdn_steps_[size_t(slot)]; // ME11: into bank 0 and set 0 (target::restored sets the selector)
     for (int32_t c = 0; c < 2; ++c) {
         model::pass_card & p = t.card(c);
         cudaStream_t s = static_cast<cudaStream_t>(t.stream(c));
-        const uint8_t * q = ck_[slot][c];
+        const uint8_t * q = ck_[size_t(slot)][size_t(c)];
         int64_t off = 0;
         if (!cuda_ok(cudaSetDevice(m_->device[c]), "device", err)) {
             return false;
@@ -588,7 +629,7 @@ bool prefiller::begin(target & t, const std::vector<int32_t> & all, int64_t n_re
         return true;
     }
     const int64_t c = book_.at(slot).pos;
-    if (!t.rewind(err) || !load(t, slot, err) || !t.restored(c, all, ck_gdn_steps_[slot], err)) {
+    if (!t.rewind(err) || !load(t, slot, err) || !t.restored(c, all, ck_gdn_steps_[size_t(slot)], err)) {
         book_.clear_owner(owner); // the slot's state is unknown
         return false;
     }

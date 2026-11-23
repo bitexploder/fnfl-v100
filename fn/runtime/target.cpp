@@ -726,7 +726,25 @@ bool target::set_sampling(const fn::samp::options & o, std::string & err) {
     }
     o_.sampling = o;
     var_ = v;
+    force_ = -1; // write_params wrote the params whole, the force cleared
     set_pick(v);
+    return true;
+}
+
+bool target::set_force(int32_t token, std::string & err) {
+    if (token == force_ || stage_front()) {
+        return true;
+    }
+    if (!o_.sample) {
+        return token < 0 || fail(err, "a forced token needs the sampler's verdict (target_options::sample)");
+    }
+    for (int32_t c = 0; c < 2; ++c) {
+        if (!cuda_ok(cudaSetDevice(m_->device[c]), "cudaSetDevice", err) ||
+            !fn::samp::write_force(p_[c].samp, token, st_[c])) {
+            return err.empty() ? fail(err, "the sampler's forced token") : false;
+        }
+    }
+    force_ = token;
     return true;
 }
 

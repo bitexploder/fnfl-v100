@@ -26,8 +26,9 @@
 //   a device slot is overwritten only after its last GPU reader completed: the copy stream waits for the event the
 //   compute stream records after the chunk's last round (FC-D5), not for the copy's completion.
 //
-// Checkpoints (FC-ST1): at each absolute multiple of 8,192 a chunk ends on and at the prompt's end, at most 8 a slot
-// (the oldest written dropped first), each the GDN states (ME11: the selector's bank and its live records, restored
+// Checkpoints (FC-ST1): at each absolute multiple of 8,192 a chunk ends on and, BG3, one token before the prompt's end
+// (a chunk ends there), in the slot's own book in pinned host memory (the multiples it holds and its newest prompt-end
+// checkpoint), each the GDN states (ME11: the selector's bank and its live records, restored
 // into bank 0 and set 0 with the same count) and histories and the PLE history at version 0 and the
 // draft's retained carry, copied on each card's stream after the chunk's last catch-up. KV, index keys and summaries
 // are not copied: a restore shortens their valid lengths. Each checkpoint carries a hash of its token prefix.
@@ -46,6 +47,7 @@
 #include "fn/runtime/target.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -59,7 +61,6 @@ namespace fn::runtime {
 
 // the chunk geometry (pf_span, pf_chunk_rows, pf_half_rows, pf_split_rows, pf_slice_rows, pf_chunk, plan_chunks,
 // pf_max_half, pf_short_read, pf_short_rows, checkpoint_due): fn/runtime/prompt_plan.h (ME4)
-constexpr int32_t pf_max_checkpoints = 8;
 
 // ME3: the calling thread's affinity to cpus (empty or !apply: left as inherited), read back as a mask of CPUs 0..63
 uint64_t pf_helper_affinity(const std::vector<int32_t> & cpus, bool apply);
@@ -70,31 +71,44 @@ uint64_t token_key(const int32_t * tok, int64_t n);
 struct pf_checkpoint {
     int64_t pos = -1;  // -1: empty
     uint64_t key = 0;  // token_key of the prefix
-    uint64_t age = 0;  // write order
-    int32_t owner = 0; // MU1: the engine slot whose state it holds (a checkpoint restores its owner only)
+    uint64_t age = 0;  // write order (the owner's)
+    int32_t owner = 0; // the engine slot whose state it holds (a checkpoint restores its owner only)
 };
 
-// the checkpoint bookkeeping, host only. MU1: one book for every engine slot, each entry owned by one; an entry is
-// written into (slot_for) as before whatever its owner: the one the owner already has at pos, else an empty one, else
-// the oldest written. Every query and drop names its owner; with one slot (owner 0) it is the one-slot book.
+// the checkpoint bookkeeping, host only. BG3: one book a slot (an owner), each of `per_owner` entries, so a slot's
+// book changes only by its own writes, restores and drops: no slot's writes evict another's, and the split's two
+// stages, which make the same writes for the same read, keep the same books whatever the order of the other slots'
+// work on each box. An entry is identified by its index (owner * per_owner + k), the storage it is written into.
+// The keep rule: every multiple of 8,192 the owner holds, and its newest prompt-end checkpoint (one off the
+// multiples: a new one replaces it). per_owner covers a slot's context (model::prefill_checkpoints_per_slot); with
+// every entry used, a write replaces the owner's oldest.
 class checkpoint_book {
   public:
-    // the entry a checkpoint at pos is written into: the owner's one already at pos, else an empty one, else the
-    // oldest written (any owner's)
+    explicit checkpoint_book(int32_t owners = 1, int32_t per_owner = 8);
+    // the entry a checkpoint at pos is written into: the owner's one already at pos; for a position off the multiples
+    // of 8,192, the owner's prompt-end entry; else an empty entry of the owner's, else the owner's oldest written;
+    // -1: no such owner
     int32_t slot_for(int64_t pos, int32_t owner = 0) const;
+    // the entry is written (its owner is its index's)
     void record(int32_t slot, int64_t pos, uint64_t key, int32_t owner = 0);
     // the owner's latest checkpoint at or before n, -1 when none
     int32_t latest(int64_t n, int32_t owner = 0) const;
     void drop(int32_t slot);
     void drop_after(int64_t n, int32_t owner = 0); // every one of the owner's checkpoints past n
     void clear();                                  // every entry
-    void clear_owner(int32_t owner);               // MU1: every entry of the owner
-    const pf_checkpoint & at(int32_t slot) const { return e_[slot]; }
+    void clear_owner(int32_t owner);               // every entry of the owner
+    const pf_checkpoint & at(int32_t slot) const { return e_[size_t(slot)]; }
     int32_t count() const;                    // every entry
-    int32_t count_owner(int32_t owner) const; // MU1
+    int32_t count_owner(int32_t owner) const;
+    int32_t owners() const { return owners_; }
+    int32_t per_owner() const { return per_; }
+    int32_t entries() const { return owners_ * per_; }
 
   private:
-    pf_checkpoint e_[pf_max_checkpoints];
+    bool owned(int32_t owner) const { return owner >= 0 && owner < owners_; }
+
+    int32_t owners_ = 1, per_ = 8;
+    std::vector<pf_checkpoint> e_;
     uint64_t next_age_ = 1;
 };
 
@@ -489,9 +503,10 @@ class prefiller {
 
     model::model * m_ = nullptr;
     checkpoint_book book_;
-    uint8_t * ck_[pf_max_checkpoints][2] = {}; // [checkpoint][card] in the reserved class
+    // BG3: [entry][card] in the reserved class (pinned host memory), an entry a book index
+    std::vector<std::array<uint8_t *, 2>> ck_;
     int64_t ck_bytes_ = 0;                     // one checkpoint on one card (model::checkpoint_bytes)
-    int32_t ck_gdn_steps_[pf_max_checkpoints] = {}; // ME11: each checkpoint's live GDN records (the selector's k)
+    std::vector<int32_t> ck_gdn_steps_;        // ME11: each checkpoint's live GDN records (the selector's k)
     float * dev_[2][2] = {};                   // [slot][card] device staging
     float * host_[2] = {nullptr, nullptr};     // pinned [slot][3072][2560]
     void * copy_[2] = {nullptr, nullptr};      // a copy stream a card

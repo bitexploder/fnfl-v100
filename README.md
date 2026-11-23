@@ -18,6 +18,7 @@ Oh, and, FNFL stands for "Flash Next For Life".
 - Two machines with two V100s each, serving the 4-bit Q4 quant (new in 0.4)
 - Image input, JPEG and PNG (new in 0.4)
 - Long prompts read while other users keep generating (new in 0.4)
+- A per-request thinking budget that ends the thinking and goes on to the answer (new in 0.5)
 - Fast decode and prompt reading at full context depth
 
 ## Why should you care?
@@ -39,6 +40,13 @@ These are PCIe cards:
 I care about agentic coding, so that is what I had time to bench so far. It's still fast on other stuff. It may not be as smart, but this quant has proven strong. 
 
 ## Changes
+
+**0.5**
+- A per-request thinking budget: `reasoning_budget_tokens` (also `thinking_budget_tokens`, OpenRouter's `reasoning.max_tokens`, and `thinking.budget_tokens` on the Anthropic route) caps the model's reasoning. At the budget the engine feeds a short closing sentence and then closes the reasoning the way the model writes its own close, so the reply goes on to the answer instead of thinking on inside it. `--reasoning-budget-message` and a request's `reasoning_budget_message` change the sentence. See [Reasoning budget](docs/fnfl/server.md#reasoning-budget).
+- `usage.completion_tokens_details.reasoning_tokens` on every reply.
+- Fixed: the server stopped on a failed assertion after days of load, when its task counter overflowed.
+- Fixed: agent follow-up requests re-read most of the conversation, and requests on two machines failed when the machines' prompt checkpoints disagreed.
+- A request whose body does not parse is answered 400, not 500.
 
 **0.4**
 - Two machines with two V100s each are now the production setup. They serve Unsloth's `UD-Q4_K_XL` 4-bit quant to up to eight users, and they run on machines other than the development ones, since the second machine now takes its model path. The link uses RoCE when its checks pass and TCP otherwise. See [Two machines](#two-machines).
@@ -316,7 +324,6 @@ Measured speeds are under [Benchmaxx Metrics](#benchmaxx-metrics). [`docs/fnfl/s
   - log-probabilities
   - `n > 1`
   - DRY, XTC, typical-p, mirostat or dynamic temperature
-  - a reasoning budget
   - a custom sampler order
   - top-k above 256 at a temperature above 0
   - constrained output: a grammar, a JSON schema, or `response_format` of type `json_object` or `json_schema`

@@ -3,7 +3,9 @@
 #include "server-task.h"
 
 #include <atomic>
+#include <climits>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <exception>
 #include <mutex>
@@ -11,11 +13,18 @@
 #include <vector>
 #include <unordered_set>
 
+struct server_response;
+
 // struct for managing server tasks
 // in most cases, use server_response_reader to post new tasks and retrieve results
 struct server_queue {
 private:
+    // FBH1 B1: the next id; ids run 0 .. id_max and wrap to 0 (an int counted past INT_MAX reached -1, the "unset" id
+    // post() asserts on). After a wrap an id still queued or waiting for its result is skipped
     int id = 0;
+    bool id_wrapped = false;
+    uint64_t n_ids = 0;                // ids drawn (for /metrics)
+    server_response * results = nullptr; // the ids waiting for a result (null: only queued ones are skipped)
     bool running  = false;
     bool sleeping = false;
     bool req_stop_sleeping = false;
@@ -64,8 +73,29 @@ public:
     // Add a new task, but defer until one slot is available
     void defer(server_task && task);
 
-    // Get the next id for creating a new task
+    // FBH1 B1: the largest id drawn
+    static constexpr int id_max = INT_MAX - 1;
+    // FBH1 B2: the id of a task that has no result and is never cancelled (the slots' NEXT_RESPONSE turn), so posting
+    // one draws no id; never drawn
+    static constexpr int id_no_result = INT_MAX;
+
+    // Get the next id for creating a new task (never negative, never id_no_result)
     int get_new_id();
+
+    // FBH1 B1: the response queue whose waiting ids a wrapped counter skips; set before start_loop()
+    void set_results(server_response * r) { results = r; }
+
+    // FBH1 B2: ids drawn since the start
+    uint64_t ids_drawn() {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        return n_ids;
+    }
+
+    // FBH1 B1 (tests): the next id drawn, as if the counter had run that far
+    void set_next_id(int next) {
+        std::unique_lock<std::mutex> lock(mutex_tasks);
+        id = next;
+    }
 
     // Call when the state of one slot is changed, it will move one task from deferred to main queue
     // prioritize tasks that use the specified slot (otherwise, pop the first deferred task)
@@ -146,6 +176,9 @@ public:
     }
 
 private:
+    // the next free id; mutex_tasks held
+    int next_id();
+
     void cleanup_pending_task(int id_target);
 
     // process all pending tasks in the queue
@@ -184,6 +217,9 @@ public:
 
     // remove multiple tasks from waiting list
     void remove_waiting_task_ids(const std::unordered_set<int> & id_tasks);
+
+    // FBH1 B1: whether id_task waits for a result (thread-safe)
+    bool is_waiting(int id_task);
 
     // This function blocks the thread until there is a response for one of the id_tasks
     server_task_result_ptr recv(const std::unordered_set<int> & id_tasks);

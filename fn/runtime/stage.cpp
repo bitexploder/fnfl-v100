@@ -823,7 +823,11 @@ run_status leader::set_sampling(int32_t slot, const request_options & o) {
     c.max_tokens = o.max_tokens;
     c.n_ctx      = o.n_ctx;
     c.ignore_eos = o.ignore_eos ? 1 : 0;
-    std::shared_ptr<cmd> k = send_cmd(c, nullptr);
+    // GLFL16 thinking budget: the back decides, so it keeps its own tracker of the same request
+    std::vector<int32_t> pay;
+    think_pack(o.think, c, pay);
+    c.n_tokens             = int32_t(pay.size());
+    std::shared_ptr<cmd> k = send_cmd(c, pay.data());
     if (k == nullptr) {
         return run_status::error;
     }
@@ -984,10 +988,41 @@ int32_t leader::read_begin(int32_t                           slot,
     x_->expect(slot, c.base);
     read_base_[size_t(slot)]  = c.base;
     next_[size_t(slot)].valid = false;
-    const int32_t r           = e_->read_begin(slot, tokens, n_tokens, n_reuse, n_processed, images);
-    if (r != 0 || a.a != n_processed) {
-        err_ = r != 0 ? e_->error() :
-                        "read_begin: the follower processes " + std::to_string(a.a) + " tokens, the leader " +
+    int32_t r = e_->read_begin(slot, tokens, n_tokens, n_reuse, n_processed, images);
+    int32_t n_back = a.a;
+    bool front_live = r == 0; // the leader's read is prepared (ended below if the read fails)
+    if (r == 0 && n_back != n_processed) {
+        // BG3: the stages' restore points differ (each box chose from its own book): never the request's failure.
+        // Both drop the slot's checkpoints and read it from token 0, as the truncate path does when one box loses them
+        const int32_t was_back = n_back, was_front = n_processed;
+        ctrl cr;
+        cr.op = int32_t(op::read_restart);
+        cr.slot = slot;
+        ack ra;
+        if (!command(cr, nullptr, ra, ctrl_timeout_s)) {
+            return -1;
+        }
+        const int32_t rr = ra.status == 0 ? e_->read_restart(slot, n_processed) : -1;
+        n_back = ra.status == 0 ? ra.a : -1;
+        read_info ri;
+        e_->get_read_info(slot, ri);
+        front_live = ri.live; // a failed restart may have ended the leader's read
+        ++st_.restarts;
+        fprintf(stderr,
+                "FNFL split: slot %d: read_begin: the follower processes %d tokens, the leader %d (their checkpoints "
+                "differ): both drop the slot's checkpoints and read from token 0 (%d tokens)%s\n",
+                slot, was_back, was_front, n_processed,
+                ra.status != 0 ? (" [the follower's restart: " + why_of(ra.why, sizeof ra.why) + "]").c_str()
+                : rr != 0      ? (" [the leader's restart: " + e_->error() + "]").c_str()
+                               : "");
+        fflush(stderr);
+        if (ra.status != 0 || rr != 0) {
+            r = -1;
+        }
+    }
+    if (r != 0 || n_back != n_processed) {
+        err_ = r != 0 ? e_->error()
+                      : "read_begin: the follower processes " + std::to_string(n_back) + " tokens, the leader " +
                             std::to_string(n_processed);
         // the follower's prepared read ends: cancelled before its first chunk
         ctrl cc;
@@ -995,7 +1030,7 @@ int32_t leader::read_begin(int32_t                           slot,
         cc.slot = slot;
         ack ca;
         command(cc, nullptr, ca, ctrl_timeout_s);
-        if (r == 0) {
+        if (front_live) {
             e_->read_cancel(slot);
             e_->read_step(slot, 1, read_mode::shared);
         }
@@ -2117,6 +2152,11 @@ void follower::next_of(const std::vector<int32_t> & slots, std::vector<pre> & ou
         if (b < 1 || t.slot().u != 1) {
             continue;  // the request ended, or a prompt's handoff (the bootstrap begins it): none
         }
+        std::string e;
+        if (!runtime::draft_level(t, e)) {
+            why[i] = "draft catch-up: " + e;  // GLFL16: after a reasoning budget's generate round
+            continue;
+        }
         if (b == 1) {
             out[i].valid = true;
             out[i].kind  = int32_t(mkind::generate);
@@ -2181,6 +2221,16 @@ void follower::next_of(const std::vector<int32_t> & slots, std::vector<pre> & ou
         p.to_draft_s = since(t0);
     }
     for (size_t i = 0; i < slots.size(); ++i) {
+        if (out[i].valid && out[i].kind == int32_t(mkind::verify)) {
+            // GLFL16 thinking budget: the proposals cut at the boundary (none left: a generate round; a cut d goes
+            // alone, as the leader's lane rule then sends it)
+            step_info si;
+            si.d = out[i].d;
+            std::copy(out[i].prop, out[i].prop + 4, si.prop);
+            runtime::think_cut(e_->think(slots[i]), si);
+            out[i].d    = si.d;
+            out[i].kind = si.d > 0 ? int32_t(mkind::verify) : int32_t(mkind::generate);
+        }
         if (out[i].valid) {
             out[i].rounds = e_->test_target(slots[i]).round_next() - r0[i];
         }
@@ -2921,6 +2971,13 @@ bool follower::serve(std::string & why) {
                         ro.max_tokens     = c.max_tokens;
                         ro.n_ctx          = c.n_ctx;
                         ro.ignore_eos     = c.ignore_eos != 0;
+                        // the payload is this command's only when it has one (tokens keeps the last one's)
+                        const int32_t n_pay = std::clamp(c.n_tokens, 0, int32_t(tokens.size()));
+                        if (!think_unpack(c, tokens.data(), n_pay, ro.think)) {
+                            a.status = int32_t(run_status::bad_request);
+                            set_why(a.why, sizeof a.why, "set_sampling: the reasoning sequences do not add up");
+                            break;
+                        }
                         discard(c.slot);
                         status(e_->set_sampling(c.slot, ro));
                         break;
@@ -2963,6 +3020,20 @@ bool follower::serve(std::string & why) {
                             set_why(a.why, sizeof a.why, e_->error());
                         } else {
                             read_info ri;  // PRD1 item 11: the read's plan, for the crossings taken ahead
+                            e_->get_read_info(c.slot, ri);
+                            x_->plan(c.slot, ri.chunks);
+                        }
+                        break;
+                    }
+                    case op::read_restart: {
+                        // BG3: the slot's checkpoints dropped and its prepared read from token 0 (leader::read_begin)
+                        int32_t np = 0;
+                        a.status = e_->read_restart(c.slot, np);
+                        a.a = np;
+                        if (a.status != 0) {
+                            set_why(a.why, sizeof a.why, e_->error());
+                        } else {
+                            read_info ri; // PRD1 item 11: the read's new plan, for the crossings taken ahead
                             e_->get_read_info(c.slot, ri);
                             x_->plan(c.slot, ri.chunks);
                         }

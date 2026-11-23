@@ -1906,8 +1906,8 @@ bool reads_case(const options & o, bool eager, std::string & report) {
         return true;
     }
     const std::vector<int32_t> small = tokens_of(970, 256);   // item 7: a small read (at most 512 rows)
-    const std::vector<int32_t> two   = tokens_of(971, 9000);  // two chunks (8,192 and 808 rows)
-    const std::vector<int32_t> one_a = tokens_of(972, 700);   // one chunk each, not small
+    const std::vector<int32_t> two = tokens_of(971, 9000);    // chunks of 8,192, 807 and 1 rows (BG3)
+    const std::vector<int32_t> one_a = tokens_of(972, 700);   // one chunk each and the last token's, not small
     const std::vector<int32_t> one_b = tokens_of(973, 900);
     const std::vector<int32_t> wp    = tokens_of(974, 150);   // the writer's prompt (slot 1)
 
@@ -2100,7 +2100,7 @@ bool reads_case(const options & o, bool eager, std::string & report) {
     big.budget_ms = 1000.0;
     big.known     = true;
 
-    // ---- item 7: a small read beside a writer runs whole: one front step, one back step, no units ----
+    // ---- item 7: a small read beside a writer runs whole: one front step, one back step a chunk, no units ----
     for (int32_t arm = 0; arm < 2 && writer(); ++arm) {
         read_budget b = served;
         b.budget_ms   = arm == 0 ? 12.0 : -1.0;
@@ -2116,9 +2116,10 @@ bool reads_case(const options & o, bool eager, std::string & report) {
         ef.get_read_info(0, fi);
         eb.get_read_info(0, bi);
         L.back_info(0, ba);
-        check(what + ": one front step, whole on the back, 0 units",
-              st == read_status::done && calls == 1 && fi.steps == 1 && bi.steps == 1 && fi.units_run == 0 &&
-                  bi.units_run == 0 && ba.units_run == 0,
+        // BG3: two chunks (255 rows and the last token alone), one front step and one back step each
+        check(what + ": one front step a chunk, whole on the back, 0 units",
+              st == read_status::done && fi.chunks == 2 && calls == 2 && fi.steps == 2 && bi.steps == 2 &&
+                  fi.units_run == 0 && bi.units_run == 0 && ba.units_run == 0,
               "status " + std::to_string(int(st)) + ", front calls " + std::to_string(calls) + ", steps " +
                   std::to_string(fi.steps) + "/" + std::to_string(bi.steps) + ", units " +
                   std::to_string(fi.units_run) + "/" + std::to_string(bi.units_run));
@@ -2236,9 +2237,10 @@ bool reads_case(const options & o, bool eager, std::string & report) {
               s0 == read_status::done && s2 == (cancel == 2 ? read_status::cancelled : read_status::done),
               "statuses " + std::to_string(int(s0)) + " " + std::to_string(int(s2)));
         if (&first == &two) {
-            // item 11: the second chunk's crossing all received before the back took it (the front sent both first)
-            check(what + ": the second chunk received ahead", xb.received_ahead(0) == 1,
-                  std::to_string(xb.received_ahead(0)) + " of 1");
+            // item 11: the later chunks' crossings all received before the back took them (the front sent all three
+            // first: 8,192, 807 and the last token's, BG3)
+            check(what + ": the second and third chunks received ahead", xb.received_ahead(0) == 2,
+                  std::to_string(xb.received_ahead(0)) + " of 2");
         }
         tail(what + ", the first", 0, first);
         if (cancel == 2) {
@@ -3096,6 +3098,201 @@ bool truncate_case(const options & o, bool eager, std::string & report) {
     return failed == 0 && fbye;
 }
 
+// ---- BG3: the split's checkpoint books (the server's calls, k = 27) ----
+
+// (a) slot 0 reads a 9,000-token prompt (checkpoints at 8,192 and 8,999) and steps. Slots 1 .. 3 then read 16,000-token
+// prompts twice each, interleaved a layer group at a time (12 checkpoint writes after slot 0's, past the old shared
+// book's 8 entries), and the back's book of slot 2 is dropped (the boxes' books now differ in another slot). Slot 0's
+// follow-up, keeping all but the last token of its prompt, restores at 8,999 on both boxes with no restart.
+// (b) slot 2's follow-up, keeping all but its prompt's last token: the front restores at 15,999, the back has none:
+// the stages disagree, so both drop the slot's checkpoints and read it from token 0; the request does not fail, and
+// both boxes then hold the same checkpoints for it. Every step's tokens are the shell's (the state check)
+bool books_case(const options & o, bool eager, std::string & report) {
+    const int32_t k = 27;
+    md::window wf, wb;
+    wf.hi = k - 1;
+    wf.head = false;
+    wb.lo = k;
+    loaded LF, LB;
+    if (!load_synth(o, wf, LF) || !load_synth(o, wb, LB)) {
+        report = "the split's loads";
+        return false;
+    }
+    std::unique_ptr<stage::port> pa, pb;
+    stage::loop_pair(pa, pb);
+    stage::buffers bf, bb;
+    stage::crossing xf, xb;
+    std::string err;
+    if (!bf.alloc(n_slot, pa.get(), err) || !bb.alloc(n_slot, pb.get(), err) || !xf.init(*pa, true, k, err) ||
+        !xb.init(*pb, false, k, err)) {
+        report = "the split's buffers: " + err;
+        return false;
+    }
+    engine_config cf = engine_cfg(o), cb = engine_cfg(o);
+    cf.eager = cb.eager = eager;
+    cf.stage = 1;
+    cf.stage_buf = bf.slot;
+    cf.record_hash = false;
+    cb.stage = 2;
+    cb.stage_buf = bb.slot;
+    engine ef, eb;
+    if (!ef.init(std::move(LF.m), cf, err) || !eb.init(std::move(LB.m), cb, err)) {
+        report = "the split's engines: " + err;
+        return false;
+    }
+    ef.prefill_driver().set_stage(&xf);
+    eb.prefill_driver().set_stage(&xb);
+    stage::leader L;
+    stage::follower F;
+    if (!L.init(ef, *pa, xf, err) || !F.init(eb, *pb, xb, err)) {
+        report = "the split's stages: " + err;
+        return false;
+    }
+    std::string fwhy;
+    bool fbye = false;
+    std::thread fth([&]() { fbye = F.serve(fwhy); });
+    stage::pipeline P(L);
+    deliver_shell sh(ef, L, P, n_slot);
+    std::string out, a_note, b_note;
+    // a read's front to its end, one layer group a call (shared: the back's answers are not waited for): front_done
+    // while the back's halves are out, else the read's end; a hang guard of 600 s, not a budget
+    const auto front_end = [&](int32_t s) {
+        const auto t0 = std::chrono::steady_clock::now();
+        read_status st = read_status::yielded;
+        while ((st == read_status::yielded || st == read_status::chunk_done) &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(600)) {
+            st = L.read_step(s, 1, read_mode::shared);
+        }
+        return st;
+    };
+    // a front-done read to its end (the back's answers polled), then a step of the slot
+    const auto finish = [&](int32_t s, read_status st) {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (st == read_status::front_done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(600)) {
+            if (L.read_ready(s)) {
+                st = L.read_poll(s);
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (st != read_status::done) {
+            return sh.fail("the read of slot " + std::to_string(s) + ": " + L.error());
+        }
+        sh.v[size_t(s)].reading = false;
+        sh.v[size_t(s)].gen = true;
+        return sh.check(s, "a held read") && sh.lone(s, 1);
+    };
+    // the follower's test hold, released on every way out
+    struct hold_guard {
+        stage::follower & f;
+
+        explicit hold_guard(stage::follower & x) : f(x) { f.test_hold_reads = true; }
+
+        ~hold_guard() { f.test_hold_reads = false; }
+    };
+
+    // a follow-up keeping all but the last token of the slot's last prompt (prompt), a token changed there (BG3's
+    // client case: the turn's end re-rendered) and new tokens after it
+    const auto follow_up = [](const std::vector<int32_t> & prompt, uint64_t seed) {
+        std::vector<int32_t> next(prompt.begin(), prompt.end() - 1);
+        next.push_back(prompt.back() == 1234 ? 1235 : 1234);
+        const std::vector<int32_t> tail = tokens_of(seed, 40);
+        next.insert(next.end(), tail.begin(), tail.end());
+        return next;
+    };
+    const bool ok = deliver_one(
+        sh, "books: other slots' writes and a back-only drop; then a disagreement",
+        [&]() {
+            const std::vector<int32_t> p0 = deliver_prompt(0, 11, 9000);
+            if (!sh.start(0, p0, true) || !sh.lone(0, 4)) {
+                return false;
+            }
+            // round 0: slots 1 .. 3 read 16,000 tokens each in turn (the server's one long read at a time), 6 writes
+            std::vector<int32_t> q2;
+            for (int32_t s = 1; s < n_slot; ++s) {
+                if (!sh.start(s, deliver_prompt(s, 20, 16000), true) || !sh.lone(s, 1)) {
+                    return false;
+                }
+            }
+            // round 1, cause 4's order: the back held, the front reads slots 1 .. 3 again to their fronts' ends (6 more
+            // writes in the front's books, none yet in the back's); then slot 0's follow-up is begun, the follower
+            // answering read_begin with those back halves still queued. (a) slot 0 restores at L - 1 on both boxes
+            read_info ri;
+            const int64_t r0 = L.stats().restarts;
+            {
+                std::vector<read_status> fronts(size_t(n_slot), read_status::error);
+                {
+                    const hold_guard hold(F);
+                    for (int32_t s = 1; s < n_slot; ++s) {
+                        const std::vector<int32_t> q = deliver_prompt(s, 23, 16000);
+                        q2 = s == 2 ? q : q2;
+                        if (!sh.start(s, q, false)) {
+                            return false;
+                        }
+                        fronts[size_t(s)] = front_end(s);
+                        if (fronts[size_t(s)] != read_status::front_done) {
+                            return sh.fail("slot " + std::to_string(s) + "'s front with the back held: status " +
+                                           std::to_string(int(fronts[size_t(s)])) + " (want front_done): " + L.error());
+                        }
+                    }
+                    if (!sh.start(0, follow_up(p0, 940), false)) {
+                        return false;
+                    }
+                    ef.get_read_info(0, ri);
+                }
+                for (int32_t s = 1; s < n_slot; ++s) {
+                    if (!finish(s, fronts[size_t(s)])) {
+                        return false;
+                    }
+                }
+            }
+            const bool a_ok = ri.from == 8999 && L.stats().restarts == r0;
+            a_note = "slot 0's follow-up, begun with 3 reads' back halves held, from " + std::to_string(ri.from) +
+                     " (want 8999), restarts " + std::to_string(L.stats().restarts - r0) + " (want 0)";
+            if (!sh.read_all(0)) {
+                return false;
+            }
+            sh.v[0].gen = true;
+            if (!sh.check(0, "the follow-up") || !sh.lone(0, 4)) {
+                return false;
+            }
+            if (!a_ok) {
+                return sh.fail(a_note);
+            }
+            // (b) slot 2: the front holds 15,999, the back nothing: both from token 0, no error
+            P.settle_all();
+            eb.prefill_driver().drop_owner(2); // the injection: the back's book of slot 2 gone (the follower idle)
+            const int64_t r1 = L.stats().restarts;
+            if (!sh.start(2, follow_up(q2, 941), false)) {
+                return false;
+            }
+            ef.get_read_info(2, ri);
+            const int64_t from2 = ri.from;
+            if (!sh.read_all(2)) {
+                return false;
+            }
+            sh.v[2].gen = true;
+            if (!sh.check(2, "the restarted read") || !sh.lone(2, 4)) {
+                return false;
+            }
+            P.settle_all();
+            const int32_t nf = ef.prefill_driver().book().count_owner(2),
+                          nb = eb.prefill_driver().book().count_owner(2);
+            const bool b_ok = from2 == 0 && L.stats().restarts == r1 + 1 && nf == 2 && nb == 2;
+            b_note = "slot 2's follow-up from " + std::to_string(from2) + " (want 0), restarts " +
+                     std::to_string(L.stats().restarts - r1) + " (want 1), checkpoints held front " +
+                     std::to_string(nf) + " back " + std::to_string(nb) + " (want 2 each)";
+            return b_ok || sh.fail(b_note);
+        },
+        out);
+    P.settle_all();
+    L.bye();
+    fth.join();
+    printf("%s", out.c_str());
+    report = out + "(a) " + a_note + "; (b) " + b_note + "; follower " + (fbye ? "ended at X-BYE" : "lost: " + fwhy);
+    return ok && fbye;
+}
+
 // ---- APF1 Part 4: the ladder's coverage (structured reads through the real callers) ----
 
 // the process's executed-variant counts (every prompt path of every engine here: md::prompt_route_totals) less a mark
@@ -3653,6 +3850,18 @@ int fnfl_split_test(int argc, char ** argv) {
             fflush(stdout);
             failed += ok ? 0 : 1;
             if (o.cases == "truncate") {
+                continue;
+            }
+        }
+        if (("," + o.cases + ",").find(",books,") != std::string::npos) {
+            std::string report;
+            const bool ok = books_case(o, eager, report);
+            printf("split-test %s books (BG3: the checkpoint books a slot; a disagreement reads from token 0, k = 27): "
+                   "%s: %s\n",
+                   mname, report.c_str(), ok ? "PASS" : "FAIL");
+            fflush(stdout);
+            failed += ok ? 0 : 1;
+            if (o.cases == "books") {
                 continue;
             }
         }

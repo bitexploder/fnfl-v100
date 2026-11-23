@@ -334,6 +334,9 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
+    // IFR1 R2: the OpenAI budget fields are not this endpoint's
+    reasoning_controls_check(body, true);
+
     // Convert system prompt
     json oai_messages = json::array();
     auto system_param = json_value(body, "system", json());
@@ -576,7 +579,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     }
 
     // Pass through common params
-    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs"}) {
+    // FBH1 A2: reasoning_budget_message is the same field on every route
+    for (const auto & key : {"temperature", "top_p", "top_k", "stream", "chat_template_kwargs",
+                             "reasoning_budget_message"}) {
         if (body.contains(key)) {
             oai_body[key] = body.at(key);
         }
@@ -587,8 +592,10 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         json thinking = json_value(body, "thinking", json::object());
         std::string thinking_type = json_value(thinking, "type", std::string());
         if (thinking_type == "enabled") {
-            int budget_tokens = json_value(thinking, "budget_tokens", 10000);
-            oai_body["thinking_budget_tokens"] = budget_tokens;
+            // IFR1 R1: validated as the OpenAI fields are; absent or null, 10000
+            const bool given = thinking.contains("budget_tokens") && !thinking.at("budget_tokens").is_null();
+            oai_body["thinking_budget_tokens"] =
+                given ? reasoning_budget_value("thinking.budget_tokens", thinking.at("budget_tokens")) : 10000;
         }
     }
 

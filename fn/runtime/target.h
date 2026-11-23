@@ -158,6 +158,10 @@ class target {
     // SV1: a request's sampling options, between requests (no round in flight): refused unless check passes and their
     // decision variant was captured; written to both cards on their streams (samp::write_params), synchronous
     bool set_sampling(const fn::samp::options & o, std::string & err);
+    // GLFL16 thinking budget: the token the next bootstrap or generate decisions take in place of their draws (-1:
+    // none; samp::params::force), written on both cards' streams before the next round when it changes. A front stage
+    // decides nothing and needs none
+    bool set_force(int32_t token, std::string & err);
     const fn::samp::options & sampling() const { return o_.sampling; }
     // SV1: the second variant's capture (both_paths): its graphs, seconds, and the device memory it took on each card
     int32_t variant_captures() const { return var_captures_; }
@@ -518,6 +522,7 @@ class target {
     void * exec_[2][fn::round::max_rows + 1][2] = {};
     void * graph_[2][fn::round::max_rows + 1][2] = {};
     int32_t var_ = 0;               // the variant the current options run
+    int32_t force_ = -1;            // GLFL16: the forced token the cards hold (set_force)
     int32_t var_key_[2] = {-1, -1}; // the captured variant's decision path (samp::path), -1: not captured
     fn::samp::options var_opts_[2]; // SP4: the sampling options each variant was captured with (set_expert_map)
     int32_t var_captures_ = 0;      // SV1: the second variant's graphs

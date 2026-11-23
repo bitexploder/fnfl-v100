@@ -48,28 +48,31 @@ class port {
 
 enum class op : int32_t {
     set_sampling = 1,
-    prefill      = 2,
-    read_begin   = 3,
-    read_step    = 4,
-    read_cancel  = 5,
-    truncate     = 6,
+    prefill = 2,
+    read_begin = 3,
+    read_step = 4,
+    read_cancel = 5,
+    truncate = 6,
     release_slot = 7,
-    pool         = 8,
-    step_group   = 9,
-    bye          = 10,
-    set_draft    = 11,
-    drain        = 12,  // a failed read's crossings the follower did not take: received and dropped
+    pool = 8,
+    step_group = 9,
+    bye = 10,
+    set_draft = 11,
+    drain = 12, // a failed read's crossings the follower did not take: received and dropped
     // the drive's tests (rollback-test mu1, joint-kl): a probe of the back's state (a: what; answered with the
     // ack's a bytes, then the bytes), the engine rebuilt (reconfigure: a the KV format q8, b the d, c the joint
     // switches, base the cells a slot), and a slot reset with a ledger of the given tokens (test_prompt)
-    probe        = 13,
-    reconfigure  = 14,
-    test_prompt  = 15,  // MUP2: a 1 keeps the processed tokens and appends (no reset)
-    pos_offset   = 16,  // MUP1 piece 5: the slot's rotary position offset (a), between its requests
+    probe = 13,
+    reconfigure = 14,
+    test_prompt = 15, // MUP2: a 1 keeps the processed tokens and appends (no reset)
+    pos_offset = 16,  // MUP1 piece 5: the slot's rotary position offset (a), between its requests
     // APF2 (the drive's tests): the back's forced prompt routes (model::prompt_route_force: a dense, b hc, c expert,
     // base graph), answered with the follower process's executed-variant totals (model::prompt_route_totals,
     // collected from here on) in acct_i[0 .. route_count_fields - 1]
-    test_route   = 17,
+    test_route = 17,
+    // BG3: the slot's prepared read (read_begin, no chunk run) reads from token 0, its checkpoints dropped (the
+    // stages' restore points differed); answered with the read's tokens in a
+    read_restart = 18,
 };
 
 // APF2: test_route's answer: the totals' counts in model::prompt_path::route_counts' order (dense_ladder .. ple)
@@ -119,7 +122,14 @@ struct ctrl {
     // so the back's reads follow the server's props switch
     int32_t  graphs     = -1;
     int32_t  ignore_eos = 0;   // VBENCH: set_sampling's (1: the back ends the request only at its budget)
-    int32_t  pad[5]     = {};  // the record's size kept: 5a674fe1's pad[7] less graphs and ignore_eos
+    // GLFL16 thinking budget (set_sampling's request_options::think): the budget, the opening and closing sequences'
+    // lengths (the payload holds the opening sequence, the closing one, then each other ending as its length and its
+    // tokens, then FBH1 K1's forced-close lead and tail behind one word of their lengths, then FBH1's budget message
+    // as its negated length and its tokens, then IFR1's think_utf8_n UTF-8 table entries; stage_wire.cpp think_pack)
+    // and whether the prompt ends inside reasoning. The record's
+    // size is 5a674fe1's: its pad[7] became graphs, ignore_eos and these
+    int32_t  think_budget = -1, think_open_n = 0, think_at_start = 0, think_close_n = 0;
+    int32_t  think_utf8_n = 0;
 };
 
 static_assert(sizeof(ctrl) % 8 == 0, "X-CTRL's record");

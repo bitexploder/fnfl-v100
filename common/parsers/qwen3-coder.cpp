@@ -76,9 +76,13 @@ common_chat_params common_chat_params_init_qwen3_coder(const common_chat_templat
 
         auto reasoning = p.eps();
         if (supports_reasoning && extract_reasoning) {
+            // GLFL16 (R16-P2's rule): a section the end of the reply cuts off (a length stop) is still reasoning, as
+            // the lenient parser below already reads it; the final parse must not re-read the opened tag and its text
+            // as content. A partial parse stops at the reasoning's need for more input, so only a complete reply ends
+            // it with the text's end.
             reasoning = p.optional("<think>" + p.space() +
                                    p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
-                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
+                                   (p.literal("</think>") | p.peek(p.literal("<tool_call>")) | p.end()));
         }
 
         // Response format parser

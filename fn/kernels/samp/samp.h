@@ -178,7 +178,10 @@ struct params {
     int32_t window_bins; // hist_bins; TEST ONLY: fewer, to reach the tail bin
     uint32_t seed_lo, seed_hi, req_lo, req_hi;
     int32_t eos; // FC-DEC3: the end-of-generation token a verify verdict cuts at (-1: none)
-    int32_t pad[1];
+    // GLFL16 thinking budget: a bootstrap or generate decision's token in place of its draw (-1: none), the reasoning
+    // closing sequence's next token once a request's budget is spent (write_force; both cards alike). A verify
+    // decision ignores it: the engine forces only one-token steps
+    int32_t force;
 };
 static_assert(sizeof(params) % 16 == 0, "params stay 16-byte aligned");
 constexpr uint32_t f_bias = 1u << 0;
@@ -312,6 +315,8 @@ bool rewind(const card_view & v, int32_t cap, const std::vector<int32_t> & ledge
             void * stream);
 bool read_record(const card_view & v, record & out, void * stream);
 bool write_params(const card_view & v, const params & p, const options & o, void * stream);
+// GLFL16 thinking budget: params::force alone, enqueued on stream (the decisions after it read it); -1 clears it
+bool write_force(const card_view & v, int32_t token, void * stream);
 
 // TEST ONLY: this card's top-k list of row (the words it sent in samp_a: n, then (logit, ID) pairs)
 bool read_list(const card_view & v, int32_t row, std::vector<uint32_t> & words, void * stream);

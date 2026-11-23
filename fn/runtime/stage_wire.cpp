@@ -10,6 +10,7 @@
 #include <cstring>
 #include <deque>
 #include <map>
+#include <memory>
 #include <mutex>
 
 namespace fn::runtime::stage {
@@ -248,6 +249,91 @@ uint64_t probe_tag(uint32_t seq) {
 
 uint64_t crossing_tag(int64_t n, int32_t piece) {
     return lk::make_tag(lk::kind::prompt, 0, uint32_t(n), 0, uint8_t(piece));
+}
+
+namespace {
+
+// FBH1 K1: the payload word of the forced close's lead and tail is -(this + 256 x the lead's length + the tail's)
+constexpr int32_t think_form_base = 1 << 16;
+
+} // namespace
+
+void think_pack(const fn::think::config & t, ctrl & c, std::vector<int32_t> & pay) {
+    pay = t.open;
+    pay.insert(pay.end(), t.close.begin(), t.close.end());
+    for (const std::vector<int32_t> & e : t.ends) {
+        pay.push_back(int32_t(e.size()));
+        pay.insert(pay.end(), e.begin(), e.end());
+    }
+    // FBH1 K1: the forced close's lead and tail after the endings, with a budget only: one word below every negated
+    // message length, holding both lengths, then their tokens
+    if (t.budget >= 0 && (!t.lead.empty() || !t.tail.empty())) {
+        pay.push_back(-(think_form_base + int32_t(t.lead.size()) * 256 + int32_t(t.tail.size())));
+        pay.insert(pay.end(), t.lead.begin(), t.lead.end());
+        pay.insert(pay.end(), t.tail.begin(), t.tail.end());
+    }
+    // FBH1: the budget message after them, its length negated (an ending's is positive), with a budget only
+    if (t.budget >= 0 && !t.message.empty()) {
+        pay.push_back(-int32_t(t.message.size()));
+        pay.insert(pay.end(), t.message.begin(), t.message.end());
+    }
+    // IFR1 R3: the UTF-8 table with a budget only (an unlimited request forces nothing); each entry's bits as an int32
+    c.think_utf8_n = 0;
+    if (t.budget >= 0 && t.utf8) {
+        for (const uint32_t e : *t.utf8) {
+            pay.push_back(int32_t(e));
+        }
+        c.think_utf8_n = int32_t(t.utf8->size());
+    }
+    c.think_budget   = t.budget;
+    c.think_open_n   = int32_t(t.open.size());
+    c.think_close_n  = int32_t(t.close.size());
+    c.think_at_start = t.open_at_start ? 1 : 0;
+}
+
+bool think_unpack(const ctrl & c, const int32_t * pay, int32_t n, fn::think::config & t) {
+    t = fn::think::config{};
+    if (n < 0 || c.think_open_n < 0 || c.think_close_n < 0 || c.think_utf8_n < 0 || c.think_utf8_n > n ||
+        c.think_open_n > n - c.think_utf8_n - c.think_close_n) {
+        return false;
+    }
+    t.budget = c.think_budget;
+    t.open.assign(pay, pay + c.think_open_n);
+    t.close.assign(pay + c.think_open_n, pay + c.think_open_n + c.think_close_n);
+    t.open_at_start = c.think_at_start != 0;
+    if (c.think_utf8_n > 0) {
+        auto u = std::make_shared<std::vector<uint32_t>>();
+        for (int32_t i = n - c.think_utf8_n; i < n; ++i) {
+            u->push_back(uint32_t(pay[i]));
+        }
+        t.utf8 = std::move(u);
+    }
+    n -= c.think_utf8_n;
+    for (int32_t i = c.think_open_n + c.think_close_n; i < n;) {
+        const int32_t k = pay[i];
+        if (k < 0 && k >= -fn::think::max_message && -k == n - i - 1) {
+            t.message.assign(pay + i + 1, pay + n); // FBH1: the message, the last entry
+            break;
+        }
+        if (k <= -think_form_base) {
+            // K1: the forced close's lead and tail, once
+            const int32_t v = -(k + think_form_base), n_lead = v / 256, n_tail = v % 256;
+            if (!t.lead.empty() || !t.tail.empty() || n_lead > 255 || n_lead + n_tail < 1 ||
+                n_lead + n_tail > n - i - 1) {
+                return false;
+            }
+            t.lead.assign(pay + i + 1, pay + i + 1 + n_lead);
+            t.tail.assign(pay + i + 1 + n_lead, pay + i + 1 + n_lead + n_tail);
+            i += 1 + n_lead + n_tail;
+            continue;
+        }
+        if (k < 1 || k > n - i - 1) {
+            return false;
+        }
+        t.ends.emplace_back(pay + i + 1, pay + i + 1 + k);
+        i += 1 + k;
+    }
+    return true;
 }
 
 void trace(const char * who, const std::string & what) {

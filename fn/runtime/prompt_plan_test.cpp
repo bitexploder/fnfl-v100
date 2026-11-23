@@ -118,11 +118,47 @@ void check_chunks() {
     expect(cached && rt::pf_max_half(2049, cs) == 2049 && rt::pf_max_half(4096, cs) == 4096 &&
                rt::pf_max_half(8192, cs) == 4096 && rt::pf_max_half(65, cs) == 65,
            "chunks (MX3, split 4,096): one half to 4,096 rows; the largest half (2,049 | 4,096 | 8,192 | 65)");
-    // the checkpoint arithmetic and the tail across a boundary
+    // the checkpoint arithmetic and the tail across a boundary (BG3: the last token its own chunk)
     const auto t = rt::plan_chunks(16184, 16584);
-    expect(t.size() == 2 && t[0].rows == 200 && t[1].start == 16384 && rt::checkpoint_due(16384, 16584) &&
-               rt::checkpoint_due(16584, 16584) && !rt::checkpoint_due(16583, 16584),
-           "chunks: a 400-row part across 16,384 is 200 + 200, checkpoints at 16,384 and its end");
+    expect(t.size() == 3 && t[0].rows == 200 && t[1].start == 16384 && t[1].rows == 199 && t[2].start == 16583 &&
+               t[2].rows == 1 && rt::checkpoint_due(16384, 16584) && rt::checkpoint_due(16583, 16584) &&
+               !rt::checkpoint_due(16584, 16584),
+           "chunks: a 400-row read across 16,384 is 200 + 199 + 1, checkpoints at 16,384 and one before its end");
+    // BG3 (F1): every read [from, to) whose to - 1 lies past from has a chunk ending at to - 1, so its checkpoints
+    // are the multiples of 8,192 in (from, to] and to - 1, never to itself off a multiple; to - 1 on a multiple
+    // changes nothing; a one-token prompt has none; the policy model's shapes (end_cut off) are unchanged
+    bool f1 = true;
+    int32_t f1_cases = 0;
+    for (const int64_t f : {int64_t(0), int64_t(1), int64_t(7001), int64_t(8191), int64_t(8192), int64_t(81920)}) {
+        for (const int64_t n : {int64_t(1), int64_t(2), int64_t(64), int64_t(523), int64_t(8191), int64_t(8192),
+                                int64_t(8193), int64_t(8194), int64_t(9645), int64_t(20000)}) {
+            const int64_t to = f + n;
+            std::vector<int64_t> due, want;
+            for (const auto & c : rt::plan_chunks(f, to)) {
+                if (rt::checkpoint_due(c.start + c.rows, to)) {
+                    due.push_back(c.start + c.rows);
+                }
+            }
+            for (int64_t k = (f / rt::pf_span + 1) * rt::pf_span; k <= to; k += rt::pf_span) {
+                if (k > f) {
+                    want.push_back(k);
+                }
+            }
+            if (to - 1 > f && (to - 1) % rt::pf_span != 0) {
+                want.push_back(to - 1);
+                std::sort(want.begin(), want.end());
+            }
+            f1 = f1 && due == want;
+            const auto plain = rt::plan_chunks(f, to, rt::pf_chunk_rows, rt::pf_split_rows, false);
+            f1 = f1 && (plain.empty() || plain.back().start + plain.back().rows == to);
+            ++f1_cases;
+        }
+    }
+    const auto ex = rt::plan_chunks(81920, 90359); // BG3's logged follow-up: 89,836 kept of the slot's 90,795
+    f1 = f1 && ex.size() == 3 && ex[1].start + ex[1].rows == 90358 && ex[2].rows == 1 && !rt::checkpoint_due(1, 1) &&
+         rt::checkpoint_due(90358, 90359) && !rt::checkpoint_due(90359, 90359);
+    expect(f1, "chunks (BG3 F1): a checkpoint one token before the prompt's end, the multiples kept, " +
+                   std::to_string(f1_cases) + " reads; 81,920 .. 90,359 is 8,192 + 246 + 1");
 }
 
 void check_paths() {
@@ -134,11 +170,12 @@ void check_paths() {
     const auto ar = small_arena;
     pp::plan p;
     std::string err;
-    // the pending token: a follow-up of 63 IDs processes 64 rows (windows), 64 IDs 65 rows (bulk)
-    const bool w64 = pp::make(o, pl, 1774, 1774 + 64, ar, p, err) && p.p == pp::path::windows && p.rounds == 13;
+    // the pending token: a follow-up of 63 IDs processes 64 rows (windows; BG3: the last token its own round, 12 x 5,
+    // 3 and 1), 64 IDs 65 rows (bulk)
+    const bool w64 = pp::make(o, pl, 1774, 1774 + 64, ar, p, err) && p.p == pp::path::windows && p.rounds == 14;
     const bool b65 = pp::make(o, pl, 1774, 1774 + 65, ar, p, err) && p.p == pp::path::bulk && p.chunks.size() == 1 &&
                      p.chunks[0].s == pp::staging::ring;
-    expect(w64 && b65, "paths: 64 rows windows (13 rounds), 65 rows one ring chunk");
+    expect(w64 && b65, "paths: 64 rows windows (14 rounds), 65 rows one ring chunk");
     o.short_read = 0;
     expect(pp::make(o, pl, 0, 13, ar, p, err) && p.p == pp::path::bulk, "paths: short read 0 always bulk");
     o.short_read = 64;

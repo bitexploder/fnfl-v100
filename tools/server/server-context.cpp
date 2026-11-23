@@ -72,6 +72,7 @@ struct server_slot {
 
     std::string  generated_text;
     std::string  debug_generated_text;
+    think_close_hide think_hide; // FBH1 K2: the model's own closing tag right after a forced close is not shown
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
 
@@ -255,6 +256,13 @@ struct server_slot {
         SLT_INF(*this,
                 "      total time = %10.2f ms / %5d tokens\n",
                 t_prompt_total + t_gen_total, (int) (stats.n_prompt_processed + stats.n_gen));
+
+        if (stats.think_budget >= 0) {
+            SLT_INF(*this, "thinking budget = %d: %llu reasoning tokens counted, %llu past it finishing a character, "
+                    "%llu message, newline, closing and blank-line tokens forced\n", stats.think_budget,
+                    (unsigned long long) stats.n_think, (unsigned long long) stats.n_think_extra,
+                    (unsigned long long) stats.n_think_forced);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -311,6 +319,17 @@ public:
 
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
+
+    // GLFL16 thinking budget: the model's reasoning opening and closing sequences (the chat template's reasoning tags,
+    // tokenized with the model's vocabulary at load; empty: the template has none, and a budget is refused)
+    std::vector<int32_t> think_open, think_close;
+    std::vector<std::vector<int32_t>> think_ends;  // C2: the other reasoning endings (never forced)
+    std::shared_ptr<const std::vector<uint32_t>> think_utf8; // IFR1 R3: the tokens not whole UTF-8 characters
+    // FBH1 A2: the reasoning tags' texts (a budget message may hold none) and the server's message, tokenized once
+    std::vector<std::string> think_tag_list;
+    std::vector<int32_t> think_message;
+    // FBH1 K1: the forced close's form, the model's own: its newline before the closing sequence, its blank line after
+    std::vector<int32_t> think_lead, think_tail;
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
@@ -683,6 +702,7 @@ private:
         GGML_ASSERT(!sleeping);
 
         // wiring up server queues
+        queue_tasks.set_results(&queue_results); // FBH1 B1: a wrapped id counter skips ids waiting for a result
         queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
             return process_single_task(std::move(task), is_yielding);
         });
@@ -778,7 +798,110 @@ private:
             }
         }
 
+        if (!think_tags()) {
+            return false;
+        }
+
         return true;
+    }
+
+    // GLFL16 thinking budget: the reasoning tags the chat template's analysis finds (the parser's own: a thinking
+    // request's thinking_start_tag and thinking_end_tags, the first the forced close, any others natural endings),
+    // tokenized with special tokens; the server's default budget checked against them. False: a setting the engine
+    // cannot honor
+    bool think_tags() {
+        std::string              open_tag;
+        std::vector<std::string> end_tags;
+        if (params_base.use_jinja && chat_params.tmpls) {
+            std::string err;
+            if (!think_tag_texts(chat_params, open_tag, end_tags, err)) {
+                SRV_WRN("thinking budget: the chat template's reasoning tags are unknown (%s)\n", err.c_str());
+            }
+        }
+        think_open = think_tag_ids(vocab, open_tag);
+        think_close.clear();
+        think_ends.clear();
+        const auto str = [](const std::vector<int32_t> & v) {
+            std::string s;
+            for (const int32_t x : v) {
+                s += (s.empty() ? "" : " ") + std::to_string(x);
+            }
+            return s;
+        };
+        std::string ends_log;
+        for (size_t i = 0; i < end_tags.size(); ++i) {
+            std::vector<int32_t> ids = think_tag_ids(vocab, end_tags[i]);
+            if (i > 0) {
+                ends_log += ", '" + end_tags[i] + "' [" + str(ids) + "]";
+            }
+            (i == 0 ? think_close : think_ends.emplace_back()) = std::move(ids);
+        }
+        const std::string close_tag = end_tags.empty() ? std::string() : end_tags.front();
+        SRV_INF("thinking budget: reasoning opens with '%s' [%s] and closes with '%s' [%s]; it also ends with%s; the "
+                "server's default budget is %d (-1 unlimited)\n", open_tag.c_str(), str(think_open).c_str(),
+                close_tag.c_str(), str(think_close).c_str(), ends_log.empty() ? " nothing else" : ends_log.c_str() + 1,
+                params_base.sampling.reasoning_budget_tokens);
+        // FBH1 A2: the server's budget message (a request's reasoning_budget_message replaces it)
+        think_tag_list = end_tags;
+        think_tag_list.push_back(open_tag);
+        std::string msg_err;
+        if (!think_message_ids(vocab, params_base.sampling.reasoning_budget_message, think_tag_list, think_message,
+                               msg_err)) {
+            SRV_ERR("--reasoning-budget-message: %s\n", msg_err.c_str());
+            return false;
+        }
+        SRV_INF("thinking budget: the budget message is %zu tokens [%s], fed before the close and reserved inside a "
+                "budget of at least %zu (4 x its tokens); a smaller budget closes alone\n", think_message.size(),
+                str(think_message).c_str(), 4 * think_message.size());
+        // FBH1 K1: a forced close takes the model's own form
+        think_form_ids(vocab, think_open, think_close, think_ends, think_lead, think_tail);
+        SRV_INF("thinking budget: a forced close is a newline [%s], the closing sequence, then a blank line [%s], as "
+                "the model writes its own; the newline is reasoning, reserved inside the budget\n",
+                str(think_lead).c_str(), str(think_tail).c_str());
+        if (params_base.sampling.reasoning_budget_tokens >= 0 && think_close.empty()) {
+            SRV_ERR("--reasoning-budget %d needs the model's reasoning closing sequence; the chat template has none\n",
+                    params_base.sampling.reasoning_budget_tokens);
+            return false;
+        }
+        think_utf8 = think_utf8_table(vocab, params_base.special, fnfl_think_utf8_entry);
+        SRV_INF("thinking budget: %zu of %d tokens are listed (not whole UTF-8 characters, or ending a sentence); a "
+                "budget spent inside a character waits for its bytes, at most 3 tokens; the budget message starts at "
+                "a sentence's end inside its window\n", think_utf8->size(), llama_vocab_n_tokens(vocab));
+        return true;
+    }
+
+    // GLFL16 thinking budget: the request's budget and sequences, and whether its prompt ends inside reasoning (its
+    // last opening sequence after its last closing one, as a template that opens reasoning renders it)
+    // FBH1 A3: without a budget the sequences go too, so the engine still counts the reasoning for the usage report.
+    // FBH1 A2: with a budget, the request's message (fnfl_refused checked it at admission), else the server's.
+    // FBH1 K1: with a budget, the forced close's lead and tail. K2: the slot's filter for the model's own closing tag
+    // after a forced close, on the routes that parse the reply into a message
+    void think_sampling(server_slot & slot, fnfl_sampling & fs) const {
+        const common_params_sampling & sp = slot.task->params.sampling;
+        const task_response_type       rt = slot.task->params.res_type;
+        slot.think_hide.reset(think_close, rt != TASK_RESPONSE_TYPE_NONE && rt != TASK_RESPONSE_TYPE_OAI_CMPL);
+        fs.reasoning_budget = sp.reasoning_budget_tokens;
+        if (fs.reasoning_budget < 0 && think_close.empty()) {
+            return;
+        }
+        fs.think_open  = think_open;
+        fs.think_close = think_close;
+        fs.think_ends  = think_ends;
+        std::vector<std::vector<int32_t>> all = think_ends;
+        all.push_back(think_close);
+        fs.think_open_at_start = prompt_opens_reasoning(slot.task->tokens.get_tokens(), think_open, all);
+        if (fs.reasoning_budget < 0) {
+            return;
+        }
+        fs.think_utf8 = think_utf8;
+        fs.think_lead = think_lead;
+        fs.think_tail = think_tail;
+        if (sp.reasoning_budget_message == params_base.sampling.reasoning_budget_message) {
+            fs.think_message = think_message;
+        } else {
+            std::string err;
+            think_message_ids(vocab, sp.reasoning_budget_message, think_tag_list, fs.think_message, err);
+        }
     }
 
     server_slot * get_slot_by_id(int id_slot) {
@@ -929,11 +1052,24 @@ private:
         if (s.samplers != params_base.sampling.samplers) {
             v.push_back("samplers (a non-default sampler order)");
         }
-        if (s.reasoning_budget_tokens >= 0) {
-            v.push_back("reasoning_budget_tokens (thinking_budget_tokens)");
+        if (s.reasoning_control) {
+            v.push_back("reasoning_control (ending reasoning at runtime)");
+        }
+        if (!s.reasoning_budget_start.empty() || !s.reasoning_budget_end.empty() ||
+            !s.reasoning_budget_forced.empty()) {
+            v.push_back("reasoning_budget_start_tag / reasoning_budget_end_tags (the engine uses the model's own "
+                        "reasoning sequences)");
         }
         if (p.n_cmpl > 1) {
             v.push_back("n (" + std::to_string(p.n_cmpl) + " completions)");
+        }
+        // FBH1 A2: a request's own budget message that holds a reasoning tag
+        if (s.reasoning_budget_message != params_base.sampling.reasoning_budget_message) {
+            std::vector<int32_t> ids;
+            std::string          why;
+            if (!think_message_ids(vocab, s.reasoning_budget_message, think_tag_list, ids, why)) {
+                v.push_back("reasoning_budget_message (" + why + ")");
+            }
         }
         std::string msg;
         for (const auto & f : v) {
@@ -1082,6 +1218,26 @@ private:
     void prompt_keep_first(server_slot & slot, size_t n) {
         slot.prompt.tokens.keep_first(n);
         server_answers_keep_first(slot.answers, n);
+    }
+
+    // FBH1 C2: a request's admission in one line, so a reply that looks like another conversation's can be traced from
+    // the log: what the slot kept, where the engine's read starts (the restored checkpoint; -1: not known, the read
+    // ended early) and an FNV-1a hash of the first 16 new tokens (their int32 values, low byte first)
+    void log_admission(server_slot & slot, int32_t n_kept, int32_t from, int32_t n_read, const llama_token * fresh,
+                       int32_t n_fresh) {
+        const int32_t n_hash = std::min<int32_t>(n_fresh, 16);
+        uint64_t      h      = 1469598103934665603ull;
+        for (int32_t i = 0; i < n_hash; ++i) {
+            const uint32_t t = (uint32_t) fresh[i];
+            for (int32_t b = 0; b < 4; ++b) {
+                h = (h ^ ((t >> (8 * b)) & 0xffu)) * 1099511628211ull;
+            }
+        }
+        const char * how = from < 0 ? "not known" : from == 0 ? "token 0" : from >= n_kept ? "in place" : "a checkpoint";
+        SLT_INF(slot,
+                "admission: slot %d, %d tokens kept, read from %d (%s), %d tokens to read, first %d new tokens' hash "
+                "%016llx\n",
+                slot.id, n_kept, from, how, n_read, n_hash, (unsigned long long) h);
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -1493,6 +1649,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
+                    res->n_task_ids          = queue_tasks.ids_drawn();
                     res->metrics             = metrics;
 
                     if (task.metrics_reset_bucket) {
@@ -1639,6 +1796,8 @@ private:
             fs.max_tokens  = slot.n_predict_max;
             fs.n_ctx       = slot.n_ctx;
             fs.ignore_eos  = sp.ignore_eos;
+            think_sampling(slot, fs);
+            slot.stats.think_budget = fs.reasoning_budget;
             std::string err;
             if (fnfl_set_sampling(engine, slot.id, fs, err) != FNFL_OK) {
                 send_error(slot, "FNFL: " + err, ERROR_TYPE_INVALID_REQUEST);
@@ -1695,6 +1854,9 @@ private:
             st = fnfl_prefill_images(engine, slot.id, all.data() + n_past, n_new, n_past, im.data(), int32_t(im.size()),
                                      &n_processed, &on_prefill_chunk, &watch);
         });
+        // one slot: the read has run by now, so the line follows it
+        log_admission(slot, n_past, st == FNFL_OK ? slot.task->n_tokens() - n_processed : -1,
+                      st == FNFL_OK ? n_processed : 0, all.data() + n_past, n_new);
         if (st == FNFL_CANCELLED) {
             // the client left during the prefill: the slot keeps the prompt's tokens the engine kept (n_processed)
             const int32_t kept = std::min(n_processed, slot.task->n_tokens());
@@ -1787,12 +1949,20 @@ private:
                 slot.n_gen_last   = 0;
             }
             slot.stats.update_gen_last();
+            // GLFL16 thinking budget: the token's reasoning count and whether the budget forced it
+            slot.stats.n_think        += (uint64_t) r.think_add[i];
+            slot.stats.n_think_forced += (r.think_forced >> i) & 1u;
+            slot.stats.n_think_extra  += (uint64_t) r.think_extra[i];
 
             completion_token_output result;
             result.tok          = tok;
             result.text_to_send = common_token_to_piece(vocab, tok,
                     accept_special || slot.task->params.sampling.preserved_tokens.count(tok) > 0);
             result.prob         = 1.0f;
+            // FBH1 K2: the model's own closing tag right after a forced close is not shown
+            if (slot.think_hide.hide(tok, ((r.think_forced >> i) & 1u) != 0, result.text_to_send)) {
+                result.text_to_send.clear();
+            }
 
             if (!process_token(result, slot) || (r.end && i + 1 == r.n_tokens)) {
                 if (slot.stop == STOP_TYPE_NONE) {
@@ -1977,6 +2147,8 @@ private:
             fs.max_tokens  = slot.n_predict_max;
             fs.n_ctx       = slot.n_ctx;
             fs.ignore_eos  = sp.ignore_eos;
+            think_sampling(slot, fs);
+            slot.stats.think_budget = fs.reasoning_budget;
             std::string err;
             if (fnfl_set_sampling(engine, slot.id, fs, err) != FNFL_OK) {
                 send_error(slot, "FNFL: " + err, ERROR_TYPE_INVALID_REQUEST);
@@ -2039,6 +2211,7 @@ private:
         slot.tu_t_start     = ggml_time_us();
         slot.state          = SLOT_STATE_PROCESSING_PROMPT;
         SLT_INF(slot, "read job begun: %d tokens kept, %d new, %d to process\n", n_past, n_new, n_processed);
+        log_admission(slot, n_past, slot.task->n_tokens() - n_processed, n_processed, all.data() + n_past, n_new);
         return true;
     }
 
@@ -2637,8 +2810,10 @@ private:
 
             SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
+            // FBH1 B2: the turn's own wake-up has no result and is never cancelled, so it takes no new id (a finishing
+            // slot's poll posts one a turn, hundreds of thousands a second, which ran the counter out)
             server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
-            task.id = queue_tasks.get_new_id();
+            task.id = server_queue::id_no_result;
             queue_tasks.post(std::move(task));
         }
 

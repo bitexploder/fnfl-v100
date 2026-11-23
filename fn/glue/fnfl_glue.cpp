@@ -25,6 +25,10 @@
 
 static_assert(sizeof(fnfl_step_result::tokens) / sizeof(int32_t) == fn::runtime::max_step_tokens,
               "fnfl.h's step result must hold a step");
+static_assert(sizeof(fnfl_step_result::think_add) == sizeof(fnfl_step_result::tokens),
+              "fnfl.h's step result: a reasoning count a token");
+static_assert(sizeof(fnfl_step_result::think_extra) == sizeof(fnfl_step_result::tokens),
+              "fnfl.h's step result: an extra reasoning count a token");
 
 namespace {
 
@@ -580,6 +584,15 @@ fnfl_status fnfl_set_sampling(fnfl_engine * engine, int32_t slot, const fnfl_sam
     o.max_tokens = params.max_tokens;
     o.n_ctx = params.n_ctx;
     o.ignore_eos = params.ignore_eos;
+    o.think.budget = params.reasoning_budget;
+    o.think.open = params.think_open;
+    o.think.close = params.think_close;
+    o.think.ends = params.think_ends;
+    o.think.open_at_start = params.think_open_at_start;
+    o.think.utf8 = params.think_utf8;
+    o.think.message = params.think_message;
+    o.think.lead = params.think_lead;
+    o.think.tail = params.think_tail;
     if (engine->split != nullptr) {
         const fnfl_status st = to_status(engine->split->pipe->set_sampling(slot, o));
         if (st != FNFL_OK) {
@@ -697,6 +710,17 @@ fnfl_status fnfl_prefill_images(fnfl_engine *             engine,
     return st;
 }
 
+// GLFL16 thinking budget: the slot's last step's accounting (the split's leader engine records its steps too)
+static void think_of(const fnfl_engine * engine, int32_t slot, fnfl_step_result & result) {
+    if (slot >= 0 && slot < engine->rt.n_slots()) {
+        engine->rt.think_step(slot, result.think_add, result.think_forced, result.think_extra);
+    }
+}
+
+uint32_t fnfl_think_utf8_entry(int32_t token, const char * bytes, size_t n) {
+    return fn::think::utf8_entry(token, bytes, n);
+}
+
 fnfl_status fnfl_step(fnfl_engine * engine, int32_t slot, fnfl_step_result & result) {
     result = fnfl_step_result();
     if (engine == nullptr) {
@@ -711,9 +735,12 @@ fnfl_status fnfl_step(fnfl_engine * engine, int32_t slot, fnfl_step_result & res
         }
         result.n_tokens = out.n_out;
         result.end      = out.end;
+        think_of(engine, slot, result);
         return to_status(out.st);
     }
-    return to_status(engine->rt.step(slot, result.tokens, result.n_tokens, result.end));
+    const fnfl_status st = to_status(engine->rt.step(slot, result.tokens, result.n_tokens, result.end));
+    think_of(engine, slot, result);
+    return st;
 }
 
 fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t n, fnfl_step_result * results,
@@ -743,6 +770,7 @@ fnfl_status fnfl_step_joint(fnfl_engine * engine, const int32_t * slots, int32_t
         results[k].end      = out[k].end;
         status[k]           = to_status(out[k].st);
         errors[k]           = out[k].why;
+        think_of(engine, slots[k], results[k]);
     }
     return FNFL_OK;
 }
@@ -789,6 +817,7 @@ fnfl_status fnfl_step_pipe(fnfl_engine *      engine,
         results[k].end = out[k].end;
         status[k] = to_status(out[k].st);
         errors[k] = out[k].why;
+        think_of(engine, slots[k], results[k]);
     }
     return FNFL_OK;
 }

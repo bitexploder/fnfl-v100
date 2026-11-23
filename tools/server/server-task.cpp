@@ -253,7 +253,10 @@ common_chat_msg task_result_state::update_chat_msg(
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls) {
-    generated_text += text_added;
+    // IFR1 R3: invalid UTF-8 (the model's own broken bytes) reaches the parser as U+FFFD, so reasoning stays reasoning.
+    // Each added text ends on a whole character (process_token sends at those points), so this equals replacing the
+    // whole text
+    generated_text += utf8_replace_invalid(text_added);
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     auto new_msg = common_chat_parse(
@@ -262,8 +265,9 @@ common_chat_msg task_result_state::update_chat_msg(
         chat_parser_params);
     const bool healed = tc1_settle_tool_calls(new_msg, is_partial);
     if (!is_partial && (new_msg.lenient_parse || healed)) {
-        // FNFL (TC1): the raw text of every reply the strict parser would not have taken, on one line
-        SRV_WRN("TC1 lenient parse: task %d: %s\n", id_task, json(generated_text).dump().c_str());
+        // FNFL (TC1): the raw text of every reply the strict parser would not have taken, on one line (IFR1 R3: safely,
+        // as a reply can hold invalid UTF-8)
+        SRV_WRN("TC1 lenient parse: task %d: %s\n", id_task, safe_json_to_str(json(generated_text)).c_str());
     }
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
@@ -274,8 +278,9 @@ common_chat_msg task_result_state::update_chat_msg(
         } catch (const std::exception & e) {
             // FNFL (TC1): a guard, which the replay corpus shows unused. Never retract what was sent: keep it, and
             // let the final parse only append to it.
-            SRV_WRN("TC1 stream guard: task %d: %s; raw text: %s\n", id_task, json(std::string(e.what())).dump().c_str(),
-                    json(generated_text).dump().c_str());
+            SRV_WRN("TC1 stream guard: task %d: %s; raw text: %s\n", id_task,
+                    safe_json_to_str(json(std::string(e.what()))).c_str(),
+                    safe_json_to_str(json(generated_text)).c_str());
             if (!is_partial) {
                 chat_msg  = tc1_append_only(msg_prv_copy, new_msg);
                 all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -467,12 +472,17 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
 }
 
 json server_task_result_cmpl_final::usage_json_oaicompat() {
-    return json {
+    json u = json {
         {"completion_tokens", n_decoded},
         {"prompt_tokens",     n_prompt_tokens},
         {"total_tokens",      n_decoded + n_prompt_tokens},
         {"prompt_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
     };
+    // GLFL16 thinking budget: the reasoning tokens the engine counted (FBH1 A3: with or without a budget; a budget
+    // message's tokens among them) and (IFR1 R3) those past the budget that finished a UTF-8 character; forced closing
+    // tokens are completion tokens, not reasoning ones
+    u["completion_tokens_details"] = json { {"reasoning_tokens", stats.n_think + stats.n_think_extra} };
+    return u;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat() {
@@ -1606,6 +1616,10 @@ std::string server_task_result_metrics::to_metrics() {
             "spec_decode_num_drafts_total",
             "Speculative: Total speculative decoding verification steps",
             (double) metrics.n_draft_verif_steps
+        }, {
+            "task_ids_total",
+            "Task ids drawn from the queue's counter (FBH1 B2)",
+            (double) n_task_ids
         },
     };
 

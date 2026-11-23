@@ -24,6 +24,7 @@
 #include "fn/runtime/pace.h"
 #include "fn/runtime/prefill.h"
 #include "fn/runtime/target.h"
+#include "fn/runtime/think_budget.h"
 #include "fn/runtime/vision_service.h"
 
 #include <array>
@@ -85,9 +86,18 @@ bool extend(target & t, const int32_t * tokens, int32_t n, std::string & err);
 // extend's first part (PF1's pure extension): the draft caught up to N, the processed tokens kept and tokens appended
 bool extend_ledger(target & t, const int32_t * tokens, int32_t n, std::string & err);
 // one step of at most budget (>= 1) tokens (above); d: the drafts a speculative step proposes (SP2: 1..4);
-// eog: the end-of-generation IDs
+// eog: the end-of-generation IDs; think (GLFL16 thinking budget, null: none): the proposals cut by think_cut
 bool step(target & t, int32_t budget, int32_t d, const std::vector<int32_t> & eog, step_info & s, std::string & err,
-          const after_draft_fn * after_draft = nullptr);
+          const after_draft_fn * after_draft = nullptr, const fn::think::tracker * think = nullptr);
+// GLFL16 thinking budget. draft_level: the draft caught up to N when a generate round left it behind (a step of the
+// budget's boundary or its forced close; the next draft step drafts from N). think_cut: s.d cut so the verify round
+// emits no position the budget forces (fn::think::tracker::cap; 0: no proposal left). step_rest: the step after
+// step_propose and think_cut: a generate round when no proposal is left (the drafted cells unused, rewritten by the
+// next catch-up), else the verify round of the s.d proposals and step_close
+bool draft_level(target & t, std::string & err);
+void think_cut(const fn::think::tracker & think, step_info & s);
+bool step_rest(target & t, int32_t budget, const std::vector<int32_t> & eog, std::chrono::steady_clock::time_point t0,
+               step_info & s, std::string & err);
 // a speculative step's halves around its verify round (FMU2: the joint round's members take theirs in between):
 // step_propose, the draft step's min(d, budget - 1) proposals into s (from s.n_before, set by the caller, and the
 // step's start t0); step_close, from the verify round's result rv the step's tokens, the end-of-generation cut and the
@@ -174,6 +184,10 @@ struct joint_step_out {
     int32_t n_out = 0;
     bool end = false;
     bool joint = false; // its verify round was a joint round's lane
+    // GLFL16 thinking budget: the reasoning tokens out[j] added to the request's count, and bit j: out[j] was a
+    // closing token the budget forced (engine::think_step)
+    int32_t think_add[max_step_tokens] = {};
+    uint32_t think_forced = 0;
     run_status st = run_status::ok;
     std::string why; // the failure's reason (the engine's error() for this slot)
 };
@@ -184,6 +198,9 @@ struct request_options {
     int32_t max_tokens = -1; // the request's token limit; -1: the context room
     int32_t n_ctx = 0;       // the shell's slot context (the room's limit); 0: the engine's
     bool ignore_eos = false; // VBENCH: no end of generation, so only the budget ends the request (vLLM's ignore_eos)
+    // GLFL16 thinking budget (fn/runtime/think_budget.h): the reasoning tokens this turn may generate (-1 unlimited)
+    // and the model's sequences; at the budget the decision is the closing sequence's next token
+    fn::think::config think;
 };
 
 // one request's steps (the per-request summary)
@@ -324,6 +341,9 @@ class engine {
     static constexpr int32_t max_pos_offset = 1 << 23;
     run_status               set_pos_offset(int32_t slot, int32_t off);
     int32_t                  pos_offset(int32_t slot) const;
+    // GLFL16 thinking budget: the slot's tracker, and its last step's accounting (as joint_step_out's)
+    const fn::think::tracker & think(int32_t slot) const { return s_[size_t(slot)].think; }
+    void think_step(int32_t slot, int32_t * add, uint32_t & forced, int32_t * extra) const;
     // the tokens the slot's state holds (processed) and its pending token (-1: none)
     run_status history(int32_t slot, std::vector<int32_t> & tokens, int32_t & pending) const;
 
@@ -339,6 +359,10 @@ class engine {
                            int32_t                           n_reuse,
                            int32_t &                         n_processed,
                            const std::vector<prompt_image> * images = nullptr);
+    // BG3: the slot's prepared read (begun, no chunk started) reads from token 0 instead, the slot's checkpoints
+    // dropped: the split's stages' answer when their restore points differ (leader::read_begin). n_processed: the
+    // read's tokens. -1: no such read (err)
+    int32_t read_restart(int32_t slot, int32_t & n_processed);
     // the job's next step: up to n_groups layer groups of its chunk in progress (or of its next chunk, started now in
     // the main arena when free, else in the other-reader lane when it fits), complete on both cards when it returns
     // FMU1: mode fixes a chunk's geometry when the step starts it (fn/runtime/prefill.h pf_mode)
@@ -500,6 +524,11 @@ class engine {
         // FMU1: the cells the pool has mapped for the slot (refreshed whenever its mapping changes), so a step's check
         // is one comparison
         int64_t cells = 0;
+        // GLFL16 thinking budget: the request's tracker, and its last step's tokens' accounting
+        fn::think::tracker think;
+        int32_t think_add[max_step_tokens] = {};
+        uint32_t think_forced = 0;
+        int32_t think_extra[max_step_tokens] = {}; // IFR1 R3: past the budget, finishing a character
     };
 
     run_status failed(run_status s, const std::string & what);
@@ -509,6 +538,9 @@ class engine {
     // the slot's open request's closing check and summary (ended: why it ended)
     void finish(slot_rt & x, const char * ended);
     int32_t budget(const slot_rt & x) const;
+    // GLFL16 thinking budget: the step's token budget b limited by the slot's reasoning budget (1 when its first
+    // token is forced; inside reasoning, no more than the positions before the boundary)
+    int32_t think_budget(const slot_rt & x, int32_t b) const;
     void lost(slot_rt & x); // a failure: the slot's state is unknown (re-prefill from token 0, no checkpoints)
     bool slot_ok(int32_t slot) const { return slot >= 0 && slot < n_slots(); }
     // MU1: the slot's first cells mapped (the pool), reclaiming idle slots when it is full; capacity: it stayed full
